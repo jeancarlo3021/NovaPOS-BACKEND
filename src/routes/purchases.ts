@@ -30,7 +30,7 @@ purchases.get('/', async (c) => {
 
     let query = db
       .from('purchases')
-      .select('*, suppliers(name)')
+      .select('*')
       .eq('tenant_id', tenantId)
       .order('created_at', { ascending: false });
 
@@ -54,7 +54,7 @@ purchases.get('/:id', async (c) => {
 
     const { data, error } = await db
       .from('purchases')
-      .select('*, suppliers(name), purchase_items(*, products(name, barcode))')
+      .select('*, purchase_items(*)')
       .eq('id', id)
       .eq('tenant_id', tenantId)
       .maybeSingle();

@@ -28,7 +28,7 @@ products.get('/', async (c) => {
 
     let query = db
       .from('products')
-      .select('*, categories(name), unit_types(name)')
+      .select('*')
       .eq('tenant_id', tenantId)
       .order('name');
 
@@ -55,7 +55,7 @@ products.get('/:id', async (c) => {
 
     const { data, error } = await db
       .from('products')
-      .select('*, categories(name), unit_types(name)')
+      .select('*')
       .eq('id', id)
       .eq('tenant_id', tenantId)
       .maybeSingle();

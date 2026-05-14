@@ -27,7 +27,7 @@ cashSessions.get('/', async (c) => {
 
     let query = db
       .from('cash_sessions')
-      .select('*, users(id, full_name, email)')
+      .select('*')
       .eq('tenant_id', tenantId)
       .order('opened_at', { ascending: false });
 
@@ -49,7 +49,7 @@ cashSessions.get('/active', async (c) => {
 
     const { data, error } = await db
       .from('cash_sessions')
-      .select('*, users(id, full_name, email)')
+      .select('*')
       .eq('tenant_id', tenantId)
       .is('closed_at', null)
       .maybeSingle();

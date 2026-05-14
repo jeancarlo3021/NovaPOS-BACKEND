@@ -31,7 +31,7 @@ accountsPayable.get('/', async (c) => {
 
     let query = db
       .from('accounts_payable')
-      .select('*, suppliers(name)')
+      .select('*')
       .eq('tenant_id', tenantId)
       .order('due_date', { ascending: true });
 
@@ -53,7 +53,7 @@ accountsPayable.get('/:id', async (c) => {
 
     const { data, error } = await db
       .from('accounts_payable')
-      .select('*, suppliers(name), accounts_payable_payments(*)')
+      .select('*, accounts_payable_payments(*)')
       .eq('id', id)
       .eq('tenant_id', tenantId)
       .maybeSingle();

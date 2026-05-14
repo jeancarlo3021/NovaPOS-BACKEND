@@ -93,7 +93,7 @@ reports.get('/stock', async (c) => {
 
     const { data, error } = await db
       .from('products')
-      .select('id, name, stock, min_stock, cost, price, categories(name), unit_types(name)')
+      .select('id, name, stock, min_stock, cost, price, category_id, unit_type_id')
       .eq('tenant_id', tenantId)
       .order('stock', { ascending: true });
 
@@ -171,7 +171,7 @@ reports.get('/cash-sessions', async (c) => {
 
     let query = db
       .from('cash_sessions')
-      .select('*, users(full_name, email)')
+      .select('*')
       .eq('tenant_id', tenantId)
       .order('opened_at', { ascending: false });
 

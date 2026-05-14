@@ -62,7 +62,7 @@ invoices.get('/:id', async (c) => {
 
     const { data, error } = await db
       .from('invoices')
-      .select('*, invoice_items(*, products(name, barcode))')
+      .select('*, invoice_items(*)')
       .eq('id', id)
       .eq('tenant_id', tenantId)
       .maybeSingle();
