@@ -23,7 +23,7 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
       if (chunks.length) body = Buffer.concat(chunks);
     }
 
-    const request  = new Request(url.toString(), { method: req.method ?? 'GET', headers, body });
+    const request  = new Request(url.toString(), { method: req.method ?? 'GET', headers, body: body ? new Uint8Array(body) : undefined });
     const response = await app.fetch(request);
 
     res.statusCode = response.status;
