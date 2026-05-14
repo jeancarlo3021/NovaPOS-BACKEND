@@ -27,7 +27,17 @@ app.use('*', cors({
   allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
 }));
 
-app.get('/health', (c) => c.json({ ok: true, ts: new Date().toISOString() }));
+// Health check — no auth, no Supabase — responds immediately
+app.get('/health', (c) => c.json({
+  ok: true,
+  ts: new Date().toISOString(),
+  env: {
+    supabase_url:  !!process.env.SUPABASE_URL,
+    service_key:   !!process.env.SUPABASE_SERVICE_ROLE_KEY,
+    anon_key:      !!process.env.SUPABASE_ANON_KEY,
+    frontend_url:  process.env.FRONTEND_URL ?? '(not set)',
+  },
+}));
 
 const api = new Hono();
 api.use('*', auth);
