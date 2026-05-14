@@ -1,3 +1,6 @@
-// Not used — Vercel catch-all syntax only works in Next.js.
-// All routing is handled by api/index.ts + vercel.json rewrites.
-export {};
+import { handle } from 'hono/vercel';
+import app from '../src/app.js';
+
+export const config = { runtime: 'nodejs' };
+
+export default handle(app);

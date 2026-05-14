@@ -1,9 +1,8 @@
 {
   "buildCommand": "npm install",
   "functions": {
-    "api/index.ts": {
-      "maxDuration": 30
-    }
+    "api/index.ts": { "maxDuration": 30 },
+    "api/[[...route]].ts": { "maxDuration": 30 }
   },
   "rewrites": [
     { "source": "/(.*)", "destination": "/api/index" }
