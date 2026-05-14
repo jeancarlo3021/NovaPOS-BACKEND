@@ -1,6 +1,2 @@
-import { handle } from 'hono/vercel';
-import app from '../src/app.js';
-
-export const config = { runtime: 'nodejs' };
-
-export default handle(app);
+// Re-uses the same handler as api/index.ts
+export { default, config } from './index.js';
