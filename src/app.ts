@@ -18,7 +18,8 @@ import plans           from './routes/plans.js';
 import tenants         from './routes/tenants.js';
 import hacienda        from './routes/hacienda.js';
 
-const app = new Hono();
+// basePath('/api') matches Vercel's catch-all at api/[[...route]].ts
+const app = new Hono().basePath('/api');
 
 app.use('*', logger());
 app.use('*', cors({
@@ -27,7 +28,7 @@ app.use('*', cors({
   allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
 }));
 
-// Health check — no auth, no Supabase — responds immediately
+// Health check — no auth, no Supabase, responds immediately
 app.get('/health', (c) => c.json({
   ok: true,
   ts: new Date().toISOString(),
@@ -39,7 +40,7 @@ app.get('/health', (c) => c.json({
   },
 }));
 
-const api = new Hono();
+const api = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 api.use('*', auth);
 api.route('/products',         products);
 api.route('/categories',       categories);
@@ -57,6 +58,6 @@ api.route('/plans',            plans);
 api.route('/tenants',          tenants);
 api.route('/hacienda',         hacienda);
 
-app.route('/api', api);
+app.route('/', api);
 
 export default app;
