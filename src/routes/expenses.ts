@@ -45,14 +45,13 @@ expenses.get('/', async (c) => {
 expenses.post('/', async (c) => {
   try {
     const tenantId = c.get('tenantId');
-    const userId = c.get('userId');
     const body = await c.req.json();
     const parsed = ExpenseSchema.safeParse(body);
     if (!parsed.success) return fail(c, parsed.error.message, 422);
 
     const { data, error } = await db
       .from('expenses')
-      .insert({ ...parsed.data, tenant_id: tenantId, created_by: userId })
+      .insert({ ...parsed.data, tenant_id: tenantId })
       .select()
       .single();
 

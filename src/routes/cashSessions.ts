@@ -7,7 +7,14 @@ const cashSessions = new Hono<{ Variables: { userId: string; tenantId: string; r
 
 // Schema matches actual DB: opening_amount, status='open'/'closed'
 const OpenSchema  = z.object({ opening_amount: z.number().nonnegative(), notes: z.string().optional().nullable() });
-const CloseSchema = z.object({ closing_amount: z.number().nonnegative(), notes: z.string().optional().nullable() });
+const CloseSchema = z.object({
+  closing_amount:  z.number().nonnegative().optional(),
+  closing_balance: z.number().nonnegative().optional(), // alias for backward compat
+  notes: z.string().optional().nullable(),
+}).transform(d => ({
+  ...d,
+  closing_amount: d.closing_amount ?? d.closing_balance ?? 0,
+}));
 
 cashSessions.get('/', async (c) => {
   try {
