@@ -12,7 +12,8 @@ function lazyClient(factory: () => SupabaseClient): SupabaseClient {
   return new Proxy({} as SupabaseClient, {
     get(_, prop) {
       if (!instance) instance = factory();
-      return (instance as any)[prop as string];
+      const value = (instance as any)[prop as string];
+      return typeof value === 'function' ? value.bind(instance) : value;
     },
   });
 }
@@ -28,7 +29,6 @@ export const db = lazyClient(() =>
 export const anonClient = lazyClient(() =>
   createClient(
     process.env.SUPABASE_URL!,
-    process.env.SUPABASE_ANON_KEY!,
-    { global: { fetch: fetchWithTimeout } }
+    process.env.SUPABASE_ANON_KEY!
   )
 );
