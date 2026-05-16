@@ -5,6 +5,7 @@ import { ok, fail } from '../utils/response.js';
 
 const invoices = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
+// CartItem from frontend has extra fields (product, promo) — accept any object with product_id
 const ItemSchema = z.object({
   product_id:       z.string().uuid(),
   quantity:         z.number().positive(),
@@ -12,12 +13,12 @@ const ItemSchema = z.object({
   discount_percent: z.number().nonnegative().optional().default(0),
   discount_amount:  z.number().nonnegative().optional().default(0),
   subtotal:         z.number().nonnegative(),
-});
+}).passthrough(); // ignore extra fields like 'product', 'promo'
 
 const InvoiceSchema = z.object({
   cash_session_id:  z.string().uuid(),
   customer_id:      z.string().uuid().optional().nullable(),
-  invoice_number:   z.string().min(1),
+  invoice_number:   z.string().optional().nullable(), // auto-generated if absent
   customer_name:    z.string().optional().nullable(),
   customer_email:   z.string().optional().nullable(),
   customer_phone:   z.string().optional().nullable(),
@@ -25,17 +26,24 @@ const InvoiceSchema = z.object({
   discount_amount:  z.number().nonnegative().optional().default(0),
   discount_percent: z.number().nonnegative().optional().default(0),
   tax_percent:      z.number().nonnegative().optional().default(13),
-  tax_amount:       z.number().nonnegative(),
+  tax_amount:       z.number().nonnegative().default(0),
   total:            z.number().nonnegative(),
   payment_method:   z.enum(['cash', 'card', 'sinpe', 'check', 'transfer']).default('cash'),
   status:           z.enum(['draft', 'completed', 'cancelled']).default('completed'),
   notes:            z.string().optional().nullable(),
-  issued_at:        z.string().optional(),
+  issued_at:        z.string().optional().nullable(),
   amount_received:  z.number().optional().nullable(),
   change_amount:    z.number().optional().nullable(),
   voucher_number:   z.string().optional().nullable(),
   items:            z.array(ItemSchema).min(1),
 });
+
+// Auto-generate invoice number
+async function nextInvoiceNumber(tenantId: string): Promise<string> {
+  const { count } = await db.from('invoices')
+    .select('*', { count: 'exact', head: true }).eq('tenant_id', tenantId);
+  return `INV-${String((count ?? 0) + 1).padStart(6, '0')}`;
+}
 
 invoices.get('/', async (c) => {
   try {
@@ -60,10 +68,8 @@ invoices.get('/', async (c) => {
 
 invoices.get('/next-number', async (c) => {
   try {
-    const tenantId = c.get('tenantId');
-    const { count } = await db.from('invoices').select('*', { count: 'exact', head: true }).eq('tenant_id', tenantId);
-    const next = String((count ?? 0) + 1).padStart(6, '0');
-    return ok(c, { invoice_number: `INV-${next}` });
+    const num = await nextInvoiceNumber(c.get('tenantId'));
+    return ok(c, { invoice_number: num });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
@@ -82,28 +88,46 @@ invoices.get('/:id', async (c) => {
 invoices.post('/', async (c) => {
   try {
     const tenantId = c.get('tenantId');
-    const parsed = InvoiceSchema.safeParse(await c.req.json());
-    if (!parsed.success) return fail(c, parsed.error.message, 422);
+    const raw = await c.req.json();
+    const parsed = InvoiceSchema.safeParse(raw);
+    if (!parsed.success) return fail(c, parsed.error.errors, 422);
 
-    const { items, ...invoiceData } = parsed.data;
+    const { items, invoice_number, ...invoiceData } = parsed.data;
 
-    const { data: inv, error: invErr } = await db.from('invoices')
-      .insert({ ...invoiceData, tenant_id: tenantId, issued_at: invoiceData.issued_at ?? new Date().toISOString() })
-      .select().single();
+    // Auto-generate invoice_number if not provided
+    const finalNumber = (invoice_number?.trim()) || await nextInvoiceNumber(tenantId);
+
+    const { data: inv, error: invErr } = await db.from('invoices').insert({
+      ...invoiceData,
+      tenant_id:      tenantId,
+      invoice_number: finalNumber,
+      issued_at:      invoiceData.issued_at ?? new Date().toISOString(),
+    }).select().single();
     if (invErr) throw new Error(invErr.message);
 
-    const itemRows = items.map(item => ({ ...item, invoice_id: inv.id }));
+    // Insert items (strip extra CartItem fields)
+    const itemRows = items.map((item: any) => ({
+      invoice_id:       inv.id,
+      product_id:       item.product_id,
+      quantity:         item.quantity,
+      unit_price:       item.unit_price,
+      discount_percent: item.discount_percent ?? 0,
+      discount_amount:  item.discount_amount ?? 0,
+      subtotal:         item.subtotal,
+    }));
     const { error: itemErr } = await db.from('invoice_items').insert(itemRows);
     if (itemErr) throw new Error(itemErr.message);
 
     // Decrement stock
-    for (const item of items) {
-      await db.from('products').select('stock_quantity').eq('id', item.product_id).single()
-        .then(async ({ data: p }) => {
-          if (p) await db.from('products').update({
-            stock_quantity: Math.max(0, (p.stock_quantity ?? 0) - item.quantity),
-          }).eq('id', item.product_id);
-        });
+    for (const item of items as any[]) {
+      const { data: p } = await db.from('products')
+        .select('stock_quantity').eq('id', item.product_id).maybeSingle();
+      if (p) {
+        await db.from('products').update({
+          stock_quantity: Math.max(0, (p.stock_quantity ?? 0) - Number(item.quantity)),
+          updated_at: new Date().toISOString(),
+        }).eq('id', item.product_id);
+      }
     }
 
     return ok(c, inv, 201);
