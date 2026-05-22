@@ -31,7 +31,7 @@ accountsPayable.get('/', async (c) => {
     if (purchase_id) query = query.eq('purchase_id', purchase_id);
 
     const { data, error } = await query;
-    if (error) throw new Error(error.message);
+    if (error) throw new Error(typeof error === 'string' ? error : (error as any).message || JSON.stringify(error));
     return ok(c, data);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
@@ -42,7 +42,7 @@ accountsPayable.get('/:id', async (c) => {
     const { id }   = c.req.param();
     const { data, error } = await db.from('accounts_payable').select('*')
       .eq('id', id).eq('tenant_id', tenantId).maybeSingle();
-    if (error) throw new Error(error.message);
+    if (error) throw new Error(typeof error === 'string' ? error : (error as any).message || JSON.stringify(error));
     if (!data) return fail(c, 'Cuenta por pagar no encontrada', 404);
     return ok(c, data);
   } catch (err: any) { return fail(c, err.message, 500); }
