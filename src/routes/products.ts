@@ -30,6 +30,7 @@ products.get('/', async (c) => {
 
     const { data, error } = await query;
     if (error) throw new Error(error.message);
+
     return ok(c, data);
   } catch (err: any) { return fail(c, err.message, 500); }
 });

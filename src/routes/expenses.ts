@@ -106,4 +106,227 @@ expenses.delete('/:id', async (c) => {
   }
 });
 
+// GET /categories/general — general expense categories
+expenses.get('/categories/general', async (c) => {
+  return ok(c, [
+    { id: '1', name: 'Servicios', color: '#3b82f6', icon: 'Zap' },
+    { id: '2', name: 'Suministros', color: '#10b981', icon: 'Package' },
+    { id: '3', name: 'Salarios', color: '#f59e0b', icon: 'Users' },
+    { id: '4', name: 'Renta', color: '#ef4444', icon: 'Home' },
+  ]);
+});
+
+// GET /categories — tenant expense categories
+expenses.get('/categories', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { data, error } = await db
+      .from('expense_categories')
+      .select('*')
+      .eq('tenant_id', tenantId);
+
+    if (error) return ok(c, []);
+    return ok(c, data ?? []);
+  } catch {
+    return ok(c, []);
+  }
+});
+
+// POST /categories/from-general — adopt general category
+expenses.post('/categories/from-general', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { general_category_id } = await c.req.json() as { general_category_id: string };
+
+    const generalCategories: Record<string, any> = {
+      '1': { name: 'Servicios', color: '#3b82f6', icon: 'Zap' },
+      '2': { name: 'Suministros', color: '#10b981', icon: 'Package' },
+      '3': { name: 'Salarios', color: '#f59e0b', icon: 'Users' },
+      '4': { name: 'Renta', color: '#ef4444', icon: 'Home' },
+    };
+
+    const general = generalCategories[general_category_id];
+    if (!general) return fail(c, 'Categoría no encontrada', 404);
+
+    const { data, error } = await db
+      .from('expense_categories')
+      .insert({ tenant_id: tenantId, ...general })
+      .select()
+      .single();
+
+    if (error) throw new Error(error.message);
+    return ok(c, data, 201);
+  } catch (err: any) {
+    return fail(c, err.message, 500);
+  }
+});
+
+// POST /categories — create custom category
+expenses.post('/categories', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { name, color, icon } = await c.req.json() as { name: string; color: string; icon: string };
+
+    const { data, error } = await db
+      .from('expense_categories')
+      .insert({ tenant_id: tenantId, name, color, icon })
+      .select()
+      .single();
+
+    if (error) throw new Error(error.message);
+    return ok(c, data, 201);
+  } catch (err: any) {
+    return fail(c, err.message, 500);
+  }
+});
+
+// PUT /categories/:id — update category
+expenses.put('/categories/:id', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { id } = c.req.param();
+    const body = await c.req.json() as Partial<{ name: string; color: string; icon: string }>;
+
+    const { data, error } = await db
+      .from('expense_categories')
+      .update(body)
+      .eq('id', id)
+      .eq('tenant_id', tenantId)
+      .select()
+      .single();
+
+    if (error) throw new Error(error.message);
+    if (!data) return fail(c, 'Categoría no encontrada', 404);
+    return ok(c, data);
+  } catch (err: any) {
+    return fail(c, err.message, 500);
+  }
+});
+
+// DELETE /categories/:id — delete category
+expenses.delete('/categories/:id', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { id } = c.req.param();
+
+    const { error } = await db
+      .from('expense_categories')
+      .delete()
+      .eq('id', id)
+      .eq('tenant_id', tenantId);
+
+    if (error) throw new Error(error.message);
+    return ok(c, { deleted: true });
+  } catch (err: any) {
+    return fail(c, err.message, 500);
+  }
+});
+
+// GET /recurring — list recurring expenses
+expenses.get('/recurring', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { data, error } = await db
+      .from('recurring_expenses')
+      .select('*')
+      .eq('tenant_id', tenantId)
+      .order('next_date', { ascending: true });
+
+    if (error) return ok(c, []);
+    return ok(c, data ?? []);
+  } catch {
+    return ok(c, []);
+  }
+});
+
+// POST /recurring — create recurring expense
+expenses.post('/recurring', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const body = await c.req.json();
+
+    const { data, error } = await db
+      .from('recurring_expenses')
+      .insert({ tenant_id: tenantId, ...body })
+      .select()
+      .single();
+
+    if (error) throw new Error(error.message);
+    return ok(c, data, 201);
+  } catch (err: any) {
+    return fail(c, err.message, 500);
+  }
+});
+
+// PUT /recurring/:id — update recurring expense
+expenses.put('/recurring/:id', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { id } = c.req.param();
+    const body = await c.req.json();
+
+    const { data, error } = await db
+      .from('recurring_expenses')
+      .update(body)
+      .eq('id', id)
+      .eq('tenant_id', tenantId)
+      .select()
+      .single();
+
+    if (error) throw new Error(error.message);
+    if (!data) return fail(c, 'Gasto recurrente no encontrado', 404);
+    return ok(c, data);
+  } catch (err: any) {
+    return fail(c, err.message, 500);
+  }
+});
+
+// DELETE /recurring/:id — delete recurring expense
+expenses.delete('/recurring/:id', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { id } = c.req.param();
+
+    const { error } = await db
+      .from('recurring_expenses')
+      .delete()
+      .eq('id', id)
+      .eq('tenant_id', tenantId);
+
+    if (error) throw new Error(error.message);
+    return ok(c, { deleted: true });
+  } catch (err: any) {
+    return fail(c, err.message, 500);
+  }
+});
+
+// PATCH /recurring/:id/toggle — toggle recurring expense
+expenses.patch('/recurring/:id/toggle', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { id } = c.req.param();
+
+    const { data: current, error: fetchErr } = await db
+      .from('recurring_expenses')
+      .select('is_active')
+      .eq('id', id)
+      .eq('tenant_id', tenantId)
+      .maybeSingle();
+
+    if (fetchErr || !current) return fail(c, 'Gasto recurrente no encontrado', 404);
+
+    const { data, error } = await db
+      .from('recurring_expenses')
+      .update({ is_active: !current.is_active })
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) throw new Error(error.message);
+    return ok(c, data);
+  } catch (err: any) {
+    return fail(c, err.message, 500);
+  }
+});
+
 export default expenses;

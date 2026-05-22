@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
 import { auth } from './middleware/auth.js';
+import authRoutes      from './routes/auth.js';
 import products        from './routes/products.js';
 import categories      from './routes/categories.js';
 import unitTypes       from './routes/unitTypes.js';
@@ -14,9 +15,14 @@ import cashSessions    from './routes/cashSessions.js';
 import accountsPayable from './routes/accountsPayable.js';
 import reports         from './routes/reports.js';
 import users           from './routes/users.js';
+import activity        from './routes/activity.js';
+import teams           from './routes/teams.js';
+import shifts          from './routes/shifts.js';
 import plans           from './routes/plans.js';
 import tenants         from './routes/tenants.js';
 import hacienda        from './routes/hacienda.js';
+import settings        from './routes/settings.js';
+import admin           from './routes/admin.js';
 
 // basePath('/api') matches Vercel's catch-all at api/[[...route]].ts
 const app = new Hono().basePath('/api');
@@ -40,6 +46,9 @@ app.get('/health', (c) => c.json({
   },
 }));
 
+// Auth routes — no auth required
+app.route('/auth', authRoutes);
+
 const api = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 api.use('*', auth);
 api.route('/products',         products);
@@ -54,9 +63,14 @@ api.route('/cash-sessions',    cashSessions);
 api.route('/accounts-payable', accountsPayable);
 api.route('/reports',          reports);
 api.route('/users',            users);
+api.route('/activity',         activity);
+api.route('/teams',            teams);
+api.route('/shifts',           shifts);
 api.route('/plans',            plans);
 api.route('/tenants',          tenants);
 api.route('/hacienda',         hacienda);
+api.route('/settings',         settings);
+api.route('/admin',            admin);
 
 app.route('/', api);
 

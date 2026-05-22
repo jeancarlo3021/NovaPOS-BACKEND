@@ -6,7 +6,9 @@
     "types": ["node"],
     "strict": true,
     "esModuleInterop": true,
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "outDir": "./lib",
+    "rootDir": "./src"
   },
-  "include": ["src", "api"]
+  "include": ["src"]
 }

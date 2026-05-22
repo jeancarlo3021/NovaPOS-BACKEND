@@ -11,10 +11,11 @@ const PromotionSchema = z.object({
   type: z.enum(['percentage', 'fixed', 'bogo', 'bundle']).optional().default('percentage'),
   value: z.number().nonnegative(),
   min_purchase: z.number().nonnegative().optional().nullable(),
+  applies_to: z.enum(['all', 'category', 'products']).optional().default('all'),
+  category_id: z.string().uuid().optional().nullable(),
   product_ids: z.array(z.string().uuid()).optional().nullable(),
-  category_ids: z.array(z.string().uuid()).optional().nullable(),
-  start_date: z.string().optional().nullable(),
-  end_date: z.string().optional().nullable(),
+  starts_at: z.string().optional(),
+  ends_at: z.string().optional().nullable(),
   is_active: z.boolean().optional().default(true),
 });
 
@@ -39,19 +40,24 @@ promotions.get('/', async (c) => {
 promotions.get('/active', async (c) => {
   try {
     const tenantId = c.get('tenantId');
-    const today = new Date().toISOString();
+    const today = new Date().toISOString().slice(0, 10);
 
-    const { data, error } = await db
+    let query = db
       .from('promotions')
       .select('*')
       .eq('tenant_id', tenantId)
       .eq('is_active', true)
-      .or(`start_date.is.null,start_date.lte.${today}`)
-      .or(`end_date.is.null,end_date.gte.${today}`)
       .order('name');
 
+    const { data, error } = await query;
     if (error) throw new Error(error.message);
-    return ok(c, data);
+
+    const active = (data ?? []).filter(p =>
+      (!p.starts_at || p.starts_at <= today) &&
+      (!p.ends_at || p.ends_at >= today)
+    );
+
+    return ok(c, active);
   } catch (err: any) {
     return fail(c, err.message, 500);
   }
@@ -65,15 +71,37 @@ promotions.post('/', async (c) => {
     const parsed = PromotionSchema.safeParse(body);
     if (!parsed.success) return fail(c, parsed.error.message, 422);
 
+    const today = new Date().toISOString().slice(0, 10);
+    const payload = {
+      tenant_id: tenantId,
+      name: parsed.data.name,
+      description: parsed.data.description || null,
+      type: parsed.data.type || 'percentage',
+      value: parsed.data.value,
+      min_purchase: parsed.data.min_purchase || null,
+      applies_to: parsed.data.applies_to || 'all',
+      category_id: parsed.data.category_id || null,
+      product_ids: parsed.data.product_ids || null,
+      starts_at: parsed.data.starts_at || today,
+      ends_at: parsed.data.ends_at || null,
+      is_active: parsed.data.is_active !== undefined ? parsed.data.is_active : true,
+    };
+
+    console.log('[PROMOTION] Creating:', payload);
     const { data, error } = await db
       .from('promotions')
-      .insert({ ...parsed.data, tenant_id: tenantId })
+      .insert(payload)
       .select()
       .single();
 
-    if (error) throw new Error(error.message);
+    if (error) {
+      console.error('[PROMOTION] Insert error:', error);
+      throw new Error(error.message);
+    }
+    console.log('[PROMOTION] Created successfully:', data?.id);
     return ok(c, data, 201);
   } catch (err: any) {
+    console.error('[PROMOTION] Catch error:', err.message);
     return fail(c, err.message, 500);
   }
 });

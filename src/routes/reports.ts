@@ -71,7 +71,7 @@ reports.get('/profit', async (c) => {
     const from = c.req.query('from');
     const to   = c.req.query('to');
 
-    let salesQ = db.from('invoices').select('total').eq('tenant_id', tenantId).neq('status', 'cancelled');
+    let salesQ = db.from('invoices').select('total, payment_method').eq('tenant_id', tenantId).neq('status', 'cancelled');
     if (from) salesQ = salesQ.gte('issued_at', from);
     if (to)   salesQ = salesQ.lte('issued_at', to);
 
@@ -87,8 +87,33 @@ reports.get('/profit', async (c) => {
     const expenses = exps?.reduce((s, r) => s + Number(r.amount ?? 0), 0) ?? 0;
     const profit   = revenue - expenses;
 
-    return ok(c, { total_revenue: revenue, total_expenses: expenses, profit,
-      profit_margin: revenue > 0 ? (profit / revenue) * 100 : 0 });
+    // Revenue by payment method
+    const methodMap: Record<string, { label: string; total: number; color: string }> = {
+      cash:     { label: 'Efectivo',       total: 0, color: '#10b981' },
+      card:     { label: 'Tarjeta',        total: 0, color: '#3b82f6' },
+      sinpe:    { label: 'SINPE',          total: 0, color: '#8b5cf6' },
+      transfer: { label: 'Transferencia',  total: 0, color: '#f59e0b' },
+      check:    { label: 'Cheque',         total: 0, color: '#6b7280' },
+    };
+
+    (sales ?? []).forEach((s: any) => {
+      const method = s.payment_method ?? 'cash';
+      if (methodMap[method]) {
+        methodMap[method].total += Number(s.total ?? 0);
+      }
+    });
+
+    const revenueByMethod = Object.entries(methodMap)
+      .filter(([, v]) => v.total > 0)
+      .map(([method, v]) => ({ method, ...v }));
+
+    return ok(c, {
+      total_revenue: revenue,
+      total_expenses: expenses,
+      profit,
+      profit_margin: revenue > 0 ? (profit / revenue) * 100 : 0,
+      revenueByMethod
+    });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
@@ -103,9 +128,223 @@ reports.get('/cash-sessions', async (c) => {
     if (from) query = query.gte('opening_date', from);
     if (to)   query = query.lte('opening_date', to);
 
-    const { data, error } = await query;
+    const { data: sessions, error } = await query;
     if (error) throw new Error(error.message);
-    return ok(c, data);
+
+    // Get invoices for each session to calculate sales by method
+    const sessionIds = (sessions ?? []).map((s: any) => s.id);
+    const { data: invoices } = await db.from('invoices')
+      .select('cash_session_id, payment_method, total')
+      .eq('tenant_id', tenantId)
+      .neq('status', 'cancelled')
+      .in('cash_session_id', sessionIds.length > 0 ? sessionIds : ['null']);
+
+    const enriched = (sessions ?? []).map((s: any) => {
+      const sessionInvoices = (invoices ?? []).filter((inv: any) => inv.cash_session_id === s.id);
+      const salesByMethod: Record<string, number> = { cash: 0, card: 0, sinpe: 0, check: 0, transfer: 0 };
+      let totalSales = 0;
+
+      sessionInvoices.forEach((inv: any) => {
+        const method = inv.payment_method ?? 'cash';
+        if (salesByMethod.hasOwnProperty(method)) {
+          salesByMethod[method] += Number(inv.total ?? 0);
+        }
+        totalSales += Number(inv.total ?? 0);
+      });
+
+      const expectedClosing = (s.opening_amount ?? 0) + salesByMethod.cash;
+      const discrepancy = s.status === 'closed' && s.closing_amount !== null
+        ? (s.closing_amount ?? 0) - expectedClosing
+        : null;
+
+      return {
+        ...s,
+        sales_total: totalSales,
+        cash_sales: salesByMethod.cash,
+        card_sales: salesByMethod.card,
+        sinpe_sales: salesByMethod.sinpe,
+        invoice_count: sessionInvoices.length,
+        expected_closing: expectedClosing,
+        discrepancy,
+        duration_min: s.closing_date && s.opening_date
+          ? Math.round((new Date(s.closing_date).getTime() - new Date(s.opening_date).getTime()) / 60000)
+          : null,
+      };
+    });
+
+    return ok(c, enriched);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// GET /sellers — sales by seller
+reports.get('/sellers', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const from = c.req.query('from');
+    const to   = c.req.query('to');
+
+    let query = db.from('invoices')
+      .select('id, total, cash_session_id, issued_at')
+      .eq('tenant_id', tenantId)
+      .neq('status', 'cancelled')
+      .order('issued_at', { ascending: false });
+    if (from) query = query.gte('issued_at', from);
+    if (to)   query = query.lte('issued_at', to);
+
+    const { data: invoices, error } = await query;
+    if (error) throw new Error(error.message);
+
+    const sessionIds = [...new Set((invoices ?? []).map((inv: any) => inv.cash_session_id))];
+    const { data: sessions } = await db.from('cash_sessions')
+      .select('id, user_id').in('id', sessionIds);
+
+    const userIds = [...new Set((sessions ?? []).map((s: any) => s.user_id))];
+    const { data: users } = await db.from('users').select('id, email, full_name').in('id', userIds);
+
+    const sellerMap: Record<string, { totalRevenue: number; totalInvoices: number }> = {};
+    (invoices ?? []).forEach((inv: any) => {
+      const session = (sessions ?? []).find((s: any) => s.id === inv.cash_session_id);
+      const uid = session?.user_id;
+      if (!uid) return;
+      if (!sellerMap[uid]) sellerMap[uid] = { totalRevenue: 0, totalInvoices: 0 };
+      sellerMap[uid].totalRevenue += Number(inv.total ?? 0);
+      sellerMap[uid].totalInvoices += 1;
+    });
+
+    const sellers = Object.entries(sellerMap).map(([uid, stats]) => {
+      const user = (users ?? []).find((u: any) => u.id === uid);
+      return {
+        userId: uid,
+        name: (user as any)?.full_name ?? 'Vendedor',
+        email: user?.email ?? '',
+        totalRevenue: stats.totalRevenue,
+        totalInvoices: stats.totalInvoices,
+        avgTicket: stats.totalInvoices > 0 ? stats.totalRevenue / stats.totalInvoices : 0,
+      };
+    }).sort((a, b) => b.totalRevenue - a.totalRevenue);
+
+    return ok(c, sellers);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// GET /products/sales — products sold grouped by product
+reports.get('/products/sales', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const from = c.req.query('from');
+    const to   = c.req.query('to');
+
+    const { data: invoices } = await db.from('invoices')
+      .select('id, invoice_number, issued_at, customer_name, payment_method, total')
+      .eq('tenant_id', tenantId)
+      .neq('status', 'cancelled')
+      .gte('issued_at', from || '1900-01-01')
+      .lte('issued_at', to || '2099-12-31');
+
+    const invoiceIds = (invoices ?? []).map((i: any) => i.id);
+
+    const { data: items } = await db.from('invoice_items')
+      .select('product_id, quantity, unit_price, subtotal')
+      .in('invoice_id', invoiceIds.length > 0 ? invoiceIds : ['null']);
+
+    const { data: products } = await db.from('products').select('id, name');
+
+    const groupMap: Record<string, any> = {};
+    (items ?? []).forEach((item: any) => {
+      const inv = (invoices ?? []).find((i: any) => i.id === item.invoice_id);
+      if (!groupMap[item.product_id]) {
+        const product = (products ?? []).find((p: any) => p.id === item.product_id);
+        groupMap[item.product_id] = {
+          product_id: item.product_id,
+          product_name: product?.name ?? 'Producto desconocido',
+          total_qty: 0,
+          total_revenue: 0,
+          sales_count: 0,
+          lines: [],
+        };
+      }
+      groupMap[item.product_id].total_qty += item.quantity;
+      groupMap[item.product_id].total_revenue += item.subtotal;
+      if (inv) {
+        groupMap[item.product_id].lines.push({
+          invoice_number: inv.invoice_number,
+          issued_at: inv.issued_at,
+          customer_name: inv.customer_name,
+          payment_method: inv.payment_method,
+          quantity: item.quantity,
+          unit_price: item.unit_price,
+          subtotal: item.subtotal,
+        });
+      }
+    });
+
+    Object.values(groupMap).forEach((g: any) => {
+      g.sales_count = g.lines.length;
+    });
+
+    return ok(c, Object.values(groupMap));
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// GET /products/purchases — products purchased grouped by product
+reports.get('/products/purchases', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const from = c.req.query('from');
+    const to   = c.req.query('to');
+
+    const { data: purchases } = await db.from('purchases')
+      .select('id, purchase_number, purchase_date, supplier_id, status')
+      .eq('tenant_id', tenantId)
+      .neq('status', 'cancelled')
+      .gte('purchase_date', from || '1900-01-01')
+      .lte('purchase_date', to || '2099-12-31');
+
+    const purchaseIds = (purchases ?? []).map((p: any) => p.id);
+    const supplierIds = [...new Set((purchases ?? []).map((p: any) => p.supplier_id))];
+
+    const { data: items } = await db.from('purchase_items')
+      .select('product_id, purchase_id, quantity, unit_price, subtotal')
+      .in('purchase_id', purchaseIds.length > 0 ? purchaseIds : ['null']);
+
+    const { data: products } = await db.from('products').select('id, name');
+    const { data: suppliers } = await db.from('suppliers').select('id, name').in('id', supplierIds);
+
+    const groupMap: Record<string, any> = {};
+    (items ?? []).forEach((item: any) => {
+      const purch = (purchases ?? []).find((p: any) => p.id === item.purchase_id);
+      if (!groupMap[item.product_id]) {
+        const product = (products ?? []).find((p: any) => p.id === item.product_id);
+        groupMap[item.product_id] = {
+          product_id: item.product_id,
+          product_name: product?.name ?? 'Producto desconocido',
+          total_qty: 0,
+          total_cost: 0,
+          purchase_count: 0,
+          lines: [],
+        };
+      }
+      groupMap[item.product_id].total_qty += item.quantity;
+      groupMap[item.product_id].total_cost += item.subtotal;
+      if (purch) {
+        const supplier = (suppliers ?? []).find((s: any) => s.id === purch.supplier_id);
+        groupMap[item.product_id].lines.push({
+          purchase_number: purch.purchase_number,
+          purchase_date: purch.purchase_date,
+          supplier_name: supplier?.name ?? 'Proveedor desconocido',
+          status: purch.status,
+          quantity: item.quantity,
+          unit_price: item.unit_price,
+          subtotal: item.subtotal,
+        });
+      }
+    });
+
+    Object.values(groupMap).forEach((g: any) => {
+      g.purchase_count = g.lines.length;
+    });
+
+    return ok(c, Object.values(groupMap));
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

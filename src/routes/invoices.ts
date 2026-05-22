@@ -38,11 +38,22 @@ const InvoiceSchema = z.object({
   items:            z.array(ItemSchema).min(1),
 });
 
-// Auto-generate invoice number
+// Auto-generate invoice number - same format as offline
 async function nextInvoiceNumber(tenantId: string): Promise<string> {
+  const now = new Date();
+  const datePart = now.toISOString().slice(0, 10).replace(/-/g, '');
+
+  // Count invoices created today
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
+  const todayEnd = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1).toISOString();
+
   const { count } = await db.from('invoices')
-    .select('*', { count: 'exact', head: true }).eq('tenant_id', tenantId);
-  return `INV-${String((count ?? 0) + 1).padStart(6, '0')}`;
+    .select('*', { count: 'exact', head: true })
+    .eq('tenant_id', tenantId)
+    .gte('created_at', todayStart)
+    .lt('created_at', todayEnd);
+
+  return `${datePart}-${String((count ?? 0) + 1).padStart(5, '0')}`;
 }
 
 invoices.get('/', async (c) => {
@@ -79,7 +90,7 @@ invoices.get('/:id', async (c) => {
     const { id } = c.req.param();
     const { data, error } = await db.from('invoices').select('*, invoice_items(*)')
       .eq('id', id).eq('tenant_id', tenantId).maybeSingle();
-    if (error) throw new Error(error.message);
+    if (error) throw new Error(typeof error === 'string' ? error : (error as any).message || JSON.stringify(error));
     if (!data) return fail(c, 'Factura no encontrada', 404);
     return ok(c, data);
   } catch (err: any) { return fail(c, err.message, 500); }
@@ -90,7 +101,7 @@ invoices.post('/', async (c) => {
     const tenantId = c.get('tenantId');
     const raw = await c.req.json();
     const parsed = InvoiceSchema.safeParse(raw);
-    if (!parsed.success) return fail(c, parsed.error.errors, 422);
+    if (!parsed.success) return fail(c, parsed.error.message, 422);
 
     const { items, invoice_number, ...invoiceData } = parsed.data;
 

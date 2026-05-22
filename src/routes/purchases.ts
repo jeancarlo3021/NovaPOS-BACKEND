@@ -8,7 +8,7 @@ const purchases = new Hono<{ Variables: { userId: string; tenantId: string; role
 const ItemSchema = z.object({
   product_id: z.string().uuid(),
   quantity:   z.number().positive(),
-  unit_price: z.number().nonnegative().optional().nullable(),
+  unit_price: z.number().nonnegative(),
   subtotal:   z.number().nonnegative().optional().nullable(),
 });
 
@@ -19,21 +19,38 @@ const PurchaseSchema = z.object({
   expected_delivery_date: z.string().optional().nullable(),
   notes:                  z.string().optional().nullable(),
   total_amount:           z.number().nonnegative().optional().nullable(),
-  items:                  z.array(ItemSchema).min(1),
+  items:                  z.array(ItemSchema).optional().default([]),
 });
 
 purchases.get('/', async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const status   = c.req.query('status');
+    const from     = c.req.query('from');
+    const to       = c.req.query('to');
 
-    let query = db.from('purchases').select('*').eq('tenant_id', tenantId)
-      .order('created_at', { ascending: false });
+    let query = db.from('purchases')
+      .select('id, supplier_id, purchase_number, purchase_date, status, total_amount, notes')
+      .eq('tenant_id', tenantId)
+      .order('purchase_date', { ascending: false });
     if (status) query = query.eq('status', status);
+    if (from) query = query.gte('purchase_date', from);
+    if (to) query = query.lte('purchase_date', to);
 
-    const { data, error } = await query;
+    const { data: purchases, error } = await query;
     if (error) throw new Error(error.message);
-    return ok(c, data);
+
+    // Get supplier names
+    const supplierIds = [...new Set((purchases ?? []).map((p: any) => p.supplier_id))];
+    const { data: suppliers } = await db.from('suppliers')
+      .select('id, name').in('id', supplierIds);
+
+    const result = (purchases ?? []).map((p: any) => ({
+      ...p,
+      supplier: (suppliers ?? []).find((s: any) => s.id === p.supplier_id) || null,
+    }));
+
+    return ok(c, result);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
@@ -41,11 +58,40 @@ purchases.get('/:id', async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const { id }   = c.req.param();
-    const { data, error } = await db.from('purchases').select('*, purchase_items(*)')
-      .eq('id', id).eq('tenant_id', tenantId).maybeSingle();
-    if (error) throw new Error(error.message);
-    if (!data) return fail(c, 'Compra no encontrada', 404);
-    return ok(c, data);
+
+    // Get purchase
+    const { data: purchase, error: pErr } = await db.from('purchases')
+      .select('*')
+      .eq('id', id)
+      .eq('tenant_id', tenantId)
+      .single();
+
+    if (pErr) throw new Error(pErr.message);
+    if (!purchase) return fail(c, 'Compra no encontrada', 404);
+
+    // Get supplier name
+    const { data: supplier, error: sErr } = await db.from('suppliers')
+      .select('name')
+      .eq('id', purchase.supplier_id)
+      .maybeSingle();
+
+    if (sErr) console.error('Error fetching supplier:', sErr);
+
+    // Get items for this purchase
+    const { data: purchaseItems, error: iErr } = await db.from('purchase_items')
+      .select('*')
+      .eq('purchase_id', id);
+
+    if (iErr) {
+      console.error('Error fetching items:', iErr);
+      return fail(c, 'Error al obtener items: ' + iErr.message, 500);
+    }
+
+    return ok(c, {
+      ...purchase,
+      suppliers: supplier ? { name: supplier.name } : null,
+      purchase_items: purchaseItems || []
+    });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
@@ -81,30 +127,103 @@ purchases.put('/:id', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
-// POST /:id/receive — mark as received, increment stock
+// POST /:id/receive — mark as received, increment stock, create accounts payable if needed
 purchases.post('/:id/receive', async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const { id }   = c.req.param();
-    const { items } = await c.req.json() as { items: { product_id: string; quantity: number }[] };
+    const body = await c.req.json() as { items: { product_id: string; quantity: number }[]; canUpdateStock?: boolean; notes?: string };
+    const { items, canUpdateStock = true, notes } = body;
 
-    const { data, error } = await db.from('purchases')
-      .update({ status: 'received', actual_delivery_date: new Date().toISOString().slice(0, 10), updated_at: new Date().toISOString() })
+    console.log(`[RECEIVE] Starting receive for purchase ${id}, tenant ${tenantId}`);
+
+    // Get purchase
+    const { data: purchase, error: pErr } = await db.from('purchases')
+      .select('*')
+      .eq('id', id).eq('tenant_id', tenantId).single();
+    if (pErr) throw new Error(`Error fetching purchase: ${pErr.message}`);
+    if (!purchase) return fail(c, 'Compra no encontrada', 404);
+
+    console.log(`[RECEIVE] Purchase found:`, { id: purchase.id, supplier_id: purchase.supplier_id, total: purchase.total_amount });
+
+    // Get supplier details
+    const { data: supplier, error: sErr } = await db.from('suppliers')
+      .select('name, payment_terms')
+      .eq('id', purchase.supplier_id)
+      .maybeSingle();
+
+    console.log(`[RECEIVE] Supplier found:`, { name: supplier?.name, payment_terms: supplier?.payment_terms, error: sErr });
+
+    // Mark as received
+    const { data: updated, error: uErr } = await db.from('purchases')
+      .update({ status: 'received', actual_delivery_date: new Date().toISOString().slice(0, 10), notes: notes || null, updated_at: new Date().toISOString() })
       .eq('id', id).eq('tenant_id', tenantId).select().single();
-    if (error) throw new Error(error.message);
+    if (uErr) throw new Error(`Error updating purchase: ${uErr.message}`);
 
-    // Increment stock for each received item
-    for (const item of (items ?? [])) {
-      const { data: p } = await db.from('products').select('stock_quantity').eq('id', item.product_id).single();
-      if (p) await db.from('products').update({
-        stock_quantity: (p.stock_quantity ?? 0) + item.quantity,
-        updated_at: new Date().toISOString(),
-      }).eq('id', item.product_id);
+    console.log(`[RECEIVE] Purchase marked as received`);
+
+    // Increment stock for each received item if canUpdateStock is true
+    if (canUpdateStock) {
+      for (const item of (items ?? [])) {
+        const { data: p } = await db.from('products').select('stock_quantity').eq('id', item.product_id).single();
+        if (p) await db.from('products').update({
+          stock_quantity: (p.stock_quantity ?? 0) + item.quantity,
+          updated_at: new Date().toISOString(),
+        }).eq('id', item.product_id);
+      }
+      console.log(`[RECEIVE] Stock incremented for ${items?.length ?? 0} items`);
+    } else {
+      console.log(`[RECEIVE] Stock update skipped (canUpdateStock=false)`);
     }
 
-    return ok(c, data);
-  } catch (err: any) { return fail(c, err.message, 500); }
+    // Create accounts payable if supplier has payment terms (credit)
+    const paymentTerms = supplier?.payment_terms;
+    console.log(`[RECEIVE] Payment terms: "${paymentTerms}", checking if credit...`);
+
+    if (paymentTerms && paymentTerms.trim().toLowerCase() !== 'contado') {
+      const dueDate = calculateDueDate(purchase.purchase_date, paymentTerms);
+      console.log(`[RECEIVE] Creating AP: due_date=${dueDate}, amount=${purchase.total_amount}`);
+
+      const { data: apData, error: apErr } = await db.from('accounts_payable').insert({
+        tenant_id: tenantId,
+        purchase_id: id,
+        supplier_id: purchase.supplier_id,
+        purchase_number: purchase.purchase_number,
+        supplier_name: supplier?.name ?? 'Proveedor desconocido',
+        total_amount: purchase.total_amount ?? 0,
+        paid_amount: 0,
+        due_date: dueDate,
+        status: 'pending',
+        payment_terms: paymentTerms,
+        notes: purchase.notes,
+      }).select().single();
+
+      if (apErr) {
+        console.error(`[RECEIVE] ERROR creating AP:`, apErr);
+      } else {
+        console.log(`[RECEIVE] AP created successfully:`, apData?.id);
+      }
+    } else {
+      console.log(`[RECEIVE] Skipping AP creation - no credit terms`);
+    }
+
+    console.log(`[RECEIVE] Receive completed successfully`);
+    return ok(c, updated);
+  } catch (err: any) {
+    console.error(`[RECEIVE] ERROR:`, err.message);
+    return fail(c, err.message, 500);
+  }
 });
+
+// Helper to calculate due date from payment terms
+function calculateDueDate(baseDate: string, terms: string): string {
+  const match = terms.match(/(\d+)/);
+  if (!match) return baseDate;
+  const days = parseInt(match[1]);
+  const date = new Date(baseDate);
+  date.setDate(date.getDate() + days);
+  return date.toISOString().slice(0, 10);
+}
 
 purchases.delete('/:id', async (c) => {
   try {
