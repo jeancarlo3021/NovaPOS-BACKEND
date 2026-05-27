@@ -16,6 +16,8 @@ const ProductSchema = z.object({
   max_stock_level: z.number().int().nonnegative().optional().default(100),
   category_id:     z.string().uuid().optional().nullable(),
   unit_type_id:    z.string().uuid().optional().nullable(),
+  image_url:       z.string().url().optional().nullable(),
+  tracks_stock:    z.boolean().optional().default(true),
 });
 
 products.get('/', async (c) => {
