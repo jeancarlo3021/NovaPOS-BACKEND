@@ -162,18 +162,66 @@ purchases.post('/:id/receive', async (c) => {
 
     console.log(`[RECEIVE] Purchase marked as received`);
 
-    // Increment stock for each received item if canUpdateStock is true
+    // Incrementar stock por item, respetando tracks_stock por producto.
+    // Cada incremento queda registrado en stock_adjustments para trazabilidad.
     if (canUpdateStock) {
+      const userId = c.get('userId');
+      let touched = 0;
+      let skipped = 0;
+
       for (const item of (items ?? [])) {
-        const { data: p } = await db.from('products').select('stock_quantity').eq('id', item.product_id).single();
-        if (p) await db.from('products').update({
-          stock_quantity: (p.stock_quantity ?? 0) + item.quantity,
+        const qty = Number(item.quantity ?? 0);
+        if (!qty || qty <= 0) continue;
+
+        const { data: p } = await db.from('products')
+          .select('stock_quantity, tracks_stock, name')
+          .eq('id', item.product_id)
+          .single();
+
+        if (!p) continue;
+
+        // Producto sin control de stock → no se toca ni se loguea.
+        if (p.tracks_stock === false) {
+          skipped++;
+          continue;
+        }
+
+        const stockBefore = Number(p.stock_quantity ?? 0);
+        const stockAfter  = stockBefore + qty;
+
+        const { error: upErr } = await db.from('products').update({
+          stock_quantity: stockAfter,
           updated_at: new Date().toISOString(),
         }).eq('id', item.product_id);
+
+        if (upErr) {
+          console.error(`[RECEIVE] ERROR updating stock for ${item.product_id}:`, upErr.message);
+          continue;
+        }
+
+        // Registrar como ajuste tipo "increase" con motivo de compra.
+        const { error: adjErr } = await db.from('stock_adjustments').insert({
+          tenant_id: tenantId,
+          product_id: item.product_id,
+          user_id: userId ?? null,
+          type: 'increase',
+          quantity: qty,
+          stock_before: stockBefore,
+          stock_after: stockAfter,
+          reason: `Compra ${purchase.purchase_number ?? ''}`.trim(),
+          notes: supplier?.name ? `Recepción de ${supplier.name}` : 'Recepción de compra',
+        });
+
+        if (adjErr) {
+          console.error(`[RECEIVE] ERROR logging stock_adjustment for ${item.product_id}:`, adjErr.message);
+        }
+
+        touched++;
       }
-      console.log(`[RECEIVE] Stock incremented for ${items?.length ?? 0} items`);
+
+      console.log(`[RECEIVE] Stock incremented for ${touched} items, ${skipped} skipped (tracks_stock=false)`);
     } else {
-      console.log(`[RECEIVE] Stock update skipped (canUpdateStock=false)`);
+      console.log(`[RECEIVE] Stock update skipped (canUpdateStock=false from plan)`);
     }
 
     // Create accounts payable if supplier has payment terms (credit)

@@ -132,7 +132,7 @@ expenses.get('/categories', async (c) => {
   }
 });
 
-// POST /categories/from-general — adopt general category
+// POST /categories/from-general — adopt general category (idempotente)
 expenses.post('/categories/from-general', async (c) => {
   try {
     const tenantId = c.get('tenantId');
@@ -148,9 +148,33 @@ expenses.post('/categories/from-general', async (c) => {
     const general = generalCategories[general_category_id];
     if (!general) return fail(c, 'Categoría no encontrada', 404);
 
+    // Si el tenant ya tiene una categoría con ese nombre, devolverla en vez de
+    // intentar insertar y romper el unique constraint (tenant_id, name).
+    const { data: existing } = await db
+      .from('expense_categories')
+      .select('*')
+      .eq('tenant_id', tenantId)
+      .eq('name', general.name)
+      .maybeSingle();
+
+    if (existing) {
+      // Si la fila existente no tiene el vínculo a la categoría general, lo
+      // completamos para que el picker la marque como adoptada en próximos cargas.
+      if (!existing.general_category_id) {
+        const { data: updated } = await db
+          .from('expense_categories')
+          .update({ general_category_id, is_general: true })
+          .eq('id', existing.id)
+          .select()
+          .single();
+        return ok(c, updated ?? existing, 200);
+      }
+      return ok(c, existing, 200);
+    }
+
     const { data, error } = await db
       .from('expense_categories')
-      .insert({ tenant_id: tenantId, ...general })
+      .insert({ tenant_id: tenantId, general_category_id, is_general: true, ...general })
       .select()
       .single();
 
@@ -167,13 +191,33 @@ expenses.post('/categories', async (c) => {
     const tenantId = c.get('tenantId');
     const { name, color, icon } = await c.req.json() as { name: string; color: string; icon: string };
 
+    const trimmed = (name ?? '').trim();
+    if (!trimmed) return fail(c, 'El nombre es requerido', 422);
+
+    // Detectar duplicado antes del insert para devolver 409 con mensaje claro
+    const { data: existing } = await db
+      .from('expense_categories')
+      .select('id, name')
+      .eq('tenant_id', tenantId)
+      .ilike('name', trimmed)
+      .maybeSingle();
+
+    if (existing) {
+      return fail(c, `Ya existe una categoría llamada "${existing.name}"`, 409);
+    }
+
     const { data, error } = await db
       .from('expense_categories')
-      .insert({ tenant_id: tenantId, name, color, icon })
+      .insert({ tenant_id: tenantId, name: trimmed, color, icon })
       .select()
       .single();
 
-    if (error) throw new Error(error.message);
+    if (error) {
+      if ((error.message || '').includes('expense_categories_tenant_id_name_key')) {
+        return fail(c, `Ya existe una categoría con ese nombre`, 409);
+      }
+      throw new Error(error.message);
+    }
     return ok(c, data, 201);
   } catch (err: any) {
     return fail(c, err.message, 500);

@@ -91,4 +91,95 @@ admin.post('/change-plan', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+// ── Comprobantes de pago de tenants ────────────────────────────────────────
+// Ver migrations/10_payment_receipts.sql
+
+// GET /payment-receipts?tenant_id=&type=&from=&to=
+admin.get('/payment-receipts', async (c) => {
+  try {
+    const tenantId = c.req.query('tenant_id');
+    const type     = c.req.query('type');     // 'subscription' | 'invoicing'
+    const from     = c.req.query('from');
+    const to       = c.req.query('to');
+
+    let query = db
+      .from('payment_receipts')
+      .select('*, tenant:tenants(id, name)')
+      .order('payment_date', { ascending: false });
+
+    if (tenantId) query = query.eq('tenant_id', tenantId);
+    if (type)     query = query.eq('type', type);
+    if (from)     query = query.gte('payment_date', from);
+    if (to)       query = query.lte('payment_date', to);
+
+    const { data, error } = await query;
+    if (error) throw new Error(error.message);
+    return ok(c, data ?? []);
+  } catch (err: any) {
+    return fail(c, err.message, 500);
+  }
+});
+
+// POST /payment-receipts — registrar un comprobante
+admin.post('/payment-receipts', async (c) => {
+  try {
+    const userId = c.get('userId');
+    const body = await c.req.json() as {
+      tenant_id: string;
+      type: 'subscription' | 'invoicing';
+      amount: number;
+      payment_date?: string;
+      period_start?: string | null;
+      period_end?: string | null;
+      payment_method?: string | null;
+      reference?: string | null;
+      notes?: string | null;
+      file_url?: string | null;
+    };
+
+    if (!body.tenant_id) return fail(c, 'tenant_id requerido', 422);
+    if (body.type !== 'subscription' && body.type !== 'invoicing') {
+      return fail(c, "type debe ser 'subscription' o 'invoicing'", 422);
+    }
+    if (!body.amount || Number(body.amount) <= 0) {
+      return fail(c, 'amount debe ser mayor a 0', 422);
+    }
+
+    const { data, error } = await db
+      .from('payment_receipts')
+      .insert({
+        tenant_id: body.tenant_id,
+        type: body.type,
+        amount: body.amount,
+        payment_date: body.payment_date ?? new Date().toISOString().slice(0, 10),
+        period_start: body.period_start ?? null,
+        period_end: body.period_end ?? null,
+        payment_method: body.payment_method ?? null,
+        reference: body.reference ?? null,
+        notes: body.notes ?? null,
+        file_url: body.file_url ?? null,
+        created_by: userId ?? null,
+      })
+      .select('*, tenant:tenants(id, name)')
+      .single();
+
+    if (error) throw new Error(error.message);
+    return ok(c, data, 201);
+  } catch (err: any) {
+    return fail(c, err.message, 500);
+  }
+});
+
+// DELETE /payment-receipts/:id
+admin.delete('/payment-receipts/:id', async (c) => {
+  try {
+    const { id } = c.req.param();
+    const { error } = await db.from('payment_receipts').delete().eq('id', id);
+    if (error) throw new Error(error.message);
+    return ok(c, { deleted: true });
+  } catch (err: any) {
+    return fail(c, err.message, 500);
+  }
+});
+
 export default admin;
