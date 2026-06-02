@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
 import { auth } from './middleware/auth.js';
+import { enforceActiveTenant } from './middleware/tenantStatus.js';
 import authRoutes      from './routes/auth.js';
 import products        from './routes/products.js';
 import categories      from './routes/categories.js';
@@ -53,6 +54,7 @@ app.route('/auth', authRoutes);
 
 const api = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 api.use('*', auth);
+api.use('*', enforceActiveTenant);
 api.route('/products',         products);
 api.route('/categories',       categories);
 api.route('/unit-types',       unitTypes);
