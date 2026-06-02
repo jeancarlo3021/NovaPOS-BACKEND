@@ -325,4 +325,94 @@ users.put('/:id/permissions', async (c) => {
   }
 });
 
+// ── Role Permissions ────────────────────────────────────────────────────────
+
+/*
+  SQL: ver migrations/09_role_permissions.sql
+*/
+
+const VALID_ROLES = [
+  'owner', 'admin', 'gerente', 'asistente_1', 'asistente_2', 'asistente_3',
+  'cocinero', 'mesero', 'cajero', 'almacenero', 'contador',
+] as const;
+
+const RolePermissionsSchema = z.record(
+  z.string(),
+  z.object({
+    can_access: z.boolean().optional(),
+    can_create: z.boolean().optional(),
+    can_edit: z.boolean().optional(),
+    can_delete: z.boolean().optional(),
+  })
+);
+
+// GET /roles/:role/permissions — get permission matrix for a role
+users.get('/roles/:role/permissions', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { role } = c.req.param();
+    if (!VALID_ROLES.includes(role as any)) return fail(c, 'Rol inválido', 422);
+
+    const { data, error } = await db
+      .from('role_permissions')
+      .select('module, can_access, can_create, can_edit, can_delete')
+      .eq('tenant_id', tenantId)
+      .eq('role', role);
+
+    if (error) throw new Error(error.message);
+
+    const result: Record<string, any> = {};
+    (data || []).forEach(perm => {
+      result[perm.module] = {
+        can_access: perm.can_access,
+        can_create: perm.can_create,
+        can_edit: perm.can_edit,
+        can_delete: perm.can_delete,
+      };
+    });
+
+    return ok(c, result);
+  } catch (err: any) {
+    return fail(c, err.message, 500);
+  }
+});
+
+// PUT /roles/:role/permissions — upsert permission matrix for a role
+users.put('/roles/:role/permissions', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { role } = c.req.param();
+    if (!VALID_ROLES.includes(role as any)) return fail(c, 'Rol inválido', 422);
+
+    const body = await c.req.json();
+    const parsed = RolePermissionsSchema.safeParse(body);
+    if (!parsed.success) return fail(c, parsed.error.message, 422);
+
+    await db
+      .from('role_permissions')
+      .delete()
+      .eq('tenant_id', tenantId)
+      .eq('role', role);
+
+    const perms = Object.entries(parsed.data).map(([module, p]) => ({
+      tenant_id: tenantId,
+      role,
+      module,
+      can_access: p.can_access ?? false,
+      can_create: p.can_create ?? false,
+      can_edit: p.can_edit ?? false,
+      can_delete: p.can_delete ?? false,
+    }));
+
+    if (perms.length > 0) {
+      const { error } = await db.from('role_permissions').insert(perms);
+      if (error) throw new Error(error.message);
+    }
+
+    return ok(c, { message: 'Permisos del rol actualizados' });
+  } catch (err: any) {
+    return fail(c, err.message, 500);
+  }
+});
+
 export default users;

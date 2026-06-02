@@ -46,19 +46,25 @@ const AddMemberSchema = z.object({
   user_id: z.string().uuid(),
 });
 
-// GET / — list teams for tenant
+// GET / — list teams for tenant (con miembros inline para UI)
 teams.get('/', async (c) => {
   try {
     const tenantId = c.get('tenantId');
 
     const { data, error } = await db
       .from('teams')
-      .select('id, name, description, color, created_at')
+      .select(`
+        id, name, description, color, created_at,
+        members:team_members(
+          id, user_id, added_at,
+          users(id, full_name, email, role)
+        )
+      `)
       .eq('tenant_id', tenantId)
       .order('name');
 
     if (error) throw new Error(error.message);
-    return ok(c, data);
+    return ok(c, data ?? []);
   } catch (err: any) {
     return fail(c, err.message, 500);
   }
