@@ -26,7 +26,10 @@ products.get('/', async (c) => {
     const search   = c.req.query('search');
     const category = c.req.query('category');
 
-    let query = db.from('products').select('*').eq('tenant_id', tenantId).order('name');
+    let query = db.from('products')
+      .select('*, category:product_categories(id, name), unit_type:unit_types(id, name, abbreviation, requires_weight)')
+      .eq('tenant_id', tenantId)
+      .order('name');
     if (search)   query = query.or(`name.ilike.%${search}%,sku.ilike.%${search}%`);
     if (category) query = query.eq('category_id', category);
 
@@ -48,6 +51,15 @@ products.get('/:id', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+// Traduce el mensaje del unique constraint en algo legible para el usuario.
+function friendlyDbError(msg: string): string | null {
+  if (!msg) return null;
+  if (msg.includes('products_sku_tenant_unique') || (msg.includes('products') && msg.includes('sku') && msg.includes('unique'))) {
+    return 'SKU o código duplicado';
+  }
+  return null;
+}
+
 products.post('/', async (c) => {
   try {
     const tenantId = c.get('tenantId');
@@ -57,9 +69,17 @@ products.post('/', async (c) => {
     const { data, error } = await db.from('products')
       .insert({ ...parsed.data, tenant_id: tenantId })
       .select().single();
-    if (error) throw new Error(error.message);
+    if (error) {
+      const friendly = friendlyDbError(error.message);
+      if (friendly) return fail(c, friendly, 409);
+      throw new Error(error.message);
+    }
     return ok(c, data, 201);
-  } catch (err: any) { return fail(c, err.message, 500); }
+  } catch (err: any) {
+    const friendly = friendlyDbError(err.message);
+    if (friendly) return fail(c, friendly, 409);
+    return fail(c, err.message, 500);
+  }
 });
 
 products.put('/:id', async (c) => {
@@ -73,10 +93,18 @@ products.put('/:id', async (c) => {
       .update({ ...parsed.data, updated_at: new Date().toISOString() })
       .eq('id', id).eq('tenant_id', tenantId)
       .select().single();
-    if (error) throw new Error(error.message);
+    if (error) {
+      const friendly = friendlyDbError(error.message);
+      if (friendly) return fail(c, friendly, 409);
+      throw new Error(error.message);
+    }
     if (!data) return fail(c, 'Producto no encontrado', 404);
     return ok(c, data);
-  } catch (err: any) { return fail(c, err.message, 500); }
+  } catch (err: any) {
+    const friendly = friendlyDbError(err.message);
+    if (friendly) return fail(c, friendly, 409);
+    return fail(c, err.message, 500);
+  }
 });
 
 products.delete('/:id', async (c) => {

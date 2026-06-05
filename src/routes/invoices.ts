@@ -149,10 +149,42 @@ invoices.post('/:id/void', async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const { id } = c.req.param();
+
+    // Traer factura + items para devolver stock.
+    const { data: existing, error: getErr } = await db.from('invoices')
+      .select('id, status, invoice_items(product_id, quantity)')
+      .eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+    if (getErr) throw new Error(getErr.message);
+    if (!existing) return fail(c, 'Factura no encontrada', 404);
+    if (existing.status === 'cancelled') {
+      return fail(c, 'La factura ya está anulada', 409);
+    }
+
+    // Marcar como cancelada.
     const { data, error } = await db.from('invoices')
       .update({ status: 'cancelled', updated_at: new Date().toISOString() })
       .eq('id', id).eq('tenant_id', tenantId).select().single();
     if (error) throw new Error(error.message);
+
+    // Devolver stock para cada item, respetando productos sin control de stock.
+    const items: Array<{ product_id: string; quantity: number }> = (existing as any).invoice_items ?? [];
+    let restored = 0;
+    for (const it of items) {
+      const qty = Number(it.quantity ?? 0);
+      if (!qty || qty <= 0) continue;
+      const { data: p } = await db.from('products')
+        .select('stock_quantity, tracks_stock')
+        .eq('id', it.product_id).maybeSingle();
+      if (!p) continue;
+      if (p.tracks_stock === false) continue; // sin control de stock → no tocar
+      await db.from('products').update({
+        stock_quantity: Number(p.stock_quantity ?? 0) + qty,
+        updated_at: new Date().toISOString(),
+      }).eq('id', it.product_id);
+      restored++;
+    }
+
+    console.log(`[VOID] Factura ${id}: stock devuelto en ${restored} productos`);
     return ok(c, data);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
