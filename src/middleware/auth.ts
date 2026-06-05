@@ -1,10 +1,13 @@
 import { createMiddleware } from 'hono/factory';
 import { db } from '../db/client.js';
 
-type Variables = { userId: string; tenantId: string; role: string };
+type Variables = { userId: string; tenantId: string; role: string; branchId?: string };
 
 export const auth = createMiddleware<{ Variables: Variables }>(async (c, next) => {
   const token = c.req.header('Authorization')?.replace('Bearer ', '');
+  // Sucursal activa enviada por el cliente; nullable mientras se va integrando.
+  const branchHeader = c.req.header('x-branch-id');
+  if (branchHeader) c.set('branchId', branchHeader);
   if (!token) {
     console.warn('[AUTH] Token no proporcionado para:', c.req.path);
     return c.json({ data: null, error: 'No autorizado: token no proporcionado' }, 401);

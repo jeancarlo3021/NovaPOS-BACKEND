@@ -26,6 +26,9 @@ import settings        from './routes/settings.js';
 import admin           from './routes/admin.js';
 import stockAdjustments from './routes/stockAdjustments.js';
 import hr              from './routes/hr.js';
+import branches        from './routes/branches.js';
+import warehouses      from './routes/warehouses.js';
+import transfers       from './routes/transfers.js';
 
 // basePath('/api') matches Vercel's catch-all at api/[[...route]].ts
 const app = new Hono().basePath('/api');
@@ -77,6 +80,9 @@ api.route('/settings',         settings);
 api.route('/admin',            admin);
 api.route('/stock-adjustments', stockAdjustments);
 api.route('/hr',                hr);
+api.route('/branches',          branches);
+api.route('/warehouses',        warehouses);
+api.route('/transfers',         transfers);
 
 app.route('/', api);
 
