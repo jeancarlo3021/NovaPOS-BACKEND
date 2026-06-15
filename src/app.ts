@@ -24,6 +24,12 @@ import tenants         from './routes/tenants.js';
 import hacienda        from './routes/hacienda.js';
 import settings        from './routes/settings.js';
 import admin           from './routes/admin.js';
+import branches        from './routes/branches.js';
+import warehouses      from './routes/warehouses.js';
+import transfers       from './routes/transfers.js';
+import customers       from './routes/customers.js';
+import modifiers       from './routes/modifiers.js';
+import tenantGroups    from './routes/tenantGroups.js';
 import stockAdjustments from './routes/stockAdjustments.js';
 import hr              from './routes/hr.js';
 
@@ -33,7 +39,7 @@ const app = new Hono().basePath('/api');
 app.use('*', logger());
 app.use('*', cors({
   origin: process.env.FRONTEND_URL?.split(',') ?? '*',
-  allowHeaders: ['Content-Type', 'Authorization'],
+  allowHeaders: ['Content-Type', 'Authorization', 'x-branch-id'],
   allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
 }));
 
@@ -73,8 +79,14 @@ api.route('/shifts',           shifts);
 api.route('/plans',            plans);
 api.route('/tenants',          tenants);
 api.route('/hacienda',         hacienda);
+api.route('/branches',         branches);
+api.route('/warehouses',       warehouses);
+api.route('/transfers',        transfers);
+api.route('/customers',        customers);
+api.route('/modifiers',        modifiers);
 api.route('/settings',         settings);
 api.route('/admin',            admin);
+api.route('/tenant-groups',    tenantGroups);
 api.route('/stock-adjustments', stockAdjustments);
 api.route('/hr',                hr);
 

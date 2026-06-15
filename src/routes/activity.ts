@@ -35,19 +35,45 @@ const LogActivitySchema = z.object({
 });
 
 // GET / — get activity logs for tenant (with filters)
+//   ?scope=tenant (default) — sólo el tenant actual
+//   ?scope=group  — todas las sucursales del grupo (donde el caller es owner)
+//   ?tenant_id=X  — sólo esa sucursal específica (debe ser accesible)
 activity.get('/', async (c) => {
   try {
-    const tenantId = c.get('tenantId');
+    const callerUserId = c.get('userId');
+    const callerTenant = c.get('tenantId');
+    const scope = c.req.query('scope') ?? 'tenant';
+    const tenantIdFilter = c.req.query('tenant_id');
     const userId = c.req.query('user_id');
     const from = c.req.query('from');
     const to = c.req.query('to');
     const action = c.req.query('action');
     const limit = parseInt(c.req.query('limit') || '100', 10);
 
+    // Resolver tenants a consultar
+    let tenantIds: string[] = callerTenant ? [callerTenant] : [];
+    if (scope === 'group') {
+      const { data: rows } = await db.from('user_tenants')
+        .select('tenant_id').eq('user_id', callerUserId);
+      tenantIds = (rows ?? []).map((r: any) => r.tenant_id);
+      if (tenantIds.length === 0 && callerTenant) tenantIds = [callerTenant];
+    }
+    if (tenantIdFilter) {
+      // Validar que el caller tenga acceso a ese tenant
+      if (!tenantIds.includes(tenantIdFilter)) {
+        const { data: ut } = await db.from('user_tenants')
+          .select('tenant_id').eq('user_id', callerUserId).eq('tenant_id', tenantIdFilter).maybeSingle();
+        if (!ut) return fail(c, 'Sin acceso a esa sucursal', 403);
+      }
+      tenantIds = [tenantIdFilter];
+    }
+
+    if (tenantIds.length === 0) return ok(c, []);
+
     let query = db
       .from('user_activity_log')
-      .select('id, user_id, user_name, action, entity_type, entity_id, details, created_at')
-      .eq('tenant_id', tenantId)
+      .select('id, tenant_id, user_id, user_name, action, entity_type, entity_id, details, created_at')
+      .in('tenant_id', tenantIds)
       .order('created_at', { ascending: false })
       .limit(limit);
 

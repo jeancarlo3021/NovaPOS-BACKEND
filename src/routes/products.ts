@@ -17,7 +17,9 @@ const ProductSchema = z.object({
   category_id:     z.string().uuid().optional().nullable(),
   unit_type_id:    z.string().uuid().optional().nullable(),
   image_url:       z.string().url().optional().nullable(),
-  tracks_stock:    z.boolean().optional().default(true),
+  tracks_stock:    z.boolean().optional(),
+  cabys_code:      z.string().optional().nullable(),
+  iva_rate:        z.number().nonnegative().max(100).optional().nullable(),
 });
 
 products.get('/', async (c) => {
@@ -55,7 +57,12 @@ products.post('/', async (c) => {
     if (!parsed.success) return fail(c, parsed.error.message, 422);
 
     const { data, error } = await db.from('products')
-      .insert({ ...parsed.data, tenant_id: tenantId })
+      .insert({
+        ...parsed.data,
+        // Default solo al CREAR: si no se especifica, rastrea stock.
+        tracks_stock: parsed.data.tracks_stock ?? true,
+        tenant_id: tenantId,
+      })
       .select().single();
     if (error) throw new Error(error.message);
     return ok(c, data, 201);

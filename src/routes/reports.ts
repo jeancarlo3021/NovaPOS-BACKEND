@@ -53,15 +53,23 @@ reports.get('/stock', async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const { data, error } = await db.from('products')
-      .select('id, name, sku, stock_quantity, min_stock_level, cost_price, unit_price, category_id, unit_type_id')
+      .select('id, name, sku, stock_quantity, min_stock_level, cost_price, unit_price, category_id, unit_type_id, tracks_stock')
       .eq('tenant_id', tenantId).order('stock_quantity', { ascending: true });
     if (error) throw new Error(error.message);
 
-    const lowStock   = data?.filter(p => (p.stock_quantity ?? 0) <= (p.min_stock_level ?? 0));
-    const outOfStock = data?.filter(p => (p.stock_quantity ?? 0) === 0);
+    // Excluir productos que NO manejan inventario (stock infinito): no deben
+    // contar como "bajo" ni "crítico", y tampoco aparecer en la lista.
+    const tracked = (data ?? []).filter(p => (p as any).tracks_stock !== false);
 
-    return ok(c, { products: data, low_stock_count: lowStock?.length ?? 0,
-      out_of_stock_count: outOfStock?.length ?? 0, low_stock_products: lowStock });
+    const lowStock   = tracked.filter(p => (p.stock_quantity ?? 0) <= (p.min_stock_level ?? 0));
+    const outOfStock = tracked.filter(p => (p.stock_quantity ?? 0) === 0);
+
+    return ok(c, {
+      products: data,
+      low_stock_count: lowStock.length,
+      out_of_stock_count: outOfStock.length,
+      low_stock_products: lowStock,
+    });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

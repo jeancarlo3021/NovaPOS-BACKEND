@@ -14,6 +14,8 @@ const CreateUserSchema = z.object({
     'cocinero', 'mesero', 'cajero', 'almacenero', 'contador',
   ]).optional().default('asistente_1'),
   phone: z.string().optional().nullable(),
+  /** Sucursal destino (si no se pasa, se usa el tenant actual del JWT). */
+  target_tenant_id: z.string().uuid().optional().nullable(),
 });
 
 const UpdateUserSchema = z.object({
@@ -33,15 +35,30 @@ const ResetPasswordSchema = z.object({
 users.get('/', async (c) => {
   try {
     const tenantId = c.get('tenantId');
+    const userId   = c.get('userId');
+    // Query param ?scope=group → trae users de TODAS las sucursales accesibles
+    // (vía user_tenants). Default ?scope=tenant → solo del tenant actual.
+    const scope = c.req.query('scope') ?? 'tenant';
+
+    let tenantIds: string[] = tenantId ? [tenantId] : [];
+    if (scope === 'group') {
+      // Resolver todos los tenants donde el user tiene acceso
+      const { data: ut } = await db.from('user_tenants')
+        .select('tenant_id').eq('user_id', userId);
+      tenantIds = (ut ?? []).map((r: any) => r.tenant_id);
+      if (tenantIds.length === 0 && tenantId) tenantIds = [tenantId];
+    }
+
+    if (tenantIds.length === 0) return ok(c, []);
 
     const { data, error } = await db
       .from('users')
-      .select('id, full_name, email, role, phone, created_at')
-      .eq('tenant_id', tenantId)
+      .select('id, full_name, email, role, phone, tenant_id, created_at, last_login_at')
+      .in('tenant_id', tenantIds)
       .order('full_name');
 
     if (error) throw new Error(error.message);
-    return ok(c, data);
+    return ok(c, data ?? []);
   } catch (err: any) {
     return fail(c, err.message, 500);
   }
@@ -51,9 +68,43 @@ users.get('/', async (c) => {
 users.post('/', async (c) => {
   try {
     const tenantId = c.get('tenantId');
-    const body = await c.req.json();
-    const parsed = CreateUserSchema.safeParse(body);
+    const userId   = c.get('userId');
+    const body     = await c.req.json();
+    const parsed   = CreateUserSchema.safeParse(body);
     if (!parsed.success) return fail(c, parsed.error.message, 422);
+
+    // Resolver tenant destino: si vino target_tenant_id, validar acceso.
+    let destTenantId = parsed.data.target_tenant_id ?? tenantId;
+    if (parsed.data.target_tenant_id && parsed.data.target_tenant_id !== tenantId) {
+      // El creador debe tener acceso al tenant destino vía user_tenants.
+      const { data: ut } = await db.from('user_tenants')
+        .select('user_id').eq('user_id', userId)
+        .eq('tenant_id', parsed.data.target_tenant_id).maybeSingle();
+      // Plus también es válido si es el owner directo del tenant
+      const { data: t } = await db.from('tenants')
+        .select('owner_id').eq('id', parsed.data.target_tenant_id).maybeSingle();
+      const canAccess = !!ut || t?.owner_id === userId;
+      if (!canAccess) {
+        return fail(c, 'No tenés acceso a la sucursal destino', 403);
+      }
+      destTenantId = parsed.data.target_tenant_id;
+    }
+
+    // Pre-check: no permitir emails duplicados (case-insensitive). El usuario
+    // se identifica por `usuario@nexoerp.local` → si ya existe un user con ese
+    // email/username, devolvemos error claro antes de llamar a Supabase Auth
+    // (que falla con mensaje genérico "email already registered").
+    const emailLc = parsed.data.email.trim().toLowerCase();
+    const { data: existingUser } = await db
+      .from('users')
+      .select('id, email')
+      .ilike('email', emailLc)
+      .maybeSingle();
+    if (existingUser) {
+      const isLocalUsername = emailLc.endsWith('@nexoerp.local');
+      const display = isLocalUsername ? emailLc.replace('@nexoerp.local', '') : emailLc;
+      return fail(c, `Ya existe un usuario con el nombre "${display}". Elegí otro.`, 409);
+    }
 
     // Create auth user via admin API
     const { data: authData, error: authError } = await db.auth.admin.createUser({
@@ -62,7 +113,16 @@ users.post('/', async (c) => {
       email_confirm: true,
     });
 
-    if (authError) throw new Error(authError.message);
+    if (authError) {
+      // Mensaje amigable si Supabase tira "User already registered" por carrera.
+      if (/already (registered|exists)/i.test(authError.message)) {
+        const display = emailLc.endsWith('@nexoerp.local')
+          ? emailLc.replace('@nexoerp.local', '')
+          : emailLc;
+        return fail(c, `Ya existe un usuario con el nombre "${display}". Elegí otro.`, 409);
+      }
+      throw new Error(authError.message);
+    }
     if (!authData.user) throw new Error('No se pudo crear el usuario');
 
     // Insert into users table
@@ -74,7 +134,7 @@ users.post('/', async (c) => {
         full_name: parsed.data.full_name,
         role: parsed.data.role,
         phone: parsed.data.phone,
-        tenant_id: tenantId,
+        tenant_id: destTenantId,
       })
       .select()
       .single();
@@ -84,6 +144,18 @@ users.post('/', async (c) => {
       await db.auth.admin.deleteUser(authData.user.id);
       throw new Error(userError.message);
     }
+
+    // Vincular en user_tenants para que el nuevo usuario pueda leer su tenant
+    // vía RLS (subscriptions, etc.) y el RPC my_tenants() lo devuelva. El role
+    // acá es el rol operativo del staff (cajero / gerente / etc.), NO 'owner':
+    // owner queda reservado para el dueño del negocio.
+    const { error: utErr } = await db.from('user_tenants').upsert({
+      user_id:    authData.user.id,
+      tenant_id:  destTenantId,
+      role:       'staff',
+      is_default: true,
+    }, { onConflict: 'user_id,tenant_id' });
+    if (utErr) console.warn('[users.create] user_tenants link falló:', utErr.message);
 
     return ok(c, userData, 201);
   } catch (err: any) {
@@ -325,6 +397,55 @@ users.put('/:id/permissions', async (c) => {
   }
 });
 
+// ── POS Quick-Switch (kiosk mode con PIN) ──────────────────────────────────
+// El terminal del POS queda logueado con un user "base". Los cajeros entran
+// y salen con su PIN — solo se cambia el `activeCashier` para atribución de
+// facturas, NO se reemplaza la sesión del navegador. Por eso devolvemos solo
+// info pública del user, no un token.
+users.post('/pin-login', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    if (!tenantId) return fail(c, 'Sin tenant', 400);
+    const { pin } = await c.req.json();
+    if (!pin || typeof pin !== 'string' || pin.length < 3) {
+      return fail(c, 'PIN inválido', 400);
+    }
+    const { data, error } = await db.from('users')
+      .select('id, full_name, role, email')
+      .eq('tenant_id', tenantId)
+      .eq('pos_pin', pin)
+      .maybeSingle();
+    if (error) throw new Error(error.message);
+    if (!data) return fail(c, 'PIN incorrecto', 401);
+    return ok(c, data);
+  } catch (err: any) {
+    return fail(c, err.message, 500);
+  }
+});
+
+// PATCH /:id/pin — setear o cambiar el PIN de un usuario (solo owner/admin)
+users.patch('/:id/pin', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { id } = c.req.param();
+    const { pin } = await c.req.json();
+    if (pin && (typeof pin !== 'string' || !/^\d{3,8}$/.test(pin))) {
+      return fail(c, 'PIN debe ser numérico de 3 a 8 dígitos', 400);
+    }
+    // Validar que el PIN no esté en uso por OTRO user en el mismo tenant
+    if (pin) {
+      const { data: existing } = await db.from('users')
+        .select('id').eq('tenant_id', tenantId).eq('pos_pin', pin).neq('id', id).maybeSingle();
+      if (existing) return fail(c, 'Ese PIN ya lo usa otro usuario', 409);
+    }
+    const { error } = await db.from('users')
+      .update({ pos_pin: pin || null })
+      .eq('id', id).eq('tenant_id', tenantId);
+    if (error) throw new Error(error.message);
+    return ok(c, { ok: true });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // ── Role Permissions ────────────────────────────────────────────────────────
 
 /*
@@ -381,36 +502,76 @@ users.get('/roles/:role/permissions', async (c) => {
 users.put('/roles/:role/permissions', async (c) => {
   try {
     const tenantId = c.get('tenantId');
+    const userId   = c.get('userId');
     const { role } = c.req.param();
+    console.log('[role-perms] PUT', { tenantId, userId, role });
+
+    if (!tenantId) {
+      return fail(c, 'Tenant ID requerido — verificá que el user tenga tenant asignado', 400);
+    }
     if (!VALID_ROLES.includes(role as any)) return fail(c, 'Rol inválido', 422);
 
     const body = await c.req.json();
+    console.log('[role-perms] body keys:', Object.keys(body ?? {}));
+
     const parsed = RolePermissionsSchema.safeParse(body);
-    if (!parsed.success) return fail(c, parsed.error.message, 422);
-
-    await db
-      .from('role_permissions')
-      .delete()
-      .eq('tenant_id', tenantId)
-      .eq('role', role);
-
-    const perms = Object.entries(parsed.data).map(([module, p]) => ({
-      tenant_id: tenantId,
-      role,
-      module,
-      can_access: p.can_access ?? false,
-      can_create: p.can_create ?? false,
-      can_edit: p.can_edit ?? false,
-      can_delete: p.can_delete ?? false,
-    }));
-
-    if (perms.length > 0) {
-      const { error } = await db.from('role_permissions').insert(perms);
-      if (error) throw new Error(error.message);
+    if (!parsed.success) {
+      console.error('[role-perms] schema parse failed:', parsed.error.message);
+      return fail(c, parsed.error.message, 422);
     }
 
-    return ok(c, { message: 'Permisos del rol actualizados' });
+    // ── Multi-empresa: si el caller es owner de un grupo, replicamos la
+    //    configuración a TODAS las sucursales del grupo. Así con guardar
+    //    una vez aplica a Demo + prueba 1 + prueba 2.
+    //    Estrategia: buscar todos los tenants donde el caller es 'owner' en
+    //    user_tenants. Si encuentra más de uno, replicar a todos.
+    const { data: ownedRows } = await db.from('user_tenants')
+      .select('tenant_id').eq('user_id', userId).eq('role', 'owner');
+    let targetTenantIds = (ownedRows ?? []).map((r: any) => r.tenant_id);
+    if (targetTenantIds.length === 0) targetTenantIds = [tenantId];
+    console.log('[role-perms] applying to tenants:', targetTenantIds);
+
+    // Borrar las matrices viejas de este rol en TODOS los tenants destino.
+    const { error: delErr } = await db
+      .from('role_permissions')
+      .delete()
+      .in('tenant_id', targetTenantIds)
+      .eq('role', role);
+    if (delErr) {
+      console.error('[role-perms] DELETE error:', delErr.message);
+      throw new Error('DELETE: ' + delErr.message);
+    }
+
+    // Generar filas: cada módulo × cada tenant destino.
+    const perms = targetTenantIds.flatMap((tid: string) =>
+      Object.entries(parsed.data).map(([module, p]) => ({
+        tenant_id: tid,
+        role,
+        module,
+        can_access: p.can_access ?? false,
+        can_create: p.can_create ?? false,
+        can_edit: p.can_edit ?? false,
+        can_delete: p.can_delete ?? false,
+      }))
+    );
+    console.log('[role-perms] insert rows:', perms.length);
+
+    if (perms.length > 0) {
+      const { error, data } = await db.from('role_permissions').insert(perms).select();
+      if (error) {
+        console.error('[role-perms] INSERT error:', error.message);
+        throw new Error('INSERT: ' + error.message);
+      }
+      console.log('[role-perms] inserted', data?.length, 'rows');
+    }
+
+    return ok(c, {
+      message: 'Permisos del rol actualizados',
+      inserted: perms.length,
+      tenants: targetTenantIds.length,
+    });
   } catch (err: any) {
+    console.error('[role-perms] FAIL:', err.message);
     return fail(c, err.message, 500);
   }
 });

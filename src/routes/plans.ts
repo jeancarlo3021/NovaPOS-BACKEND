@@ -57,6 +57,51 @@ plans.get('/:id', async (c) => {
   }
 });
 
+// POST / — crear nuevo plan (solo super-admin)
+plans.post('/', async (c) => {
+  try {
+    const body = await c.req.json();
+
+    const name = String(body.name ?? '').trim();
+    if (!name) return fail(c, 'name es requerido', 400);
+
+    const row = {
+      name,
+      description:    body.description ?? '',
+      price:          Number(body.price ?? 0),
+      billing_cycle:  body.billing_cycle ?? 'monthly',
+      max_users:      body.max_users ?? null,
+      max_products:   body.max_products ?? null,
+      max_orders:     body.max_orders ?? null,
+      features:       body.features ?? {},
+      is_active:      body.is_active ?? true,
+    };
+
+    const { data, error } = await db
+      .from('subscription_plans')
+      .insert(row)
+      .select()
+      .single();
+
+    if (error) throw new Error(error.message);
+    return ok(c, data);
+  } catch (err: any) {
+    return fail(c, err.message, 500);
+  }
+});
+
+// DELETE /:id — eliminar plan
+plans.delete('/:id', async (c) => {
+  try {
+    const { id } = c.req.param();
+    const { error } = await db.from('subscription_plans').delete().eq('id', id);
+    if (error) throw new Error(error.message);
+    return ok(c, { deleted: true });
+  } catch (err: any) {
+    return fail(c, err.message, 500);
+  }
+});
+
 // PUT /:id — update plan
 plans.put('/:id', async (c) => {
   try {

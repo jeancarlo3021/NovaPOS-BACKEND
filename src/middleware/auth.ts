@@ -98,6 +98,33 @@ export const auth = createMiddleware<{ Variables: Variables }>(async (c, next) =
 
   const tenantId = tenantData?.id;
   if (!tenantId) {
+    // ── Excepción: rutas que NO requieren tenant ─────────────────────────
+    // El SaaS admin no tiene tenant operativo. Estas rutas son globales:
+    //  - /admin/*         → gestión de tenants (super-admin)
+    //  - /tenant-groups/* → grupos multi-empresa
+    //  - /plans (GET)     → catálogo público de planes SaaS (excepto /plans/current)
+    // El control fino lo hace cada handler con userId + body.
+    const path   = c.req.path || '';
+    const method = (c.req.method || 'GET').toUpperCase();
+
+    // Usamos `includes` en lugar de `===` porque Hono puede reportar el path
+    // con o sin prefix dependiendo del mount level (p. ej. "/api/plans" vs "/plans").
+    const isAdminRoute = path.includes('/admin/')         || path.endsWith('/admin');
+    const isGroupRoute = path.includes('/tenant-groups/') || path.endsWith('/tenant-groups');
+    const isPlansRead  = method === 'GET'
+                         && (path.includes('/plans/') || path.endsWith('/plans'))
+                         && !path.endsWith('/plans/current')
+                         && !path.includes('/plans/current?');
+
+    if (isAdminRoute || isGroupRoute || isPlansRead) {
+      console.log('[AUTH] Bypass tenant for global route:', path);
+      c.set('userId', userId);
+      c.set('tenantId', ''); // explícito: sin tenant
+      c.set('role', 'admin');
+      await next();
+      return;
+    }
+
     console.warn('[AUTH] Usuario sin tenant:', userId);
     return c.json({ data: null, error: 'Usuario sin tenant asignado' }, 403);
   }

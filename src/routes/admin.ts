@@ -5,11 +5,120 @@ import { ok, fail } from '../utils/response.js';
 const admin = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
 // GET /owners — call admin_get_owners() RPC (SECURITY DEFINER)
+// Enriquece cada tenant con info del grupo al que pertenece (si pertenece) +
+// cuota mensual del grupo (saas × #sucursales + suma de planes FE).
 admin.get('/owners', async (c) => {
   try {
     const { data, error } = await db.rpc('admin_get_owners');
     if (error) throw new Error(error.message);
-    return ok(c, data);
+    const owners = Array.isArray(data) ? data : [];
+    if (owners.length === 0) return ok(c, owners);
+
+    // ── Membresía: 2 queries simples + merge en JS para evitar problemas
+    //    con la sintaxis de joins anidados de PostgREST. ──
+    const tenantIds = owners.map((o: any) => o.id);
+    const membership: Record<string, { group_id: string; group_name: string; role: string }> = {};
+    try {
+      // a) Filas de tenant_group_members para nuestros tenants
+      const { data: members, error: mErr } = await db.from('tenant_group_members')
+        .select('tenant_id, group_id, role')
+        .in('tenant_id', tenantIds);
+      if (mErr) console.warn('[owners] members lookup error:', mErr.message);
+
+      // b) Datos de los grupos involucrados
+      const groupIds = Array.from(new Set((members ?? []).map((r: any) => r.group_id))).filter(Boolean);
+      const groupsById: Record<string, { id: string; name: string }> = {};
+      if (groupIds.length > 0) {
+        const { data: groups, error: gErr } = await db.from('tenant_groups')
+          .select('id, name').in('id', groupIds);
+        if (gErr) console.warn('[owners] groups lookup error:', gErr.message);
+        for (const g of (groups ?? []) as Array<{ id: string; name: string }>) {
+          groupsById[g.id] = g;
+        }
+      }
+
+      // c) Indexar por tenant_id
+      for (const m of (members ?? []) as Array<{ tenant_id: string; group_id: string; role: string }>) {
+        const g = groupsById[m.group_id];
+        membership[m.tenant_id] = {
+          group_id:   m.group_id,
+          group_name: g?.name ?? '(grupo sin nombre)',
+          role:       m.role,
+        };
+      }
+    } catch (e: any) { console.warn('[owners] group lookup exception:', e?.message); }
+
+    // Cuota mensual por grupo (memoizado)
+    const groupBillingCache: Record<string, number> = {};
+    const getGroupBilling = async (gid: string): Promise<number> => {
+      if (groupBillingCache[gid] != null) return groupBillingCache[gid];
+      try {
+        const { data: b } = await db.rpc('group_billing', { p_group_id: gid });
+        const row = Array.isArray(b) ? b[0] : b;
+        const total = Number(row?.grand_total ?? 0);
+        groupBillingCache[gid] = total;
+        return total;
+      } catch { return 0; }
+    };
+
+    const enriched = await Promise.all(
+      owners.map(async (o: any) => {
+        const g = membership[o.id] ?? null;
+        const groupBilling = g?.group_id ? await getGroupBilling(g.group_id) : null;
+        return {
+          ...o,
+          group_id:      g?.group_id ?? null,
+          group_name:    g?.group_name ?? null,
+          group_role:    g?.role ?? null,        // 'main' | 'branch' | null
+          group_billing: groupBilling,            // total mensual del grupo (saas + FE)
+        };
+      }),
+    );
+
+    return ok(c, enriched);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// GET /users-lite — lista compacta de usuarios para selectores de owner.
+// Devuelve id + email + full_name. No expone datos sensibles. Sirve para
+// dropdowns en panel admin (ej. transferir propiedad de un grupo).
+admin.get('/users-lite', async (c) => {
+  try {
+    const { data, error } = await db.from('users')
+      .select('id, email, full_name')
+      .order('full_name', { ascending: true });
+    if (error) throw new Error(error.message);
+    return ok(c, data ?? []);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// GET /invoices-monthly — conteo de facturas no anuladas del mes en curso por
+// tenant. Reservado para tracking de Facturación Electrónica futura, donde
+// el costo del servicio suele ir por volumen mensual.
+// Respuesta: [{ tenant_id, count, period_start, period_end }]
+admin.get('/invoices-monthly', async (c) => {
+  try {
+    const now = new Date();
+    const periodStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+    const periodEnd   = new Date(now.getFullYear(), now.getMonth() + 1, 1).toISOString();
+
+    const { data, error } = await db
+      .from('invoices')
+      .select('tenant_id, status, issued_at')
+      .gte('issued_at', periodStart)
+      .lt('issued_at', periodEnd);
+    if (error) throw new Error(error.message);
+
+    const counts: Record<string, number> = {};
+    for (const row of data ?? []) {
+      if ((row as any).status === 'cancelled') continue;
+      const tid = (row as any).tenant_id as string;
+      counts[tid] = (counts[tid] ?? 0) + 1;
+    }
+    const out = Object.entries(counts).map(([tenant_id, count]) => ({
+      tenant_id, count, period_start: periodStart, period_end: periodEnd,
+    }));
+    return ok(c, out);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
@@ -145,13 +254,15 @@ admin.post('/payment-receipts', async (c) => {
       return fail(c, 'amount debe ser mayor a 0', 422);
     }
 
+    const paymentDate = body.payment_date ?? new Date().toISOString().slice(0, 10);
+
     const { data, error } = await db
       .from('payment_receipts')
       .insert({
         tenant_id: body.tenant_id,
         type: body.type,
         amount: body.amount,
-        payment_date: body.payment_date ?? new Date().toISOString().slice(0, 10),
+        payment_date: paymentDate,
         period_start: body.period_start ?? null,
         period_end: body.period_end ?? null,
         payment_method: body.payment_method ?? null,
@@ -164,6 +275,66 @@ admin.post('/payment-receipts', async (c) => {
       .single();
 
     if (error) throw new Error(error.message);
+
+    // ── Extender la suscripción cuando el comprobante es de tipo "subscription"
+    // Esto hace que el "Próximo cobro" del panel admin avance automáticamente
+    // tras registrar el pago, en vez de quedar congelado en la fecha vencida.
+    // (Los comprobantes "invoicing" — facturación electrónica — no afectan
+    // la fecha de cobro mensual del SaaS.)
+    if (body.type === 'subscription') {
+      try {
+        // 1) Suscripción más reciente del tenant
+        const { data: sub } = await db
+          .from('subscriptions')
+          .select('id, plan_id, ends_at, status')
+          .eq('tenant_id', body.tenant_id)
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        if (sub) {
+          // 2) Ciclo del plan
+          let cycleDays = 30;
+          if (sub.plan_id) {
+            const { data: plan } = await db
+              .from('subscription_plans')
+              .select('billing_cycle')
+              .eq('id', sub.plan_id)
+              .maybeSingle();
+            const cycle = (plan?.billing_cycle ?? 'monthly').toLowerCase();
+            cycleDays = cycle === 'yearly' ? 365 : 30;
+          }
+
+          // 3) Base de cálculo: si la suscripción ya estaba vencida (o sin
+          //    ends_at), sumar desde la fecha del pago. Si seguía vigente,
+          //    sumar desde ends_at para no perder días pagados.
+          const now = Date.now();
+          const currentEnds = sub.ends_at ? new Date(sub.ends_at).getTime() : null;
+          const paymentMs   = new Date(paymentDate + 'T12:00:00').getTime();
+          const baseMs = (currentEnds && currentEnds > now) ? currentEnds : paymentMs;
+          const newEndsAt = new Date(baseMs + cycleDays * 86400000).toISOString();
+
+          await db.from('subscriptions')
+            .update({
+              ends_at: newEndsAt,
+              status: 'active',
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', sub.id);
+
+          // 4) Si el tenant estaba suspendido por morosidad, reactivarlo.
+          await db.from('tenants')
+            .update({ status: 'active', updated_at: new Date().toISOString() })
+            .eq('id', body.tenant_id)
+            .in('status', ['suspended', 'inactive']);
+        }
+      } catch (extendErr: any) {
+        // No tiramos el endpoint — el comprobante se registró bien. Solo
+        // logueamos para que el admin sepa que debe renovar manualmente.
+        console.warn('No se pudo extender la suscripción:', extendErr?.message);
+      }
+    }
+
     return ok(c, data, 201);
   } catch (err: any) {
     return fail(c, err.message, 500);
@@ -180,6 +351,46 @@ admin.delete('/payment-receipts/:id', async (c) => {
   } catch (err: any) {
     return fail(c, err.message, 500);
   }
+});
+
+// ── FE / Kiosk config por tenant ────────────────────────────────────────────
+// El admin gestiona settings de sucursales que pueden NO ser su propio
+// tenant. Usa service-role (db) y no filtra por tenant del JWT.
+
+admin.get('/tenants/:id/fe-config', async (c) => {
+  try {
+    const { id } = c.req.param();
+    const { data: feRow } = await db.from('settings')
+      .select('config').eq('tenant_id', id).eq('type', 'electronic-invoice').maybeSingle();
+    const { data: kioskRow } = await db.from('settings')
+      .select('config').eq('tenant_id', id).eq('type', 'pos-kiosk').maybeSingle();
+    return ok(c, {
+      fe:    feRow?.config ?? {},
+      kiosk: kioskRow?.config ?? {},
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+admin.put('/tenants/:id/fe-config', async (c) => {
+  try {
+    const { id } = c.req.param();
+    const body = await c.req.json();
+    const { fe, kiosk } = body ?? {};
+
+    if (fe) {
+      await db.from('settings').upsert({
+        tenant_id: id, type: 'electronic-invoice', config: fe,
+        updated_at: new Date().toISOString(),
+      }, { onConflict: 'tenant_id,type' });
+    }
+    if (kiosk) {
+      await db.from('settings').upsert({
+        tenant_id: id, type: 'pos-kiosk', config: kiosk,
+        updated_at: new Date().toISOString(),
+      }, { onConflict: 'tenant_id,type' });
+    }
+    return ok(c, { ok: true });
+  } catch (err: any) { return fail(c, err.message, 500); }
 });
 
 export default admin;
