@@ -192,7 +192,7 @@ reports.get('/sellers', async (c) => {
     const to   = c.req.query('to');
 
     let query = db.from('invoices')
-      .select('id, total, cash_session_id, issued_at')
+      .select('id, total, cash_session_id, cashier_id, cashier_name, issued_at')
       .eq('tenant_id', tenantId)
       .neq('status', 'cancelled')
       .order('issued_at', { ascending: false });
@@ -202,19 +202,31 @@ reports.get('/sellers', async (c) => {
     const { data: invoices, error } = await query;
     if (error) throw new Error(error.message);
 
-    const sessionIds = [...new Set((invoices ?? []).map((inv: any) => inv.cash_session_id))];
-    const { data: sessions } = await db.from('cash_sessions')
-      .select('id, user_id').in('id', sessionIds);
+    // Atribución del vendedor: priorizamos el cajero real de la factura
+    // (cashier_id, kiosk o login normal). Si no hay, caemos al dueño de la
+    // sesión de caja (facturas viejas sin cashier_id).
+    const sessionIds = [...new Set((invoices ?? []).map((inv: any) => inv.cash_session_id).filter(Boolean))];
+    const { data: sessions } = sessionIds.length > 0
+      ? await db.from('cash_sessions').select('id, user_id').in('id', sessionIds)
+      : { data: [] as any[] };
 
-    const userIds = [...new Set((sessions ?? []).map((s: any) => s.user_id))];
-    const { data: users } = await db.from('users').select('id, email, full_name').in('id', userIds);
-
-    const sellerMap: Record<string, { totalRevenue: number; totalInvoices: number }> = {};
-    (invoices ?? []).forEach((inv: any) => {
+    // Resolver el uid efectivo por factura
+    const uidForInvoice = (inv: any): string | null => {
+      if (inv.cashier_id) return inv.cashier_id;
       const session = (sessions ?? []).find((s: any) => s.id === inv.cash_session_id);
-      const uid = session?.user_id;
+      return session?.user_id ?? null;
+    };
+
+    const allUids = [...new Set((invoices ?? []).map(uidForInvoice).filter(Boolean))] as string[];
+    const { data: users } = allUids.length > 0
+      ? await db.from('users').select('id, email, full_name').in('id', allUids)
+      : { data: [] as any[] };
+
+    const sellerMap: Record<string, { totalRevenue: number; totalInvoices: number; name?: string }> = {};
+    (invoices ?? []).forEach((inv: any) => {
+      const uid = uidForInvoice(inv);
       if (!uid) return;
-      if (!sellerMap[uid]) sellerMap[uid] = { totalRevenue: 0, totalInvoices: 0 };
+      if (!sellerMap[uid]) sellerMap[uid] = { totalRevenue: 0, totalInvoices: 0, name: inv.cashier_name ?? undefined };
       sellerMap[uid].totalRevenue += Number(inv.total ?? 0);
       sellerMap[uid].totalInvoices += 1;
     });
@@ -223,7 +235,7 @@ reports.get('/sellers', async (c) => {
       const user = (users ?? []).find((u: any) => u.id === uid);
       return {
         userId: uid,
-        name: (user as any)?.full_name ?? 'Vendedor',
+        name: (user as any)?.full_name ?? stats.name ?? 'Vendedor',
         email: user?.email ?? '',
         totalRevenue: stats.totalRevenue,
         totalInvoices: stats.totalInvoices,
