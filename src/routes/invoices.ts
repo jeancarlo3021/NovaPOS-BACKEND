@@ -237,6 +237,39 @@ invoices.post('/:id/void', async (c) => {
       // Otro request ganó la carrera y la anuló primero.
       return fail(c, 'La factura ya fue anulada por otra sesión', 409);
     }
+
+    // 3) Devolver el stock al inventario — SOLO productos que rastrean stock.
+    //    Los de stock infinito (tracks_stock=false) no se tocan.
+    const { data: items } = await db.from('invoice_items')
+      .select('product_id, quantity').eq('invoice_id', id);
+    for (const it of (items ?? []) as any[]) {
+      if (!it.product_id) continue;
+      const { data: p } = await db.from('products')
+        .select('stock_quantity, tracks_stock').eq('id', it.product_id).maybeSingle();
+      if (p && (p as any).tracks_stock !== false) {
+        await db.from('products').update({
+          stock_quantity: (p.stock_quantity ?? 0) + Number(it.quantity),
+          updated_at: new Date().toISOString(),
+        }).eq('id', it.product_id);
+      }
+    }
+
+    // 4) Revertir el movimiento de caja: registrar la salida por la anulación
+    //    para que el cierre de caja cuadre (la venta había sumado efectivo).
+    if ((data as any).cash_session_id) {
+      try {
+        await db.from('cash_movements').insert({
+          cash_session_id:  (data as any).cash_session_id,
+          type:             'out',
+          amount:           Number((data as any).total ?? 0),
+          description:      `Anulación factura ${(data as any).invoice_number}`,
+          reference_id:     id,
+        });
+      } catch (e) {
+        console.warn('[void] no se pudo registrar movimiento de caja:', e);
+      }
+    }
+
     return ok(c, data);
   } catch (err: any) { return fail(c, err.message, 500); }
 });

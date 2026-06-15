@@ -565,6 +565,88 @@ groups.get('/my/branches-stats', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+// ── GET /my/branches-report?from=&to= — reporte consolidado de TODAS las
+//    sucursales del owner en un rango. Devuelve por sucursal: ventas, IVA,
+//    facturas, ticket promedio, gastos y ganancia bruta; más un total grupo.
+groups.get('/my/branches-report', async (c) => {
+  try {
+    const userId = c.get('userId');
+    if (!userId) return ok(c, { rows: [], totals: null });
+
+    const from = c.req.query('from');
+    const to   = c.req.query('to');
+
+    // Tenants donde el user es owner
+    const { data: ownedRows } = await db.from('user_tenants')
+      .select('tenant_id').eq('user_id', userId).eq('role', 'owner');
+    const tenantIds = (ownedRows ?? []).map((r: any) => r.tenant_id);
+    if (tenantIds.length === 0) return ok(c, { rows: [], totals: null });
+
+    const { data: tenants } = await db.from('tenants')
+      .select('id, name, is_demo, status').in('id', tenantIds);
+
+    // Facturas en rango (solo completadas) por tenant
+    let invQ = db.from('invoices')
+      .select('tenant_id, total, tax_amount, status, created_at')
+      .in('tenant_id', tenantIds);
+    if (from) invQ = invQ.gte('created_at', from);
+    if (to)   invQ = invQ.lte('created_at', to);
+    const { data: invoices } = await invQ;
+
+    const salesByTenant = new Map<string, { count: number; total: number; tax: number }>();
+    for (const inv of (invoices ?? []) as any[]) {
+      if (inv.status === 'cancelled') continue;  // anuladas no cuentan
+      const cur = salesByTenant.get(inv.tenant_id) ?? { count: 0, total: 0, tax: 0 };
+      cur.count += 1;
+      cur.total += Number(inv.total ?? 0);
+      cur.tax   += Number(inv.tax_amount ?? 0);
+      salesByTenant.set(inv.tenant_id, cur);
+    }
+
+    // Gastos en rango por tenant (si la tabla existe)
+    const expByTenant = new Map<string, number>();
+    try {
+      let expQ = db.from('expenses').select('tenant_id, amount, expense_date, created_at').in('tenant_id', tenantIds);
+      const { data: expenses } = await expQ;
+      for (const e of (expenses ?? []) as any[]) {
+        const d = e.expense_date ?? e.created_at;
+        if (from && d && d < from) continue;
+        if (to && d && d > to) continue;
+        expByTenant.set(e.tenant_id, (expByTenant.get(e.tenant_id) ?? 0) + Number(e.amount ?? 0));
+      }
+    } catch { /* sin tabla de gastos */ }
+
+    const rows = (tenants ?? []).map((t: any) => {
+      const s = salesByTenant.get(t.id) ?? { count: 0, total: 0, tax: 0 };
+      const expenses = expByTenant.get(t.id) ?? 0;
+      const net = s.total - s.tax;             // ventas sin impuesto
+      return {
+        tenant_id:    t.id,
+        tenant_name:  t.name,
+        is_demo:      t.is_demo,
+        status:       t.status,
+        invoices:     s.count,
+        sales_total:  s.total,
+        tax_total:    s.tax,
+        avg_ticket:   s.count > 0 ? Math.round(s.total / s.count) : 0,
+        expenses,
+        gross_profit: net - expenses,          // aprox: ventas netas - gastos
+      };
+    });
+
+    // Totales del grupo
+    const totals = rows.reduce((acc, r) => ({
+      invoices:     acc.invoices + r.invoices,
+      sales_total:  acc.sales_total + r.sales_total,
+      tax_total:    acc.tax_total + r.tax_total,
+      expenses:     acc.expenses + r.expenses,
+      gross_profit: acc.gross_profit + r.gross_profit,
+    }), { invoices: 0, sales_total: 0, tax_total: 0, expenses: 0, gross_profit: 0 });
+
+    return ok(c, { rows, totals });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // ── POST /my/central-warehouse — crear bodega central para cada sucursal ──
 // Si la sucursal ya tiene una bodega marcada como "central"/"default", se
 // omite. Idempotente — podés llamarlo varias veces sin duplicar.
