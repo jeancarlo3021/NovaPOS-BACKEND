@@ -233,9 +233,10 @@ reports.get('/sellers', async (c) => {
 
     const sellers = Object.entries(sellerMap).map(([uid, stats]) => {
       const user = (users ?? []).find((u: any) => u.id === uid);
+      const emailName = user?.email ? String(user.email).split('@')[0] : '';
       return {
         userId: uid,
-        name: (user as any)?.full_name ?? stats.name ?? 'Vendedor',
+        name: (user as any)?.full_name || stats.name || emailName || 'Vendedor',
         email: user?.email ?? '',
         totalRevenue: stats.totalRevenue,
         totalInvoices: stats.totalInvoices,
