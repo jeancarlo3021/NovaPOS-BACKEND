@@ -36,8 +36,11 @@ cashSessions.get('/', async (c) => {
 cashSessions.get('/active', async (c) => {
   try {
     const tenantId = c.get('tenantId');
+    const userId   = c.get('userId');
+    // Sesión de caja por USUARIO: cada cajero tiene la suya.
     const { data, error } = await db.from('cash_sessions').select('*')
-      .eq('tenant_id', tenantId).eq('status', 'open').maybeSingle();
+      .eq('tenant_id', tenantId).eq('user_id', userId).eq('status', 'open')
+      .order('opening_date', { ascending: false }).limit(1).maybeSingle();
     if (error) throw new Error(error.message);
     return ok(c, data);
   } catch (err: any) { return fail(c, err.message, 500); }
@@ -50,10 +53,11 @@ cashSessions.post('/open', async (c) => {
     const parsed   = OpenSchema.safeParse(await c.req.json());
     if (!parsed.success) return fail(c, parsed.error.message, 422);
 
-    // Only one open session at a time
+    // Solo una caja abierta POR USUARIO (no por tenant). Así cada cajero
+    // maneja su propia sesión sin bloquear a los demás.
     const { data: existing } = await db.from('cash_sessions').select('id')
-      .eq('tenant_id', tenantId).eq('status', 'open').maybeSingle();
-    if (existing) return fail(c, 'Ya hay una caja abierta', 409);
+      .eq('tenant_id', tenantId).eq('user_id', userId).eq('status', 'open').maybeSingle();
+    if (existing) return fail(c, 'Ya tenés una caja abierta', 409);
 
     const { data, error } = await db.from('cash_sessions').insert({
       tenant_id:      tenantId,
