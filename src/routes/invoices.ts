@@ -29,6 +29,8 @@ const InvoiceSchema = z.object({
   tax_amount:       z.number().nonnegative().default(0),
   total:            z.number().nonnegative(),
   payment_method:   z.enum(['cash', 'card', 'sinpe', 'check', 'transfer']).default('cash'),
+  /** Tipo de documento fiscal. */
+  document_type:    z.enum(['ticket', 'tiquete_electronico', 'factura_electronica']).optional().default('ticket'),
   status:           z.enum(['draft', 'completed', 'cancelled']).default('completed'),
   notes:            z.string().optional().nullable(),
   issued_at:        z.string().optional().nullable(),

@@ -527,18 +527,23 @@ groups.get('/my/branches-stats', async (c) => {
       usersCount.set(u.tenant_id, (usersCount.get(u.tenant_id) ?? 0) + 1);
     }
 
-    // 4. Facturas del mes en curso por tenant
+    // 4. Facturas del mes en curso por tenant + desglose por tipo de documento
     const now = new Date();
     const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
     const { data: invoices } = await db.from('invoices')
-      .select('tenant_id, total, created_at')
+      .select('tenant_id, total, status, document_type, created_at')
       .in('tenant_id', tenantIds)
       .gte('created_at', monthStart);
-    const invoicesMonth = new Map<string, { count: number; total: number }>();
+    type DocC = { ticket: number; tiquete_electronico: number; factura_electronica: number };
+    const invoicesMonth = new Map<string, { count: number; total: number; docs: DocC }>();
     for (const inv of (invoices ?? []) as any[]) {
-      const cur = invoicesMonth.get(inv.tenant_id) ?? { count: 0, total: 0 };
+      if (inv.status === 'cancelled') continue;
+      const cur = invoicesMonth.get(inv.tenant_id)
+        ?? { count: 0, total: 0, docs: { ticket: 0, tiquete_electronico: 0, factura_electronica: 0 } };
       cur.count += 1;
       cur.total += Number(inv.total ?? 0);
+      const dt = (inv.document_type ?? 'ticket') as keyof DocC;
+      if (dt in cur.docs) cur.docs[dt] += 1; else cur.docs.ticket += 1;
       invoicesMonth.set(inv.tenant_id, cur);
     }
 
@@ -550,16 +555,24 @@ groups.get('/my/branches-stats', async (c) => {
       whCount.set(w.tenant_id, (whCount.get(w.tenant_id) ?? 0) + 1);
     }
 
-    const result = (tenants ?? []).map((t: any) => ({
-      tenant_id:        t.id,
-      tenant_name:      t.name,
-      is_demo:          t.is_demo,
-      status:           t.status,
-      users_count:      usersCount.get(t.id) ?? 0,
-      invoices_month:   invoicesMonth.get(t.id)?.count ?? 0,
-      invoices_total:   invoicesMonth.get(t.id)?.total ?? 0,
-      warehouses_count: whCount.get(t.id) ?? 0,
-    }));
+    const result = (tenants ?? []).map((t: any) => {
+      const im = invoicesMonth.get(t.id);
+      return {
+        tenant_id:        t.id,
+        tenant_name:      t.name,
+        is_demo:          t.is_demo,
+        status:           t.status,
+        users_count:      usersCount.get(t.id) ?? 0,
+        invoices_month:   im?.count ?? 0,
+        invoices_total:   im?.total ?? 0,
+        warehouses_count: whCount.get(t.id) ?? 0,
+        // Desglose por tipo de documento (mes en curso) — para controlar lo
+        // que cobra Hacienda por documentos electrónicos.
+        doc_ticket:              im?.docs.ticket ?? 0,
+        doc_tiquete_electronico: im?.docs.tiquete_electronico ?? 0,
+        doc_factura_electronica: im?.docs.factura_electronica ?? 0,
+      };
+    });
 
     return ok(c, result);
   } catch (err: any) { return fail(c, err.message, 500); }
@@ -587,19 +600,24 @@ groups.get('/my/branches-report', async (c) => {
 
     // Facturas en rango (solo completadas) por tenant
     let invQ = db.from('invoices')
-      .select('tenant_id, total, tax_amount, status, created_at')
+      .select('tenant_id, total, tax_amount, status, document_type, created_at')
       .in('tenant_id', tenantIds);
     if (from) invQ = invQ.gte('created_at', from);
     if (to)   invQ = invQ.lte('created_at', to);
     const { data: invoices } = await invQ;
 
-    const salesByTenant = new Map<string, { count: number; total: number; tax: number }>();
+    type DocCounts = { ticket: number; tiquete_electronico: number; factura_electronica: number };
+    const newDocCounts = (): DocCounts => ({ ticket: 0, tiquete_electronico: 0, factura_electronica: 0 });
+    const salesByTenant = new Map<string, { count: number; total: number; tax: number; docs: DocCounts }>();
     for (const inv of (invoices ?? []) as any[]) {
       if (inv.status === 'cancelled') continue;  // anuladas no cuentan
-      const cur = salesByTenant.get(inv.tenant_id) ?? { count: 0, total: 0, tax: 0 };
+      const cur = salesByTenant.get(inv.tenant_id) ?? { count: 0, total: 0, tax: 0, docs: newDocCounts() };
       cur.count += 1;
       cur.total += Number(inv.total ?? 0);
       cur.tax   += Number(inv.tax_amount ?? 0);
+      const dt = (inv.document_type ?? 'ticket') as keyof DocCounts;
+      if (dt in cur.docs) cur.docs[dt] += 1;
+      else cur.docs.ticket += 1;
       salesByTenant.set(inv.tenant_id, cur);
     }
 
@@ -617,7 +635,7 @@ groups.get('/my/branches-report', async (c) => {
     } catch { /* sin tabla de gastos */ }
 
     const rows = (tenants ?? []).map((t: any) => {
-      const s = salesByTenant.get(t.id) ?? { count: 0, total: 0, tax: 0 };
+      const s = salesByTenant.get(t.id) ?? { count: 0, total: 0, tax: 0, docs: newDocCounts() };
       const expenses = expByTenant.get(t.id) ?? 0;
       const net = s.total - s.tax;             // ventas sin impuesto
       return {
@@ -631,6 +649,10 @@ groups.get('/my/branches-report', async (c) => {
         avg_ticket:   s.count > 0 ? Math.round(s.total / s.count) : 0,
         expenses,
         gross_profit: net - expenses,          // aprox: ventas netas - gastos
+        // Desglose por tipo de documento
+        doc_ticket:               s.docs.ticket,
+        doc_tiquete_electronico:  s.docs.tiquete_electronico,
+        doc_factura_electronica:  s.docs.factura_electronica,
       };
     });
 
@@ -641,7 +663,13 @@ groups.get('/my/branches-report', async (c) => {
       tax_total:    acc.tax_total + r.tax_total,
       expenses:     acc.expenses + r.expenses,
       gross_profit: acc.gross_profit + r.gross_profit,
-    }), { invoices: 0, sales_total: 0, tax_total: 0, expenses: 0, gross_profit: 0 });
+      doc_ticket:               acc.doc_ticket + r.doc_ticket,
+      doc_tiquete_electronico:  acc.doc_tiquete_electronico + r.doc_tiquete_electronico,
+      doc_factura_electronica:  acc.doc_factura_electronica + r.doc_factura_electronica,
+    }), {
+      invoices: 0, sales_total: 0, tax_total: 0, expenses: 0, gross_profit: 0,
+      doc_ticket: 0, doc_tiquete_electronico: 0, doc_factura_electronica: 0,
+    });
 
     return ok(c, { rows, totals });
   } catch (err: any) { return fail(c, err.message, 500); }

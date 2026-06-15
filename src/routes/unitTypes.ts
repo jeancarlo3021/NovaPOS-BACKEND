@@ -9,6 +9,7 @@ const UnitTypeSchema = z.object({
   name: z.string().min(1),
   abbreviation: z.string().optional().nullable(),
   description: z.string().optional().nullable(),
+  requires_weight: z.boolean().optional(),
 });
 
 // GET / — list unit types
