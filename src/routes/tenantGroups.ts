@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
+import { endOfDay } from '../utils/dateRange.js';
 
 /**
  * Endpoints para gestión de grupos de empresas (multi-empresa con sucursales
@@ -178,7 +179,7 @@ groups.get('/:id/sales', async (c) => {
     const userId = c.get('userId');
     const { id }  = c.req.param();
     const from = c.req.query('from');
-    const to   = c.req.query('to');
+    const to   = endOfDay(c.req.query('to'));
     if (!from || !to) return fail(c, 'from y to son requeridos (ISO timestamps)', 422);
     if (!(await isGroupOwner(userId, id))) return fail(c, 'No autorizado', 403);
 
@@ -587,7 +588,7 @@ groups.get('/my/branches-report', async (c) => {
     if (!userId) return ok(c, { rows: [], totals: null });
 
     const from = c.req.query('from');
-    const to   = c.req.query('to');
+    const to   = endOfDay(c.req.query('to'));
 
     // Tenants donde el user es owner
     const { data: ownedRows } = await db.from('user_tenants')

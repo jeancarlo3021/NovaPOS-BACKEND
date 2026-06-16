@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
+import { endOfDay } from '../utils/dateRange.js';
 
 const reports = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
@@ -8,10 +9,10 @@ reports.get('/sales', async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const from = c.req.query('from');
-    const to   = c.req.query('to');
+    const to   = endOfDay(c.req.query('to'));
 
     let query = db.from('invoices')
-      .select('id, total, subtotal, tax_amount, discount_amount, payment_method, issued_at, status')
+      .select('id, invoice_number, customer_name, total, subtotal, tax_amount, discount_amount, payment_method, payments, issued_at, status')
       .eq('tenant_id', tenantId).neq('status', 'cancelled')
       .order('issued_at', { ascending: false });
     if (from) query = query.gte('issued_at', from);
@@ -35,7 +36,7 @@ reports.get('/expenses', async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const from = c.req.query('from');
-    const to   = c.req.query('to');
+    const to   = endOfDay(c.req.query('to'));
 
     let query = db.from('expenses').select('id, amount, category_id, date, description, payment_method, type')
       .eq('tenant_id', tenantId);
@@ -77,7 +78,7 @@ reports.get('/profit', async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const from = c.req.query('from');
-    const to   = c.req.query('to');
+    const to   = endOfDay(c.req.query('to'));
 
     let salesQ = db.from('invoices').select('total, payment_method').eq('tenant_id', tenantId).neq('status', 'cancelled');
     if (from) salesQ = salesQ.gte('issued_at', from);
@@ -129,7 +130,7 @@ reports.get('/cash-sessions', async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const from = c.req.query('from');
-    const to   = c.req.query('to');
+    const to   = endOfDay(c.req.query('to'));
 
     let query = db.from('cash_sessions').select('*').eq('tenant_id', tenantId)
       .order('opening_date', { ascending: false });
@@ -189,7 +190,7 @@ reports.get('/sellers', async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const from = c.req.query('from');
-    const to   = c.req.query('to');
+    const to   = endOfDay(c.req.query('to'));
 
     let query = db.from('invoices')
       .select('id, total, cash_session_id, cashier_id, cashier_name, issued_at')
@@ -253,7 +254,7 @@ reports.get('/products/sales', async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const from = c.req.query('from');
-    const to   = c.req.query('to');
+    const to   = endOfDay(c.req.query('to'));
 
     const { data: invoices } = await db.from('invoices')
       .select('id, invoice_number, issued_at, customer_name, payment_method, total')
@@ -312,7 +313,7 @@ reports.get('/products/purchases', async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const from = c.req.query('from');
-    const to   = c.req.query('to');
+    const to   = endOfDay(c.req.query('to'));
 
     const { data: purchases } = await db.from('purchases')
       .select('id, purchase_number, purchase_date, supplier_id, status')

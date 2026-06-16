@@ -90,6 +90,27 @@ users.post('/', async (c) => {
       destTenantId = parsed.data.target_tenant_id;
     }
 
+    // Límite de usuarios según el plan del tenant destino. max_users null = ilimitado.
+    {
+      const { data: sub } = await db.from('subscriptions')
+        .select('subscription_plans(max_users, name)')
+        .eq('tenant_id', destTenantId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      const plan: any = (sub as any)?.subscription_plans ?? null;
+      const maxUsers: number | null = plan?.max_users ?? null;
+      if (maxUsers != null) {
+        const { count } = await db.from('users')
+          .select('id', { count: 'exact', head: true })
+          .eq('tenant_id', destTenantId);
+        const current = count ?? 0;
+        if (current >= maxUsers) {
+          return fail(c, `Tu plan${plan?.name ? ` "${plan.name}"` : ''} permite hasta ${maxUsers} usuario${maxUsers === 1 ? '' : 's'}. Ya tenés ${current}. Mejorá tu plan para agregar más.`, 403);
+        }
+      }
+    }
+
     // Pre-check: no permitir emails duplicados (case-insensitive). El usuario
     // se identifica por `usuario@nexoerp.local` → si ya existe un user con ese
     // email/username, devolvemos error claro antes de llamar a Supabase Auth

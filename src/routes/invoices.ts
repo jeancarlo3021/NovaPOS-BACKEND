@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
+import { endOfDay } from '../utils/dateRange.js';
 
 const invoices = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
@@ -81,14 +82,22 @@ invoices.get('/', async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const from  = c.req.query('from');
-    const to    = c.req.query('to');
+    const to    = endOfDay(c.req.query('to'));
+    const cashSessionId = c.req.query('cash_session_id');
     const page  = Number(c.req.query('page') ?? 1);
     const limit = Number(c.req.query('limit') ?? 50);
 
     let query = db.from('invoices').select('*', { count: 'exact' })
       .eq('tenant_id', tenantId)
-      .order('issued_at', { ascending: false })
-      .range((page - 1) * limit, page * limit - 1);
+      .order('issued_at', { ascending: false });
+
+    // Filtro por sesión de caja (usado por el cierre de caja). Cuando viene,
+    // devolvemos TODAS las facturas de la sesión sin paginar.
+    if (cashSessionId) {
+      query = query.eq('cash_session_id', cashSessionId);
+    } else {
+      query = query.range((page - 1) * limit, page * limit - 1);
+    }
     if (from) query = query.gte('issued_at', from);
     if (to)   query = query.lte('issued_at', to);
 

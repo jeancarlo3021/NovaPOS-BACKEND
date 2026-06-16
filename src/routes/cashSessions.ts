@@ -91,6 +91,19 @@ cashSessions.post('/:id/close', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+// GET /:id/movements — list cash movements for a session (usado por el cierre)
+cashSessions.get('/:id/movements', async (c) => {
+  try {
+    const { id } = c.req.param();
+    const { data, error } = await db.from('cash_movements')
+      .select('*')
+      .eq('cash_session_id', id)
+      .order('created_at', { ascending: true });
+    if (error) throw new Error(error.message);
+    return ok(c, data ?? []);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // POST /:id/movements — register cash movement
 cashSessions.post('/:id/movements', async (c) => {
   try {
