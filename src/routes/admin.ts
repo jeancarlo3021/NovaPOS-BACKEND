@@ -1,8 +1,30 @@
 import { Hono } from 'hono';
-import { db } from '../db/client.js';
+import { db, anonClient } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
+import { sendEmail, paymentReceiptEmailHtml } from '../services/emailService.js';
 
 const admin = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
+
+// Correo + nombre del dueño y nombre del negocio (para comprobantes por email).
+async function ownerAndBusiness(tenantId: string): Promise<{ email?: string; businessName: string }> {
+  const { data: t } = await db.from('tenants').select('name, owner_id').eq('id', tenantId).maybeSingle();
+  let businessName = (t as any)?.name || 'ColónClick';
+  try {
+    const { data: s } = await db.from('settings').select('config').eq('tenant_id', tenantId).eq('type', 'general').maybeSingle();
+    const bn = (s?.config as any)?.businessName;
+    if (bn) businessName = bn;
+  } catch { /* ignore */ }
+  const ownerId = (t as any)?.owner_id;
+  let email: string | undefined;
+  if (ownerId) {
+    const { data: u } = await db.from('users').select('email').eq('id', ownerId).maybeSingle();
+    email = u?.email ?? undefined;
+    if (!email) {
+      try { const { data: au } = await db.auth.admin.getUserById(ownerId); email = au?.user?.email ?? undefined; } catch { /* ignore */ }
+    }
+  }
+  return { email, businessName };
+}
 
 // GET /owners — call admin_get_owners() RPC (SECURITY DEFINER)
 // Enriquece cada tenant con info del grupo al que pertenece (si pertenece) +
@@ -187,6 +209,36 @@ admin.post('/delete-owner', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+// POST /send-password-reset — envía al dueño un correo (vía Supabase) para que
+// él mismo cambie su contraseña. body: { ownerId?, tenantId? }.
+admin.post('/send-password-reset', async (c) => {
+  try {
+    const { ownerId, tenantId } = await c.req.json();
+    // Resolver email del dueño.
+    let uid: string | null = ownerId ?? null;
+    if (!uid && tenantId) {
+      const { data: t } = await db.from('tenants').select('owner_id').eq('id', tenantId).maybeSingle();
+      uid = (t as any)?.owner_id ?? null;
+    }
+    if (!uid) return fail(c, 'No se encontró el usuario dueño', 422);
+
+    let email: string | undefined;
+    const { data: u } = await db.from('users').select('email').eq('id', uid).maybeSingle();
+    email = u?.email ?? undefined;
+    if (!email) {
+      try { const { data: au } = await db.auth.admin.getUserById(uid); email = au?.user?.email ?? undefined; } catch { /* ignore */ }
+    }
+    if (!email) return fail(c, 'El dueño no tiene un correo válido', 422);
+
+    // Enviar el correo de restablecimiento por medio de Supabase.
+    const frontend = (process.env.FRONTEND_URL ?? '').split(',')[0]?.trim() || '';
+    const redirectTo = frontend ? `${frontend}/auth/reset-password` : undefined;
+    const { error } = await anonClient.auth.resetPasswordForEmail(email, redirectTo ? { redirectTo } : undefined);
+    if (error) throw new Error(error.message);
+    return ok(c, { message: 'Correo de cambio de contraseña enviado', email });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // POST /change-plan — update plan for a tenant
 admin.post('/change-plan', async (c) => {
   try {
@@ -281,6 +333,7 @@ admin.post('/payment-receipts', async (c) => {
     // tras registrar el pago, en vez de quedar congelado en la fecha vencida.
     // (Los comprobantes "invoicing" — facturación electrónica — no afectan
     // la fecha de cobro mensual del SaaS.)
+    let nextBilling: string | null = null;
     if (body.type === 'subscription') {
       try {
         // 1) Suscripción más reciente del tenant
@@ -313,6 +366,7 @@ admin.post('/payment-receipts', async (c) => {
           const paymentMs   = new Date(paymentDate + 'T12:00:00').getTime();
           const baseMs = (currentEnds && currentEnds > now) ? currentEnds : paymentMs;
           const newEndsAt = new Date(baseMs + cycleDays * 86400000).toISOString();
+          nextBilling = newEndsAt;
 
           await db.from('subscriptions')
             .update({
@@ -334,6 +388,27 @@ admin.post('/payment-receipts', async (c) => {
         console.warn('No se pudo extender la suscripción:', extendErr?.message);
       }
     }
+
+    // Enviar comprobante de pago por correo al dueño (fire-and-forget).
+    (async () => {
+      try {
+        const { email, businessName } = await ownerAndBusiness(body.tenant_id);
+        if (!email) return;
+        const html = paymentReceiptEmailHtml({
+          businessName,
+          type: body.type,
+          amount: Number(body.amount ?? 0),
+          paymentDate,
+          periodStart: body.period_start ?? null,
+          periodEnd: body.period_end ?? null,
+          paymentMethod: body.payment_method ?? null,
+          reference: body.reference ?? null,
+          nextBilling,
+          notes: body.notes ?? null,
+        });
+        await sendEmail({ to: email, subject: `Comprobante de pago · ${businessName}`, html });
+      } catch (e: any) { console.warn('[payment-receipt email] no se pudo enviar:', e?.message); }
+    })();
 
     return ok(c, data, 201);
   } catch (err: any) {

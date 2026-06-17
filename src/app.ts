@@ -32,6 +32,7 @@ import modifiers       from './routes/modifiers.js';
 import tenantGroups    from './routes/tenantGroups.js';
 import stockAdjustments from './routes/stockAdjustments.js';
 import hr              from './routes/hr.js';
+import email           from './routes/email.js';
 
 // basePath('/api') matches Vercel's catch-all at api/[[...route]].ts
 const app = new Hono().basePath('/api');
@@ -89,6 +90,7 @@ api.route('/admin',            admin);
 api.route('/tenant-groups',    tenantGroups);
 api.route('/stock-adjustments', stockAdjustments);
 api.route('/hr',                hr);
+api.route('/email',             email);
 
 app.route('/', api);
 

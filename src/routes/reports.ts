@@ -148,6 +148,17 @@ reports.get('/cash-sessions', async (c) => {
       .neq('status', 'cancelled')
       .in('cash_session_id', sessionIds.length > 0 ? sessionIds : ['null']);
 
+    // Resolver el vendedor (dueño) de cada sesión.
+    const userIds = [...new Set((sessions ?? []).map((s: any) => s.user_id).filter(Boolean))] as string[];
+    const { data: users } = userIds.length > 0
+      ? await db.from('users').select('id, full_name, email').in('id', userIds)
+      : { data: [] as any[] };
+    const nameOf = (uid: string | null): string => {
+      if (!uid) return 'Sin vendedor';
+      const u = (users ?? []).find((x: any) => x.id === uid);
+      return (u?.full_name) || (u?.email ? String(u.email).split('@')[0] : '') || 'Vendedor';
+    };
+
     const enriched = (sessions ?? []).map((s: any) => {
       const sessionInvoices = (invoices ?? []).filter((inv: any) => inv.cash_session_id === s.id);
       const salesByMethod: Record<string, number> = { cash: 0, card: 0, sinpe: 0, check: 0, transfer: 0 };
@@ -168,6 +179,7 @@ reports.get('/cash-sessions', async (c) => {
 
       return {
         ...s,
+        cashier_name: nameOf(s.user_id),
         sales_total: totalSales,
         cash_sales: salesByMethod.cash,
         card_sales: salesByMethod.card,

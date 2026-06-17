@@ -5,14 +5,15 @@
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc --noEmit",
     "build": "tsc --noEmit",
-    "test:api":      "playwright test",
-    "test:api:ui":   "playwright test --ui"
+    "test:api": "playwright test",
+    "test:api:ui": "playwright test --ui"
   },
   "dependencies": {
     "@hono/node-server": "^1.12.0",
     "@supabase/supabase-js": "^2.45.0",
-    "hono": "^4.6.0",
     "dotenv": "^16.4.0",
+    "hono": "^4.6.0",
+    "resend": "^6.12.4",
     "zod": "^3.23.0"
   },
   "devDependencies": {
