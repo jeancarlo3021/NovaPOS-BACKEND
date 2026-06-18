@@ -87,6 +87,15 @@ customers.delete('/:id', async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const { id } = c.req.param();
+    const hard = c.req.query('hard') === 'true';
+    if (hard) {
+      // Eliminación real (borra el registro y sus precios especiales por cascade).
+      const { error } = await db.from('customers')
+        .delete().eq('id', id).eq('tenant_id', tenantId);
+      if (error) throw new Error(error.message);
+      return ok(c, { deleted: true, hard: true });
+    }
+    // Por defecto: desactivar (soft delete).
     const { error } = await db.from('customers')
       .update({ is_active: false }).eq('id', id).eq('tenant_id', tenantId);
     if (error) throw new Error(error.message);
