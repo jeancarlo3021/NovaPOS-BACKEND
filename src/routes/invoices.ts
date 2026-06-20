@@ -51,31 +51,22 @@ const InvoiceSchema = z.object({
   items:            z.array(ItemSchema).min(1),
 });
 
-// Genera el próximo número de factura ÚNICO por tenant.
-// Formato: YYYYMMDD-NNNNN. Toma el MÁXIMO consecutivo del día para ese tenant
-// (no un simple conteo) — así no choca con números offline ni con huecos.
-// `attemptOffset` permite reintentar con el siguiente número ante colisión.
+// Genera el próximo número de factura ÚNICO por tenant: consecutivo simple
+// 000001, 000002, ... — el mismo para ventas online y offline. Toma el MAYOR
+// número de secuencia ya usado por el tenant (los dígitos finales de cualquier
+// formato) y le suma 1. `attemptOffset` permite reintentar ante colisión.
 async function nextInvoiceNumber(tenantId: string, attemptOffset = 0): Promise<string> {
-  const now = new Date();
-  const datePart = now.toISOString().slice(0, 10).replace(/-/g, '');
-
-  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
-  const todayEnd = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1).toISOString();
-
-  // Traer los números del día de ESTE tenant y calcular el mayor sufijo usado.
   const { data } = await db.from('invoices')
     .select('invoice_number')
-    .eq('tenant_id', tenantId)
-    .gte('created_at', todayStart)
-    .lt('created_at', todayEnd);
+    .eq('tenant_id', tenantId);
 
   let maxSeq = 0;
   for (const r of (data ?? []) as any[]) {
-    const m = String(r.invoice_number ?? '').match(/-(\d+)$/);
+    const m = String(r.invoice_number ?? '').match(/(\d+)\s*$/);  // dígitos finales
     if (m) maxSeq = Math.max(maxSeq, parseInt(m[1], 10));
   }
 
-  return `${datePart}-${String(maxSeq + 1 + attemptOffset).padStart(5, '0')}`;
+  return String(maxSeq + 1 + attemptOffset).padStart(6, '0');
 }
 
 invoices.get('/', async (c) => {
@@ -163,8 +154,10 @@ invoices.post('/', async (c) => {
     // número que ya existe online. Reintentamos regenerando el consecutivo.
     let inv: any = null;
     let invErr: any = null;
-    // Número inicial: el que vino (offline) o el siguiente consecutivo.
-    let finalNumber = (invoice_number?.trim()) || await nextInvoiceNumber(tenantId);
+    // Consecutivo unificado: el backend SIEMPRE asigna el número (ignora el que
+    // venga del cliente) para que online y offline compartan una sola secuencia.
+    void invoice_number;
+    let finalNumber = await nextInvoiceNumber(tenantId);
 
     for (let attempt = 0; attempt < 8; attempt++) {
       const res = await db.from('invoices').insert({

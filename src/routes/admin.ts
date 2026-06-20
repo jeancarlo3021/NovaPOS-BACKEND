@@ -70,6 +70,21 @@ admin.get('/owners', async (c) => {
       }
     } catch (e: any) { console.warn('[owners] group lookup exception:', e?.message); }
 
+    // Precio de venta personalizado por tenant (override del precio del plan).
+    const customPriceByTenant: Record<string, number> = {};
+    try {
+      const { data: subs } = await db.from('subscriptions')
+        .select('tenant_id, custom_price, created_at')
+        .in('tenant_id', tenantIds)
+        .order('created_at', { ascending: false });
+      for (const s of (subs ?? []) as any[]) {
+        // Tomar la suscripción más reciente por tenant (las vienen ordenadas desc).
+        if (!(s.tenant_id in customPriceByTenant) && s.custom_price != null) {
+          customPriceByTenant[s.tenant_id] = Number(s.custom_price);
+        }
+      }
+    } catch (e: any) { console.warn('[owners] custom_price lookup:', e?.message); }
+
     // Cuota mensual por grupo (memoizado)
     const groupBillingCache: Record<string, number> = {};
     const getGroupBilling = async (gid: string): Promise<number> => {
@@ -87,12 +102,16 @@ admin.get('/owners', async (c) => {
       owners.map(async (o: any) => {
         const g = membership[o.id] ?? null;
         const groupBilling = g?.group_id ? await getGroupBilling(g.group_id) : null;
+        const customPrice = customPriceByTenant[o.id];
         return {
           ...o,
           group_id:      g?.group_id ?? null,
           group_name:    g?.group_name ?? null,
           group_role:    g?.role ?? null,        // 'main' | 'branch' | null
           group_billing: groupBilling,            // total mensual del grupo (saas + FE)
+          custom_price:  customPrice ?? null,     // precio personalizado (si hay)
+          // El precio efectivo de venta: personalizado si existe, si no el del plan.
+          plan_price:    customPrice ?? o.plan_price,
         };
       }),
     );
@@ -236,6 +255,29 @@ admin.post('/send-password-reset', async (c) => {
     const { error } = await anonClient.auth.resetPasswordForEmail(email, redirectTo ? { redirectTo } : undefined);
     if (error) throw new Error(error.message);
     return ok(c, { message: 'Correo de cambio de contraseña enviado', email });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// POST /set-subscription-price — fija el monto de venta del plan para un negocio.
+// body: { tenantId, price }  (price null/'' = volver al precio del plan).
+admin.post('/set-subscription-price', async (c) => {
+  try {
+    const { tenantId, price } = await c.req.json();
+    if (!tenantId) return fail(c, 'tenantId requerido', 422);
+    const value = (price === null || price === '' || price === undefined) ? null : Number(price);
+    if (value != null && (isNaN(value) || value < 0)) return fail(c, 'Precio inválido', 422);
+
+    // Suscripción más reciente del tenant.
+    const { data: sub } = await db.from('subscriptions')
+      .select('id').eq('tenant_id', tenantId)
+      .order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (!sub) return fail(c, 'El negocio no tiene suscripción', 404);
+
+    const { error } = await db.from('subscriptions')
+      .update({ custom_price: value, updated_at: new Date().toISOString() })
+      .eq('id', (sub as any).id);
+    if (error) throw new Error(error.message);
+    return ok(c, { custom_price: value });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

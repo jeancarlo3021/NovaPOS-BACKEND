@@ -49,6 +49,8 @@ warehouses.post('/', async (c) => {
       code:       body.code ?? null,
       is_active:  body.is_active ?? true,
       is_default: body.is_default ?? false,
+      type:       body.type === 'truck' ? 'truck' : 'central',
+      driver_id:  body.driver_id ?? null,
     }).select().single();
     if (error) throw new Error(error.message);
     return ok(c, data);
