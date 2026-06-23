@@ -16,8 +16,47 @@ const CustomerSchema = z.object({
   canton_code:         z.string().optional().nullable(),
   district_code:       z.string().optional().nullable(),
   address:             z.string().optional().nullable(),
+  zone:                z.string().optional().nullable(),
   notes:               z.string().optional().nullable(),
   is_active:           z.boolean().optional(),
+  credit_enabled:      z.boolean().optional(),
+  credit_limit:        z.number().nonnegative().optional(),
+});
+
+// ── Zonas (lista administrable) ──────────────────────────────────────────────
+customers.get('/zones', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { data, error } = await db.from('customer_zones')
+      .select('*').eq('tenant_id', tenantId).order('name');
+    if (error) throw new Error(error.message);
+    return ok(c, data ?? []);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+customers.post('/zones', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { name } = await c.req.json() as { name?: string };
+    if (!name?.trim()) return fail(c, 'Nombre requerido', 422);
+    const { data, error } = await db.from('customer_zones')
+      .insert({ tenant_id: tenantId, name: name.trim() }).select().single();
+    if (error) {
+      if ((error as any).code === '23505') return fail(c, 'La zona ya existe', 409);
+      throw new Error(error.message);
+    }
+    return ok(c, data, 201);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+customers.delete('/zones/:id', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { id } = c.req.param();
+    const { error } = await db.from('customer_zones').delete().eq('id', id).eq('tenant_id', tenantId);
+    if (error) throw new Error(error.message);
+    return ok(c, { deleted: true });
+  } catch (err: any) { return fail(c, err.message, 500); }
 });
 
 // GET / — list customers (?q=search)

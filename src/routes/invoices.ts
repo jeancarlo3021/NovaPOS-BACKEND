@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
 import { endOfDay } from '../utils/dateRange.js';
+import { createReceivable } from './accountsReceivable.js';
 
 const invoices = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
@@ -29,7 +30,7 @@ const InvoiceSchema = z.object({
   tax_percent:      z.number().nonnegative().optional().default(13),
   tax_amount:       z.number().nonnegative().default(0),
   total:            z.number().nonnegative(),
-  payment_method:   z.enum(['cash', 'card', 'sinpe', 'check', 'transfer']).default('cash'),
+  payment_method:   z.enum(['cash', 'card', 'sinpe', 'check', 'transfer', 'credit']).default('cash'),
   /** Tipo de documento fiscal. */
   document_type:    z.enum(['ticket', 'tiquete_electronico', 'factura_electronica']).optional().default('ticket'),
   status:           z.enum(['draft', 'completed', 'cancelled']).default('completed'),
@@ -206,6 +207,21 @@ invoices.post('/', async (c) => {
           updated_at: new Date().toISOString(),
         }).eq('id', item.product_id);
       }
+    }
+
+    // Venta a CRÉDITO → generar la cuenta por cobrar (vence en 30 días).
+    if (inv.payment_method === 'credit') {
+      try {
+        const due = new Date(); due.setDate(due.getDate() + 30);
+        await createReceivable(tenantId, {
+          customer_id: inv.customer_id ?? null,
+          customer_name: inv.customer_name ?? null,
+          invoice_id: inv.id, invoice_number: inv.invoice_number,
+          total_amount: Number(inv.total ?? 0),
+          due_date: due.toISOString().slice(0, 10),
+          source: 'pos',
+        });
+      } catch (e: any) { console.warn('[invoices] crear CxC:', e?.message); }
     }
 
     return ok(c, inv, 201);

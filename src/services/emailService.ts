@@ -85,6 +85,47 @@ export function invoiceEmailHtml(opts: {
   return layout(`Tu comprobante de ${opts.businessName}`, body, opts.businessName);
 }
 
+// ─── 1b) Factura / cobro personalizado (primer cobro del SaaS) ──────────────────
+export function customInvoiceEmailHtml(opts: {
+  businessName: string;
+  ownerName?: string | null;
+  planName?: string | null;
+  items: Array<{ description: string; amount: number }>;
+  total: number;
+  dueDate?: string | null;
+  notes?: string | null;
+  planFeatures?: string[];
+  paymentInfo?: string | null;
+}): string {
+  const rows = opts.items.map(it => `
+    <tr>
+      <td style="padding:8px 0;border-bottom:1px solid #f3f4f6;">${it.description}</td>
+      <td style="padding:8px 0;border-bottom:1px solid #f3f4f6;text-align:right;font-weight:700;">${fmtCRC(it.amount)}</td>
+    </tr>`).join('');
+
+  const features = (opts.planFeatures && opts.planFeatures.length > 0)
+    ? `<div style="margin-top:18px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:10px;padding:14px 16px;">
+         <p style="margin:0 0 8px;font-weight:800;color:#166534;">Tu plan${opts.planName ? ` ${opts.planName}` : ''} incluye:</p>
+         <ul style="margin:0;padding-left:18px;color:#15803d;font-size:14px;">
+           ${opts.planFeatures.map(f => `<li style="padding:2px 0;">${f}</li>`).join('')}
+         </ul>
+       </div>`
+    : '';
+
+  const body = `
+    <p style="margin:0 0 4px;">Hola${opts.ownerName ? ` ${opts.ownerName}` : ''}, este es tu cobro de <strong>${opts.businessName}</strong>.</p>
+    ${opts.dueDate ? `<p style="margin:0 0 16px;color:#6b7280;font-size:14px;">Fecha límite de pago: <strong>${opts.dueDate}</strong></p>` : '<p style="margin:0 0 16px;"></p>'}
+    <table style="width:100%;border-collapse:collapse;font-size:14px;">${rows}</table>
+    <table style="width:100%;border-collapse:collapse;font-size:14px;margin-top:8px;">
+      <tr><td style="padding:10px 0;font-weight:800;font-size:16px;">Total a pagar</td>
+          <td style="padding:10px 0;text-align:right;font-weight:800;font-size:18px;color:#2563eb;">${fmtCRC(opts.total)}</td></tr>
+    </table>
+    ${features}
+    ${opts.paymentInfo ? `<div style="margin-top:18px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:10px;padding:14px 16px;font-size:14px;color:#1e3a8a;"><strong>Cómo pagar:</strong><br>${opts.paymentInfo.replace(/\n/g, '<br>')}</div>` : ''}
+    ${opts.notes ? `<p style="margin-top:16px;color:#6b7280;font-size:13px;white-space:pre-wrap;">${opts.notes}</p>` : ''}`;
+  return layout('Tu cobro', body, opts.businessName);
+}
+
 // ─── 2) Bienvenida de usuario ───────────────────────────────────────────────────
 export function welcomeEmailHtml(opts: { fullName: string; businessName: string; username: string }): string {
   const body = `

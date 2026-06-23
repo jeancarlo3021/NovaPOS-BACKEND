@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { db, anonClient } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
-import { sendEmail, paymentReceiptEmailHtml } from '../services/emailService.js';
+import { sendEmail, paymentReceiptEmailHtml, customInvoiceEmailHtml, planFeatureLabels } from '../services/emailService.js';
 
 const admin = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
@@ -456,6 +456,61 @@ admin.post('/payment-receipts', async (c) => {
   } catch (err: any) {
     return fail(c, err.message, 500);
   }
+});
+
+// POST /send-custom-invoice — factura/cobro personalizado (primer cobro) por correo,
+// con las líneas que defina el admin + lo que incluye el plan del negocio.
+admin.post('/send-custom-invoice', async (c) => {
+  try {
+    const body = await c.req.json() as {
+      tenant_id: string;
+      items: Array<{ description: string; amount: number }>;
+      due_date?: string | null;
+      notes?: string | null;
+      payment_info?: string | null;
+      include_plan_features?: boolean;
+    };
+    if (!body.tenant_id) return fail(c, 'tenant_id requerido', 422);
+    const items = (body.items ?? []).filter(it => it.description?.trim() && Number(it.amount) > 0)
+      .map(it => ({ description: it.description.trim(), amount: Number(it.amount) }));
+    if (items.length === 0) return fail(c, 'Agregá al menos una línea con monto', 422);
+    const total = items.reduce((s, it) => s + it.amount, 0);
+
+    const { email, businessName } = await ownerAndBusiness(body.tenant_id);
+    if (!email) return fail(c, 'El negocio no tiene correo de dueño', 422);
+
+    // Nombre del dueño + plan + features.
+    let ownerName: string | null = null;
+    let planName: string | null = null;
+    let planFeatures: string[] = [];
+    try {
+      const { data: t } = await db.from('tenants').select('owner_id').eq('id', body.tenant_id).maybeSingle();
+      if ((t as any)?.owner_id) {
+        const { data: u } = await db.from('users').select('full_name').eq('id', (t as any).owner_id).maybeSingle();
+        ownerName = (u as any)?.full_name ?? null;
+      }
+    } catch { /* ignore */ }
+    if (body.include_plan_features !== false) {
+      try {
+        const { data: sub } = await db.from('subscriptions')
+          .select('plan_id').eq('tenant_id', body.tenant_id).order('created_at', { ascending: false }).limit(1).maybeSingle();
+        if ((sub as any)?.plan_id) {
+          const { data: plan } = await db.from('subscription_plans')
+            .select('name, features').eq('id', (sub as any).plan_id).maybeSingle();
+          planName = (plan as any)?.name ?? null;
+          planFeatures = planFeatureLabels((plan as any)?.features);
+        }
+      } catch { /* ignore */ }
+    }
+
+    const html = customInvoiceEmailHtml({
+      businessName, ownerName, planName, items, total,
+      dueDate: body.due_date ?? null, notes: body.notes ?? null,
+      planFeatures, paymentInfo: body.payment_info ?? null,
+    });
+    await sendEmail({ to: email, subject: `Cobro · ${businessName}`, html });
+    return ok(c, { sent: true, to: email, total });
+  } catch (err: any) { return fail(c, err.message, 500); }
 });
 
 // DELETE /payment-receipts/:id
