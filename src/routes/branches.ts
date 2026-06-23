@@ -4,24 +4,67 @@ import { ok, fail } from '../utils/response.js';
 
 const branches = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
-// GET / — lista de branches del tenant actual
+// Garantiza que el tenant SIEMPRE tenga al menos la sucursal Principal.
+// Si no existe ninguna, la crea (marcada como default) y la devuelve.
+// Garantiza que la sucursal tenga al menos una bodega central por defecto.
+async function ensureCentralWarehouse(tenantId: string, branchId: string) {
+  const { data: ws } = await db.from('warehouses')
+    .select('id, is_default, type').eq('tenant_id', tenantId).eq('branch_id', branchId);
+  if (ws && ws.length > 0) {
+    if (!ws.some((w: any) => w.is_default)) {
+      await db.from('warehouses').update({ is_default: true }).eq('id', (ws[0] as any).id);
+    }
+    return;
+  }
+  await db.from('warehouses').insert({
+    tenant_id: tenantId, branch_id: branchId,
+    name: 'Bodega central', code: 'CENTRAL', type: 'central', is_default: true,
+  });
+}
+
+async function ensurePrincipalBranch(tenantId: string) {
+  const { data: existing } = await db.from('branches')
+    .select('*').eq('tenant_id', tenantId).order('name');
+  if (existing && existing.length > 0) {
+    // Si ninguna está marcada como default, marcamos la primera.
+    if (!existing.some((b: any) => b.is_default)) {
+      await db.from('branches').update({ is_default: true }).eq('id', (existing[0] as any).id);
+      (existing[0] as any).is_default = true;
+    }
+    const def = existing.find((b: any) => b.is_default) ?? existing[0];
+    await ensureCentralWarehouse(tenantId, (def as any).id).catch(() => {});
+    return existing;
+  }
+  // Buscar el nombre del negocio para el nombre de la sucursal.
+  let name = 'Principal';
+  try {
+    const { data: t } = await db.from('tenants').select('name').eq('id', tenantId).maybeSingle();
+    if ((t as any)?.name) name = `${(t as any).name} (Principal)`;
+  } catch { /* ignore */ }
+  const { data: created } = await db.from('branches').insert({
+    tenant_id: tenantId, name, code: 'PRINCIPAL', is_active: true, is_default: true,
+  }).select().single();
+  // Bodega central de arranque.
+  if (created) await ensureCentralWarehouse(tenantId, (created as any).id).catch(() => {});
+  return created ? [created] : [];
+}
+
+// GET / — lista de branches del tenant actual (siempre con la Principal)
 branches.get('/', async (c) => {
   try {
     const tenantId = c.get('tenantId');
     if (!tenantId) return ok(c, []);
-    const { data, error } = await db.from('branches')
-      .select('*').eq('tenant_id', tenantId).order('name');
-    if (error) throw new Error(error.message);
+    const data = await ensurePrincipalBranch(tenantId);
     return ok(c, data ?? []);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
 // GET /mine — branches accesibles para el user actual
-// (por ahora = mismas que las del tenant, sin filtro adicional)
 branches.get('/mine', async (c) => {
   try {
     const tenantId = c.get('tenantId');
     if (!tenantId) return ok(c, []);
+    await ensurePrincipalBranch(tenantId);
     const { data, error } = await db.from('branches')
       .select('*').eq('tenant_id', tenantId).eq('is_active', true).order('name');
     if (error) throw new Error(error.message);

@@ -606,6 +606,7 @@ routing.post('/:id/close', async (c) => {
 
     // 1) Devolver el sobrante del camión al INVENTARIO DEL SISTEMA (products.stock_quantity).
     let returnedItems: Array<{ product_id: string; quantity: number }> = [];
+    const returnedDetail: Array<{ name: string; quantity: number }> = [];
     {
       const { data: stock } = await db.from('warehouse_stock')
         .select('product_id, quantity').eq('warehouse_id', truckId);
@@ -614,13 +615,14 @@ routing.post('/:id/close', async (c) => {
 
       for (const it of returnedItems) {
         const { data: prod } = await db.from('products')
-          .select('stock_quantity, tracks_stock').eq('id', it.product_id).eq('tenant_id', tenantId).maybeSingle();
+          .select('name, stock_quantity, tracks_stock').eq('id', it.product_id).eq('tenant_id', tenantId).maybeSingle();
         if (prod && (prod as any).tracks_stock !== false) {
           await db.from('products').update({
             stock_quantity: Number((prod as any).stock_quantity ?? 0) + it.quantity,
             updated_at: new Date().toISOString(),
           }).eq('id', it.product_id);
         }
+        returnedDetail.push({ name: (prod as any)?.name ?? 'Producto', quantity: it.quantity });
         await db.from('warehouse_stock').upsert(
           { warehouse_id: truckId, product_id: it.product_id, quantity: 0 },
           { onConflict: 'warehouse_id,product_id' });
@@ -628,12 +630,18 @@ routing.post('/:id/close', async (c) => {
     }
     void userId;
 
-    // 2) Resumen de ventas/anulaciones de la ruta.
+    // 2) Resumen de ventas/anulaciones + desglose por método.
     const { data: invs } = await db.from('invoices')
-      .select('total, status').eq('tenant_id', tenantId).eq('route_id', id);
+      .select('total, status, payment_method').eq('tenant_id', tenantId).eq('route_id', id);
     const sales = (invs ?? []).filter((i: any) => i.status !== 'cancelled');
     const voids = (invs ?? []).filter((i: any) => i.status === 'cancelled');
     const salesTotal = sales.reduce((s: number, i: any) => s + Number(i.total ?? 0), 0);
+    const byMethod = { cash: 0, card: 0, sinpe: 0, credit: 0 };
+    for (const i of sales) {
+      const m = (i.payment_method ?? 'cash') as 'cash' | 'card' | 'sinpe' | 'credit';
+      if (m === 'card' || m === 'sinpe' || m === 'credit') byMethod[m] += Number(i.total ?? 0);
+      else byMethod.cash += Number(i.total ?? 0);
+    }
 
     // 3) Cerrar la ruta.
     await db.from('routes').update({ status: 'closed', closed_at: new Date().toISOString() })
@@ -645,6 +653,8 @@ routing.post('/:id/close', async (c) => {
       sales_total: salesTotal,
       voids_count: voids.length,
       returned_items: returnedItems.length,
+      returned: returnedDetail,
+      by_method: byMethod,
     });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
