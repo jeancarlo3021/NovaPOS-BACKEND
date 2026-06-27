@@ -467,6 +467,72 @@ routing.post('/:id/order', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+// GET /:id/sales — facturas (ventas) de la ruta, para poder anularlas.
+routing.get('/:id/sales', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { id } = c.req.param();
+    const { data: invs } = await db.from('invoices')
+      .select('id, invoice_number, total, status, payment_method, customer_name, issued_at, items:invoice_items(product_id, quantity, unit_price)')
+      .eq('tenant_id', tenantId).eq('route_id', id).order('issued_at', { ascending: false });
+    const pids = [...new Set((invs ?? []).flatMap((i: any) => (i.items ?? []).map((it: any) => it.product_id)))];
+    const nameMap = new Map<string, string>();
+    if (pids.length > 0) {
+      const { data: prods } = await db.from('products').select('id, name').in('id', pids as string[]);
+      for (const p of prods ?? []) nameMap.set((p as any).id, (p as any).name);
+    }
+    const out = (invs ?? []).map((i: any) => ({
+      ...i, items: (i.items ?? []).map((it: any) => ({ ...it, product_name: nameMap.get(it.product_id) ?? 'Producto' })),
+    }));
+    return ok(c, out);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// POST /void-sale/:invoiceId — anula una factura de ruta y DEVUELVE el stock al camión.
+routing.post('/void-sale/:invoiceId', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { invoiceId } = c.req.param();
+
+    const { data: inv } = await db.from('invoices')
+      .select('id, status, route_id, payment_method').eq('id', invoiceId).eq('tenant_id', tenantId).maybeSingle();
+    if (!inv) return fail(c, 'Factura no encontrada', 404);
+    if ((inv as any).status === 'cancelled') return fail(c, 'La factura ya está anulada', 409);
+
+    // Camión de la ruta.
+    let truckId: string | null = null;
+    if ((inv as any).route_id) {
+      const { data: route } = await db.from('routes')
+        .select('warehouse_id').eq('id', (inv as any).route_id).eq('tenant_id', tenantId).maybeSingle();
+      truckId = (route as any)?.warehouse_id ?? null;
+    }
+
+    // Devolver el stock al camión.
+    const { data: items } = await db.from('invoice_items')
+      .select('product_id, quantity').eq('invoice_id', invoiceId);
+    if (truckId) {
+      for (const it of (items ?? []) as any[]) {
+        const { data: row } = await db.from('warehouse_stock')
+          .select('quantity').eq('warehouse_id', truckId).eq('product_id', it.product_id).maybeSingle();
+        await db.from('warehouse_stock').upsert(
+          { warehouse_id: truckId, product_id: it.product_id, quantity: Number(row?.quantity ?? 0) + Number(it.quantity) },
+          { onConflict: 'warehouse_id,product_id' });
+      }
+    }
+
+    // Marcar anulada.
+    await db.from('invoices').update({ status: 'cancelled', updated_at: new Date().toISOString() })
+      .eq('id', invoiceId).eq('tenant_id', tenantId);
+
+    // Si era a crédito, anular la cuenta por cobrar ligada.
+    if ((inv as any).payment_method === 'credit') {
+      await db.from('accounts_receivable').delete().eq('invoice_id', invoiceId).eq('tenant_id', tenantId);
+    }
+
+    return ok(c, { ok: true, returned_items: (items ?? []).length });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // GET /:id/orders — lista de pedidos por entregar (preventa).
 routing.get('/:id/orders', async (c) => {
   try {
