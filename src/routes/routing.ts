@@ -231,6 +231,17 @@ routing.post('/', async (c) => {
     const b = await c.req.json();
     if (!b.warehouse_id) return fail(c, 'Falta el camión (warehouse_id)', 422);
 
+    // Un camión solo puede tener UNA ruta abierta a la vez. La carga se guarda
+    // por camión (warehouse_stock), así que dos rutas abiertas con el mismo
+    // camión compartirían el stock. Hay que cerrar la anterior primero.
+    const { data: openRoute } = await db.from('routes')
+      .select('id, route_date')
+      .eq('tenant_id', tenantId).eq('warehouse_id', b.warehouse_id).eq('status', 'open')
+      .maybeSingle();
+    if (openRoute) {
+      return fail(c, 'Ese camión ya tiene una ruta abierta. Cerrá esa ruta antes de crear otra con el mismo camión.', 409);
+    }
+
     const { data: route, error } = await db.from('routes').insert({
       tenant_id: tenantId,
       warehouse_id: b.warehouse_id,
