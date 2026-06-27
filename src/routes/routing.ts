@@ -355,7 +355,7 @@ routing.get('/:id/truck-stock', async (c) => {
       .select('warehouse_id').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
     if (!route) return fail(c, 'Ruta no encontrada', 404);
     const { data } = await db.from('warehouse_stock')
-      .select('product_id, quantity, product:products!warehouse_stock_product_id_fkey(id, name, sku, unit_price)')
+      .select('product_id, quantity, product:products!warehouse_stock_product_id_fkey(id, name, sku, unit_price, unit_type:unit_types(name, abbreviation))')
       .eq('warehouse_id', (route as any).warehouse_id);
     return ok(c, (data ?? []).filter((s: any) => Number(s.quantity) !== 0));
   } catch (err: any) { return fail(c, err.message, 500); }
