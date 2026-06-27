@@ -11,7 +11,7 @@ const CreateUserSchema = z.object({
   full_name: z.string().min(1),
   role: z.enum([
     'owner', 'admin', 'gerente', 'asistente_1', 'asistente_2', 'asistente_3',
-    'cocinero', 'mesero', 'cajero', 'almacenero', 'contador',
+    'cocinero', 'mesero', 'cajero', 'almacenero', 'contador', 'repartidor',
   ]).optional().default('asistente_1'),
   phone: z.string().optional().nullable(),
   /** Sucursal destino (si no se pasa, se usa el tenant actual del JWT). */
@@ -22,7 +22,7 @@ const UpdateUserSchema = z.object({
   full_name: z.string().min(1).optional(),
   role: z.enum([
     'owner', 'admin', 'gerente', 'asistente_1', 'asistente_2', 'asistente_3',
-    'cocinero', 'mesero', 'cajero', 'almacenero', 'contador',
+    'cocinero', 'mesero', 'cajero', 'almacenero', 'contador', 'repartidor',
   ]).optional(),
   phone: z.string().optional().nullable(),
 });
@@ -230,6 +230,7 @@ users.get('/roles', async (c) => {
     { value: 'cajero', label: 'Cajero' },
     { value: 'almacenero', label: 'Almacenero' },
     { value: 'contador', label: 'Contador' },
+    { value: 'repartidor', label: 'Repartidor' },
   ];
   return ok(c, roles);
 });
@@ -475,7 +476,7 @@ users.patch('/:id/pin', async (c) => {
 
 const VALID_ROLES = [
   'owner', 'admin', 'gerente', 'asistente_1', 'asistente_2', 'asistente_3',
-  'cocinero', 'mesero', 'cajero', 'almacenero', 'contador',
+  'cocinero', 'mesero', 'cajero', 'almacenero', 'contador', 'repartidor',
 ] as const;
 
 const RolePermissionsSchema = z.record(

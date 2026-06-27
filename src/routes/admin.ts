@@ -145,19 +145,25 @@ admin.get('/invoices-monthly', async (c) => {
 
     const { data, error } = await db
       .from('invoices')
-      .select('tenant_id, status, issued_at')
+      .select('tenant_id, status, issued_at, route_id')
       .gte('issued_at', periodStart)
       .lt('issued_at', periodEnd);
     if (error) throw new Error(error.message);
 
     const counts: Record<string, number> = {};
+    const distCounts: Record<string, number> = {};
     for (const row of data ?? []) {
       if ((row as any).status === 'cancelled') continue;
       const tid = (row as any).tenant_id as string;
       counts[tid] = (counts[tid] ?? 0) + 1;
+      if ((row as any).route_id) distCounts[tid] = (distCounts[tid] ?? 0) + 1;
     }
-    const out = Object.entries(counts).map(([tenant_id, count]) => ({
-      tenant_id, count, period_start: periodStart, period_end: periodEnd,
+    const tids = new Set([...Object.keys(counts), ...Object.keys(distCounts)]);
+    const out = Array.from(tids).map((tenant_id) => ({
+      tenant_id,
+      count: counts[tenant_id] ?? 0,
+      distribution_count: distCounts[tenant_id] ?? 0,
+      period_start: periodStart, period_end: periodEnd,
     }));
     return ok(c, out);
   } catch (err: any) { return fail(c, err.message, 500); }
