@@ -87,12 +87,15 @@ routing.get('/trucks', async (c) => {
 });
 
 // Consecutivo único por tenant (mismo esquema que el POS: 000001, 000002, ...).
+// IMPORTANTE: solo contamos números consecutivos SIMPLES (1-6 dígitos puros).
+// Si tomáramos los dígitos finales de cualquier factura, una clave de FE o un
+// número con fecha (ej. 20260627) haría saltar el consecutivo a algo tipo fecha.
 async function nextInvoiceNumber(tenantId: string, attemptOffset = 0): Promise<string> {
   const { data } = await db.from('invoices').select('invoice_number').eq('tenant_id', tenantId);
   let maxSeq = 0;
   for (const r of (data ?? []) as any[]) {
-    const m = String(r.invoice_number ?? '').match(/(\d+)\s*$/);
-    if (m) maxSeq = Math.max(maxSeq, parseInt(m[1], 10));
+    const s = String(r.invoice_number ?? '').trim();
+    if (/^\d{1,6}$/.test(s)) maxSeq = Math.max(maxSeq, parseInt(s, 10));
   }
   return String(maxSeq + 1 + attemptOffset).padStart(6, '0');
 }

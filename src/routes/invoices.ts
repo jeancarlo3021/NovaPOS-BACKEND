@@ -61,10 +61,12 @@ async function nextInvoiceNumber(tenantId: string, attemptOffset = 0): Promise<s
     .select('invoice_number')
     .eq('tenant_id', tenantId);
 
+  // Solo consecutivos SIMPLES (1-6 dígitos puros). Ignoramos números con fecha,
+  // claves de FE o formatos largos para que el consecutivo no salte.
   let maxSeq = 0;
   for (const r of (data ?? []) as any[]) {
-    const m = String(r.invoice_number ?? '').match(/(\d+)\s*$/);  // dígitos finales
-    if (m) maxSeq = Math.max(maxSeq, parseInt(m[1], 10));
+    const s = String(r.invoice_number ?? '').trim();
+    if (/^\d{1,6}$/.test(s)) maxSeq = Math.max(maxSeq, parseInt(s, 10));
   }
 
   return String(maxSeq + 1 + attemptOffset).padStart(6, '0');
