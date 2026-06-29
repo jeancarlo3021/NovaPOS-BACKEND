@@ -346,6 +346,49 @@ routing.post('/:id/load', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+// POST /:id/clear-load — BORRAR la carga del camión (devuelve TODO al inventario del
+// sistema) sin cerrar la ruta. Para corregir una carga hecha por error.
+routing.post('/:id/clear-load', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { id } = c.req.param();
+
+    const { data: route } = await db.from('routes')
+      .select('id, warehouse_id, status').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+    if (!route) return fail(c, 'Ruta no encontrada', 404);
+    if ((route as any).status === 'closed') return fail(c, 'La ruta está cerrada', 409);
+
+    // Si ya hubo ventas en esta ruta, no se puede borrar la carga (el stock no cuadra).
+    const { count: salesCount } = await db.from('invoices')
+      .select('id', { count: 'exact', head: true })
+      .eq('tenant_id', tenantId).eq('route_id', id).neq('status', 'cancelled');
+    if ((salesCount ?? 0) > 0) {
+      return fail(c, 'No se puede borrar la carga: la ruta ya tiene ventas. Anulá las ventas o cerrá la ruta.', 409);
+    }
+
+    const truckId = (route as any).warehouse_id;
+    const { data: stock } = await db.from('warehouse_stock')
+      .select('product_id, quantity').eq('warehouse_id', truckId);
+    const rows = (stock ?? []).filter((s: any) => Number(s.quantity) > 0);
+
+    for (const it of rows as any[]) {
+      const { data: prod } = await db.from('products')
+        .select('stock_quantity, tracks_stock').eq('id', it.product_id).eq('tenant_id', tenantId).maybeSingle();
+      if (prod && (prod as any).tracks_stock !== false) {
+        await db.from('products').update({
+          stock_quantity: Number((prod as any).stock_quantity ?? 0) + Number(it.quantity),
+          updated_at: new Date().toISOString(),
+        }).eq('id', it.product_id);
+      }
+      await db.from('warehouse_stock').upsert(
+        { warehouse_id: truckId, product_id: it.product_id, quantity: 0 },
+        { onConflict: 'warehouse_id,product_id' });
+    }
+
+    return ok(c, { ok: true, returned_items: rows.length });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // GET /:id/truck-stock — stock actual del camión de la ruta
 routing.get('/:id/truck-stock', async (c) => {
   try {

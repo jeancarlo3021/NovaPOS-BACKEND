@@ -5,9 +5,14 @@ import { ok, fail } from '../utils/response.js';
 
 const users = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
+// Contraseña segura: al menos 6 caracteres y combinar letras y números.
+const securePassword = z.string().min(6)
+  .regex(/[a-zA-Z]/, 'La contraseña debe combinar letras y números')
+  .regex(/[0-9]/, 'La contraseña debe combinar letras y números');
+
 const CreateUserSchema = z.object({
   email: z.string().email(),
-  password: z.string().min(6),
+  password: securePassword,
   full_name: z.string().min(1),
   role: z.enum([
     'owner', 'admin', 'gerente', 'asistente_1', 'asistente_2', 'asistente_3',
@@ -28,7 +33,7 @@ const UpdateUserSchema = z.object({
 });
 
 const ResetPasswordSchema = z.object({
-  password: z.string().min(6),
+  password: securePassword,
 });
 
 // GET / — list users for the tenant
