@@ -6,6 +6,9 @@ type Variables = { userId: string; tenantId: string; role: string };
 // Estados del tenant que cortan acceso al API.
 const BLOCKED = new Set(['suspended', 'inactive', 'cancelled']);
 
+// Días de gracia tras el vencimiento antes de pasar a SOLO LECTURA.
+const GRACE_DAYS = 6;
+
 // Rutas que SIEMPRE deben pasar (panel admin, info propia del tenant para que
 // el frontend pueda renderizar el modal con datos coherentes).
 const BYPASS_PATTERNS = [
@@ -47,6 +50,32 @@ export const enforceActiveTenant = createMiddleware<{ Variables: Variables }>(as
       code: 'tenant_suspended',
       status,
     }, 403);
+  }
+
+  // ── Expiración con gracia → SOLO LECTURA ──────────────────────────────────
+  // Si la suscripción venció hace más de GRACE_DAYS, se bloquean las
+  // MUTACIONES (POST/PUT/PATCH/DELETE) pero se permite seguir viendo (GET).
+  // Las de plan Admin / sin fecha de fin nunca vencen.
+  const method = c.req.method;
+  if (method !== 'GET' && method !== 'OPTIONS' && method !== 'HEAD') {
+    const { data: sub } = await db
+      .from('subscriptions')
+      .select('ends_at')
+      .eq('tenant_id', tenantId)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    const endsAt = (sub as any)?.ends_at;
+    if (endsAt) {
+      const graceMs = GRACE_DAYS * 24 * 60 * 60 * 1000;
+      if (new Date(endsAt).getTime() + graceMs < Date.now()) {
+        return c.json({
+          data: null,
+          error: 'Suscripción vencida — modo solo lectura. Regularizá el pago para hacer cambios.',
+          code: 'tenant_expired',
+        }, 403);
+      }
+    }
   }
 
   await next();

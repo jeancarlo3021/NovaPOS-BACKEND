@@ -155,8 +155,13 @@ admin.get('/invoices-monthly', async (c) => {
     for (const row of data ?? []) {
       if ((row as any).status === 'cancelled') continue;
       const tid = (row as any).tenant_id as string;
-      counts[tid] = (counts[tid] ?? 0) + 1;
-      if ((row as any).route_id) distCounts[tid] = (distCounts[tid] ?? 0) + 1;
+      if ((row as any).route_id) {
+        // Factura de distribución: cuenta SOLO en distribución, no en las corrientes.
+        distCounts[tid] = (distCounts[tid] ?? 0) + 1;
+      } else {
+        // Factura corriente (POS).
+        counts[tid] = (counts[tid] ?? 0) + 1;
+      }
     }
     const tids = new Set([...Object.keys(counts), ...Object.keys(distCounts)]);
     const out = Array.from(tids).map((tenant_id) => ({
@@ -284,6 +289,30 @@ admin.post('/set-subscription-price', async (c) => {
       .eq('id', (sub as any).id);
     if (error) throw new Error(error.message);
     return ok(c, { custom_price: value });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// POST /set-subscription-days — fija los DÍAS RESTANTES de la suscripción.
+// body: { tenantId, days }  → ends_at = hoy + days, status 'active'.
+admin.post('/set-subscription-days', async (c) => {
+  try {
+    const { tenantId, days } = await c.req.json();
+    if (!tenantId) return fail(c, 'tenantId requerido', 422);
+    const d = Number(days);
+    if (isNaN(d) || d < 0 || d > 3650) return fail(c, 'Días inválidos (0 a 3650)', 422);
+
+    // Suscripción más reciente del tenant.
+    const { data: sub } = await db.from('subscriptions')
+      .select('id').eq('tenant_id', tenantId)
+      .order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (!sub) return fail(c, 'El negocio no tiene suscripción', 404);
+
+    const endsAt = new Date(Date.now() + d * 24 * 60 * 60 * 1000).toISOString();
+    const { error } = await db.from('subscriptions')
+      .update({ ends_at: endsAt, status: 'active', updated_at: new Date().toISOString() })
+      .eq('id', (sub as any).id);
+    if (error) throw new Error(error.message);
+    return ok(c, { ends_at: endsAt, days: d });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

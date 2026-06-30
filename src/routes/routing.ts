@@ -398,7 +398,7 @@ routing.get('/:id/truck-stock', async (c) => {
       .select('warehouse_id').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
     if (!route) return fail(c, 'Ruta no encontrada', 404);
     const { data } = await db.from('warehouse_stock')
-      .select('product_id, quantity, product:products!warehouse_stock_product_id_fkey(id, name, sku, unit_price, unit_type:unit_types(name, abbreviation))')
+      .select('product_id, quantity, product:products!warehouse_stock_product_id_fkey(id, name, sku, unit_price, category_id, unit_type:unit_types(name, abbreviation))')
       .eq('warehouse_id', (route as any).warehouse_id);
     return ok(c, (data ?? []).filter((s: any) => Number(s.quantity) !== 0));
   } catch (err: any) { return fail(c, err.message, 500); }
@@ -766,11 +766,7 @@ routing.post('/:id/close', async (c) => {
       else byMethod.cash += Number(i.total ?? 0);
     }
 
-    // 3) Cerrar la ruta.
-    await db.from('routes').update({ status: 'closed', closed_at: new Date().toISOString() })
-      .eq('id', id).eq('tenant_id', tenantId);
-
-    return ok(c, {
+    const summary = {
       route_id: id,
       sales_count: sales.length,
       sales_total: salesTotal,
@@ -778,6 +774,54 @@ routing.post('/:id/close', async (c) => {
       returned_items: returnedItems.length,
       returned: returnedDetail,
       by_method: byMethod,
+    };
+
+    // 3) Cerrar la ruta y GUARDAR el resumen para poder reimprimirlo luego.
+    //    El update de close_summary es best-effort (por si la columna aún no existe).
+    await db.from('routes').update({ status: 'closed', closed_at: new Date().toISOString() })
+      .eq('id', id).eq('tenant_id', tenantId);
+    try {
+      await db.from('routes').update({ close_summary: summary }).eq('id', id).eq('tenant_id', tenantId);
+    } catch { /* columna close_summary no existe todavía */ }
+
+    return ok(c, summary);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// GET /:id/close-summary — resumen de una ruta cerrada, para REIMPRIMIR el cierre.
+// Usa el resumen guardado; si no existe, recalcula ventas por método (sin el
+// detalle de sobrante, que ya volvió al inventario al cerrar).
+routing.get('/:id/close-summary', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { id } = c.req.param();
+
+    const { data: route } = await db.from('routes')
+      .select('id, route_date, close_summary, warehouse:warehouses!routes_warehouse_id_fkey(name)')
+      .eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+    if (!route) return fail(c, 'Ruta no encontrada', 404);
+
+    const truck = (route as any).warehouse?.name;
+    if ((route as any).close_summary) {
+      return ok(c, { ...(route as any).close_summary, truck, route_date: (route as any).route_date });
+    }
+
+    // Fallback: recomputar ventas por método desde las facturas.
+    const { data: invs } = await db.from('invoices')
+      .select('total, status, payment_method').eq('tenant_id', tenantId).eq('route_id', id);
+    const sales = (invs ?? []).filter((i: any) => i.status !== 'cancelled');
+    const voids = (invs ?? []).filter((i: any) => i.status === 'cancelled');
+    const byMethod = { cash: 0, card: 0, sinpe: 0, credit: 0 };
+    for (const i of sales) {
+      const m = (i.payment_method ?? 'cash') as 'cash' | 'card' | 'sinpe' | 'credit';
+      if (m === 'card' || m === 'sinpe' || m === 'credit') byMethod[m] += Number(i.total ?? 0);
+      else byMethod.cash += Number(i.total ?? 0);
+    }
+    return ok(c, {
+      route_id: id, truck, route_date: (route as any).route_date,
+      sales_count: sales.length,
+      sales_total: sales.reduce((s: number, i: any) => s + Number(i.total ?? 0), 0),
+      voids_count: voids.length, returned_items: 0, returned: [], by_method: byMethod,
     });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
