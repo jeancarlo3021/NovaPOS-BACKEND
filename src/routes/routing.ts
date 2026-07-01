@@ -157,11 +157,13 @@ routing.get('/my-orders', async (c) => {
 });
 
 // ── Rutas ────────────────────────────────────────────────────────────────────
-// GET /?date=&status=&driver_id=
+// GET /?date=&from=&to=&status=&driver_id=
 routing.get('/', async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const date   = c.req.query('date');
+    const from   = c.req.query('from');
+    const to     = c.req.query('to');
     const status = c.req.query('status');
     const driver = c.req.query('driver_id');
     let q = db.from('routes')
@@ -169,6 +171,8 @@ routing.get('/', async (c) => {
       .eq('tenant_id', tenantId)
       .order('route_date', { ascending: false });
     if (date)   q = q.eq('route_date', date);
+    if (from)   q = q.gte('route_date', from);   // rango de fechas (inclusive)
+    if (to)     q = q.lte('route_date', to);
     if (status) q = q.eq('status', status);
     if (driver) q = q.eq('driver_id', driver);
     const { data, error } = await q;
@@ -516,10 +520,13 @@ routing.post('/:id/order', async (c) => {
     const items: any[] = Array.isArray(b.items) ? b.items : [];
     if (items.length === 0) return fail(c, 'Sin productos', 422);
 
+    // Total del pedido: si no viene, se calcula desde los ítems (no guardar 0).
+    const itemsTotal = items.reduce((s: number, it: any) => s + Number(it.unit_price ?? 0) * Number(it.quantity ?? 0), 0);
+    const orderTotal = Number(b.total) > 0 ? Number(b.total) : itemsTotal;
     const { data: order, error } = await db.from('route_orders').insert({
       tenant_id: tenantId, route_id: id,
       customer_id: b.customer_id ?? null, customer_name: b.customer_name ?? null,
-      total: b.total ?? 0, notes: b.notes ?? null,
+      total: orderTotal, notes: b.notes ?? null,
     }).select().single();
     if (error) throw new Error(error.message);
 
@@ -646,7 +653,10 @@ routing.post('/order/:orderId/deliver', async (c) => {
 
     const items: any[] = (order as any).items ?? [];
     const subtotal = items.reduce((s, it) => s + Number(it.unit_price) * Number(it.quantity), 0);
-    const total = Number((order as any).total ?? subtotal);
+    // Total del pedido; si viene en 0/vacío, se recalcula desde los ítems (evita
+    // facturas en ₡0 cuando el pedido se guardó sin total).
+    const orderTotal = Number((order as any).total ?? 0);
+    const total = orderTotal > 0 ? orderTotal : subtotal;
 
     // Crear factura con consecutivo único.
     let inv: any = null, invErr: any = null;
@@ -768,15 +778,23 @@ routing.post('/:id/close', async (c) => {
 
     // 2) Resumen de ventas/anulaciones + desglose por método.
     const { data: invs } = await db.from('invoices')
-      .select('total, status, payment_method').eq('tenant_id', tenantId).eq('route_id', id);
+      .select('total, status, payment_method, payments').eq('tenant_id', tenantId).eq('route_id', id);
     const sales = (invs ?? []).filter((i: any) => i.status !== 'cancelled');
     const voids = (invs ?? []).filter((i: any) => i.status === 'cancelled');
     const salesTotal = sales.reduce((s: number, i: any) => s + Number(i.total ?? 0), 0);
     const byMethod = { cash: 0, card: 0, sinpe: 0, credit: 0 };
+    const addMethod = (m: string, amt: number) => {
+      if (m === 'card' || m === 'sinpe' || m === 'credit') byMethod[m] += amt;
+      else byMethod.cash += amt;
+    };
     for (const i of sales) {
-      const m = (i.payment_method ?? 'cash') as 'cash' | 'card' | 'sinpe' | 'credit';
-      if (m === 'card' || m === 'sinpe' || m === 'credit') byMethod[m] += Number(i.total ?? 0);
-      else byMethod.cash += Number(i.total ?? 0);
+      // Pago MIXTO: repartir por cada split (antes se contaba todo como efectivo,
+      // así la parte de tarjeta/SINPE/crédito del mixto no se contabilizaba).
+      if (i.payment_method === 'mixed' && Array.isArray(i.payments) && i.payments.length > 0) {
+        for (const p of i.payments) addMethod(p.method ?? 'cash', Number(p.amount ?? 0));
+        continue;
+      }
+      addMethod(i.payment_method ?? 'cash', Number(i.total ?? 0));
     }
 
     returnedDetail.sort((a, b) => a.name.localeCompare(b.name, 'es'));

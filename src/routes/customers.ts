@@ -17,6 +17,7 @@ const CustomerSchema = z.object({
   canton_code:         z.string().optional().nullable(),
   district_code:       z.string().optional().nullable(),
   address:             z.string().optional().nullable(),
+  economic_activity_code: z.string().optional().nullable(),
   zone:                z.string().optional().nullable(),
   notes:               z.string().optional().nullable(),
   is_active:           z.boolean().optional(),

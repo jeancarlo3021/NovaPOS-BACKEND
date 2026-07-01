@@ -62,9 +62,11 @@ const COMPROBANTE: Record<string, string> = {
   ticket: '04',
 };
 
-// Hacienda MedioPago: 01 efectivo, 02 tarjeta, 03 cheque, 04 transferencia/SINPE.
+// Hacienda MedioPago: 01 efectivo, 02 tarjeta, 03 cheque,
+// 04 transferencia/depósito, 05 canje, 06 SINPE Móvil, 07 plataforma digital, 99 otros.
 const MEDIO_PAGO: Record<string, string> = {
-  cash: '01', card: '02', sinpe: '04', transfer: '04', check: '03', credit: '02', mixed: '01',
+  cash: '01', card: '02', check: '03', transfer: '04', deposit: '04',
+  sinpe: '06', sinpe_movil: '06', credit: '02', mixed: '01',
 };
 
 const pad = (s: string | number, n: number) => String(s).replace(/\D/g, '').padStart(n, '0').slice(-n);
@@ -81,20 +83,30 @@ export function tipoComprobante(documentType?: string): string {
 
 export function buildConsecutivo(
   inv: FEInvoice,
-  opts: { sucursal?: string; terminal?: string; situacion?: string } = {},
+  opts: { sucursal?: string; terminal?: string; situacion?: string; tipoComprobante?: string } = {},
 ): ConsecutivoModel {
   return {
     Sucursal: pad(opts.sucursal ?? '1', 3),
     Terminal: pad(opts.terminal ?? '1', 5),
-    TipoComprobante: tipoComprobante(inv.document_type),
+    TipoComprobante: opts.tipoComprobante ?? tipoComprobante(inv.document_type),
     ConsecutivoInterno: pad(inv.invoice_number, 10),
     SituacionDelComprobante: opts.situacion ?? '1',
   };
 }
 
-/** ISO-8601 con offset de Costa Rica (-06:00). */
+/** Referencia al documento original (para Nota de Crédito de anulación). */
+export interface FEReference {
+  tipoDoc: string;    // 04 tiquete, 01 factura…
+  numero: string;     // clave de 50 díg del documento original
+  fecha?: string;     // fecha de emisión del original (ISO)
+  codigo?: string;    // 01 = anula documento de referencia
+  razon?: string;
+}
+
+/** ISO-8601 con offset de Costa Rica (-06:00). Acota a no-futura. */
 function fechaCR(issuedAt?: string): string {
-  const d = issuedAt ? new Date(issuedAt) : new Date();
+  let d = issuedAt ? new Date(issuedAt) : new Date();
+  if (isNaN(d.getTime()) || d.getTime() > Date.now()) d = new Date();  // inválida/futura → ahora
   return new Date(d.getTime() - 6 * 60 * 60 * 1000).toISOString().replace(/\.\d{3}Z$/, '-06:00');
 }
 
@@ -119,8 +131,10 @@ export function buildDocumentoJson(
   inv: FEInvoice,
   lines: FELine[],
   receptor?: FEReceptor | null,
+  options?: { tipoComprobante?: string; reference?: FEReference },
 ): string {
-  const esFactura = tipoComprobante(inv.document_type) === '01';
+  const tipo = options?.tipoComprobante ?? tipoComprobante(inv.document_type);
+  const esFactura = tipo === '01';
   const condicionVenta = inv.payment_method === 'credit' ? '02' : '01';
   const medioPago = MEDIO_PAGO[inv.payment_method] ?? '01';
 
@@ -201,6 +215,20 @@ export function buildDocumentoJson(
       ],
     },
   };
+
+  // Nota de Crédito: referencia al documento original que se anula.
+  // InformacionReferencia = ARRAY. OJO: los campos del modelo de Facturemos son
+  // TipoDocIR y FechaEmisionIR (no TipoDoc/FechaEmisionDoc como en la doc/XSD).
+  if (options?.reference) {
+    const r = options.reference;
+    cuerpo.InformacionReferencia = [{
+      TipoDocIR: r.tipoDoc,
+      Numero: r.numero,
+      FechaEmisionIR: r.fecha ? fechaCR(r.fecha) : fechaCR(),
+      Codigo: r.codigo ?? '01',           // 01 = anula documento de referencia
+      Razon: r.razon ?? 'Anulación de documento',
+    }];
+  }
 
   // Sin wrapper: el contenido de `Factura` son directamente los campos del documento.
   // El tipo (tiquete/factura) lo determina el TipoComprobante del ConsecutivoModel.
