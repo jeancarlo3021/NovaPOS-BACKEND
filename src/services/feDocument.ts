@@ -68,6 +68,10 @@ const MEDIO_PAGO: Record<string, string> = {
 };
 
 const pad = (s: string | number, n: number) => String(s).replace(/\D/g, '').padStart(n, '0').slice(-n);
+// Provincia = 1 díg (sin ceros a la izquierda: "04" → "4").
+const prov1 = (s: any) => (String(s ?? '').replace(/\D/g, '').replace(/^0+/, '') || '').slice(0, 1);
+// Cantón/Distrito = 2 díg ("3" → "03").
+const pad2 = (s: any) => { const d = String(s ?? '').replace(/\D/g, ''); return d ? d.padStart(2, '0').slice(-2) : ''; };
 const money = (n: number) => (Math.round(Number(n || 0) * 100) / 100).toFixed(2);
 const num = (n: number) => String(Math.round(Number(n || 0) * 1000) / 1000);
 
@@ -137,53 +141,58 @@ export function buildDocumentoJson(
       BaseImponible: money(subtotal),
       MontoTotalLinea: money(subtotal + impuestoMonto),
     };
-    if (l.sku) linea.CodigoComercial = { Tipo: '04', Codigo: l.sku };
+    if (l.sku) linea.CodigoComercial = [{ Tipo: '04', Codigo: l.sku }];
     if (tarifa > 0) {
-      linea.Impuesto = {
+      linea.Impuesto = [{
         Codigo: '01',
         CodigoTarifaIVA: codigoTarifaIVA(tarifa),
         Tarifa: String(tarifa),
         Monto: money(impuestoMonto),
-      };
+      }];
       linea.ImpuestoNeto = money(impuestoMonto);
     }
+    // Requerido por Hacienda: impuesto asumido por el emisor de fábrica (0 si no aplica).
+    linea.ImpuestoAsumidoEmisorFabrica = '0';
     return linea;
   });
 
   const totalComprobante = Math.round(Number(inv.total ?? 0) * 100) / 100;
 
+  // Facturemos indica: NO enviar Clave ni NumeroConsecutivo (los asigna su API;
+  // si mandamos "0" los toma como valor 0). Y el contenido de `Factura` va SIN el
+  // wrapper TiqueteElectronico/FacturaElectronica.
   const cuerpo: any = {
-    Clave: '0',
     ProveedorSistemas: emisor.proveedor_sistemas ?? '',
     CodigoActividadEmisor: emisor.economic_activity_code ?? '',
-    NumeroConsecutivo: '0',
     FechaEmision: fechaCR(inv.issued_at),
     Emisor: {
       Nombre: emisor.name,
       Identificacion: { Tipo: emisor.identification_type, Numero: emisor.identification },
       Ubicacion: {
-        Provincia: emisor.province_code ?? '',
-        Canton: emisor.canton_code ?? '',
-        Distrito: emisor.district_code ?? '',
+        Provincia: prov1(emisor.province_code),   // 1 díg
+        Canton: pad2(emisor.canton_code),         // 2 díg
+        Distrito: pad2(emisor.district_code),     // 2 díg
         OtrasSenas: emisor.address ?? '',
       },
-      CorreoElectronico: emisor.email ?? '',
+      // Hacienda/Facturemos espera CorreoElectronico como ARRAY de strings.
+      CorreoElectronico: emisor.email ? [emisor.email] : [],
     },
     Receptor: receptor && receptor.identification
       ? {
           Nombre: receptor.name ?? 'Cliente',
           Identificacion: { Tipo: receptor.identification_type ?? '01', Numero: receptor.identification },
-          ...(receptor.email ? { CorreoElectronico: receptor.email } : {}),
+          ...(receptor.email ? { CorreoElectronico: [receptor.email] } : {}),
         }
       : { Nombre: receptor?.name || 'Cliente General', NombreComercial: 'Cliente General' },
     CondicionVenta: condicionVenta,
     PlazoCredito: '0',
     DetalleServicio: {
-      // Línea única = objeto; varias = array (como en el ejemplo de Facturemos).
-      LineaDetalle: lineaDetalle.length === 1 ? lineaDetalle[0] : lineaDetalle,
+      // Facturemos espera SIEMPRE un array (aunque sea una sola línea); si mandamos
+      // un objeto, su parser lo ve como "detalle vacío".
+      LineaDetalle: lineaDetalle,
     },
     ResumenFactura: {
-      MedioPago: { TipoMedioPago: medioPago, TotalMedioPago: money(totalComprobante) },
+      MedioPago: [{ TipoMedioPago: medioPago, TotalMedioPago: money(totalComprobante) }],
     },
     Otros: {
       OtroTexto: [
@@ -193,6 +202,8 @@ export function buildDocumentoJson(
     },
   };
 
-  const root = esFactura ? 'FacturaElectronica' : 'TiqueteElectronico';
-  return JSON.stringify({ [root]: cuerpo });
+  // Sin wrapper: el contenido de `Factura` son directamente los campos del documento.
+  // El tipo (tiquete/factura) lo determina el TipoComprobante del ConsecutivoModel.
+  void esFactura;
+  return JSON.stringify(cuerpo);
 }

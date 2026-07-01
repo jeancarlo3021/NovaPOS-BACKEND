@@ -779,6 +779,7 @@ routing.post('/:id/close', async (c) => {
       else byMethod.cash += Number(i.total ?? 0);
     }
 
+    returnedDetail.sort((a, b) => a.name.localeCompare(b.name, 'es'));
     const summary = {
       route_id: id,
       sales_count: sales.length,
@@ -854,6 +855,7 @@ routing.get('/:id/close-summary', async (c) => {
         }));
       }
     }
+    returned = [...returned].sort((a, b) => String(a.name).localeCompare(String(b.name), 'es'));
 
     return ok(c, {
       route_id: id, truck, route_date: (route as any).route_date,

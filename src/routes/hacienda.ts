@@ -58,8 +58,9 @@ hacienda.get('/status/:clave', async (c) => {
 hacienda.post('/emit', async (c) => {
   const tenantId = c.get('tenantId');
   let invoice_id: string | undefined;
+  let debug = false;
   try {
-    ({ invoice_id } = await c.req.json().catch(() => ({})));
+    ({ invoice_id, debug } = await c.req.json().catch(() => ({})));
     if (!invoice_id) return fail(c, 'Falta invoice_id', 422);
 
     const cfg = await loadFEConfig(tenantId);
@@ -93,7 +94,8 @@ hacienda.post('/emit', async (c) => {
         iva_rate: p.iva_rate ?? 0,
         unit: (p.unit_type?.abbreviation) ?? 'Unid',
       };
-    });
+    }).filter((l: FELine) => Number(l.quantity) > 0 && l.product_name);
+    if (lines.length === 0) return fail(c, 'La factura no tiene líneas de detalle para emitir.', 422);
 
     // Receptor (cliente), opcional para tiquete.
     let receptor: any = null;
@@ -126,11 +128,25 @@ hacienda.post('/emit', async (c) => {
     });
     const facturaJson = buildDocumentoJson(emisor, inv as any, lines, receptor);
 
+    const apiMasked = String(cfg.api_key_emisor).slice(-4);
+    // Modo debug: NO envía. Devuelve exactamente lo que mandaríamos, para
+    // compartir con soporte de Facturemos.
+    if (debug) {
+      return ok(c, {
+        environment: env,
+        apiKeyEmisor_last4: apiMasked,
+        emisor_cedula: emisor.identification,
+        ConsecutivoModel: consecutivo,
+        Factura: JSON.parse(facturaJson),
+      });
+    }
+
     // Enviar a Facturemos.
     const resp = await enviaDocumentoConsecutivoJson(env, cfg.api_key_emisor, facturaJson, consecutivo);
 
-    const clave = resp?.Clave ?? resp?.clave ?? null;
-    const consec = resp?.Consecutivo ?? resp?.NumeroConsecutivo ?? null;
+    // La respuesta de emisión puede venir como string (la clave) o como objeto.
+    const clave = typeof resp === 'string' ? resp : (resp?.Clave ?? resp?.clave ?? null);
+    const consec = typeof resp === 'object' ? (resp?.Consecutivo ?? resp?.NumeroConsecutivo ?? null) : null;
 
     await db.from('invoices').update({
       fe_clave: clave,

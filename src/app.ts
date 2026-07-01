@@ -36,6 +36,7 @@ import hr              from './routes/hr.js';
 import email           from './routes/email.js';
 import customerPrices   from './routes/customerPrices.js';
 import routing          from './routes/routing.js';
+import cabys            from './routes/cabys.js';
 
 // basePath('/api') matches Vercel's catch-all at api/[[...route]].ts
 const app = new Hono().basePath('/api');
@@ -97,6 +98,7 @@ api.route('/hr',                hr);
 api.route('/email',             email);
 api.route('/customer-prices',   customerPrices);
 api.route('/routes',            routing);
+api.route('/cabys',             cabys);
 
 app.route('/', api);
 
