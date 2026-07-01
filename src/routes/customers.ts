@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
+import { getUserZone } from '../utils/userZone.js';
 
 const customers = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
@@ -67,6 +68,9 @@ customers.get('/', async (c) => {
     const q = c.req.query('q')?.trim();
     let query = db.from('customers')
       .select('*').eq('tenant_id', tenantId).order('name').limit(500);
+    // Restricción por zona: si el usuario tiene zona asignada, solo ve esa zona.
+    const userZone = await getUserZone(c.get('userId'));
+    if (userZone) query = query.eq('zone', userZone);
     if (q) {
       // ilike sobre name + identification + email
       query = query.or(`name.ilike.%${q}%,identification.ilike.%${q}%,email.ilike.%${q}%,commercial_name.ilike.%${q}%`);

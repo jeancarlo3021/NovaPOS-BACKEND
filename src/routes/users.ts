@@ -19,6 +19,8 @@ const CreateUserSchema = z.object({
     'cocinero', 'mesero', 'cajero', 'almacenero', 'contador', 'repartidor',
   ]).optional().default('asistente_1'),
   phone: z.string().optional().nullable(),
+  /** Zona asignada: si se setea, el usuario solo ve clientes/CxC de esa zona. */
+  zone: z.string().optional().nullable(),
   /** Sucursal destino (si no se pasa, se usa el tenant actual del JWT). */
   target_tenant_id: z.string().uuid().optional().nullable(),
 });
@@ -30,6 +32,7 @@ const UpdateUserSchema = z.object({
     'cocinero', 'mesero', 'cajero', 'almacenero', 'contador', 'repartidor',
   ]).optional(),
   phone: z.string().optional().nullable(),
+  zone: z.string().optional().nullable(),
 });
 
 const ResetPasswordSchema = z.object({
@@ -58,7 +61,7 @@ users.get('/', async (c) => {
 
     const { data, error } = await db
       .from('users')
-      .select('id, full_name, email, role, phone, tenant_id, created_at, last_login_at')
+      .select('id, full_name, email, role, phone, zone, tenant_id, created_at, last_login_at')
       .in('tenant_id', tenantIds)
       .order('full_name');
 
@@ -160,6 +163,7 @@ users.post('/', async (c) => {
         full_name: parsed.data.full_name,
         role: parsed.data.role,
         phone: parsed.data.phone,
+        zone: parsed.data.zone ?? null,
         tenant_id: destTenantId,
       })
       .select()
@@ -263,6 +267,7 @@ users.put('/:id', async (c) => {
     if (parsed.data.full_name !== undefined) updateData.full_name = parsed.data.full_name;
     if (parsed.data.role !== undefined) updateData.role = parsed.data.role;
     if (parsed.data.phone !== undefined) updateData.phone = parsed.data.phone;
+    if (parsed.data.zone !== undefined) updateData.zone = parsed.data.zone;
 
     const { data: updated, error } = await db
       .from('users')

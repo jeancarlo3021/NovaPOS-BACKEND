@@ -341,6 +341,14 @@ routing.post('/:id/load', async (c) => {
         { onConflict: 'warehouse_id,product_id' });
     }
 
+    // Acumular lo cargado en routes.loaded_summary (para reconstruir sobrante).
+    try {
+      const { data: r } = await db.from('routes').select('loaded_summary').eq('id', id).maybeSingle();
+      const acc: Record<string, number> = { ...((r as any)?.loaded_summary ?? {}) };
+      for (const it of items) acc[it.product_id] = Number(acc[it.product_id] ?? 0) + it.quantity;
+      await db.from('routes').update({ loaded_summary: acc }).eq('id', id).eq('tenant_id', tenantId);
+    } catch { /* columna loaded_summary no existe todavía */ }
+
     void userId;
     return ok(c, { ok: true, loaded: items.length });
   } catch (err: any) { return fail(c, err.message, 500); }
@@ -384,6 +392,9 @@ routing.post('/:id/clear-load', async (c) => {
         { warehouse_id: truckId, product_id: it.product_id, quantity: 0 },
         { onConflict: 'warehouse_id,product_id' });
     }
+
+    // La carga se borró: reiniciar el acumulado de cargado.
+    try { await db.from('routes').update({ loaded_summary: {} }).eq('id', id).eq('tenant_id', tenantId); } catch { /* sin columna */ }
 
     return ok(c, { ok: true, returned_items: rows.length });
   } catch (err: any) { return fail(c, err.message, 500); }
@@ -618,7 +629,8 @@ routing.post('/order/:orderId/deliver', async (c) => {
     const tenantId = c.get('tenantId');
     const { orderId } = c.req.param();
     const b = await c.req.json().catch(() => ({}));
-    const paymentMethod = b.payment_method ?? 'cash';
+    const mixedPayments = Array.isArray(b.payments) && b.payments.length > 1 ? b.payments : null;
+    const paymentMethod = mixedPayments ? 'mixed' : (b.payment_method ?? 'cash');
 
     // Cargar el pedido + items + datos de la ruta.
     const { data: order } = await db.from('route_orders')
@@ -650,6 +662,7 @@ routing.post('/order/:orderId/deliver', async (c) => {
         tax_amount: 0,
         total,
         payment_method: paymentMethod,
+        payments: mixedPayments,
         customer_name: (order as any).customer_name ?? null,
         document_type: 'ticket',
         issued_at: b.issued_at ?? new Date().toISOString(),
@@ -797,18 +810,16 @@ routing.get('/:id/close-summary', async (c) => {
     const { id } = c.req.param();
 
     const { data: route } = await db.from('routes')
-      .select('id, route_date, close_summary, warehouse:warehouses!routes_warehouse_id_fkey(name)')
+      .select('id, route_date, close_summary, loaded_summary, warehouse:warehouses!routes_warehouse_id_fkey(name)')
       .eq('id', id).eq('tenant_id', tenantId).maybeSingle();
     if (!route) return fail(c, 'Ruta no encontrada', 404);
 
     const truck = (route as any).warehouse?.name;
-    if ((route as any).close_summary) {
-      return ok(c, { ...(route as any).close_summary, truck, route_date: (route as any).route_date });
-    }
+    const stored = (route as any).close_summary;
 
-    // Fallback: recomputar ventas por método desde las facturas.
+    // Recomputar ventas por método desde las facturas (siempre disponibles).
     const { data: invs } = await db.from('invoices')
-      .select('total, status, payment_method').eq('tenant_id', tenantId).eq('route_id', id);
+      .select('id, total, status, payment_method').eq('tenant_id', tenantId).eq('route_id', id);
     const sales = (invs ?? []).filter((i: any) => i.status !== 'cancelled');
     const voids = (invs ?? []).filter((i: any) => i.status === 'cancelled');
     const byMethod = { cash: 0, card: 0, sinpe: 0, credit: 0 };
@@ -817,11 +828,41 @@ routing.get('/:id/close-summary', async (c) => {
       if (m === 'card' || m === 'sinpe' || m === 'credit') byMethod[m] += Number(i.total ?? 0);
       else byMethod.cash += Number(i.total ?? 0);
     }
+
+    // Sobrante: 1) el guardado en close_summary; si no, 2) reconstruir cargado − vendido.
+    let returned: Array<{ name: string; quantity: number }> = stored?.returned ?? [];
+    if (returned.length === 0) {
+      const loaded: Record<string, number> = (route as any).loaded_summary ?? {};
+      if (Object.keys(loaded).length > 0) {
+        // Vendido por producto (facturas no anuladas de la ruta).
+        const saleIds = sales.map((i: any) => i.id);
+        const sold: Record<string, number> = {};
+        if (saleIds.length > 0) {
+          const { data: lines } = await db.from('invoice_items')
+            .select('product_id, quantity, invoice_id').in('invoice_id', saleIds);
+          for (const l of (lines ?? []) as any[]) sold[l.product_id] = Number(sold[l.product_id] ?? 0) + Number(l.quantity);
+        }
+        const leftoverIds = Object.keys(loaded).filter(pid => Number(loaded[pid]) - Number(sold[pid] ?? 0) > 0.0001);
+        const nameMap = new Map<string, string>();
+        if (leftoverIds.length > 0) {
+          const { data: prods } = await db.from('products').select('id, name').in('id', leftoverIds);
+          for (const p of prods ?? []) nameMap.set((p as any).id, (p as any).name);
+        }
+        returned = leftoverIds.map(pid => ({
+          name: nameMap.get(pid) ?? 'Producto',
+          quantity: Math.round((Number(loaded[pid]) - Number(sold[pid] ?? 0)) * 1000) / 1000,
+        }));
+      }
+    }
+
     return ok(c, {
       route_id: id, truck, route_date: (route as any).route_date,
-      sales_count: sales.length,
-      sales_total: sales.reduce((s: number, i: any) => s + Number(i.total ?? 0), 0),
-      voids_count: voids.length, returned_items: 0, returned: [], by_method: byMethod,
+      sales_count: stored?.sales_count ?? sales.length,
+      sales_total: stored?.sales_total ?? sales.reduce((s: number, i: any) => s + Number(i.total ?? 0), 0),
+      voids_count: stored?.voids_count ?? voids.length,
+      returned_items: returned.length,
+      returned,
+      by_method: stored?.by_method ?? byMethod,
     });
   } catch (err: any) { return fail(c, err.message, 500); }
 });

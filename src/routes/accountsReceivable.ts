@@ -2,8 +2,15 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
+import { getUserZone } from '../utils/userZone.js';
 
 const accountsReceivable = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
+
+/** Mapa customer_id → zona, para filtrar/etiquetar CxC por zona. */
+async function customerZoneMap(tenantId: string): Promise<Map<string, string | null>> {
+  const { data } = await db.from('customers').select('id, zone').eq('tenant_id', tenantId);
+  return new Map((data ?? []).map((c: any) => [c.id, c.zone ?? null]));
+}
 
 const ARSchema = z.object({
   customer_id:    z.string().uuid().optional().nullable(),
@@ -62,6 +69,13 @@ accountsReceivable.get('/', async (c) => {
     if (error) throw new Error(error.message);
     let rows = (data ?? []).map(withDerivedStatus);
     if (status) rows = rows.filter((r: any) => r.status === status);
+
+    // Zona: restricción por usuario (repartidor) o filtro por query. Etiqueta cada CxC.
+    const zmap = await customerZoneMap(tenantId);
+    rows = rows.map((r: any) => ({ ...r, zone: r.customer_id ? (zmap.get(r.customer_id) ?? null) : null }));
+    const filterZone = (await getUserZone(c.get('userId'))) ?? c.req.query('zone') ?? null;
+    if (filterZone) rows = rows.filter((r: any) => r.zone === filterZone);
+
     return ok(c, rows);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
@@ -72,16 +86,23 @@ accountsReceivable.get('/summary', async (c) => {
     const tenantId = c.get('tenantId');
     const { data } = await db.from('accounts_receivable').select('*')
       .eq('tenant_id', tenantId);
-    const rows = (data ?? []).map(withDerivedStatus);
+    let rows = (data ?? []).map(withDerivedStatus);
+
+    // Zona por cliente + restricción/filtro.
+    const zmap = await customerZoneMap(tenantId);
+    rows = rows.map((r: any) => ({ ...r, zone: r.customer_id ? (zmap.get(r.customer_id) ?? null) : null }));
+    const filterZone = (await getUserZone(c.get('userId'))) ?? c.req.query('zone') ?? null;
+    if (filterZone) rows = rows.filter((r: any) => r.zone === filterZone);
+
     const outstanding = rows.reduce((s: number, r: any) => s + (Number(r.total_amount) - Number(r.paid_amount)), 0);
     const overdue = rows.filter((r: any) => r.status === 'overdue');
     const overdueAmount = overdue.reduce((s: number, r: any) => s + (Number(r.total_amount) - Number(r.paid_amount)), 0);
-    const byCustomer: Record<string, { customer_id: string | null; customer_name: string; balance: number; count: number }> = {};
+    const byCustomer: Record<string, { customer_id: string | null; customer_name: string; zone: string | null; balance: number; count: number }> = {};
     for (const r of rows) {
       const bal = Number(r.total_amount) - Number(r.paid_amount);
       if (bal <= 0) continue;
       const key = r.customer_id ?? r.customer_name ?? 'sin';
-      if (!byCustomer[key]) byCustomer[key] = { customer_id: r.customer_id ?? null, customer_name: r.customer_name ?? 'Sin cliente', balance: 0, count: 0 };
+      if (!byCustomer[key]) byCustomer[key] = { customer_id: r.customer_id ?? null, customer_name: r.customer_name ?? 'Sin cliente', zone: r.zone ?? null, balance: 0, count: 0 };
       byCustomer[key].balance += bal;
       byCustomer[key].count += 1;
     }
