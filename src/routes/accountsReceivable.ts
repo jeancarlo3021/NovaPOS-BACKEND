@@ -174,6 +174,7 @@ accountsReceivable.post('/:id/pay', async (c) => {
 
     await db.from('accounts_receivable_payments').insert({
       tenant_id: tenantId, receivable_id: id, amount, method: method ?? 'cash', note: note ?? null,
+      user_id: c.get('userId') ?? null,   // quién cobró el abono (repartidor)
     });
     const { data, error } = await db.from('accounts_receivable')
       .update({ paid_amount: newPaid, status, updated_at: new Date().toISOString() })

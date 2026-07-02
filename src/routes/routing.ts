@@ -744,7 +744,7 @@ routing.post('/:id/close', async (c) => {
     const { id } = c.req.param();
 
     const { data: route } = await db.from('routes')
-      .select('id, warehouse_id, status, route_date').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+      .select('id, warehouse_id, status, route_date, driver_id').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
     if (!route) return fail(c, 'Ruta no encontrada', 404);
     if ((route as any).status === 'closed') return fail(c, 'La ruta ya está cerrada', 409);
 
@@ -798,6 +798,40 @@ routing.post('/:id/close', async (c) => {
     }
 
     returnedDetail.sort((a, b) => a.name.localeCompare(b.name, 'es'));
+
+    // 2b) Abonos de CxC cobrados por el repartidor ese día (efectivo/tarjeta/SINPE
+    //     por aparte + detalle de quién abonó) y gastos del día del repartidor.
+    const driverId = (route as any).driver_id ?? null;
+    const routeDate = (route as any).route_date;
+    const dayFrom = `${routeDate}T00:00:00`;
+    const dayTo   = `${routeDate}T23:59:59.999`;
+    const abonos = { cash: 0, card: 0, sinpe: 0, total: 0 };
+    const abonosList: Array<{ customer: string; amount: number; method: string }> = [];
+    const gastosList: Array<{ description: string; amount: number; payment_method?: string }> = [];
+    let gastosTotal = 0;
+    if (driverId) {
+      const { data: pays } = await db.from('accounts_receivable_payments')
+        .select('amount, method, receivable:accounts_receivable(customer_name, invoice_number)')
+        .eq('tenant_id', tenantId).eq('user_id', driverId)
+        .gte('created_at', dayFrom).lte('created_at', dayTo);
+      for (const p of (pays ?? []) as any[]) {
+        const m = (p.method ?? 'cash') as 'cash' | 'card' | 'sinpe';
+        const amt = Number(p.amount ?? 0);
+        if (m === 'card' || m === 'sinpe') abonos[m] += amt; else abonos.cash += amt;
+        abonos.total += amt;
+        abonosList.push({ customer: p.receivable?.customer_name ?? p.receivable?.invoice_number ?? 'Cliente', amount: amt, method: m });
+      }
+
+      const { data: exps } = await db.from('expenses')
+        .select('amount, description, payment_method')
+        .eq('tenant_id', tenantId).eq('user_id', driverId).eq('date', routeDate);
+      for (const g of (exps ?? []) as any[]) {
+        const amt = Number(g.amount ?? 0);
+        gastosTotal += amt;
+        gastosList.push({ description: g.description ?? 'Gasto', amount: amt, payment_method: g.payment_method ?? undefined });
+      }
+    }
+
     const summary = {
       route_id: id,
       sales_count: sales.length,
@@ -806,6 +840,9 @@ routing.post('/:id/close', async (c) => {
       returned_items: returnedItems.length,
       returned: returnedDetail,
       by_method: byMethod,
+      // Abonos de CxC del día (repartidor) y gastos del día.
+      ar_payments: { by_method: { cash: abonos.cash, card: abonos.card, sinpe: abonos.sinpe }, total: abonos.total, list: abonosList },
+      expenses: { total: gastosTotal, list: gastosList },
     };
 
     // 3) Cerrar la ruta y GUARDAR el resumen para poder reimprimirlo luego.
@@ -883,6 +920,9 @@ routing.get('/:id/close-summary', async (c) => {
       returned_items: returned.length,
       returned,
       by_method: stored?.by_method ?? byMethod,
+      // Abonos de CxC y gastos del día (del resumen guardado al cerrar).
+      ar_payments: stored?.ar_payments,
+      expenses: stored?.expenses,
     });
   } catch (err: any) { return fail(c, err.message, 500); }
 });

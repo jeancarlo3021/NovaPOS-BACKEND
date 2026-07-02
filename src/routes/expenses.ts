@@ -9,6 +9,7 @@ const ExpenseSchema = z.object({
   description: z.string().min(1),
   amount: z.number().positive(),
   category: z.string().optional().nullable(),
+  category_id: z.string().uuid().optional().nullable(),   // categoría (FK) — requerida por la BD
   date: z.string().optional(),
   payment_method: z.string().optional().nullable(),
   reference: z.string().optional().nullable(),
@@ -51,7 +52,7 @@ expenses.post('/', async (c) => {
 
     const { data, error } = await db
       .from('expenses')
-      .insert({ ...parsed.data, tenant_id: tenantId })
+      .insert({ ...parsed.data, tenant_id: tenantId, user_id: c.get('userId') ?? null })
       .select()
       .single();
 
