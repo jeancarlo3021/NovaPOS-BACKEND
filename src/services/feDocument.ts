@@ -195,7 +195,8 @@ export function buildDocumentoJson(
       ? {
           Nombre: receptor.name ?? 'Cliente',
           Identificacion: { Tipo: receptor.identification_type ?? '01', Numero: receptor.identification },
-          ...(receptor.email ? { CorreoElectronico: [receptor.email] } : {}),
+          // OJO: en el Receptor, CorreoElectronico es STRING (no array como el Emisor).
+          ...(receptor.email ? { CorreoElectronico: receptor.email } : {}),
         }
       : { Nombre: receptor?.name || 'Cliente General', NombreComercial: 'Cliente General' },
     CondicionVenta: condicionVenta,

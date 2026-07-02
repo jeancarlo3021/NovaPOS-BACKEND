@@ -564,6 +564,101 @@ admin.delete('/payment-receipts/:id', async (c) => {
 // El admin gestiona settings de sucursales que pueden NO ser su propio
 // tenant. Usa service-role (db) y no filtra por tenant del JWT.
 
+// ── Configuración GLOBAL de FE (cédula del proveedor de sistemas) ────────────
+admin.get('/global-fe', async (c) => {
+  try {
+    const { data } = await db.from('app_config').select('value').eq('key', 'fe').maybeSingle();
+    return ok(c, (data as any)?.value ?? {});
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+admin.put('/global-fe', async (c) => {
+  try {
+    const body = await c.req.json();
+    const value = { proveedor_sistemas: String(body?.proveedor_sistemas ?? '').replace(/\D/g, '') };
+    await db.from('app_config').upsert(
+      { key: 'fe', value, updated_at: new Date().toISOString() },
+      { onConflict: 'key' });
+    return ok(c, value);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// ── Planes de Facturación Electrónica (tabla fe_plans) ───────────────────────
+const feOut = (r: any) => ({
+  id: r.id, name: r.name, description: r.description ?? '',
+  price: Number(r.price ?? 0),
+  docsPerMonth: r.docs_per_month == null ? null : Number(r.docs_per_month),
+  extraDocPrice: Number(r.extra_doc_price ?? 0),
+  features: Array.isArray(r.features) ? r.features : [],
+  is_active: r.is_active !== false,
+});
+const feIn = (p: any) => ({
+  id: p.id, name: p.name ?? '', description: p.description ?? '',
+  price: Number(p.price ?? 0),
+  docs_per_month: p.docsPerMonth == null || p.docsPerMonth === '' ? null : Number(p.docsPerMonth),
+  extra_doc_price: Number(p.extraDocPrice ?? 0),
+  features: Array.isArray(p.features) ? p.features : [],
+  is_active: p.is_active !== false,
+  updated_at: new Date().toISOString(),
+});
+
+admin.get('/fe-plans', async (c) => {
+  try {
+    const { data, error } = await db.from('fe_plan_catalog').select('*').order('price', { ascending: true });
+    if (error) throw new Error(error.message);
+    return ok(c, (data ?? []).map(feOut));
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+admin.put('/fe-plans', async (c) => {
+  try {
+    const body = await c.req.json();
+    const plans: any[] = Array.isArray(body?.plans) ? body.plans : (Array.isArray(body) ? body : []);
+    // Borrar los que ya no están, y upsertar el resto.
+    const { data: existing } = await db.from('fe_plan_catalog').select('id');
+    const keep = new Set(plans.map(p => p.id));
+    for (const row of (existing ?? []) as any[]) {
+      if (!keep.has(row.id)) await db.from('fe_plan_catalog').delete().eq('id', row.id);
+    }
+    for (const p of plans) {
+      const { error } = await db.from('fe_plan_catalog').upsert(feIn(p), { onConflict: 'id' });
+      if (error) throw new Error(error.message);
+    }
+    return ok(c, plans);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// PUT /tenants/:id/fe-plan — asigna (o quita) un plan FE al negocio. Copia la
+// cuota del catálogo a la config FE del tenant. fe_plan_id vacío = sin FE.
+admin.put('/tenants/:id/fe-plan', async (c) => {
+  try {
+    const { id } = c.req.param();
+    const { fe_plan_id } = await c.req.json().catch(() => ({}));
+
+    const { data: prev } = await db.from('settings').select('config')
+      .eq('tenant_id', id).eq('type', 'electronic-invoice').maybeSingle();
+    const cfg: any = { ...((prev?.config as any) ?? {}) };
+
+    if (!fe_plan_id) {
+      // Quitar el plan FE (deja la config pero sin plan ni cuota).
+      cfg.fe_plan_id = null;
+    } else {
+      const { data: plan } = await db.from('fe_plan_catalog').select('*').eq('id', fe_plan_id).maybeSingle();
+      if (!plan) return fail(c, 'Plan FE no encontrado', 404);
+      cfg.fe_plan_id = (plan as any).id;
+      cfg.fe_included_docs = (plan as any).docs_per_month == null ? 0 : Number((plan as any).docs_per_month);
+      cfg.fe_included_nc = cfg.fe_included_nc ?? 0;
+      cfg.fe_extra_fee = Number((plan as any).extra_doc_price ?? 0);
+      cfg.enabled = true;
+    }
+
+    await db.from('settings').upsert(
+      { tenant_id: id, type: 'electronic-invoice', config: cfg, updated_at: new Date().toISOString() },
+      { onConflict: 'tenant_id,type' });
+    return ok(c, { ok: true, fe_plan_id: cfg.fe_plan_id ?? null });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 admin.get('/tenants/:id/fe-config', async (c) => {
   try {
     const { id } = c.req.param();

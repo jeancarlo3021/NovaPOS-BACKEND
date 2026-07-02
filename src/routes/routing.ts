@@ -545,7 +545,7 @@ routing.get('/:id/sales', async (c) => {
     const tenantId = c.get('tenantId');
     const { id } = c.req.param();
     const { data: invs } = await db.from('invoices')
-      .select('id, invoice_number, total, status, payment_method, customer_name, issued_at, items:invoice_items(product_id, quantity, unit_price)')
+      .select('id, invoice_number, total, status, payment_method, customer_name, issued_at, fe_clave, fe_nc_clave, items:invoice_items(product_id, quantity, unit_price)')
       .eq('tenant_id', tenantId).eq('route_id', id).order('issued_at', { ascending: false });
     const pids = [...new Set((invs ?? []).flatMap((i: any) => (i.items ?? []).map((it: any) => it.product_id)))];
     const nameMap = new Map<string, string>();
@@ -674,7 +674,7 @@ routing.post('/order/:orderId/deliver', async (c) => {
         payment_method: paymentMethod,
         payments: mixedPayments,
         customer_name: (order as any).customer_name ?? null,
-        document_type: 'ticket',
+        document_type: b.document_type ?? 'ticket',
         issued_at: b.issued_at ?? new Date().toISOString(),
       }).select().single();
       if (!res.error) { inv = res.data; break; }
