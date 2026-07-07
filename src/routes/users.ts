@@ -33,6 +33,7 @@ const UpdateUserSchema = z.object({
   ]).optional(),
   phone: z.string().optional().nullable(),
   zone: z.string().optional().nullable(),
+  ticket_alias: z.string().max(60).optional().nullable(),
 });
 
 const ResetPasswordSchema = z.object({
@@ -61,7 +62,7 @@ users.get('/', async (c) => {
 
     const { data, error } = await db
       .from('users')
-      .select('id, full_name, email, role, phone, zone, tenant_id, created_at, last_login_at')
+      .select('id, full_name, email, role, phone, zone, ticket_alias, tenant_id, created_at, last_login_at')
       .in('tenant_id', tenantIds)
       .order('full_name');
 
@@ -268,6 +269,7 @@ users.put('/:id', async (c) => {
     if (parsed.data.role !== undefined) updateData.role = parsed.data.role;
     if (parsed.data.phone !== undefined) updateData.phone = parsed.data.phone;
     if (parsed.data.zone !== undefined) updateData.zone = parsed.data.zone;
+    if (parsed.data.ticket_alias !== undefined) updateData.ticket_alias = parsed.data.ticket_alias || null;
 
     const { data: updated, error } = await db
       .from('users')
@@ -443,7 +445,7 @@ users.post('/pin-login', async (c) => {
       return fail(c, 'PIN inválido', 400);
     }
     const { data, error } = await db.from('users')
-      .select('id, full_name, role, email')
+      .select('id, full_name, role, email, ticket_alias')
       .eq('tenant_id', tenantId)
       .eq('pos_pin', pin)
       .maybeSingle();

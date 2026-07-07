@@ -16,37 +16,44 @@ async function loadFEConfig(tenantId: string): Promise<any> {
 }
 
 /**
- * Cuota de comprobantes del plan FE (acumulable). Cada mes se otorga la cantidad
- * incluida; lo NO usado se acumula. Al superar la cuota, cada comprobante extra
- * tiene un cobro por unidad (fe_extra_fee).
+ * Cuota de comprobantes del plan FE como BOLSA (bucket) prepagada. Se otorga una
+ * cantidad fija (fe_included_docs, ej. 300) que se gasta hasta agotarse — puede
+ * durar meses o un año. NO se acumula por mes. Cuando el cliente paga, se renueva
+ * (POST /admin/tenants/:id/fe-renew reinicia fe_quota_start a hoy → bolsa nueva).
+ * Umbrales de aviso: quedan 50, 20 y 10 comprobantes.
  */
 async function computeFeQuota(tenantId: string) {
   const cfg = await loadFEConfig(tenantId);
   // Un solo contador: facturas, tiquetes Y notas de crédito cuentan juntos.
-  const included = Number(cfg.fe_included_docs ?? 0);       // comprobantes / mes (0 = ilimitado)
+  const included = Number(cfg.fe_included_docs ?? 0);       // comprobantes por bolsa (0 = ilimitado)
   const extraFee = Number(cfg.fe_extra_fee ?? 0);           // ₡ por comprobante extra
 
-  // Meses transcurridos desde el inicio de la suscripción (para acumular).
-  const { data: t } = await db.from('tenants')
-    .select('created_at, subscription:subscriptions!tenants_subscription_id_fkey(started_at)')
-    .eq('id', tenantId).maybeSingle();
-  const startISO = (t as any)?.subscription?.started_at ?? (t as any)?.created_at ?? new Date().toISOString();
-  const now = new Date(); const start = new Date(startISO);
-  const monthsElapsed = Math.max(1, (now.getFullYear() - start.getFullYear()) * 12 + (now.getMonth() - start.getMonth()) + 1);
+  // Inicio de la bolsa vigente: fe_quota_start (se reinicia al renovar/pagar);
+  // si no existe, cae al inicio de la suscripción o creación del tenant.
+  let startISO: string = cfg.fe_quota_start ?? '';
+  if (!startISO) {
+    const { data: t } = await db.from('tenants')
+      .select('created_at, subscription:subscriptions!tenants_subscription_id_fkey(started_at)')
+      .eq('id', tenantId).maybeSingle();
+    startISO = (t as any)?.subscription?.started_at ?? (t as any)?.created_at ?? new Date().toISOString();
+  }
 
+  // Comprobantes emitidos DESDE el inicio de la bolsa vigente.
   const { count: usedDocs } = await db.from('invoices')
-    .select('id', { count: 'exact', head: true }).eq('tenant_id', tenantId).not('fe_clave', 'is', null);
+    .select('id', { count: 'exact', head: true }).eq('tenant_id', tenantId)
+    .not('fe_clave', 'is', null).gte('created_at', startISO);
   const { count: usedNc } = await db.from('invoices')
-    .select('id', { count: 'exact', head: true }).eq('tenant_id', tenantId).not('fe_nc_clave', 'is', null);
+    .select('id', { count: 'exact', head: true }).eq('tenant_id', tenantId)
+    .not('fe_nc_clave', 'is', null).gte('created_at', startISO);
 
   const used = (usedDocs ?? 0) + (usedNc ?? 0);             // facturas + tiquetes + NC
-  const grant = included > 0 ? included * monthsElapsed : 0;
-  const overage = included > 0 ? Math.max(0, used - grant) : 0;
+  const available = included > 0 ? included - used : null;  // null = ilimitado
+  const overage = included > 0 ? Math.max(0, used - included) : 0;
 
   return {
-    included, extra_fee: extraFee, months_elapsed: monthsElapsed,
+    included, extra_fee: extraFee, quota_start: startISO, months_elapsed: 1,
     used, used_docs: usedDocs ?? 0, used_nc: usedNc ?? 0,
-    available: included > 0 ? grant - used : null,          // null = ilimitado
+    available,
     overage,
     extra_charge: extraFee * overage,
   };

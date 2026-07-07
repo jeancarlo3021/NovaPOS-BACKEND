@@ -151,12 +151,13 @@ reports.get('/cash-sessions', async (c) => {
     // Resolver el vendedor (dueño) de cada sesión.
     const userIds = [...new Set((sessions ?? []).map((s: any) => s.user_id).filter(Boolean))] as string[];
     const { data: users } = userIds.length > 0
-      ? await db.from('users').select('id, full_name, email').in('id', userIds)
+      ? await db.from('users').select('id, full_name, email, ticket_alias').in('id', userIds)
       : { data: [] as any[] };
     const nameOf = (uid: string | null): string => {
       if (!uid) return 'Sin vendedor';
       const u = (users ?? []).find((x: any) => x.id === uid);
-      return (u?.full_name) || (u?.email ? String(u.email).split('@')[0] : '') || 'Vendedor';
+      // El alias de ticket (control interno) tiene prioridad sobre el nombre real.
+      return (u?.ticket_alias) || (u?.full_name) || (u?.email ? String(u.email).split('@')[0] : '') || 'Vendedor';
     };
 
     const enriched = (sessions ?? []).map((s: any) => {
@@ -232,7 +233,7 @@ reports.get('/sellers', async (c) => {
 
     const allUids = [...new Set((invoices ?? []).map(uidForInvoice).filter(Boolean))] as string[];
     const { data: users } = allUids.length > 0
-      ? await db.from('users').select('id, email, full_name').in('id', allUids)
+      ? await db.from('users').select('id, email, full_name, ticket_alias').in('id', allUids)
       : { data: [] as any[] };
 
     const sellerMap: Record<string, { totalRevenue: number; totalInvoices: number; name?: string }> = {};
@@ -249,7 +250,7 @@ reports.get('/sellers', async (c) => {
       const emailName = user?.email ? String(user.email).split('@')[0] : '';
       return {
         userId: uid,
-        name: (user as any)?.full_name || stats.name || emailName || 'Vendedor',
+        name: (user as any)?.ticket_alias || (user as any)?.full_name || stats.name || emailName || 'Vendedor',
         email: user?.email ?? '',
         totalRevenue: stats.totalRevenue,
         totalInvoices: stats.totalInvoices,

@@ -695,4 +695,21 @@ admin.put('/tenants/:id/fe-config', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+// POST /tenants/:id/fe-renew — renovar la bolsa de comprobantes FE (cuando el
+// cliente paga). Reinicia fe_quota_start a HOY → el contador vuelve a 0 y el
+// tenant recupera la cantidad incluida completa.
+admin.post('/tenants/:id/fe-renew', async (c) => {
+  try {
+    const { id } = c.req.param();
+    const { data: row } = await db.from('settings')
+      .select('config').eq('tenant_id', id).eq('type', 'electronic-invoice').maybeSingle();
+    const cfg = { ...((row as any)?.config ?? {}), fe_quota_start: new Date().toISOString() };
+    await db.from('settings').upsert({
+      tenant_id: id, type: 'electronic-invoice', config: cfg,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'tenant_id,type' });
+    return ok(c, { ok: true, fe_quota_start: cfg.fe_quota_start });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 export default admin;

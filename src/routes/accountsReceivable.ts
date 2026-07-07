@@ -68,6 +68,14 @@ accountsReceivable.get('/', async (c) => {
     const { data, error } = await query;
     if (error) throw new Error(error.message);
     let rows = (data ?? []).map(withDerivedStatus);
+    // Backfill del nº de factura para las cuentas que solo tienen invoice_id.
+    const needInv = rows.filter((r: any) => !r.invoice_number && r.invoice_id).map((r: any) => r.invoice_id);
+    if (needInv.length > 0) {
+      const { data: invs } = await db.from('invoices').select('id, invoice_number').in('id', needInv);
+      const map = new Map((invs ?? []).map((i: any) => [i.id, i.invoice_number]));
+      rows = rows.map((r: any) => (!r.invoice_number && r.invoice_id && map.get(r.invoice_id))
+        ? { ...r, invoice_number: map.get(r.invoice_id) } : r);
+    }
     if (status) rows = rows.filter((r: any) => r.status === status);
 
     // Zona: restricción por usuario (repartidor) o filtro por query. Etiqueta cada CxC.
@@ -123,9 +131,15 @@ accountsReceivable.get('/:id', async (c) => {
       .eq('id', id).eq('tenant_id', tenantId).maybeSingle();
     if (error) throw new Error(error.message);
     if (!data) return fail(c, 'Cuenta por cobrar no encontrada', 404);
+    // Si no guardó el nº de factura pero tiene invoice_id, lo traemos de la factura.
+    let row: any = data;
+    if (!row.invoice_number && row.invoice_id) {
+      const { data: inv } = await db.from('invoices').select('invoice_number').eq('id', row.invoice_id).maybeSingle();
+      if ((inv as any)?.invoice_number) row = { ...row, invoice_number: (inv as any).invoice_number };
+    }
     const { data: payments } = await db.from('accounts_receivable_payments')
       .select('*').eq('receivable_id', id).order('created_at', { ascending: false });
-    return ok(c, { ...withDerivedStatus(data), payments: payments ?? [] });
+    return ok(c, { ...withDerivedStatus(row), payments: payments ?? [] });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

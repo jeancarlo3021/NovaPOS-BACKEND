@@ -44,8 +44,8 @@ routing.get('/report', async (c) => {
     const driverIds = [...new Set((routes ?? []).map((r: any) => r.driver_id).filter(Boolean))] as string[];
     const driverName = new Map<string, string>();
     if (driverIds.length > 0) {
-      const { data: us } = await db.from('users').select('id, full_name, email').in('id', driverIds);
-      for (const u of us ?? []) driverName.set((u as any).id, (u as any).full_name || (u as any).email);
+      const { data: us } = await db.from('users').select('id, full_name, email, ticket_alias').in('id', driverIds);
+      for (const u of us ?? []) driverName.set((u as any).id, (u as any).ticket_alias || (u as any).full_name || (u as any).email);
     }
 
     const routeRows = (routes ?? []).map((r: any) => ({
@@ -822,9 +822,14 @@ routing.post('/:id/close', async (c) => {
         abonosList.push({ customer: p.receivable?.customer_name ?? p.receivable?.invoice_number ?? 'Cliente', amount: amt, method: m });
       }
 
+      // Gastos del repartidor en el día de la ruta. Mismo criterio que los abonos
+      // (rango de created_at), NO por el campo `date` exacto: ese `date` lo manda
+      // el front como fecha UTC (toISOString) y se corre un día si el gasto se
+      // registra después de las 6pm de Costa Rica, dejando gastos fuera del cierre.
       const { data: exps } = await db.from('expenses')
         .select('amount, description, payment_method')
-        .eq('tenant_id', tenantId).eq('user_id', driverId).eq('date', routeDate);
+        .eq('tenant_id', tenantId).eq('user_id', driverId)
+        .gte('created_at', dayFrom).lte('created_at', dayTo);
       for (const g of (exps ?? []) as any[]) {
         const amt = Number(g.amount ?? 0);
         gastosTotal += amt;

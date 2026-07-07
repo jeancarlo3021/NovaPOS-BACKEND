@@ -8,8 +8,10 @@ const promotions = new Hono<{ Variables: { userId: string; tenantId: string; rol
 const PromotionSchema = z.object({
   name: z.string().min(1),
   description: z.string().optional().nullable(),
-  type: z.enum(['percentage', 'fixed', 'bogo', 'bundle']).optional().default('percentage'),
+  type: z.enum(['percentage', 'fixed', 'bogo', 'bundle', '2x1', 'combo']).optional().default('percentage'),
   value: z.number().nonnegative(),
+  // Combo/bundle: 'price' = precio fijo del combo · 'percent' = % de descuento sobre el combo.
+  combo_mode: z.enum(['price', 'percent']).optional().nullable(),
   min_purchase: z.number().nonnegative().optional().nullable(),
   applies_to: z.enum(['all', 'category', 'products']).optional().default('all'),
   category_id: z.string().uuid().optional().nullable(),
@@ -78,6 +80,7 @@ promotions.post('/', async (c) => {
       description: parsed.data.description || null,
       type: parsed.data.type || 'percentage',
       value: parsed.data.value,
+      combo_mode: parsed.data.combo_mode ?? null,
       min_purchase: parsed.data.min_purchase || null,
       applies_to: parsed.data.applies_to || 'all',
       category_id: parsed.data.category_id || null,
