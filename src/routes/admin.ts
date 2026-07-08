@@ -712,4 +712,170 @@ admin.post('/tenants/:id/fe-renew', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+// ── Usuarios por empresa (super-admin) ─────────────────────────────────────────
+const VALID_ROLES = [
+  'admin', 'gerente', 'asistente_1', 'asistente_2', 'asistente_3',
+  'cocinero', 'mesero', 'cajero', 'almacenero', 'contador', 'repartidor',
+] as const;
+
+// GET /tenants/:id/users — lista de usuarios de una empresa.
+admin.get('/tenants/:id/users', async (c) => {
+  try {
+    const { id } = c.req.param();
+    const { data, error } = await db.from('users')
+      .select('id, full_name, email, role, phone, ticket_alias, created_at')
+      .eq('tenant_id', id)
+      .order('full_name');
+    if (error) throw new Error(error.message);
+    return ok(c, data ?? []);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// POST /tenants/:id/users — crear un usuario en una empresa (bypass de acceso: es super-admin).
+admin.post('/tenants/:id/users', async (c) => {
+  try {
+    const { id } = c.req.param();
+    const body = await c.req.json();
+    const email = String(body?.email ?? '').trim();
+    const password = String(body?.password ?? '');
+    const full_name = String(body?.full_name ?? '').trim();
+    const role = String(body?.role ?? 'cajero');
+    const phone = body?.phone ? String(body.phone) : null;
+    const ticket_alias = body?.ticket_alias ? String(body.ticket_alias).slice(0, 60) : null;
+    if (!email || !full_name) return fail(c, 'Faltan email/usuario o nombre', 422);
+    if (password.length < 6) return fail(c, 'La contraseña debe tener al menos 6 caracteres', 422);
+    if (!(VALID_ROLES as readonly string[]).includes(role)) return fail(c, 'Rol inválido', 422);
+
+    const emailLc = email.toLowerCase();
+    const { data: dup } = await db.from('users').select('id').ilike('email', emailLc).maybeSingle();
+    if (dup) {
+      const display = emailLc.endsWith('@nexoerp.local') ? emailLc.replace('@nexoerp.local', '') : emailLc;
+      return fail(c, `Ya existe un usuario con el nombre "${display}".`, 409);
+    }
+
+    const { data: authData, error: authError } = await db.auth.admin.createUser({
+      email, password, email_confirm: true,
+    });
+    if (authError) throw new Error(authError.message);
+    if (!authData.user) throw new Error('No se pudo crear el usuario');
+
+    const { data: userData, error: userError } = await db.from('users')
+      .insert({ id: authData.user.id, email, full_name, role, phone, ticket_alias, tenant_id: id })
+      .select('id, full_name, email, role, phone, ticket_alias, created_at')
+      .single();
+    if (userError) {
+      await db.auth.admin.deleteUser(authData.user.id);
+      throw new Error(userError.message);
+    }
+    await db.from('user_tenants').upsert({
+      user_id: authData.user.id, tenant_id: id, role: 'staff', is_default: true,
+    }, { onConflict: 'user_id,tenant_id' });
+
+    return ok(c, userData, 201);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// PATCH /tenants/:id/users/:uid — ajustar nombre/rol/alias de un usuario de la empresa.
+admin.patch('/tenants/:id/users/:uid', async (c) => {
+  try {
+    const { id, uid } = c.req.param();
+    const body = await c.req.json();
+    const patch: Record<string, any> = {};
+    if (body.full_name !== undefined) patch.full_name = String(body.full_name).trim();
+    if (body.role !== undefined) {
+      if (!(VALID_ROLES as readonly string[]).includes(String(body.role))) return fail(c, 'Rol inválido', 422);
+      patch.role = body.role;
+    }
+    if (body.phone !== undefined) patch.phone = body.phone || null;
+    if (body.ticket_alias !== undefined) patch.ticket_alias = body.ticket_alias ? String(body.ticket_alias).slice(0, 60) : null;
+    const { data, error } = await db.from('users')
+      .update(patch).eq('id', uid).eq('tenant_id', id)
+      .select('id, full_name, email, role, phone, ticket_alias, created_at').single();
+    if (error) throw new Error(error.message);
+    return ok(c, data);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// GET /fe-quotas — resumen de la bolsa de comprobantes FE por negocio (para el
+// panel admin). Devuelve { [tenantId]: { included, used, available, quota_start,
+// expires_at } }. Vencimiento = inicio de la bolsa + 1 año.
+admin.get('/fe-quotas', async (c) => {
+  try {
+    const { data: rows } = await db.from('settings')
+      .select('tenant_id, config').eq('type', 'electronic-invoice');
+    const YEAR_MS = 365 * 24 * 60 * 60 * 1000;
+    const result: Record<string, any> = {};
+    for (const r of (rows ?? []) as any[]) {
+      const cfg = r.config ?? {};
+      const included = Number(cfg.fe_included_docs ?? 0);
+      if (included <= 0) {
+        // FE activa pero sin límite de bolsa → ilimitado. Si ni siquiera está
+        // activa, no devolvemos nada (el panel muestra "Sin FE").
+        if (cfg.enabled) result[r.tenant_id] = { unlimited: true };
+        continue;
+      }
+      let start: string = cfg.fe_quota_start ?? '';
+      if (!start) {
+        const { data: t } = await db.from('tenants')
+          .select('created_at, subscription:subscriptions!tenants_subscription_id_fkey(started_at)')
+          .eq('id', r.tenant_id).maybeSingle();
+        start = (t as any)?.subscription?.started_at ?? (t as any)?.created_at ?? new Date().toISOString();
+      }
+      const [{ count: docs }, { count: ncs }] = await Promise.all([
+        db.from('invoices').select('id', { count: 'exact', head: true })
+          .eq('tenant_id', r.tenant_id).not('fe_clave', 'is', null).gte('created_at', start),
+        db.from('invoices').select('id', { count: 'exact', head: true })
+          .eq('tenant_id', r.tenant_id).not('fe_nc_clave', 'is', null).gte('created_at', start),
+      ]);
+      const used = (docs ?? 0) + (ncs ?? 0);
+      result[r.tenant_id] = {
+        included, used, available: included - used,
+        quota_start: start,
+        expires_at: new Date(new Date(start).getTime() + YEAR_MS).toISOString(),
+      };
+    }
+    return ok(c, result);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// ── Módulos personalizados por empresa (override sobre el plan base) ───────────
+// GET /tenants/:id/features → { base: plan.features, overrides: settings }.
+admin.get('/tenants/:id/features', async (c) => {
+  try {
+    const { id } = c.req.param();
+    // Features del plan vigente (base).
+    const { data: sub } = await db.from('subscriptions')
+      .select('plan_id')
+      .eq('tenant_id', id)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    let base: Record<string, any> = {};
+    if ((sub as any)?.plan_id) {
+      const { data: plan } = await db.from('subscription_plans')
+        .select('features').eq('id', (sub as any).plan_id).maybeSingle();
+      base = ((plan as any)?.features && typeof (plan as any).features === 'object') ? (plan as any).features : {};
+    }
+    // Overrides por tenant.
+    const { data: ovRow } = await db.from('settings')
+      .select('config').eq('tenant_id', id).eq('type', 'feature-overrides').maybeSingle();
+    const overrides = (ovRow as any)?.config ?? {};
+    return ok(c, { base, overrides });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// PUT /tenants/:id/feature-overrides → guarda los overrides (solo las diferencias).
+admin.put('/tenants/:id/feature-overrides', async (c) => {
+  try {
+    const { id } = c.req.param();
+    const body = await c.req.json();
+    const overrides = (body?.overrides && typeof body.overrides === 'object') ? body.overrides : {};
+    await db.from('settings').upsert({
+      tenant_id: id, type: 'feature-overrides', config: overrides,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'tenant_id,type' });
+    return ok(c, { ok: true, overrides });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 export default admin;
