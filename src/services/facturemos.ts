@@ -41,11 +41,32 @@ export class FacturemosError extends Error {
   constructor(message: string, status = 502) { super(message); this.status = status; }
 }
 
-function getApiKeyCliente(): string {
-  const key = process.env.FACTUREMOS_API_KEY_CLIENTE;
+/** Error de red al llamar a Facturemos. Expone la causa real (undici la pone en
+ *  `err.cause`: ENOTFOUND=DNS, ECONNREFUSED=puerto cerrado, ETIMEDOUT/UND_ERR_CONNECT_TIMEOUT=timeout,
+ *  CERT_*=TLS). Así "fetch failed" deja de ser opaco. */
+function connError(env: string, err: any): FacturemosError {
+  const cause = err?.cause;
+  const detail = cause?.code || cause?.message || err?.message || 'fetch failed';
+  return new FacturemosError(
+    `No se pudo conectar con Facturemos (ambiente "${env}", ${baseUrl(env)}): ${detail}. ` +
+    `Revisá conectividad de red/DNS/firewall del servidor hacia Facturemos.`,
+  );
+}
+
+// Clave MAESTRA del cliente, por ambiente. QA y producción de Facturemos usan
+// credenciales maestras distintas, así que se puede configurar una por ambiente:
+//   - producción: FACTUREMOS_API_KEY_CLIENTE_PRODUCTION (o la legacy FACTUREMOS_API_KEY_CLIENTE)
+//   - sandbox/QA: FACTUREMOS_API_KEY_CLIENTE_SANDBOX     (o la legacy)
+function getApiKeyCliente(env: Env): string {
+  const legacy = process.env.FACTUREMOS_API_KEY_CLIENTE;
+  const key = env === 'sandbox'
+    ? (process.env.FACTUREMOS_API_KEY_CLIENTE_SANDBOX || legacy)
+    : (process.env.FACTUREMOS_API_KEY_CLIENTE_PRODUCTION || legacy);
   if (!key) {
     throw new FacturemosError(
-      'Falta FACTUREMOS_API_KEY_CLIENTE en el servidor. Configurá la variable de entorno.',
+      `Falta la ApiKey maestra del servidor para ambiente "${env}". Configurá ` +
+      (env === 'sandbox' ? 'FACTUREMOS_API_KEY_CLIENTE_SANDBOX' : 'FACTUREMOS_API_KEY_CLIENTE_PRODUCTION') +
+      ' (o FACTUREMOS_API_KEY_CLIENTE).',
       500,
     );
   }
@@ -65,14 +86,16 @@ export async function obtenerToken(env: string = 'sandbox'): Promise<string> {
   const res = await fetch(`${baseUrl(e)}/api/Token/ObtenerToken`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ApiKeyCliente: getApiKeyCliente() }),
-  }).catch((err) => { throw new FacturemosError(`No se pudo conectar con Facturemos: ${err.message}`); });
+    body: JSON.stringify({ ApiKeyCliente: getApiKeyCliente(e) }),
+  }).catch((err) => { throw connError(env, err); });
 
   const body: any = await res.json().catch(() => ({}));
   // La API responde { Response, CurrentException, Status }. Status 0 = éxito.
   if (!res.ok || body?.Status === 1 || !body?.Response) {
     throw new FacturemosError(
-      body?.CurrentException || `Facturemos respondió ${res.status} al obtener token`,
+      `Facturemos rechazó la autenticación del servidor en ambiente "${e}". ` +
+      `Verificá la ApiKey maestra del ambiente y que el negocio esté en el ambiente correcto. ` +
+      `(${body?.CurrentException || `HTTP ${res.status}`})`,
       res.status === 409 ? 401 : 502,
     );
   }
@@ -96,7 +119,7 @@ export async function consultaEstatus(
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
     body: JSON.stringify({ ApiKeyEmisor: apiKeyEmisor, ClaveDocumento: claveDocumento }),
-  }).catch((err) => { throw new FacturemosError(`No se pudo conectar con Facturemos: ${err.message}`); });
+  }).catch((err) => { throw connError(env, err); });
 
   const body: any = await res.json().catch(() => ({}));
   if (!res.ok || body?.Status === 1) {
@@ -134,7 +157,7 @@ export async function enviaDocumentoConsecutivoJson(
       FacturaModel: { ApiKeyEmisor: apiKeyEmisor, Factura: facturaJson },
       ConsecutivoModel: consecutivo,
     }),
-  }).catch((err) => { throw new FacturemosError(`No se pudo conectar con Facturemos: ${err.message}`); });
+  }).catch((err) => { throw connError(env, err); });
 
   const body: any = await res.json().catch(() => ({}));
   if (!res.ok || body?.Status === 1) {

@@ -803,8 +803,12 @@ routing.post('/:id/close', async (c) => {
     //     por aparte + detalle de quién abonó) y gastos del día del repartidor.
     const driverId = (route as any).driver_id ?? null;
     const routeDate = (route as any).route_date;
-    const dayFrom = `${routeDate}T00:00:00`;
-    const dayTo   = `${routeDate}T23:59:59.999`;
+    // Ventana del cierre: desde la medianoche de Costa Rica (UTC-6) del día de la
+    // ruta hasta AHORA (el momento del cierre). Antes usaba el día en UTC, así que
+    // lo cobrado/gastado en la tarde-noche de CR (18:00–23:59 = 00:00–05:59 UTC del
+    // día siguiente) quedaba FUERA de la ventana → faltaban abonos/gastos.
+    const windowEnd   = new Date().toISOString();
+    const windowStart = `${routeDate}T06:00:00.000Z`; // 00:00 CR = 06:00 UTC
     const abonos = { cash: 0, card: 0, sinpe: 0, total: 0 };
     const abonosList: Array<{ customer: string; amount: number; method: string }> = [];
     const gastosList: Array<{ description: string; amount: number; payment_method?: string }> = [];
@@ -813,7 +817,7 @@ routing.post('/:id/close', async (c) => {
       const { data: pays } = await db.from('accounts_receivable_payments')
         .select('amount, method, receivable:accounts_receivable(customer_name, invoice_number)')
         .eq('tenant_id', tenantId).eq('user_id', driverId)
-        .gte('created_at', dayFrom).lte('created_at', dayTo);
+        .gte('created_at', windowStart).lte('created_at', windowEnd);
       for (const p of (pays ?? []) as any[]) {
         const m = (p.method ?? 'cash') as 'cash' | 'card' | 'sinpe';
         const amt = Number(p.amount ?? 0);
@@ -822,14 +826,11 @@ routing.post('/:id/close', async (c) => {
         abonosList.push({ customer: p.receivable?.customer_name ?? p.receivable?.invoice_number ?? 'Cliente', amount: amt, method: m });
       }
 
-      // Gastos del repartidor en el día de la ruta. Mismo criterio que los abonos
-      // (rango de created_at), NO por el campo `date` exacto: ese `date` lo manda
-      // el front como fecha UTC (toISOString) y se corre un día si el gasto se
-      // registra después de las 6pm de Costa Rica, dejando gastos fuera del cierre.
+      // Gastos del repartidor en la misma ventana (desde el cierre anterior).
       const { data: exps } = await db.from('expenses')
         .select('amount, description, payment_method')
         .eq('tenant_id', tenantId).eq('user_id', driverId)
-        .gte('created_at', dayFrom).lte('created_at', dayTo);
+        .gte('created_at', windowStart).lte('created_at', windowEnd);
       for (const g of (exps ?? []) as any[]) {
         const amt = Number(g.amount ?? 0);
         gastosTotal += amt;

@@ -12,7 +12,16 @@ const hacienda = new Hono<{ Variables: { userId: string; tenantId: string; role:
 async function loadFEConfig(tenantId: string): Promise<any> {
   const { data } = await db.from('settings').select('config')
     .eq('tenant_id', tenantId).eq('type', 'electronic-invoice').maybeSingle();
-  return (data as any)?.config ?? {};
+  const cfg = (data as any)?.config ?? {};
+  // ApiKey del emisor SEGÚN AMBIENTE: producción vs QA/sandbox. Se resuelve acá
+  // para que todos los handlers usen la llave correcta con `cfg.api_key_emisor`.
+  // Fallback a la llave única legacy si la del ambiente no está.
+  const env = cfg.environment === 'sandbox' ? 'sandbox' : 'production';
+  const byEnv = env === 'sandbox'
+    ? (cfg.api_key_emisor_sandbox || cfg.api_key_emisor)
+    : (cfg.api_key_emisor_production || cfg.api_key_emisor);
+  cfg.api_key_emisor = String(byEnv || '').trim();
+  return cfg;
 }
 
 /**
@@ -117,6 +126,9 @@ hacienda.get('/status/:clave', async (c) => {
 function friendlyFEError(raw: string): string {
   const m = String(raw || '');
   const l = m.toLowerCase();
+  // Los mensajes ya-claros de autenticación del SERVIDOR/ambiente (clave maestra)
+  // se dejan tal cual — no los pisamos con el genérico de "ApiKey del emisor".
+  if (/autenticaci[oó]n del servidor|apikey maestra|ambiente\b/i.test(l)) return m;
   const map: Array<[RegExp, string]> = [
     [/código de producto\/servicio|codigocabys|cabys/i, 'Falta el código CABYS en uno o más productos. Asignáselo en Inventario → Productos (o configurá un CABYS por defecto en Facturación Electrónica).'],
     [/detalle no debe estar vac/i, 'La factura no tiene líneas de detalle.'],

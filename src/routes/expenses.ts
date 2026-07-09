@@ -50,9 +50,18 @@ expenses.post('/', async (c) => {
     const parsed = ExpenseSchema.safeParse(body);
     if (!parsed.success) return fail(c, parsed.error.message, 422);
 
+    // Gastos registrados OFFLINE: el front manda el created_at del momento real
+    // de creación. Sin esto, al sincronizar tarde quedaría con la hora del sync y
+    // podría caer fuera de la ventana del cierre del repartidor.
+    const row: Record<string, any> = { ...parsed.data, tenant_id: tenantId, user_id: c.get('userId') ?? null };
+    const clientCreatedAt = body?.created_at;
+    if (typeof clientCreatedAt === 'string' && !isNaN(Date.parse(clientCreatedAt))) {
+      row.created_at = clientCreatedAt;
+    }
+
     const { data, error } = await db
       .from('expenses')
-      .insert({ ...parsed.data, tenant_id: tenantId, user_id: c.get('userId') ?? null })
+      .insert(row)
       .select()
       .single();
 

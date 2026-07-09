@@ -176,7 +176,7 @@ accountsReceivable.post('/:id/pay', async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const { id } = c.req.param();
-    const { amount, method, note } = await c.req.json() as { amount: number; method?: string; note?: string };
+    const { amount, method, note, created_at } = await c.req.json() as { amount: number; method?: string; note?: string; created_at?: string };
     if (!amount || amount <= 0) return fail(c, 'Monto inválido', 422);
 
     const { data: ar } = await db.from('accounts_receivable')
@@ -186,10 +186,16 @@ accountsReceivable.post('/:id/pay', async (c) => {
     const newPaid = Number(ar.paid_amount) + Number(amount);
     const status = newPaid >= Number(ar.total_amount) ? 'paid' : 'partial';
 
-    await db.from('accounts_receivable_payments').insert({
+    const payment: Record<string, any> = {
       tenant_id: tenantId, receivable_id: id, amount, method: method ?? 'cash', note: note ?? null,
       user_id: c.get('userId') ?? null,   // quién cobró el abono (repartidor)
-    });
+    };
+    // Abono registrado OFFLINE: usar el created_at real (no la hora del sync), para
+    // que caiga dentro de la ventana del cierre del repartidor.
+    if (typeof created_at === 'string' && !isNaN(Date.parse(created_at))) {
+      payment.created_at = created_at;
+    }
+    await db.from('accounts_receivable_payments').insert(payment);
     const { data, error } = await db.from('accounts_receivable')
       .update({ paid_amount: newPaid, status, updated_at: new Date().toISOString() })
       .eq('id', id).select().single();
