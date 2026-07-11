@@ -908,18 +908,25 @@ admin.post('/tenants/:id/products-import', async (c) => {
     const norm = (s: any) => String(s ?? '').trim().toLowerCase();
     const catMap = new Map<string, string>();
     const unitMap = new Map<string, string>();
-    const { data: cats } = await db.from('categories').select('id, name').eq('tenant_id', id);
+    const supMap = new Map<string, string>();
+    const { data: cats } = await db.from('product_categories').select('id, name').eq('tenant_id', id);
     for (const ct of (cats as any[]) ?? []) catMap.set(norm(ct.name), ct.id);
     const { data: units } = await db.from('unit_types').select('id, name, abbreviation').eq('tenant_id', id);
     for (const u of (units as any[]) ?? []) {
       unitMap.set(norm(u.name), u.id);
       if (u.abbreviation) unitMap.set(norm(u.abbreviation), u.id);
     }
+    const { data: sups } = await db.from('suppliers').select('id, name').eq('tenant_id', id);
+    for (const s of (sups as any[]) ?? []) supMap.set(norm(s.name), s.id);
+    // ¿La tabla products tiene columna supplier_id? (probe — si no, solo creamos
+    // el proveedor en la lista, sin vincularlo al producto).
+    const probe = await db.from('products').select('supplier_id').limit(1);
+    const hasSupplierCol = !probe.error;
 
     const resolveCat = async (raw: any): Promise<string | null> => {
       const key = norm(raw); if (!key) return null;
       if (catMap.has(key)) return catMap.get(key)!;
-      const { data } = await db.from('categories').insert({ tenant_id: id, name: String(raw).trim() }).select('id').single();
+      const { data } = await db.from('product_categories').insert({ tenant_id: id, name: String(raw).trim() }).select('id').single();
       if ((data as any)?.id) { catMap.set(key, (data as any).id); return (data as any).id; }
       return null;
     };
@@ -932,36 +939,58 @@ admin.post('/tenants/:id/products-import', async (c) => {
       if ((data as any)?.id) { unitMap.set(key, (data as any).id); return (data as any).id; }
       return null;
     };
+    const resolveSupplier = async (raw: any): Promise<string | null> => {
+      const key = norm(raw); if (!key) return null;
+      if (supMap.has(key)) return supMap.get(key)!;
+      const { data } = await db.from('suppliers').insert({ tenant_id: id, name: String(raw).trim() }).select('id').single();
+      if ((data as any)?.id) { supMap.set(key, (data as any).id); return (data as any).id; }
+      return null;
+    };
 
     let created = 0, errors = 0;
     let firstError: string | null = null;
+
+    // 1) Resolver categoría/unidad/proveedor y construir los objetos de producto.
+    const toInsert: Record<string, any>[] = [];
     for (const r of rows) {
-      try {
-        if (!r?.name) { errors++; firstError = firstError ?? 'Fila sin nombre'; continue; }
-        const category_id = await resolveCat(r.category);
-        const unit_type_id = await resolveUnit(r.unit_type);
-        const minStock = Math.max(0, Math.round(Number(r.min_stock_level) || 0));
-        let maxStock = Math.max(0, Math.round(Number(r.max_stock_level) || 0));
-        if (maxStock < minStock) maxStock = minStock;   // evita violar max>=min
-        if (maxStock === 0) maxStock = Math.max(minStock, 100);
-        const { error } = await db.from('products').insert({
-          tenant_id: id,
-          name: String(r.name).trim(),
-          sku: r.sku ? String(r.sku) : '',
-          sku2: r.sku2 ? String(r.sku2) : null,
-          description: r.description ?? null,
-          unit_price: Number(r.unit_price) || 0,
-          cost_price: Number(r.cost_price) || 0,
-          stock_quantity: Math.max(0, Math.round(Number(r.stock_quantity) || 0)),
-          min_stock_level: minStock,
-          max_stock_level: maxStock,
-          tracks_stock: r.tracks_stock !== false,
-          category_id, unit_type_id,
-          cabys_code: r.cabys_code ? String(r.cabys_code) : null,
-          iva_rate: r.iva_rate ?? 13,
-        });
-        if (error) { errors++; firstError = firstError ?? error.message; } else created++;
-      } catch (e: any) { errors++; firstError = firstError ?? (e?.message ?? 'error'); }
+      if (!r?.name) { errors++; firstError = firstError ?? 'Fila sin nombre'; continue; }
+      const category_id = await resolveCat(r.category);
+      const unit_type_id = await resolveUnit(r.unit_type);
+      const supplier_id = await resolveSupplier(r.supplier);
+      const minStock = Math.max(0, Math.round(Number(r.min_stock_level) || 0));
+      let maxStock = Math.max(0, Math.round(Number(r.max_stock_level) || 0));
+      if (maxStock < minStock) maxStock = minStock;   // evita violar max>=min
+      if (maxStock === 0) maxStock = Math.max(minStock, 100);
+      toInsert.push({
+        tenant_id: id,
+        name: String(r.name).trim(),
+        sku: r.sku ? String(r.sku) : '',
+        sku2: r.sku2 ? String(r.sku2) : null,
+        description: r.description ?? null,
+        unit_price: Number(r.unit_price) || 0,
+        cost_price: Number(r.cost_price) || 0,
+        stock_quantity: Math.max(0, Math.round(Number(r.stock_quantity) || 0)),
+        min_stock_level: minStock,
+        max_stock_level: maxStock,
+        tracks_stock: r.tracks_stock !== false,
+        category_id, unit_type_id,
+        cabys_code: r.cabys_code ? String(r.cabys_code) : null,
+        iva_rate: r.iva_rate ?? 13,
+        ...(hasSupplierCol && supplier_id ? { supplier_id } : {}),
+      });
+    }
+
+    // 2) Insertar por LOTE (rápido). Si un lote falla, caemos a fila-por-fila
+    // para contar exactamente cuántos entraron y capturar el error real.
+    const CHUNK = 200;
+    for (let i = 0; i < toInsert.length; i += CHUNK) {
+      const batch = toInsert.slice(i, i + CHUNK);
+      const { error } = await db.from('products').insert(batch);
+      if (!error) { created += batch.length; continue; }
+      for (const row of batch) {
+        const { error: e2 } = await db.from('products').insert(row);
+        if (e2) { errors++; firstError = firstError ?? e2.message; } else created++;
+      }
     }
     return ok(c, { created, errors, error_detail: firstError });
   } catch (err: any) { return fail(c, err.message, 500); }
@@ -1142,10 +1171,11 @@ admin.put('/tenants/:id/feature-overrides', async (c) => {
     const { id } = c.req.param();
     const body = await c.req.json();
     const overrides = (body?.overrides && typeof body.overrides === 'object') ? body.overrides : {};
-    await db.from('settings').upsert({
+    const { error } = await db.from('settings').upsert({
       tenant_id: id, type: 'feature-overrides', config: overrides,
       updated_at: new Date().toISOString(),
     }, { onConflict: 'tenant_id,type' });
+    if (error) throw new Error(error.message);
     return ok(c, { ok: true, overrides });
   } catch (err: any) { return fail(c, err.message, 500); }
 });

@@ -12,7 +12,7 @@ reports.get('/sales', async (c) => {
     const to   = endOfDay(c.req.query('to'));
 
     let query = db.from('invoices')
-      .select('id, invoice_number, customer_name, total, subtotal, tax_amount, discount_amount, payment_method, payments, issued_at, status')
+      .select('id, invoice_number, customer_name, total, subtotal, tax_amount, discount_amount, payment_method, payments, currency, exchange_rate, issued_at, status')
       .eq('tenant_id', tenantId).neq('status', 'cancelled')
       .order('issued_at', { ascending: false });
     if (from) query = query.gte('issued_at', from);
@@ -26,9 +26,18 @@ reports.get('/sales', async (c) => {
     const byMethod: Record<string, number> = {};
     data?.forEach(r => { const m = r.payment_method ?? 'cash'; byMethod[m] = (byMethod[m] ?? 0) + Number(r.total ?? 0); });
 
+    // Ventas cobradas en dólares (moneda de la venta = USD). Se reporta el total
+    // en ₡ (moneda base) y el equivalente en $ según el tipo de cambio de cada venta.
+    const usdRows = (data ?? []).filter((r: any) => r.currency === 'USD');
+    const usd = {
+      count: usdRows.length,
+      total_crc: usdRows.reduce((s: number, r: any) => s + Number(r.total ?? 0), 0),
+      total_usd: usdRows.reduce((s: number, r: any) => s + (Number(r.exchange_rate) > 0 ? Number(r.total ?? 0) / Number(r.exchange_rate) : 0), 0),
+    };
+
     return ok(c, { total_revenue: totalRevenue, total_invoices: totalCount,
       average_ticket: totalCount > 0 ? totalRevenue / totalCount : 0,
-      by_payment_method: byMethod, invoices: data });
+      by_payment_method: byMethod, usd, invoices: data });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

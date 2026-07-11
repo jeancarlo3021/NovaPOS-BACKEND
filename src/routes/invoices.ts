@@ -33,6 +33,10 @@ const InvoiceSchema = z.object({
   payment_method:   z.enum(['cash', 'card', 'sinpe', 'check', 'transfer', 'credit']).default('cash'),
   /** Tipo de documento fiscal. */
   document_type:    z.enum(['ticket', 'tiquete_electronico', 'factura_electronica']).optional().default('ticket'),
+  // Multimoneda: moneda del pago en efectivo y tipo de cambio (₡ por $1).
+  currency:         z.enum(['CRC', 'USD']).optional().default('CRC'),
+  exchange_rate:    z.number().positive().optional().nullable(),
+  change_currency:  z.enum(['CRC', 'USD']).optional().nullable(),
   status:           z.enum(['draft', 'completed', 'cancelled']).default('completed'),
   notes:            z.string().optional().nullable(),
   issued_at:        z.string().optional().nullable(),

@@ -182,6 +182,10 @@ export function buildDocumentoJson(
     const tarifa = Number(l.iva_rate ?? 0);
     const montoTotal = Math.round(l.unit_price * l.quantity * 100) / 100;
     const subtotal = Math.round(Number(l.subtotal ?? montoTotal) * 100) / 100;
+    // Hacienda exige SubTotal = MontoTotal − Descuento. Si lo cobrado (subtotal)
+    // es menor que precio×cantidad (precio especial del cliente, promo, % desc.),
+    // la diferencia se declara como DESCUENTO de línea; si no, la validación falla.
+    const descuento = Math.round((montoTotal - subtotal) * 100) / 100;
     const impuestoMonto = Math.round(subtotal * (tarifa / 100) * 100) / 100;
     const linea: any = {
       NumeroLinea: String(i + 1),
@@ -195,6 +199,9 @@ export function buildDocumentoJson(
       BaseImponible: money(subtotal),
       MontoTotalLinea: money(subtotal + impuestoMonto),
     };
+    if (descuento > 0.005) {
+      linea.Descuento = [{ MontoDescuento: money(descuento), NaturalezaDescuento: 'Descuento' }];
+    }
     if (l.sku) linea.CodigoComercial = [{ Tipo: '04', Codigo: l.sku }];
     if (tarifa > 0) {
       linea.Impuesto = [{
