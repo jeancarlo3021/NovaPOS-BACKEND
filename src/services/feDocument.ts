@@ -81,6 +81,46 @@ export function tipoComprobante(documentType?: string): string {
   return COMPROBANTE[documentType ?? 'tiquete_electronico'] ?? '04';
 }
 
+// ── Unidad de medida → código del catálogo de Hacienda v4.4 ───────────────────
+// Hacienda es CASE-SENSITIVE: el kilogramo es "Kg" (no "kg"), litro "L", etc.
+// Los códigos válidos exactos (subconjunto comercial del XSD v4.4).
+const UNIDADES_VALIDAS = new Set([
+  'Unid', 'Kg', 'G', 'L', 'mL', 'm', 'cm', 'Cm', 'Mm', 'Km', 'm²', 'm³',
+  'Gal', 'Oz', 'h', 'Min', 's', 'd', 'Sp', 'Spe', 'St', 'Al', 'Alc', 'Os',
+  'Otros', 'Cc', 'Cu', 'Fa', 'Qq', 'Acv', 't',
+]);
+// Variantes comunes (en minúscula) → código oficial.
+const UNIDAD_MAP: Record<string, string> = {
+  unid: 'Unid', und: 'Unid', un: 'Unid', u: 'Unid', uni: 'Unid',
+  unidad: 'Unid', unidades: 'Unid', pza: 'Unid', pzas: 'Unid', pieza: 'Unid',
+  piezas: 'Unid', pcs: 'Unid', ea: 'Unid', caja: 'Unid', cajas: 'Unid',
+  paquete: 'Unid', paq: 'Unid', bolsa: 'Unid', saco: 'Unid', doc: 'Unid',
+  kg: 'Kg', kgs: 'Kg', kilo: 'Kg', kilos: 'Kg', kilogramo: 'Kg', kilogramos: 'Kg', k: 'Kg',
+  g: 'G', gr: 'G', grs: 'G', gramo: 'G', gramos: 'G',
+  l: 'L', lt: 'L', ltr: 'L', lts: 'L', litro: 'L', litros: 'L',
+  ml: 'mL', mililitro: 'mL', mililitros: 'mL', cc: 'mL',
+  m: 'm', metro: 'm', metros: 'm', mt: 'm', mts: 'm',
+  cm: 'cm', centimetro: 'cm', centimetros: 'cm',
+  mm: 'Mm', km: 'Km',
+  m2: 'm²', m3: 'm³',
+  gal: 'Gal', galon: 'Gal', galones: 'Gal',
+  oz: 'Oz', onza: 'Oz', onzas: 'Oz',
+  h: 'h', hr: 'h', hrs: 'h', hora: 'h', horas: 'h',
+  min: 'Min', minuto: 'Min', minutos: 'Min',
+  sp: 'Sp', serv: 'Sp', servicio: 'Sp', servicios: 'Sp',
+  qq: 'Qq', quintal: 'Qq', quintales: 'Qq', t: 't', ton: 't', tonelada: 't',
+};
+
+/** Normaliza la unidad del producto al código exacto del catálogo de Hacienda.
+ *  Si ya es un código válido, lo respeta; si no, mapea variantes comunes;
+ *  desconocidas → "Unid" (siempre aceptada). */
+export function haciendaUnit(unit?: string | null): string {
+  const raw = String(unit ?? '').trim();
+  if (!raw) return 'Unid';
+  if (UNIDADES_VALIDAS.has(raw)) return raw;      // ya es válido (respeta mayúsculas)
+  return UNIDAD_MAP[raw.toLowerCase()] ?? 'Unid';
+}
+
 export function buildConsecutivo(
   inv: FEInvoice,
   opts: { sucursal?: string; terminal?: string; situacion?: string; tipoComprobante?: string } = {},
@@ -147,7 +187,7 @@ export function buildDocumentoJson(
       NumeroLinea: String(i + 1),
       CodigoCABYS: l.cabys_code ?? '',
       Cantidad: num(l.quantity),
-      UnidadMedida: l.unit ?? 'Unid',
+      UnidadMedida: haciendaUnit(l.unit),
       Detalle: l.product_name,
       PrecioUnitario: money(l.unit_price),
       MontoTotal: money(montoTotal),

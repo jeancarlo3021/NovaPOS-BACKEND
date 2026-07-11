@@ -123,8 +123,15 @@ export async function consultaEstatus(
 
   const body: any = await res.json().catch(() => ({}));
   if (!res.ok || body?.Status === 1) {
+    const exc = String(body?.CurrentException ?? '');
+    // Hacienda procesa de forma ASÍNCRONA: justo después de emitir, la consulta
+    // suele responder "no ha sido recibido" / "en proceso". No es un error: es
+    // que todavía no terminó de procesarse. Lo devolvemos como PENDIENTE.
+    if (/no ha sido recibido|no recibido|en proceso|procesando|procesand|a[uú]n no/i.test(exc)) {
+      return { Ind_estado: 'procesando', pending: true, message: exc };
+    }
     throw new FacturemosError(
-      body?.CurrentException || `Facturemos respondió ${res.status} al consultar estatus`,
+      exc || `Facturemos respondió ${res.status} al consultar estatus`,
       res.status,
     );
   }

@@ -681,8 +681,14 @@ admin.put('/tenants/:id/fe-config', async (c) => {
     const { fe, kiosk } = body ?? {};
 
     if (fe) {
+      // MERGE con la config existente para no pisar campos administrados por
+      // otros endpoints (certificado .p12, secretos, cuota FE, id de Alanube).
+      // Solo las claves presentes en `fe` sobreescriben; el resto se conserva.
+      const { data: prev } = await db.from('settings').select('config')
+        .eq('tenant_id', id).eq('type', 'electronic-invoice').maybeSingle();
+      const merged = { ...((prev?.config as any) ?? {}), ...fe };
       await db.from('settings').upsert({
-        tenant_id: id, type: 'electronic-invoice', config: fe,
+        tenant_id: id, type: 'electronic-invoice', config: merged,
         updated_at: new Date().toISOString(),
       }, { onConflict: 'tenant_id,type' });
     }
@@ -778,6 +784,187 @@ admin.get('/alanube/ping', async (c) => {
     }
     return fail(c, `${err.message} · ambiente=${env} · url=${url}`, status);
   }
+});
+
+// ── Alanube: dar de alta la empresa (emisor) — Paso 3 ─────────────────────────
+// Construye el payload de POST /cri/v1/companies desde la config FE del tenant:
+//  · datos del emisor (nombre, identificación, dirección, actividad, email)
+//  · certificate: el .p12 (bajado de Storage → base64) + su contraseña
+//  · token: credenciales API generadas en ATV (usuario/contraseña)
+// Guarda el id de la empresa que devuelve Alanube en cfg.alanube_company_id.
+//
+// NOTA: los nombres de los sub-objetos `certificate` y `token` siguen las
+// convenciones CRI de Alanube; si el sandbox reporta un campo distinto, se
+// ajusta SOLO en `buildAlanubeCompanyPayload`.
+function buildAlanubeCompanyPayload(cfg: Record<string, any>, p12Base64: string) {
+  const others = String(cfg.emisor_address ?? '').trim();
+  const activity = String(cfg.economic_activity_code ?? '').trim();
+  const email = String(cfg.emisor_email ?? '').trim();
+  const phone = String(cfg.emisor_phone ?? '').replace(/\D/g, '');
+
+  const payload: Record<string, any> = {
+    name: String(cfg.emisor_name ?? '').trim(),
+    identificationType: String(cfg.emisor_identification_type ?? '02'),
+    identificationNumber: String(cfg.emisor_identification ?? '').replace(/\D/g, ''),
+    // La cuenta Alanube solo admite UNA empresa 'main'; cada emisor/tenant va
+    // como 'associated'. Se puede forzar con cfg.alanube_company_type.
+    type: (cfg.alanube_company_type === 'main' ? 'main' : 'associated'),
+    address: {
+      province: String(cfg.emisor_province_code ?? '').trim(),
+      canton: String(cfg.emisor_canton_code ?? '').trim(),
+      district: String(cfg.emisor_district_code ?? '').trim(),
+      otrasSenas: others,
+    },
+    // Certificado de firma (.p12) — clave criptográfica + su PIN/contraseña.
+    certificate: {
+      extension: 'p12',
+      content: p12Base64,
+      password: String(cfg.p12_password ?? cfg.hacienda_pin ?? ''),
+    },
+    // Credenciales del token de Hacienda generadas en ATV.
+    token: {
+      username: String(cfg.atv_username ?? '').trim(),
+      password: String(cfg.atv_password ?? cfg.hacienda_pin ?? ''),
+    },
+  };
+  if (cfg.emisor_commercial_name) payload.tradeName = String(cfg.emisor_commercial_name).trim();
+  if (activity) payload.economicActivities = [activity];
+  if (email) payload.emails = [email];
+  if (phone) payload.phone = { countryCode: '506', number: phone };
+  return payload;
+}
+
+// Busca el id de la empresa en la respuesta de Alanube (rutas comunes + escaneo).
+function findCompanyId(result: any): string | null {
+  if (!result || typeof result !== 'object') return null;
+  const direct = result.id ?? result.companyId ?? result.company?.id
+    ?? result.data?.id ?? result.data?.companyId ?? result.data?.company?.id ?? result._id;
+  if (direct) return String(direct);
+  // Escaneo en profundidad: primera clave id/_id/*Id con valor string/number.
+  const seen = new Set<any>();
+  const walk = (o: any): string | null => {
+    if (!o || typeof o !== 'object' || seen.has(o)) return null;
+    seen.add(o);
+    for (const [k, v] of Object.entries(o)) {
+      if (/(^id$|_id$|Id$)/.test(k) && (typeof v === 'string' || typeof v === 'number') && String(v).length >= 6) {
+        return String(v);
+      }
+    }
+    for (const v of Object.values(o)) { const r = walk(v); if (r) return r; }
+    return null;
+  };
+  return walk(result);
+}
+
+// POST /tenants/:id/alanube/company — crea/da de alta la empresa en Alanube.
+admin.post('/tenants/:id/alanube/company', async (c) => {
+  const { id } = c.req.param();
+  try {
+    const { data: row } = await db.from('settings').select('config')
+      .eq('tenant_id', id).eq('type', 'electronic-invoice').maybeSingle();
+    const cfg: Record<string, any> = { ...((row as any)?.config ?? {}) };
+
+    // Validaciones mínimas antes de llamar a Alanube.
+    if (!cfg.emisor_name) return fail(c, 'Falta el nombre del emisor (Datos de FE).', 422);
+    if (!cfg.emisor_identification) return fail(c, 'Falta la identificación del emisor.', 422);
+    if (!cfg.certificate?.path) return fail(c, 'Falta subir el certificado .p12 (Datos de FE).', 422);
+    if (!cfg.atv_username) return fail(c, 'Falta el usuario de API de ATV (Datos de FE).', 422);
+
+    // Bajar el .p12 de Storage y pasarlo a base64 (sin prefijo data:).
+    const { data: file, error: dlErr } = await db.storage.from(FE_CERT_BUCKET).download(cfg.certificate.path);
+    if (dlErr || !file) return fail(c, `No se pudo leer el certificado del Storage: ${dlErr?.message ?? 'vacío'}`, 500);
+    const p12Base64 = Buffer.from(await file.arrayBuffer()).toString('base64');
+
+    const payload = buildAlanubeCompanyPayload(cfg, p12Base64);
+    const result: any = await alanube.createCompany(payload);
+
+    // Guardar el id de la empresa devuelto por Alanube para emitir después.
+    // Buscamos en las rutas comunes y, si no, escaneamos en profundidad cualquier
+    // clave `id`/`*Id`/`_id` con valor string (el nombre exacto varía por país).
+    const companyId = findCompanyId(result);
+    cfg.alanube_env = alanube.env();
+    cfg.alanube_registered_at = new Date().toISOString();
+    cfg.alanube_company_raw = result;   // respuesta cruda (para depurar el nombre del id)
+    if (companyId) cfg.alanube_company_id = companyId;
+    await db.from('settings').upsert({
+      tenant_id: id, type: 'electronic-invoice', config: cfg, updated_at: new Date().toISOString(),
+    }, { onConflict: 'tenant_id,type' });
+    return ok(c, { ok: true, company_id: companyId, env: alanube.env(), result });
+  } catch (err: any) {
+    const status = err instanceof AlanubeError ? err.status : 500;
+    return fail(c, err.message, status);
+  }
+});
+
+// POST /tenants/:id/products-import — importa productos por Excel para un tenant
+// (desde el panel admin). Resuelve/crea categorías y unidades por nombre y crea
+// los productos con el service-role. body: { rows: [...] }.
+admin.post('/tenants/:id/products-import', async (c) => {
+  try {
+    const { id } = c.req.param();
+    const { rows } = await c.req.json().catch(() => ({ rows: [] }));
+    if (!Array.isArray(rows) || rows.length === 0) return fail(c, 'No hay filas para importar', 422);
+
+    const norm = (s: any) => String(s ?? '').trim().toLowerCase();
+    const catMap = new Map<string, string>();
+    const unitMap = new Map<string, string>();
+    const { data: cats } = await db.from('categories').select('id, name').eq('tenant_id', id);
+    for (const ct of (cats as any[]) ?? []) catMap.set(norm(ct.name), ct.id);
+    const { data: units } = await db.from('unit_types').select('id, name, abbreviation').eq('tenant_id', id);
+    for (const u of (units as any[]) ?? []) {
+      unitMap.set(norm(u.name), u.id);
+      if (u.abbreviation) unitMap.set(norm(u.abbreviation), u.id);
+    }
+
+    const resolveCat = async (raw: any): Promise<string | null> => {
+      const key = norm(raw); if (!key) return null;
+      if (catMap.has(key)) return catMap.get(key)!;
+      const { data } = await db.from('categories').insert({ tenant_id: id, name: String(raw).trim() }).select('id').single();
+      if ((data as any)?.id) { catMap.set(key, (data as any).id); return (data as any).id; }
+      return null;
+    };
+    const resolveUnit = async (raw: any): Promise<string | null> => {
+      const key = norm(raw); if (!key) return null;
+      if (unitMap.has(key)) return unitMap.get(key)!;
+      const { data } = await db.from('unit_types')
+        .insert({ tenant_id: id, name: String(raw).trim(), abbreviation: String(raw).trim().slice(0, 4).toLowerCase() })
+        .select('id').single();
+      if ((data as any)?.id) { unitMap.set(key, (data as any).id); return (data as any).id; }
+      return null;
+    };
+
+    let created = 0, errors = 0;
+    let firstError: string | null = null;
+    for (const r of rows) {
+      try {
+        if (!r?.name) { errors++; firstError = firstError ?? 'Fila sin nombre'; continue; }
+        const category_id = await resolveCat(r.category);
+        const unit_type_id = await resolveUnit(r.unit_type);
+        const minStock = Math.max(0, Math.round(Number(r.min_stock_level) || 0));
+        let maxStock = Math.max(0, Math.round(Number(r.max_stock_level) || 0));
+        if (maxStock < minStock) maxStock = minStock;   // evita violar max>=min
+        if (maxStock === 0) maxStock = Math.max(minStock, 100);
+        const { error } = await db.from('products').insert({
+          tenant_id: id,
+          name: String(r.name).trim(),
+          sku: r.sku ? String(r.sku) : '',
+          sku2: r.sku2 ? String(r.sku2) : null,
+          description: r.description ?? null,
+          unit_price: Number(r.unit_price) || 0,
+          cost_price: Number(r.cost_price) || 0,
+          stock_quantity: Math.max(0, Math.round(Number(r.stock_quantity) || 0)),
+          min_stock_level: minStock,
+          max_stock_level: maxStock,
+          tracks_stock: r.tracks_stock !== false,
+          category_id, unit_type_id,
+          cabys_code: r.cabys_code ? String(r.cabys_code) : null,
+          iva_rate: r.iva_rate ?? 13,
+        });
+        if (error) { errors++; firstError = firstError ?? error.message; } else created++;
+      } catch (e: any) { errors++; firstError = firstError ?? (e?.message ?? 'error'); }
+    }
+    return ok(c, { created, errors, error_detail: firstError });
+  } catch (err: any) { return fail(c, err.message, 500); }
 });
 
 // POST /tenants/:id/fe-renew — renovar la bolsa de comprobantes FE (cuando el

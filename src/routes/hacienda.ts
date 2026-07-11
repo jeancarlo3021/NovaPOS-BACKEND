@@ -3,10 +3,30 @@ import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
 import { obtenerToken, consultaEstatus, enviaDocumentoConsecutivoJson, FacturemosError } from '../services/facturemos.js';
 import { buildConsecutivo, buildDocumentoJson, tipoComprobante, type FELine } from '../services/feDocument.js';
+import { alanube, AlanubeError } from '../services/alanube.js';
+import { buildAlanubeDocument } from '../services/alanubeDocument.js';
 import { endOfDay } from '../utils/dateRange.js';
 import { sendEmail } from '../services/emailService.js';
 
 const hacienda = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
+
+/** Busca en profundidad el primer valor string/number cuya clave matchea `re`
+ *  y cuyo largo ≥ minLen. Sirve para leer id/clave sin conocer la ruta exacta. */
+function deepFind(obj: any, re: RegExp, minLen = 1): string | null {
+  const seen = new Set<any>();
+  const walk = (o: any): string | null => {
+    if (!o || typeof o !== 'object' || seen.has(o)) return null;
+    seen.add(o);
+    for (const [k, v] of Object.entries(o)) {
+      if (re.test(k) && (typeof v === 'string' || typeof v === 'number') && String(v).length >= minLen) {
+        return String(v);
+      }
+    }
+    for (const v of Object.values(o)) { const r = walk(v); if (r) return r; }
+    return null;
+  };
+  return walk(obj);
+}
 
 /** Carga la config de FE del tenant (settings type='electronic-invoice'). */
 async function loadFEConfig(tenantId: string): Promise<any> {
@@ -154,6 +174,22 @@ function mapEstado(ind: string): string {
   return 'sent';   // procesando / recibido
 }
 
+/** Mapea el status de Alanube (REGISTERED/ACCEPTED/REJECTED…) a fe_status. */
+function mapAlanubeStatus(s: any): string {
+  const t = String(s ?? '').toUpperCase();
+  if (t.includes('ACCEPT') || t.includes('ACEPT')) return 'accepted';
+  if (t.includes('REJECT') || t.includes('RECHAZ')) return 'rejected';
+  if (t.includes('ERROR')) return 'error';
+  return 'sent';   // REGISTERED / PENDING / PROCESSING…
+}
+
+/** Consulta el estado de un documento en Alanube por su id (ULID). */
+async function alanubeDocStatus(docId: string): Promise<{ status: string; raw: any }> {
+  const doc: any = await alanube.getDocument(docId);
+  const d = doc?.ticket ?? doc?.invoice ?? doc?.creditNote ?? doc?.document ?? doc?.data ?? doc;
+  return { status: mapAlanubeStatus(d?.status), raw: doc };
+}
+
 // POST /refresh-status — consulta el estatus de una factura por su Clave y lo GUARDA.
 hacienda.post('/refresh-status', async (c) => {
   try {
@@ -162,24 +198,34 @@ hacienda.post('/refresh-status', async (c) => {
     if (!invoice_id) return fail(c, 'Falta invoice_id', 422);
 
     const cfg = await loadFEConfig(tenantId);
-    if (!cfg.api_key_emisor) return fail(c, 'Falta configurar la ApiKey del emisor', 422);
+    const provider = cfg.fe_provider === 'alanube' ? 'alanube' : 'facturemos';
+    if (provider === 'facturemos' && !cfg.api_key_emisor) return fail(c, 'Falta configurar la ApiKey del emisor', 422);
     const env = cfg.environment === 'sandbox' ? 'sandbox' : 'production'; // default producción
 
     const { data: inv } = await db.from('invoices')
-      .select('id, fe_clave').eq('id', invoice_id).eq('tenant_id', tenantId).maybeSingle();
+      .select('id, fe_clave, fe_consecutivo').eq('id', invoice_id).eq('tenant_id', tenantId).maybeSingle();
     if (!(inv as any)?.fe_clave) return fail(c, 'La factura no fue emitida', 422);
 
-    const data = await consultaEstatus(env, cfg.api_key_emisor, (inv as any).fe_clave);
-    const fe_status = mapEstado(data?.Ind_estado);
+    let fe_status = 'sent';
+    const patch: Record<string, any> = { updated_at: new Date().toISOString() };
+    let indEstado: any = null, errDetail: any = null;
+    if (provider === 'alanube') {
+      const docId = (inv as any).fe_consecutivo;
+      if (!docId) return fail(c, 'No hay id de documento de Alanube para consultar. Volvé a emitir.', 422);
+      const r = await alanubeDocStatus(docId);
+      fe_status = r.status; indEstado = r.status;
+      patch.fe_status = fe_status;
+    } else {
+      const data = await consultaEstatus(env, cfg.api_key_emisor, (inv as any).fe_clave);
+      fe_status = mapEstado(data?.Ind_estado);
+      indEstado = data?.Ind_estado ?? null; errDetail = data?.Error ?? null;
+      patch.fe_status = fe_status;
+      patch.fe_xml = data?.Respuesta_xml ?? null;
+      patch.fe_error = data?.Error ?? null;
+    }
+    await db.from('invoices').update(patch).eq('id', invoice_id).eq('tenant_id', tenantId);
 
-    await db.from('invoices').update({
-      fe_status,
-      fe_xml: data?.Respuesta_xml ?? null,
-      fe_error: data?.Error ?? null,
-      updated_at: new Date().toISOString(),
-    }).eq('id', invoice_id).eq('tenant_id', tenantId);
-
-    return ok(c, { fe_status, ind_estado: data?.Ind_estado ?? null, error: data?.Error ?? null });
+    return ok(c, { fe_status, ind_estado: indEstado, error: errDetail });
   } catch (err: any) {
     const status = err instanceof FacturemosError ? err.status : 500;
     return fail(c, err.message, status);
@@ -193,24 +239,33 @@ hacienda.post('/refresh-pending', async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const cfg = await loadFEConfig(tenantId);
-    if (!cfg.api_key_emisor) return ok(c, { updated: 0 });
+    const provider = cfg.fe_provider === 'alanube' ? 'alanube' : 'facturemos';
+    if (provider === 'facturemos' && !cfg.api_key_emisor) return ok(c, { updated: 0 });
     const env = cfg.environment === 'sandbox' ? 'sandbox' : 'production'; // default producción
 
     const { data: pend } = await db.from('invoices')
-      .select('id, fe_clave')
+      .select('id, fe_clave, fe_consecutivo')
       .eq('tenant_id', tenantId).eq('fe_status', 'sent').not('fe_clave', 'is', null)
       .order('issued_at', { ascending: false }).limit(60);
 
     let updated = 0;
     for (const inv of (pend ?? []) as any[]) {
       try {
-        const data = await consultaEstatus(env, cfg.api_key_emisor, inv.fe_clave);
-        const fe_status = mapEstado(data?.Ind_estado);
+        let fe_status = 'sent';
+        const patch: Record<string, any> = { updated_at: new Date().toISOString() };
+        if (provider === 'alanube') {
+          if (!inv.fe_consecutivo) continue;   // sin id de Alanube no podemos consultar
+          const r = await alanubeDocStatus(inv.fe_consecutivo);
+          fe_status = r.status;
+        } else {
+          const data = await consultaEstatus(env, cfg.api_key_emisor, inv.fe_clave);
+          fe_status = mapEstado(data?.Ind_estado);
+          patch.fe_xml = data?.Respuesta_xml ?? null;
+          patch.fe_error = data?.Error ?? null;
+        }
         if (fe_status !== 'sent') {
-          await db.from('invoices').update({
-            fe_status, fe_xml: data?.Respuesta_xml ?? null, fe_error: data?.Error ?? null,
-            updated_at: new Date().toISOString(),
-          }).eq('id', inv.id).eq('tenant_id', tenantId);
+          patch.fe_status = fe_status;
+          await db.from('invoices').update(patch).eq('id', inv.id).eq('tenant_id', tenantId);
           updated++;
         }
       } catch { /* seguir con los demás */ }
@@ -231,7 +286,9 @@ hacienda.post('/emit', async (c) => {
 
     const cfg = await loadFEConfig(tenantId);
     if (!cfg.enabled) return fail(c, 'La facturación electrónica no está activada', 409);
-    if (!cfg.api_key_emisor) return fail(c, 'Falta configurar la ApiKey del emisor', 422);
+    const provider = cfg.fe_provider === 'alanube' ? 'alanube' : 'facturemos';
+    if (provider === 'facturemos' && !cfg.api_key_emisor) return fail(c, 'Falta configurar la ApiKey del emisor', 422);
+    if (provider === 'alanube' && !cfg.alanube_company_id) return fail(c, 'La empresa no está dada de alta en Alanube. Usá «Crear empresa en Alanube».', 422);
     const env = cfg.environment === 'sandbox' ? 'sandbox' : 'production'; // default producción
 
     // Factura + ítems.
@@ -316,6 +373,43 @@ hacienda.post('/emit', async (c) => {
       return await failFE('Para emitir Factura Electrónica el cliente debe tener cédula (identificación). Seleccioná un cliente registrado con identificación o emití como tiquete.');
     }
 
+    // ── Proveedor ALANUBE ─────────────────────────────────────────────────────
+    if (provider === 'alanube') {
+      const kind = tipoDoc === '01' ? 'invoice' : 'ticket';
+      const doc = buildAlanubeDocument(emisor, inv as any, lines, receptor, {
+        tipoDoc,
+        headquarters: cfg.sucursal, terminal: cfg.terminal,
+        numberOfDocument: (inv as any).invoice_number,
+      });
+      if (debug) {
+        return ok(c, { provider: 'alanube', environment: env, kind, company_id: cfg.alanube_company_id, payload: doc });
+      }
+      let resp: any;
+      try {
+        resp = await alanube.emitDocument(kind as any, doc, cfg.alanube_company_id);
+      } catch (e: any) {
+        return await failFE(e instanceof AlanubeError ? e.message : (e?.message ?? 'Error emitiendo con Alanube'));
+      }
+      // La respuesta viene envuelta según el tipo: { ticket|invoice|creditNote: {
+      //   id (ULID), key (clave 50 díg de Hacienda), status } }.
+      const docObj = resp?.ticket ?? resp?.invoice ?? resp?.creditNote ?? resp?.document ?? resp?.data ?? resp;
+      const docId = docObj?.id ?? deepFind(resp, /(^id$|_id$|documentId$)/i, 10) ?? null;
+      const clave = docObj?.key ?? docObj?.clave ?? deepFind(resp, /(clave|^key$)/i, 40) ?? null;
+      const alanubeStatus = docObj?.status ?? null;   // REGISTERED, ACCEPTED, REJECTED…
+      await db.from('invoices').update({
+        fe_clave: clave ?? docId,           // preferimos la clave real de Hacienda
+        fe_consecutivo: docId,              // id ULID de Alanube (para consultar estado)
+        fe_status: 'sent',
+        fe_situacion: '1',
+        fe_error: null,
+        document_type: tipoDoc === '01' ? 'factura_electronica' : 'tiquete_electronico',
+        sale_condition: (inv as any).payment_method === 'credit' ? '02' : '01',
+        updated_at: new Date().toISOString(),
+      }).eq('id', invoice_id).eq('tenant_id', tenantId);
+      return ok(c, { ok: true, provider: 'alanube', clave, alanube_doc_id: docId, alanube_status: alanubeStatus, tipo: tipoDoc, response: resp });
+    }
+
+    // ── Proveedor FACTUREMOS (flujo existente) ────────────────────────────────
     const consecutivo = buildConsecutivo(inv as any, {
       sucursal: cfg.sucursal, terminal: cfg.terminal, situacion: '1', tipoComprobante: tipoDoc,
     });
