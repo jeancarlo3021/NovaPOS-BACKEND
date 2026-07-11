@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { db, anonClient } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
 import { sendEmail, paymentReceiptEmailHtml, customInvoiceEmailHtml, planFeatureLabels } from '../services/emailService.js';
+import { alanube, AlanubeError } from '../services/alanube.js';
 
 const admin = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
@@ -693,6 +694,90 @@ admin.put('/tenants/:id/fe-config', async (c) => {
     }
     return ok(c, { ok: true });
   } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// ── Certificado criptográfico (.p12) por empresa — Supabase Storage PRIVADO ─────
+const FE_CERT_BUCKET = 'fe-certificates';
+
+// POST /tenants/:id/fe-certificate — sube el .p12 (base64) a Storage y guarda
+// metadata + PIN/clave en la config FE. body: { file_base64, filename, p12_password, hacienda_pin }.
+admin.post('/tenants/:id/fe-certificate', async (c) => {
+  try {
+    const { id } = c.req.param();
+    const body = await c.req.json();
+    const { file_base64, filename, p12_password, hacienda_pin } = body ?? {};
+    if (!file_base64) return fail(c, 'Falta el archivo del certificado (.p12)', 422);
+    const buf = Buffer.from(String(file_base64).replace(/^data:[^;]*;base64,/, ''), 'base64');
+    if (buf.length === 0) return fail(c, 'El archivo del certificado está vacío', 422);
+
+    // Bucket privado (idempotente).
+    await db.storage.createBucket(FE_CERT_BUCKET, { public: false }).catch(() => {});
+    const path = `${id}/certificado.p12`;
+    const { error: upErr } = await db.storage.from(FE_CERT_BUCKET)
+      .upload(path, buf, { contentType: 'application/x-pkcs12', upsert: true });
+    if (upErr) throw new Error(upErr.message);
+
+    // Metadata + secretos en la config FE (electronic-invoice).
+    const { data: row } = await db.from('settings').select('config')
+      .eq('tenant_id', id).eq('type', 'electronic-invoice').maybeSingle();
+    const cfg: Record<string, any> = { ...((row as any)?.config ?? {}) };
+    cfg.certificate = { path, filename: filename || 'certificado.p12', uploaded_at: new Date().toISOString() };
+    if (p12_password !== undefined) cfg.p12_password = String(p12_password);
+    if (hacienda_pin !== undefined) cfg.hacienda_pin = String(hacienda_pin);
+    await db.from('settings').upsert({
+      tenant_id: id, type: 'electronic-invoice', config: cfg, updated_at: new Date().toISOString(),
+    }, { onConflict: 'tenant_id,type' });
+
+    return ok(c, { ok: true, certificate: cfg.certificate });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// DELETE /tenants/:id/fe-certificate — borra el archivo y limpia metadata/secretos.
+admin.delete('/tenants/:id/fe-certificate', async (c) => {
+  try {
+    const { id } = c.req.param();
+    await db.storage.from(FE_CERT_BUCKET).remove([`${id}/certificado.p12`]).catch(() => {});
+    const { data: row } = await db.from('settings').select('config')
+      .eq('tenant_id', id).eq('type', 'electronic-invoice').maybeSingle();
+    const cfg: Record<string, any> = { ...((row as any)?.config ?? {}) };
+    delete cfg.certificate; delete cfg.p12_password; delete cfg.hacienda_pin;
+    await db.from('settings').upsert({
+      tenant_id: id, type: 'electronic-invoice', config: cfg, updated_at: new Date().toISOString(),
+    }, { onConflict: 'tenant_id,type' });
+    return ok(c, { ok: true });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// GET /tenants/:id/fe-certificate-url — URL firmada temporal para descargar el
+// .p12 (ej. para subirlo a Alanube en el Paso 2). Solo super-admin.
+admin.get('/tenants/:id/fe-certificate-url', async (c) => {
+  try {
+    const { id } = c.req.param();
+    const { data, error } = await db.storage.from(FE_CERT_BUCKET)
+      .createSignedUrl(`${id}/certificado.p12`, 300); // 5 min
+    if (error) throw new Error(error.message);
+    return ok(c, { url: data?.signedUrl ?? null });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// GET /alanube/ping — verifica el token/ambiente de Alanube del servidor.
+// No hay GET de listado en CRI, así que probamos POST /companies con body vacío:
+//   401/403 → token inválido · 400/422 → token OK (llegó a la validación) · 2xx → OK.
+admin.get('/alanube/ping', async (c) => {
+  const env = alanube.env(); const url = alanube.baseUrl();
+  try {
+    await alanube.createCompany({});
+    return ok(c, { ok: true, authenticated: true, env, base_url: url, note: 'Conexión y token OK' });
+  } catch (err: any) {
+    const status = err instanceof AlanubeError ? err.status : 500;
+    if (status === 401 || status === 403) {
+      return fail(c, `Token de Alanube inválido o sin permisos (401). ambiente=${env}`, 401);
+    }
+    if (status === 400 || status === 422) {
+      return ok(c, { ok: true, authenticated: true, env, base_url: url, note: 'Token OK (Alanube respondió validación del payload de prueba)' });
+    }
+    return fail(c, `${err.message} · ambiente=${env} · url=${url}`, status);
+  }
 });
 
 // POST /tenants/:id/fe-renew — renovar la bolsa de comprobantes FE (cuando el

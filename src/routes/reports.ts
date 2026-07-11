@@ -32,6 +32,55 @@ reports.get('/sales', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+// GET /taxes — reporte de impuestos (IVA débito fiscal) con CIERRE MENSUAL.
+// Agrupa las ventas por mes: base (subtotal), IVA (tax_amount) y total. Sirve
+// para la declaración de IVA y para "cerrar" cada mes.
+reports.get('/taxes', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const from = c.req.query('from');
+    const to   = endOfDay(c.req.query('to'));
+
+    const sel = 'id, invoice_number, customer_name, total, subtotal, tax_amount, issued_at, status, fe_clave, fe_nc_clave';
+    // Dos consultas (más robusto que un .or con is-not-null):
+    //  1) Ventas VÁLIDAS (no anuladas).
+    //  2) Facturas con NOTA DE CRÉDITO (aunque estén anuladas).
+    let qVentas = db.from('invoices').select(sel).eq('tenant_id', tenantId).neq('status', 'cancelled');
+    let qNc     = db.from('invoices').select(sel).eq('tenant_id', tenantId).not('fe_nc_clave', 'is', null);
+    if (from) { qVentas = qVentas.gte('issued_at', from); qNc = qNc.gte('issued_at', from); }
+    if (to)   { qVentas = qVentas.lte('issued_at', to);   qNc = qNc.lte('issued_at', to); }
+    const [rVentas, rNc] = await Promise.all([qVentas, qNc]);
+    if (rVentas.error) throw new Error(rVentas.error.message);
+    if (rNc.error)     throw new Error(rNc.error.message);
+
+    // Ventas GROSS = válidas ∪ las que tienen NC (por id, sin duplicar). Toda venta
+    // emitida cuenta como débito positivo; su NC (si tiene) resta aparte.
+    const salesById = new Map<string, any>();
+    for (const r of (rVentas.data ?? []) as any[]) salesById.set(r.id, r);
+    for (const r of (rNc.data ?? []) as any[]) salesById.set(r.id, r);
+
+    const invoices: Array<{ kind: 'venta' | 'nc'; invoice_number: string; customer_name: string; issued_at: string; month: string; base: number; iva: number; total: number; electronic: boolean }> = [];
+    const mkRow = (r: any, kind: 'venta' | 'nc') => {
+      const month = String(r.issued_at ?? '').slice(0, 7) || 'sin-fecha';
+      const sales = Number(r.total ?? 0);
+      const iva = Number(r.tax_amount ?? 0);
+      const base = Number(r.subtotal ?? (sales - iva));
+      const sign = kind === 'nc' ? -1 : 1;
+      invoices.push({
+        kind, invoice_number: r.invoice_number ?? '', customer_name: r.customer_name ?? '',
+        issued_at: r.issued_at ?? '', month,
+        base: base * sign, iva: iva * sign, total: sales * sign,
+        electronic: kind === 'nc' ? true : !!r.fe_clave,
+      });
+    };
+    for (const r of salesById.values()) mkRow(r, 'venta');
+    for (const r of (rNc.data ?? []) as any[]) mkRow(r, 'nc');
+    invoices.sort((a, b) => (a.issued_at || '').localeCompare(b.issued_at || ''));
+
+    return ok(c, { invoices });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 reports.get('/expenses', async (c) => {
   try {
     const tenantId = c.get('tenantId');

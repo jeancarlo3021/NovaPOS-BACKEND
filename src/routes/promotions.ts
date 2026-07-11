@@ -42,7 +42,8 @@ promotions.get('/', async (c) => {
 promotions.get('/active', async (c) => {
   try {
     const tenantId = c.get('tenantId');
-    const today = new Date().toISOString().slice(0, 10);
+    // Fecha de HOY en hora de Costa Rica (evita corrimiento por UTC en la noche).
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Costa_Rica' });
 
     let query = db
       .from('promotions')
@@ -73,7 +74,7 @@ promotions.post('/', async (c) => {
     const parsed = PromotionSchema.safeParse(body);
     if (!parsed.success) return fail(c, parsed.error.message, 422);
 
-    const today = new Date().toISOString().slice(0, 10);
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Costa_Rica' });
     const payload = {
       tenant_id: tenantId,
       name: parsed.data.name,

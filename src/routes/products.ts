@@ -8,6 +8,7 @@ const products = new Hono<{ Variables: { userId: string; tenantId: string; role:
 const ProductSchema = z.object({
   name:            z.string().min(1),
   sku:             z.string().optional().default(''),
+  sku2:            z.string().optional().nullable(),   // segundo código (alterno/barras)
   description:     z.string().optional().nullable(),
   unit_price:      z.number().nonnegative().optional().nullable(),
   cost_price:      z.number().nonnegative().optional().nullable(),
@@ -29,7 +30,7 @@ products.get('/', async (c) => {
     const category = c.req.query('category');
 
     let query = db.from('products').select('*').eq('tenant_id', tenantId).order('name');
-    if (search)   query = query.or(`name.ilike.%${search}%,sku.ilike.%${search}%`);
+    if (search)   query = query.or(`name.ilike.%${search}%,sku.ilike.%${search}%,sku2.ilike.%${search}%`);
     if (category) query = query.eq('category_id', category);
 
     const { data, error } = await query;
