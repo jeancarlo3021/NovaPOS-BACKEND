@@ -200,7 +200,13 @@ export function buildDocumentoJson(
       MontoTotalLinea: money(subtotal + impuestoMonto),
     };
     if (descuento > 0.005) {
-      linea.Descuento = [{ MontoDescuento: money(descuento), NaturalezaDescuento: 'Descuento' }];
+      // Hacienda v4.4 exige CodigoDescuento (enum 01-09,99). '01' = descuento
+      // comercial/general. Sin este campo, el comprobante era rechazado.
+      linea.Descuento = [{
+        MontoDescuento: money(descuento),
+        CodigoDescuento: '01',
+        NaturalezaDescuento: 'Descuento',
+      }];
     }
     if (l.sku) linea.CodigoComercial = [{ Tipo: '04', Codigo: l.sku }];
     if (tarifa > 0) {
