@@ -196,6 +196,51 @@ routing.get('/', async (c) => {
 // GET /central-stock — stock del INVENTARIO DEL SISTEMA (products), para "Cargar".
 // IMPORTANTE: debe ir ANTES de /:id, si no '/:id' captura 'central-stock'.
 // Valor -1 = stock infinito (producto sin control de inventario).
+// GET /load-suggestion?warehouse_id=&days=30 — sugerencia de carga por histórico:
+// cantidad promedio vendida por producto en las rutas de ese camión/bodega en los
+// últimos N días. Sirve para pre-llenar la carga y no salir corto ni sobrado.
+routing.get('/load-suggestion', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const warehouseId = c.req.query('warehouse_id');
+    const days = Math.max(1, Math.min(180, Number(c.req.query('days')) || 30));
+    const since = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
+
+    // 1. Rutas de esa bodega en el rango.
+    let rq = db.from('routes').select('id').eq('tenant_id', tenantId).gte('route_date', since);
+    if (warehouseId) rq = rq.eq('warehouse_id', warehouseId);
+    const { data: routes } = await rq;
+    const routeIds = (routes ?? []).map((r: any) => r.id);
+    if (routeIds.length === 0) return ok(c, { suggestion: {}, routes: 0, days });
+
+    // 2. Facturas de esas rutas (no anuladas).
+    const { data: invs } = await db.from('invoices')
+      .select('id, route_id, status').eq('tenant_id', tenantId).in('route_id', routeIds).neq('status', 'cancelled');
+    const invIds = (invs ?? []).map((i: any) => i.id);
+    if (invIds.length === 0) return ok(c, { suggestion: {}, routes: routeIds.length, days });
+
+    // 3. Ítems → suma de cantidad por producto.
+    const byProduct: Record<string, number> = {};
+    const CH = 300;
+    for (let i = 0; i < invIds.length; i += CH) {
+      const { data: items } = await db.from('invoice_items')
+        .select('product_id, quantity').in('invoice_id', invIds.slice(i, i + CH));
+      for (const it of (items ?? []) as any[]) {
+        if (!it.product_id) continue;
+        byProduct[it.product_id] = (byProduct[it.product_id] ?? 0) + Number(it.quantity ?? 0);
+      }
+    }
+    // 4. Promedio por ruta (redondeado hacia arriba).
+    const nRoutes = routeIds.length;
+    const suggestion: Record<string, number> = {};
+    for (const [pid, total] of Object.entries(byProduct)) {
+      const avg = Math.ceil(total / nRoutes);
+      if (avg > 0) suggestion[pid] = avg;
+    }
+    return ok(c, { suggestion, routes: nRoutes, days });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 routing.get('/central-stock', async (c) => {
   try {
     const tenantId = c.get('tenantId');

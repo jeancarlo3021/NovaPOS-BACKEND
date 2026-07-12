@@ -896,6 +896,47 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
   }
 });
 
+// GET /tenants/:id/products — preview de los productos de un tenant (para revisar
+// la carga por Excel desde el panel admin). Incluye nombres de categoría/unidad/proveedor.
+admin.get('/tenants/:id/products', async (c) => {
+  try {
+    const { id } = c.req.param();
+    const { data: prods, error } = await db.from('products')
+      .select('id, name, sku, sku2, unit_price, cost_price, stock_quantity, tracks_stock, cabys_code, iva_rate, category_id, unit_type_id, supplier_id, created_at')
+      .eq('tenant_id', id).order('created_at', { ascending: false }).limit(3000);
+    if (error) throw new Error(error.message);
+    const rows = (prods as any[]) ?? [];
+
+    // Resolver nombres de categoría / unidad / proveedor.
+    const catIds = [...new Set(rows.map(r => r.category_id).filter(Boolean))];
+    const unitIds = [...new Set(rows.map(r => r.unit_type_id).filter(Boolean))];
+    const supIds = [...new Set(rows.map(r => r.supplier_id).filter(Boolean))];
+    const nameMap = async (table: string, ids: string[]) => {
+      const map = new Map<string, string>();
+      if (ids.length) {
+        const { data } = await db.from(table).select('id, name').in('id', ids);
+        for (const x of (data as any[]) ?? []) map.set(x.id, x.name);
+      }
+      return map;
+    };
+    const [cats, units, sups] = await Promise.all([
+      nameMap('product_categories', catIds), nameMap('unit_types', unitIds), nameMap('suppliers', supIds),
+    ]);
+
+    const products = rows.map(r => ({
+      id: r.id, name: r.name, sku: r.sku, sku2: r.sku2,
+      unit_price: r.unit_price, cost_price: r.cost_price,
+      stock_quantity: r.stock_quantity, tracks_stock: r.tracks_stock,
+      cabys_code: r.cabys_code, iva_rate: r.iva_rate,
+      category: r.category_id ? cats.get(r.category_id) ?? null : null,
+      unit_type: r.unit_type_id ? units.get(r.unit_type_id) ?? null : null,
+      supplier: r.supplier_id ? sups.get(r.supplier_id) ?? null : null,
+      created_at: r.created_at,
+    }));
+    return ok(c, { products, count: products.length });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // POST /tenants/:id/products-import — importa productos por Excel para un tenant
 // (desde el panel admin). Resuelve/crea categorías y unidades por nombre y crea
 // los productos con el service-role. body: { rows: [...] }.

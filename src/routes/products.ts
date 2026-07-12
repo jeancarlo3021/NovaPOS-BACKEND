@@ -18,6 +18,7 @@ const ProductSchema = z.object({
   category_id:     z.string().uuid().optional().nullable(),
   unit_type_id:    z.string().uuid().optional().nullable(),
   supplier_id:     z.string().uuid().optional().nullable(),
+  is_favorite:     z.boolean().optional(),
   image_url:       z.string().url().optional().nullable(),
   tracks_stock:    z.boolean().optional(),
   cabys_code:      z.string().optional().nullable(),
@@ -30,14 +31,23 @@ products.get('/', async (c) => {
     const search   = c.req.query('search');
     const category = c.req.query('category');
 
-    let query = db.from('products').select('*').eq('tenant_id', tenantId).order('name');
-    if (search)   query = query.or(`name.ilike.%${search}%,sku.ilike.%${search}%,sku2.ilike.%${search}%`);
-    if (category) query = query.eq('category_id', category);
+    // Paginamos para traer TODOS los productos: Supabase corta en 1000 filas por
+    // defecto, así que un catálogo grande (importado por Excel) no aparecía completo.
+    const PAGE = 1000;
+    const all: any[] = [];
+    for (let from = 0; ; from += PAGE) {
+      let query = db.from('products').select('*').eq('tenant_id', tenantId).order('name')
+        .range(from, from + PAGE - 1);
+      if (search)   query = query.or(`name.ilike.%${search}%,sku.ilike.%${search}%,sku2.ilike.%${search}%`);
+      if (category) query = query.eq('category_id', category);
+      const { data, error } = await query;
+      if (error) throw new Error(error.message);
+      const chunk = data ?? [];
+      all.push(...chunk);
+      if (chunk.length < PAGE) break;   // última página
+    }
 
-    const { data, error } = await query;
-    if (error) throw new Error(error.message);
-
-    return ok(c, data);
+    return ok(c, all);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
