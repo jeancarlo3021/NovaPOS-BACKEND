@@ -6,10 +6,15 @@ import { ok, fail } from '../utils/response.js';
 const cashSessions = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
 // Schema matches actual DB: opening_amount, status='open'/'closed'
-const OpenSchema  = z.object({ opening_amount: z.number().nonnegative(), notes: z.string().optional().nullable() });
+const OpenSchema  = z.object({
+  opening_amount: z.number().nonnegative(),
+  opening_usd: z.number().nonnegative().optional(),   // dólares contados en apertura
+  notes: z.string().optional().nullable(),
+});
 const CloseSchema = z.object({
   closing_amount:  z.number().nonnegative().optional(),
   closing_balance: z.number().nonnegative().optional(), // alias for backward compat
+  closing_usd: z.number().nonnegative().optional(),     // dólares contados en cierre
   notes: z.string().optional().nullable(),
 }).transform(d => ({
   ...d,
@@ -63,6 +68,7 @@ cashSessions.post('/open', async (c) => {
       tenant_id:      tenantId,
       user_id:        userId,
       opening_amount: parsed.data.opening_amount,
+      opening_usd:    parsed.data.opening_usd ?? 0,
       opening_date:   new Date().toISOString(),
       status:         'open',
       notes:          parsed.data.notes,
@@ -81,6 +87,7 @@ cashSessions.post('/:id/close', async (c) => {
 
     const { data, error } = await db.from('cash_sessions').update({
       closing_amount: parsed.data.closing_amount,
+      closing_usd:    parsed.data.closing_usd ?? null,
       closing_date:   new Date().toISOString(),
       status:         'closed',
       notes:          parsed.data.notes,

@@ -7,6 +7,7 @@ import {
   paymentReceiptEmailHtml, paymentReminderEmailHtml, newBusinessEmailHtml,
   planFeatureLabels,
 } from '../services/emailService.js';
+import { reportPdfBase64 } from '../services/reportPdf.js';
 
 const email = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
@@ -48,6 +49,64 @@ async function subInfo(tenantId: string) {
 
 // GET /status — saber si el correo está configurado (para la UI)
 email.get('/status', (c) => ok(c, { enabled: emailEnabled() }));
+
+// POST /report — envía un reporte (cierre de caja, distribución) por correo a
+// los correos configurados (settings general.close_report_emails) + los que
+// vengan en `to`. body: { subject, title, subtitle?, sections:[{heading, rows:[[a,b]]}], to? }
+const isEmail = (s: string) => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(s);
+function parseEmails(v: any): string[] {
+  if (Array.isArray(v)) return v.map(String);
+  return String(v ?? '').split(/[,;\s]+/).map(s => s.trim()).filter(Boolean);
+}
+// HTML con apariencia de TICKET de cierre (monoespaciado, bordes por sección),
+// para que el correo se vea igual que el cierre impreso del POS / distribución.
+function reportHtml(title: string, subtitle: string, sections: Array<{ heading?: string; rows: Array<[string, string]> }>): string {
+  const secs = sections.map(s => `
+    ${s.heading ? `<div style="font-weight:900;font-size:13px;border-top:3px solid #000;border-bottom:3px solid #000;margin:8px 0 4px;padding:3px 0;letter-spacing:1px;text-align:center">${s.heading}</div>` : ''}
+    <table style="width:100%;border-collapse:collapse">
+      ${s.rows.map(([a, b]) => `<tr><td style="padding:2px 0;font-weight:800">${a}</td><td style="padding:2px 0;text-align:right;font-weight:900">${b}</td></tr>`).join('')}
+    </table>`).join('');
+  return `<div style="font-family:'Courier New',Courier,monospace;max-width:340px;margin:0 auto;padding:14px;color:#000;background:#fff;font-weight:700;line-height:1.6">
+    <div style="font-size:18px;font-weight:900;text-align:center;letter-spacing:2px;padding:4px 0;margin-bottom:6px;border-top:4px solid #000;border-bottom:4px solid #000">${title.toUpperCase()}</div>
+    ${subtitle ? `<div style="font-size:12px;font-weight:800;text-align:center;margin-bottom:6px">${subtitle}</div>` : ''}
+    ${secs}
+    <div style="text-align:center;font-size:11px;color:#666;margin-top:16px;border-top:2px dashed #999;padding-top:8px">Generado automáticamente por ColónClick</div>
+  </div>`;
+}
+
+email.post('/report', async (c) => {
+  try {
+    if (!emailEnabled()) return ok(c, { sent: 0, note: 'Email no configurado en el servidor' });
+    const tenantId = c.get('tenantId');
+    const b = await c.req.json();
+    const { data: gen } = await db.from('settings').select('config')
+      .eq('tenant_id', tenantId).eq('type', 'general').maybeSingle();
+    const cfgEmails = parseEmails((gen?.config as any)?.close_report_emails);
+    const recipients = Array.from(new Set([...(Array.isArray(b.to) ? b.to : []), ...cfgEmails]))
+      .map(String).filter(isEmail);
+    if (recipients.length === 0) return ok(c, { sent: 0, note: 'Sin correos configurados' });
+
+    const title = String(b.title ?? 'Reporte');
+    const subtitle = String(b.subtitle ?? '');
+    const sections = Array.isArray(b.sections) ? b.sections : [];
+    const html = reportHtml(title, subtitle, sections);
+
+    // PDF adjunto con el mismo diseño (ticket de cierre).
+    let attachments: Array<{ filename: string; content: string }> | undefined;
+    try {
+      const pdf = await reportPdfBase64(title, subtitle, sections);
+      const safe = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'reporte';
+      attachments = [{ filename: `${safe}.pdf`, content: pdf }];
+    } catch { /* si el PDF falla, se manda solo el HTML */ }
+
+    let sent = 0;
+    for (const r of recipients) {
+      try { await sendEmail({ to: r, subject: String(b.subject ?? title), html, attachments }); sent++; }
+      catch { /* seguir con los demás */ }
+    }
+    return ok(c, { sent });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
 
 // POST /test — { to } enviar un correo de prueba
 email.post('/test', async (c) => {

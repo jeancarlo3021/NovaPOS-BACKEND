@@ -501,6 +501,40 @@ groups.get('/my/tenants', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+// ── GET /my/tenant-plan/:tenantId — plan/features de una sucursal del usuario.
+// El cliente no puede leer la suscripción de OTRO tenant por RLS; acá lo
+// resolvemos con service-role, validando que el user pertenezca a ese tenant.
+groups.get('/my/tenant-plan/:tenantId', async (c) => {
+  try {
+    const userId = c.get('userId');
+    const { tenantId } = c.req.param();
+    if (!userId || !tenantId) return fail(c, 'No autorizado', 401);
+
+    // Validar pertenencia: el user tiene fila en user_tenants para ese tenant,
+    // o comparten grupo con su tenant actual.
+    const { data: membership } = await db.from('user_tenants')
+      .select('tenant_id').eq('user_id', userId).eq('tenant_id', tenantId).maybeSingle();
+    let allowed = !!membership;
+    if (!allowed) {
+      const cur = c.get('tenantId');
+      const { data: g1 } = await db.from('tenant_group_members').select('group_id').eq('tenant_id', cur).maybeSingle();
+      const { data: g2 } = await db.from('tenant_group_members').select('group_id').eq('tenant_id', tenantId).maybeSingle();
+      allowed = !!(g1 as any)?.group_id && (g1 as any)?.group_id === (g2 as any)?.group_id;
+    }
+    if (!allowed) return fail(c, 'No autorizado para este tenant', 403);
+
+    // Suscripción vigente + plan (service-role, sin RLS).
+    const { data: sub } = await db.from('subscriptions')
+      .select('status, subscription_plans(name, features)')
+      .eq('tenant_id', tenantId).order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (!sub || (sub as any).status !== 'active') {
+      return ok(c, { name: 'demo', features: null });
+    }
+    const plan = (sub as any).subscription_plans;
+    return ok(c, { name: plan?.name ?? 'demo', features: plan?.features ?? null });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // ── GET /my/branches-stats — métricas por sucursal del grupo del owner ────
 // Devuelve, para cada tenant donde el caller es 'owner' en user_tenants:
 //   { tenant_id, tenant_name, users_count, invoices_month, warehouses_count }
@@ -510,10 +544,18 @@ groups.get('/my/branches-stats', async (c) => {
     const userId = c.get('userId');
     if (!userId) return ok(c, []);
 
-    // 1. Tenants donde el user es owner
-    const { data: ownedRows } = await db.from('user_tenants')
-      .select('tenant_id').eq('user_id', userId).eq('role', 'owner');
-    const tenantIds = (ownedRows ?? []).map((r: any) => r.tenant_id);
+    // 1. Solo las sucursales del MISMO GRUPO del tenant actual. Antes devolvía
+    //    TODOS los tenants donde el user era owner en user_tenants — para el
+    //    super-admin (que creó todos los negocios) eso filtraba negocios ajenos
+    //    ("sucursales que no debería ver"). Si el negocio actual no pertenece a
+    //    un grupo, no hay panel de sucursales.
+    const currentTenantId = c.get('tenantId');
+    const { data: myGroupRow } = await db.from('tenant_group_members')
+      .select('group_id').eq('tenant_id', currentTenantId).maybeSingle();
+    if (!(myGroupRow as any)?.group_id) return ok(c, []);
+    const { data: memberRows } = await db.from('tenant_group_members')
+      .select('tenant_id').eq('group_id', (myGroupRow as any).group_id);
+    const tenantIds = Array.from(new Set((memberRows ?? []).map((r: any) => r.tenant_id)));
     if (tenantIds.length === 0) return ok(c, []);
 
     // 2. Nombres

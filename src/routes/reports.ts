@@ -41,6 +41,51 @@ reports.get('/sales', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+// GET /vouchers — comprobantes de PAGOS y ANULACIONES en un rango.
+// Devuelve cada factura con su medio de pago, comprobante (voucher), moneda,
+// clave FE, y si fue anulada (con su Nota de Crédito). El front lo separa en
+// "Pagos" y "Anulaciones".
+reports.get('/vouchers', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const from = c.req.query('from');
+    const to   = endOfDay(c.req.query('to'));
+
+    let q = db.from('invoices')
+      .select('id, invoice_number, customer_name, total, payment_method, payments, voucher_number, currency, exchange_rate, status, fe_clave, fe_nc_clave, cashier_name, issued_at, created_at')
+      .eq('tenant_id', tenantId)
+      .order('issued_at', { ascending: false }).limit(2000);
+    if (from) q = q.gte('issued_at', from);
+    if (to)   q = q.lte('issued_at', to);
+
+    const { data, error } = await q;
+    if (error) throw new Error(error.message);
+    const rows = (data ?? []) as any[];
+
+    const voids = rows.filter(r => r.status === 'cancelled');
+    const payments = rows.filter(r => r.status !== 'cancelled');
+
+    const totalPagos = payments.reduce((s, r) => s + Number(r.total ?? 0), 0);
+    const totalAnulado = voids.reduce((s, r) => s + Number(r.total ?? 0), 0);
+    // Desglose de pagos por método (incluye splits de pago mixto).
+    const byMethod: Record<string, number> = {};
+    for (const r of payments) {
+      const splits = Array.isArray(r.payments) && r.payments.length > 0
+        ? r.payments : [{ method: r.payment_method ?? 'cash', amount: r.total }];
+      for (const s of splits) byMethod[s.method ?? 'cash'] = (byMethod[s.method ?? 'cash'] ?? 0) + Number(s.amount ?? 0);
+    }
+
+    return ok(c, {
+      payments, voids,
+      summary: {
+        payments_count: payments.length, payments_total: totalPagos,
+        voids_count: voids.length, voids_total: totalAnulado,
+        by_method: byMethod,
+      },
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // GET /taxes — reporte de impuestos (IVA débito fiscal) con CIERRE MENSUAL.
 // Agrupa las ventas por mes: base (subtotal), IVA (tax_amount) y total. Sirve
 // para la declaración de IVA y para "cerrar" cada mes.

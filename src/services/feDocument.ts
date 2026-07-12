@@ -178,14 +178,19 @@ export function buildDocumentoJson(
   const condicionVenta = inv.payment_method === 'credit' ? '02' : '01';
   const medioPago = MEDIO_PAGO[inv.payment_method] ?? '01';
 
+  let totalLineas = 0;   // suma de MontoTotalLinea (subtotal + impuesto) de todas las líneas
   const lineaDetalle = lines.map((l, i) => {
     const tarifa = Number(l.iva_rate ?? 0);
-    const montoTotal = Math.round(l.unit_price * l.quantity * 100) / 100;
-    const subtotal = Math.round(Number(l.subtotal ?? montoTotal) * 100) / 100;
-    // Hacienda exige SubTotal = MontoTotal − Descuento. Si lo cobrado (subtotal)
-    // es menor que precio×cantidad (precio especial del cliente, promo, % desc.),
-    // la diferencia se declara como DESCUENTO de línea; si no, la validación falla.
-    const descuento = Math.round((montoTotal - subtotal) * 100) / 100;
+    const cantidad = Number(l.quantity) || 0;
+    // Subtotal = lo realmente cobrado por la línea (con precio especial/promo ya aplicado).
+    const subtotal = Math.round(Number(l.subtotal ?? l.unit_price * cantidad) * 100) / 100;
+    // PRECIO EFECTIVO: usamos el precio realmente cobrado por unidad como
+    // PrecioUnitario, de modo que MontoTotal = SubTotal y NO haya que declarar un
+    // nodo Descuento (evita las validaciones de CodigoDescuento /
+    // ImpuestoAsumidoEmisorFabrica). El precio especial/promo queda reflejado en
+    // el precio unitario, que es una forma válida ante Hacienda.
+    const precioUnitario = cantidad > 0 ? subtotal / cantidad : subtotal;
+    const montoTotal = Math.round(precioUnitario * cantidad * 100) / 100;  // == subtotal
     const impuestoMonto = Math.round(subtotal * (tarifa / 100) * 100) / 100;
     const linea: any = {
       NumeroLinea: String(i + 1),
@@ -193,22 +198,12 @@ export function buildDocumentoJson(
       Cantidad: num(l.quantity),
       UnidadMedida: haciendaUnit(l.unit),
       Detalle: l.product_name,
-      PrecioUnitario: money(l.unit_price),
+      PrecioUnitario: (Math.round(precioUnitario * 100000) / 100000).toFixed(5),  // hasta 5 decimales
       MontoTotal: money(montoTotal),
       SubTotal: money(subtotal),
       BaseImponible: money(subtotal),
       MontoTotalLinea: money(subtotal + impuestoMonto),
     };
-    if (descuento > 0.005) {
-      // Hacienda v4.4 exige CodigoDescuento. Usamos '09' = Descuento Comercial
-      // (precio especial de cliente / promo). NO usar 01/02/03 (regalía/
-      // bonificación): esos disparan la validación de ImpuestoAsumidoEmisorFabrica.
-      linea.Descuento = [{
-        MontoDescuento: money(descuento),
-        CodigoDescuento: '09',
-        NaturalezaDescuento: 'Descuento comercial',
-      }];
-    }
     if (l.sku) linea.CodigoComercial = [{ Tipo: '04', Codigo: l.sku }];
     if (tarifa > 0) {
       linea.Impuesto = [{
@@ -221,10 +216,14 @@ export function buildDocumentoJson(
     }
     // Requerido por Hacienda: impuesto asumido por el emisor de fábrica (0 si no aplica).
     linea.ImpuestoAsumidoEmisorFabrica = '0';
+    totalLineas += subtotal + impuestoMonto;
     return linea;
   });
 
-  const totalComprobante = Math.round(Number(inv.total ?? 0) * 100) / 100;
+  // El total del comprobante DEBE ser la suma de las líneas (lo que Facturemos
+  // recalcula con RecalcularResumen=1). Usar inv.total podía diferir por el
+  // redondeo a ₡10 del POS → los medios de pago no cuadraban con el total.
+  const totalComprobante = Math.round(totalLineas * 100) / 100;
 
   // Facturemos indica: NO enviar Clave ni NumeroConsecutivo (los asigna su API;
   // si mandamos "0" los toma como valor 0). Y el contenido de `Factura` va SIN el
