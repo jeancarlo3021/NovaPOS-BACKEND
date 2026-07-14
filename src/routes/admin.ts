@@ -332,11 +332,33 @@ admin.post('/set-subscription-days', async (c) => {
 admin.post('/change-plan', async (c) => {
   try {
     const { tenantId, newPlanId } = await c.req.json();
+    if (!tenantId || !newPlanId) return fail(c, 'tenantId y newPlanId requeridos', 422);
+
     const { error: te } = await db.from('tenants').update({ plan_id: newPlanId }).eq('id', tenantId);
     if (te) throw new Error(te.message);
-    // Update active subscription plan_id
-    await db.from('subscriptions').update({ plan_id: newPlanId, updated_at: new Date().toISOString() })
-      .eq('tenant_id', tenantId).eq('status', 'active');
+
+    // Actualizar la suscripción ACTIVA. Si no hay ninguna (sucursales enlazadas o
+    // creadas sin plan), se CREA una — antes solo se actualizaba y quedaba el
+    // tenant con plan_id pero sin suscripción activa ("básico pero a la vez no").
+    const { data: updated } = await db.from('subscriptions')
+      .update({ plan_id: newPlanId, status: 'active', updated_at: new Date().toISOString() })
+      .eq('tenant_id', tenantId).eq('status', 'active').select('id');
+
+    if (!updated || updated.length === 0) {
+      const { data: plan } = await db.from('subscription_plans')
+        .select('billing_cycle').eq('id', newPlanId).maybeSingle();
+      const cycleDays = String((plan as any)?.billing_cycle ?? 'monthly').toLowerCase() === 'yearly' ? 365 : 30;
+      const nowISO = new Date().toISOString();
+      const endsAt = new Date(Date.now() + cycleDays * 86_400_000).toISOString();
+      const { data: sub, error: sErr } = await db.from('subscriptions').insert({
+        tenant_id: tenantId, plan_id: newPlanId, status: 'active',
+        started_at: nowISO, ends_at: endsAt, auto_renew: true,
+      }).select('id').single();
+      if (sErr) throw new Error(sErr.message);
+      if ((sub as any)?.id) {
+        await db.from('tenants').update({ subscription_id: (sub as any).id }).eq('id', tenantId);
+      }
+    }
     return ok(c, { ok: true });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
