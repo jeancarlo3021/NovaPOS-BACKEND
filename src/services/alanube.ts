@@ -99,6 +99,19 @@ export const alanube = {
   /** Crea/registra una empresa (emisor) en Alanube. CONFIRMADO: POST /cri/v1/companies. */
   createCompany: (payload: Record<string, any>) =>
     alanubeFetch('/companies', { method: 'POST', body: JSON.stringify(payload) }),
+
+  /** Actualiza una empresa existente (ej. para activar el webhook de recepción).
+   *  El método/path no está documentado; probamos PUT y luego PATCH. */
+  updateCompany: async (id: string, payload: Record<string, any>) => {
+    try {
+      return await alanubeFetch(`/companies/${id}`, { method: 'PUT', body: JSON.stringify(payload) });
+    } catch (e: any) {
+      if (e instanceof AlanubeError && (e.status === 404 || e.status === 405)) {
+        return await alanubeFetch(`/companies/${id}`, { method: 'PATCH', body: JSON.stringify(payload) });
+      }
+      throw e;
+    }
+  },
   /** Emite factura electrónica. Sigue el patrón versionado (POST /purchase-invoices/v44
    *  está confirmado; ventas debería ser /invoices/v44 — confirmar en la doc CRI). */
   emitVoucher: (payload: Record<string, any>) =>
@@ -106,11 +119,12 @@ export const alanube = {
   /** Emite un documento electrónico por tipo (path versionado /v44). CRI:
    *  invoice → factura electrónica (01) · ticket → tiquete electrónico (04) ·
    *  credit-note → nota de crédito (03). Los paths están en un solo lugar. */
-  emitDocument: (kind: 'invoice' | 'ticket' | 'credit-note', payload: Record<string, any>, companyId?: string) => {
+  emitDocument: (kind: 'invoice' | 'ticket' | 'credit-note' | 'debit-note', payload: Record<string, any>, companyId?: string) => {
     const path: Record<string, string> = {
       invoice: '/invoices/v44',
       ticket: '/tickets/v44',
       'credit-note': '/credit-notes/v44',
+      'debit-note': '/debit-notes/v44',
     };
     // Cuenta multi-empresa: indicamos la empresa emisora con un header.
     // (nombre del header POR CONFIRMAR con Alanube; si requiere el id en el path,
@@ -121,4 +135,22 @@ export const alanube = {
   /** Consulta el estado de un documento por su id (ULID). PATH a confirmar. */
   getDocument: (id: string) =>
     alanubeFetch(`/documents/${id}`, { method: 'GET' }),
+
+  // ── RECEPCIÓN / Mensaje Receptor (CRI) ───────────────────────────────────────
+  // CONFIRMADO en la doc CRI (developer.alanube.co/v1.0-CRI):
+  //   POST /cri/v1/receiver-messages        → enviar aceptación(1)/parcial(2)/rechazo(3)
+  //   GET  /cri/v1/receiver-messages/{id}    → consultar el mensaje receptor
+  // NO hay endpoint de "listar recibidos" en CRI (eso es solo DOM). En CRI, los
+  // comprobantes de proveedores llegan por WEBHOOK; el body top-level del mensaje
+  // es: { idDoc, sender, receiver, information, totals }.
+  /** Envía el Mensaje Receptor (aceptación 1 / aceptación parcial 2 / rechazo 3). */
+  sendReceiverMessage: (payload: Record<string, any>, companyId?: string) => {
+    const headers = companyId ? { 'X-Company-Id': companyId } : undefined;
+    return alanubeFetch('/receiver-messages', { method: 'POST', body: JSON.stringify(payload), headers });
+  },
+  /** Consulta un Mensaje Receptor por su id. */
+  getReceiverMessage: (id: string, companyId?: string) => {
+    const headers = companyId ? { 'X-Company-Id': companyId } : undefined;
+    return alanubeFetch(`/receiver-messages/${id}`, { method: 'GET', headers });
+  },
 };

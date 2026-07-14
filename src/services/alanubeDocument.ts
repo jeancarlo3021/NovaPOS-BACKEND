@@ -70,41 +70,50 @@ export function buildAlanubeDocument(
   lines: FELine[],
   receptor: AlanubeReceptor | null,
   opts: {
-    tipoDoc: string;            // '01' factura · '04' tiquete
+    tipoDoc: string;            // '01' factura · '04' tiquete · '03' nota de crédito
     headquarters?: string;      // sucursal
     terminal?: string;
     numberOfDocument?: string;  // consecutivo interno
+    // Para nota de crédito (03): referencia al documento que anula.
+    reference?: {
+      documentType: string;     // tipo del doc original (01/04)
+      number: string;           // clave (50 díg) del doc original
+      date: string;             // fecha de emisión del original (ISO)
+      code?: string;            // código de referencia (01 = anula)
+      reason?: string;          // razón
+    };
   },
 ) {
   const condicionVenta = inv.payment_method === 'credit' ? '02' : '01';
   const medioPago = MEDIO_PAGO[inv.payment_method ?? 'cash'] ?? '01';
 
-  let totalTaxedGoods = 0, totalExemptGoods = 0, totalDiscounts = 0, totalTax = 0, totalSale = 0;
+  let totalTaxedGoods = 0, totalExemptGoods = 0, totalTax = 0, totalSale = 0;
 
+  // Enfoque PRECIO EFECTIVO (igual que Facturemos): el descuento se absorbe en el
+  // precio unitario, así amountTotal == subTotal y no hay que declarar descuento.
+  // Evita todas las validaciones de "subTotal = amountTotal - descuentos".
   const itemDetails = lines.map((l) => {
     const tarifa = Number(l.iva_rate ?? 0);
     const cantidad = Number(l.quantity);
-    const precio = r2(l.unit_price);
-    const bruto = r2(precio * cantidad);            // monto total (sin descuento)
-    const neto = r2(l.subtotal);                    // subtotal (con descuento, sin IVA)
-    const descuento = r2(Math.max(0, bruto - neto));
-    const impuesto = r2(neto * (tarifa / 100));
-    const lineTotal = r2(neto + impuesto);
+    const neto = r2(l.subtotal);                             // subtotal (con descuento, sin IVA)
+    const precioEfectivo = cantidad > 0 ? neto / cantidad : neto;  // precio unitario neto
+    const montoTotal = r2(precioEfectivo * cantidad);        // == neto (por redondeo)
+    const impuesto = r2(montoTotal * (tarifa / 100));
+    const lineTotal = r2(montoTotal + impuesto);
 
-    if (tarifa > 0) totalTaxedGoods += neto; else totalExemptGoods += neto;
-    totalDiscounts += descuento;
+    if (tarifa > 0) totalTaxedGoods += montoTotal; else totalExemptGoods += montoTotal;
     totalTax += impuesto;
-    totalSale += bruto;
+    totalSale += montoTotal;
 
     const item: Record<string, any> = {
       code: String(l.cabys_code ?? '').replace(/\D/g, ''),   // CABYS
       quantity: String(cantidad),
       unitMeasurement: haciendaUnit(l.unit),
       detail: l.product_name,
-      unitPrice: money(precio),
-      amountTotal: money(bruto),
-      subTotal: money(neto),
-      taxableBase: money(neto),
+      unitPrice: precioEfectivo.toFixed(5),                  // 5 decimales para cuadrar el total
+      amountTotal: money(montoTotal),
+      subTotal: money(montoTotal),
+      taxableBase: money(montoTotal),
       taxNet: money(impuesto),
       amountTotalLine: money(lineTotal),
       taxes: [{ code: '01', feeCode: rateCode(tarifa), fee: String(tarifa), amount: money(impuesto) }],
@@ -116,6 +125,10 @@ export function buildAlanubeDocument(
   const saleCondition: Record<string, any> = { id: condicionVenta };
   if (condicionVenta === '02') saleCondition.creditTerm = '30';
 
+  // NOTA: la emisión de factura/tiquete ya fue ACEPTADA por Alanube con ESTA
+  // estructura exacta (sin `currency` — default CRC; con `senderEconomicActivity`
+  // dentro de header). NO agregar `currency`/`sender` top-level sin confirmarlo
+  // contra el sandbox: el validador CRI rechaza propiedades desconocidas.
   const payload: Record<string, any> = {
     header: {
       issueDate: fechaCR(inv.issued_at),
@@ -135,10 +148,10 @@ export function buildAlanubeDocument(
       totalExemptGoods: money(totalExemptGoods),
       totalExempt: money(totalExemptGoods),
       totalSale: money(totalSale),
-      totalDiscounts: money(totalDiscounts),
-      totalNetSale: money(totalSale - totalDiscounts),
+      totalDiscounts: money(0),
+      totalNetSale: money(totalSale),
       totalTax: money(totalTax),
-      totalVoucher: money(totalSale - totalDiscounts + totalTax),
+      totalVoucher: money(totalSale + totalTax),
     },
   };
 
@@ -146,8 +159,12 @@ export function buildAlanubeDocument(
   if (receptor && (receptor.identification || receptor.name)) {
     const rec: Record<string, any> = { name: receptor.name ?? '' };
     if (receptor.identification_type && receptor.identification) {
-      rec.identificationType = receptor.identification_type;
-      rec.identificationNumber = String(receptor.identification).replace(/\D/g, '');
+      // Alanube CRI exige la identificación ANIDADA en
+      // `identification: { identificationType, identificationNumber }`.
+      rec.identification = {
+        identificationType: receptor.identification_type,
+        identificationNumber: String(receptor.identification).replace(/\D/g, ''),
+      };
     }
     if (receptor.email) rec.email = receptor.email;
     if (receptor.province_code) {
@@ -159,6 +176,17 @@ export function buildAlanubeDocument(
       };
     }
     payload.receiver = rec;
+  }
+
+  // Nota de crédito (03): bloque de referencia al documento original.
+  if (opts.reference) {
+    payload.referenceDocuments = [{
+      typeDoc: opts.reference.documentType,
+      number: opts.reference.number,
+      dateEmission: opts.reference.date ? fechaCR(opts.reference.date) : fechaCR(),
+      code: opts.reference.code ?? '01',
+      reason: opts.reference.reason ?? 'Anulación de documento',
+    }];
   }
 
   return payload;

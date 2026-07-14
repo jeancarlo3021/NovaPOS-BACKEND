@@ -523,15 +523,49 @@ groups.get('/my/tenant-plan/:tenantId', async (c) => {
     }
     if (!allowed) return fail(c, 'No autorizado para este tenant', 403);
 
-    // Suscripción vigente + plan (service-role, sin RLS).
-    const { data: sub } = await db.from('subscriptions')
-      .select('status, subscription_plans(name, features)')
-      .eq('tenant_id', tenantId).order('created_at', { ascending: false }).limit(1).maybeSingle();
-    if (!sub || (sub as any).status !== 'active') {
-      return ok(c, { name: 'demo', features: null });
+    // Suscripción ACTIVA de un tenant (service-role, sin RLS). Filtra por
+    // status='active' (no toma la más reciente y después chequea, que fallaba si
+    // la última fila no estaba activa). Devuelve también fecha/valor del plan.
+    const activeSubOf = async (tid: string) => {
+      const { data } = await db.from('subscriptions')
+        .select('ends_at, subscription_plans(name, features, price, billing_cycle, description)')
+        .eq('tenant_id', tid).eq('status', 'active')
+        .order('created_at', { ascending: false }).limit(1).maybeSingle();
+      return (data as any) ?? null;
+    };
+
+    // 1) Suscripción propia de la sucursal.
+    let sub = await activeSubOf(tenantId);
+
+    // 2) Si no tiene suscripción propia (sucursal enlazada/creada sin plan), HEREDA
+    //    el plan del tenant principal del grupo.
+    if (!sub?.subscription_plans) {
+      const { data: gm } = await db.from('tenant_group_members')
+        .select('group_id').eq('tenant_id', tenantId).maybeSingle();
+      const groupId = (gm as any)?.group_id;
+      if (groupId) {
+        const { data: grp } = await db.from('tenant_groups')
+          .select('main_tenant_id').eq('id', groupId).maybeSingle();
+        let mainId = (grp as any)?.main_tenant_id ?? null;
+        if (!mainId) {
+          const { data: mainMember } = await db.from('tenant_group_members')
+            .select('tenant_id').eq('group_id', groupId).eq('role', 'main').maybeSingle();
+          mainId = (mainMember as any)?.tenant_id ?? null;
+        }
+        if (mainId && mainId !== tenantId) sub = await activeSubOf(mainId);
+      }
     }
-    const plan = (sub as any).subscription_plans;
-    return ok(c, { name: plan?.name ?? 'demo', features: plan?.features ?? null });
+
+    const plan = (sub as any)?.subscription_plans ?? null;
+    if (!plan) return ok(c, { name: 'demo', features: null, ends_at: null, price: null, billing_cycle: null, description: null });
+    return ok(c, {
+      name: plan.name ?? 'demo',
+      features: plan.features ?? null,
+      ends_at: (sub as any)?.ends_at ?? null,
+      price: plan.price ?? null,
+      billing_cycle: plan.billing_cycle ?? null,
+      description: plan.description ?? null,
+    });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

@@ -1,5 +1,6 @@
 import { createMiddleware } from 'hono/factory';
 import { db } from '../db/client.js';
+import { maybeResetDemo } from '../services/demoReset.js';
 
 type Variables = { userId: string; tenantId: string; role: string };
 
@@ -31,7 +32,7 @@ export const enforceActiveTenant = createMiddleware<{ Variables: Variables }>(as
 
   const { data, error } = await db
     .from('tenants')
-    .select('status')
+    .select('status, is_demo, demo_reset_at')
     .eq('id', tenantId)
     .maybeSingle();
 
@@ -50,6 +51,15 @@ export const enforceActiveTenant = createMiddleware<{ Variables: Variables }>(as
       code: 'tenant_suspended',
       status,
     }, 403);
+  }
+
+  // ── DEMO ETERNO ───────────────────────────────────────────────────────────
+  // La cuenta demo nunca vence; en cambio, sus datos (productos y movimientos)
+  // se limpian cada 8 días. El reseteo se dispara perezosamente al acceder.
+  if ((data as any)?.is_demo) {
+    try { await maybeResetDemo(tenantId, (data as any).demo_reset_at ?? null); }
+    catch (e: any) { console.warn('[demo-reset] middleware:', e?.message); }
+    return next();
   }
 
   // ── Expiración con gracia → SOLO LECTURA ──────────────────────────────────

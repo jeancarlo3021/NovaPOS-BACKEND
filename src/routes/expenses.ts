@@ -5,6 +5,22 @@ import { ok, fail } from '../utils/response.js';
 
 const expenses = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
+// Categorías por defecto (con EMOJI real — la UI las muestra como `{icon} {name}`).
+const DEFAULT_CATEGORIES: Array<{ id: string; name: string; color: string; icon: string }> = [
+  { id: '1',  name: 'Servicios públicos',    color: '#3b82f6', icon: '⚡' },
+  { id: '2',  name: 'Suministros',           color: '#10b981', icon: '📦' },
+  { id: '3',  name: 'Salarios',              color: '#f59e0b', icon: '👥' },
+  { id: '4',  name: 'Alquiler',              color: '#ef4444', icon: '🏠' },
+  { id: '5',  name: 'Mercadería',            color: '#8b5cf6', icon: '🛒' },
+  { id: '6',  name: 'Combustible',           color: '#f97316', icon: '⛽' },
+  { id: '7',  name: 'Mantenimiento',         color: '#64748b', icon: '🔧' },
+  { id: '8',  name: 'Transporte',            color: '#06b6d4', icon: '🚚' },
+  { id: '9',  name: 'Impuestos',             color: '#e11d48', icon: '🏛️' },
+  { id: '10', name: 'Publicidad',            color: '#a855f7', icon: '📣' },
+  { id: '11', name: 'Comisiones bancarias',  color: '#6366f1', icon: '🏦' },
+  { id: '12', name: 'Otros',                 color: '#6b7280', icon: '💰' },
+];
+
 const ExpenseSchema = z.object({
   description: z.string().min(1),
   amount: z.number().positive(),
@@ -118,15 +134,11 @@ expenses.delete('/:id', async (c) => {
 
 // GET /categories/general — general expense categories
 expenses.get('/categories/general', async (c) => {
-  return ok(c, [
-    { id: '1', name: 'Servicios', color: '#3b82f6', icon: 'Zap' },
-    { id: '2', name: 'Suministros', color: '#10b981', icon: 'Package' },
-    { id: '3', name: 'Salarios', color: '#f59e0b', icon: 'Users' },
-    { id: '4', name: 'Renta', color: '#ef4444', icon: 'Home' },
-  ]);
+  return ok(c, DEFAULT_CATEGORIES);
 });
 
-// GET /categories — tenant expense categories
+// GET /categories — tenant expense categories. Si el tenant no tiene ninguna,
+// se auto-crean las por defecto (así el selector nunca queda vacío).
 expenses.get('/categories', async (c) => {
   try {
     const tenantId = c.get('tenantId');
@@ -134,8 +146,17 @@ expenses.get('/categories', async (c) => {
       .from('expense_categories')
       .select('*')
       .eq('tenant_id', tenantId);
-
     if (error) return ok(c, []);
+
+    if ((data ?? []).length === 0) {
+      const rows = DEFAULT_CATEGORIES.map(cat => ({
+        tenant_id: tenantId, name: cat.name, color: cat.color, icon: cat.icon,
+        general_category_id: cat.id, is_general: true,
+      }));
+      const { data: seeded } = await db.from('expense_categories')
+        .insert(rows).select();
+      return ok(c, seeded ?? []);
+    }
     return ok(c, data ?? []);
   } catch {
     return ok(c, []);
@@ -148,14 +169,7 @@ expenses.post('/categories/from-general', async (c) => {
     const tenantId = c.get('tenantId');
     const { general_category_id } = await c.req.json() as { general_category_id: string };
 
-    const generalCategories: Record<string, any> = {
-      '1': { name: 'Servicios', color: '#3b82f6', icon: 'Zap' },
-      '2': { name: 'Suministros', color: '#10b981', icon: 'Package' },
-      '3': { name: 'Salarios', color: '#f59e0b', icon: 'Users' },
-      '4': { name: 'Renta', color: '#ef4444', icon: 'Home' },
-    };
-
-    const general = generalCategories[general_category_id];
+    const general = DEFAULT_CATEGORIES.find(x => x.id === general_category_id);
     if (!general) return fail(c, 'Categoría no encontrada', 404);
 
     // Si el tenant ya tiene una categoría con ese nombre, devolverla en vez de
@@ -184,7 +198,10 @@ expenses.post('/categories/from-general', async (c) => {
 
     const { data, error } = await db
       .from('expense_categories')
-      .insert({ tenant_id: tenantId, general_category_id, is_general: true, ...general })
+      .insert({
+        tenant_id: tenantId, general_category_id, is_general: true,
+        name: general.name, color: general.color, icon: general.icon,
+      })
       .select()
       .single();
 

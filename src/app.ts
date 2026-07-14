@@ -4,6 +4,7 @@ import { logger } from 'hono/logger';
 import { auth } from './middleware/auth.js';
 import { enforceActiveTenant } from './middleware/tenantStatus.js';
 import authRoutes      from './routes/auth.js';
+import webhooks        from './routes/webhooks.js';
 import products        from './routes/products.js';
 import categories      from './routes/categories.js';
 import unitTypes       from './routes/unitTypes.js';
@@ -63,6 +64,9 @@ app.get('/health', (c) => c.json({
 
 // Auth routes — no auth required
 app.route('/auth', authRoutes);
+
+// Webhooks entrantes (Alanube) — públicos, validados por secreto propio
+app.route('/webhooks', webhooks);
 
 const api = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 api.use('*', auth);

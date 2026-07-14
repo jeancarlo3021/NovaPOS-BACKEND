@@ -86,6 +86,16 @@ admin.get('/owners', async (c) => {
       }
     } catch (e: any) { console.warn('[owners] custom_price lookup:', e?.message); }
 
+    // Proveedor de FE por tenant (para mostrar/ocultar acciones de Alanube).
+    const feProviderByTenant: Record<string, string> = {};
+    try {
+      const { data: feRows } = await db.from('settings')
+        .select('tenant_id, config').eq('type', 'electronic-invoice').in('tenant_id', tenantIds);
+      for (const r of (feRows ?? []) as any[]) {
+        feProviderByTenant[r.tenant_id] = r.config?.fe_provider === 'alanube' ? 'alanube' : 'facturemos';
+      }
+    } catch (e: any) { console.warn('[owners] fe_provider lookup:', e?.message); }
+
     // Cuota mensual por grupo (memoizado)
     const groupBillingCache: Record<string, number> = {};
     const getGroupBilling = async (gid: string): Promise<number> => {
@@ -111,6 +121,7 @@ admin.get('/owners', async (c) => {
           group_role:    g?.role ?? null,        // 'main' | 'branch' | null
           group_billing: groupBilling,            // total mensual del grupo (saas + FE)
           custom_price:  customPrice ?? null,     // precio personalizado (si hay)
+          fe_provider:   feProviderByTenant[o.id] ?? 'facturemos',
           // El precio efectivo de venta: personalizado si existe, si no el del plan.
           plan_price:    customPrice ?? o.plan_price,
         };
@@ -831,6 +842,22 @@ function buildAlanubeCompanyPayload(cfg: Record<string, any>, p12Base64: string)
   if (activity) payload.economicActivities = [activity];
   if (email) payload.emails = [email];
   if (phone) payload.phone = { countryCode: '506', number: phone };
+
+  // Webhook de RECEPCIÓN: Alanube nos avisa cuando un proveedor emite un
+  // comprobante hacia esta cédula, y lo guardamos en la bandeja.
+  const apiBase = String(process.env.PUBLIC_API_URL ?? process.env.BACKEND_URL ?? '').replace(/\/+$/, '');
+  const whSecret = String(process.env.ALANUBE_WEBHOOK_SECRET ?? '').trim();
+  if (apiBase && whSecret) {
+    payload.webhooks = {
+      documents: {
+        reception: {
+          status: 'active',
+          url: `${apiBase}/webhooks/alanube`,
+          headers: { 'x-api-key': whSecret },
+        },
+      },
+    };
+  }
   return payload;
 }
 
@@ -890,6 +917,38 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
       tenant_id: id, type: 'electronic-invoice', config: cfg, updated_at: new Date().toISOString(),
     }, { onConflict: 'tenant_id,type' });
     return ok(c, { ok: true, company_id: companyId, env: alanube.env(), result });
+  } catch (err: any) {
+    const status = err instanceof AlanubeError ? err.status : 500;
+    return fail(c, err.message, status);
+  }
+});
+
+// PUT /tenants/:id/alanube/company — actualiza la empresa en Alanube (ej. para
+// activar el webhook de recepción sin volver a registrarla).
+admin.put('/tenants/:id/alanube/company', async (c) => {
+  const { id } = c.req.param();
+  try {
+    const { data: row } = await db.from('settings').select('config')
+      .eq('tenant_id', id).eq('type', 'electronic-invoice').maybeSingle();
+    const cfg: Record<string, any> = { ...((row as any)?.config ?? {}) };
+    if (!cfg.alanube_company_id) return fail(c, 'La empresa no está registrada en Alanube todavía. Usá «Crear empresa».', 422);
+    if (!cfg.certificate?.path) return fail(c, 'Falta el certificado .p12 (Datos de FE).', 422);
+
+    const { data: file, error: dlErr } = await db.storage.from(FE_CERT_BUCKET).download(cfg.certificate.path);
+    if (dlErr || !file) return fail(c, `No se pudo leer el certificado del Storage: ${dlErr?.message ?? 'vacío'}`, 500);
+    const p12Base64 = Buffer.from(await file.arrayBuffer()).toString('base64');
+
+    const payload = buildAlanubeCompanyPayload(cfg, p12Base64);
+    // Al ACTUALIZAR, Alanube no acepta `type` (solo se define al crear).
+    delete (payload as any).type;
+    const result: any = await alanube.updateCompany(String(cfg.alanube_company_id), payload);
+
+    cfg.alanube_updated_at = new Date().toISOString();
+    cfg.alanube_webhook_active = !!payload.webhooks;
+    await db.from('settings').upsert({
+      tenant_id: id, type: 'electronic-invoice', config: cfg, updated_at: new Date().toISOString(),
+    }, { onConflict: 'tenant_id,type' });
+    return ok(c, { ok: true, company_id: cfg.alanube_company_id, webhook_active: !!payload.webhooks, result });
   } catch (err: any) {
     const status = err instanceof AlanubeError ? err.status : 500;
     return fail(c, err.message, status);
@@ -1170,8 +1229,11 @@ admin.get('/fe-quotas', async (c) => {
           .eq('tenant_id', r.tenant_id).not('fe_nc_clave', 'is', null).gte('created_at', start),
       ]);
       const used = (docs ?? 0) + (ncs ?? 0);
+      const extraFee = Number(cfg.fe_extra_fee ?? 0);          // ₡ por comprobante extra (del plan)
+      const overage = Math.max(0, used - included);            // comprobantes sobre la bolsa
       result[r.tenant_id] = {
         included, used, available: included - used,
+        overage, extra_fee: extraFee, extra_charge: overage * extraFee,
         quota_start: start,
         expires_at: new Date(new Date(start).getTime() + YEAR_MS).toISOString(),
       };
