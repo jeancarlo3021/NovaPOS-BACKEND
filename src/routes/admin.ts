@@ -831,11 +831,20 @@ admin.get('/alanube/ping', async (c) => {
 // NOTA: los nombres de los sub-objetos `certificate` y `token` siguen las
 // convenciones CRI de Alanube; si el sandbox reporta un campo distinto, se
 // ajusta SOLO en `buildAlanubeCompanyPayload`.
-function buildAlanubeCompanyPayload(cfg: Record<string, any>, p12Base64: string) {
+function buildAlanubeCompanyPayload(cfg: Record<string, any>, p12Base64: string, env: 'sandbox' | 'production' = 'production') {
   const others = String(cfg.emisor_address ?? '').trim();
   const activity = String(cfg.economic_activity_code ?? '').trim();
   const email = String(cfg.emisor_email ?? '').trim();
   const phone = String(cfg.emisor_phone ?? '').replace(/\D/g, '');
+
+  // Credenciales POR AMBIENTE (con fallback a las genéricas). Las de producción y
+  // pruebas de Hacienda son distintas.
+  const prod = env === 'production';
+  const atvUser = String((prod ? cfg.atv_username_production : cfg.atv_username_sandbox) ?? cfg.atv_username ?? '').trim();
+  // La contraseña ATV es su PROPIO valor (NO el PIN del certificado — eran cosas
+  // distintas y el fallback anterior causaba "Invalid credentials").
+  const atvPass = String((prod ? cfg.atv_password_production : cfg.atv_password_sandbox) ?? cfg.atv_password ?? '');
+  const p12Pass = String((prod ? cfg.p12_password_production : cfg.p12_password_sandbox) ?? cfg.p12_password ?? cfg.hacienda_pin ?? '');
 
   const payload: Record<string, any> = {
     name: String(cfg.emisor_name ?? '').trim(),
@@ -854,12 +863,12 @@ function buildAlanubeCompanyPayload(cfg: Record<string, any>, p12Base64: string)
     certificate: {
       extension: 'p12',
       content: p12Base64,
-      password: String(cfg.p12_password ?? cfg.hacienda_pin ?? ''),
+      password: p12Pass,
     },
-    // Credenciales del token de Hacienda generadas en ATV.
+    // Credenciales del token de Hacienda generadas en ATV (por ambiente).
     token: {
-      username: String(cfg.atv_username ?? '').trim(),
-      password: String(cfg.atv_password ?? cfg.hacienda_pin ?? ''),
+      username: atvUser,
+      password: atvPass,
     },
   };
   if (cfg.emisor_commercial_name) payload.tradeName = String(cfg.emisor_commercial_name).trim();
@@ -928,7 +937,7 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
 
     // Ambiente del TENANT (producción o QA/sandbox según su config FE).
     const client = alanube.forEnv(cfg.environment);
-    const payload = buildAlanubeCompanyPayload(cfg, p12Base64);
+    const payload = buildAlanubeCompanyPayload(cfg, p12Base64, client.env);
     const result: any = await client.createCompany(payload);
 
     // Guardar el id de la empresa devuelto por Alanube para emitir después.
@@ -964,10 +973,11 @@ admin.put('/tenants/:id/alanube/company', async (c) => {
     if (dlErr || !file) return fail(c, `No se pudo leer el certificado del Storage: ${dlErr?.message ?? 'vacío'}`, 500);
     const p12Base64 = Buffer.from(await file.arrayBuffer()).toString('base64');
 
-    const payload = buildAlanubeCompanyPayload(cfg, p12Base64);
+    const client = alanube.forEnv(cfg.environment);
+    const payload = buildAlanubeCompanyPayload(cfg, p12Base64, client.env);
     // Al ACTUALIZAR, Alanube no acepta `type` (solo se define al crear).
     delete (payload as any).type;
-    const result: any = await alanube.forEnv(cfg.environment).updateCompany(String(cfg.alanube_company_id), payload);
+    const result: any = await client.updateCompany(String(cfg.alanube_company_id), payload);
 
     cfg.alanube_updated_at = new Date().toISOString();
     cfg.alanube_webhook_active = !!payload.webhooks;

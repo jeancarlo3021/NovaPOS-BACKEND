@@ -11,6 +11,7 @@ const ProductSchema = z.object({
   sku2:            z.string().optional().nullable(),   // segundo código (alterno/barras)
   description:     z.string().optional().nullable(),
   unit_price:      z.number().nonnegative().optional().nullable(),
+  delivery_price:  z.number().nonnegative().optional().nullable(),   // precio para delivery
   cost_price:      z.number().nonnegative().optional().nullable(),
   stock_quantity:  z.number().int().nonnegative().optional().default(0),
   min_stock_level: z.number().int().nonnegative().optional().default(0),
@@ -23,6 +24,7 @@ const ProductSchema = z.object({
   tracks_stock:    z.boolean().optional(),
   cabys_code:      z.string().optional().nullable(),
   iva_rate:        z.number().nonnegative().max(100).optional().nullable(),
+  exclude_from_fe: z.boolean().optional(),   // no enviar a Hacienda (productos sin precio)
 });
 
 products.get('/', async (c) => {

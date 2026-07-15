@@ -38,6 +38,12 @@ const InvoiceSchema = z.object({
   exchange_rate:    z.number().positive().optional().nullable(),
   change_currency:  z.enum(['CRC', 'USD']).optional().nullable(),
   status:           z.enum(['draft', 'completed', 'cancelled']).default('completed'),
+  // Delivery: la venta NO se suma al cierre de caja; se contabiliza aparte. Se le
+  // puede restar una comisión (%) para saber el neto recibido.
+  is_delivery:              z.boolean().optional().default(false),
+  delivery_commission_pct:  z.number().nonnegative().max(100).optional().default(0),
+  delivery_net:             z.number().optional().nullable(),
+  delivery_platform:        z.string().optional().nullable(),
   notes:            z.string().optional().nullable(),
   issued_at:        z.string().optional().nullable(),
   amount_received:  z.number().optional().nullable(),

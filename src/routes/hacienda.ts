@@ -349,14 +349,18 @@ hacienda.post('/emit', async (c) => {
     if (!inv) return fail(c, 'Factura no encontrada', 404);
     if ((inv as any).fe_clave) return fail(c, 'La factura ya fue emitida', 409);
 
-    const items: any[] = (inv as any).invoice_items ?? [];
-    const pids = [...new Set(items.map(it => it.product_id).filter(Boolean))];
+    const allItems: any[] = (inv as any).invoice_items ?? [];
+    const pids = [...new Set(allItems.map(it => it.product_id).filter(Boolean))];
     const prodMap = new Map<string, any>();
     if (pids.length > 0) {
       const { data: prods } = await db.from('products')
-        .select('id, name, sku, cabys_code, iva_rate, unit_type:unit_types(abbreviation)').in('id', pids as string[]);
+        .select('id, name, sku, cabys_code, iva_rate, exclude_from_fe, unit_type:unit_types(abbreviation)').in('id', pids as string[]);
       for (const p of prods ?? []) prodMap.set((p as any).id, p);
     }
+    // No se envían a Hacienda los productos SIN PRECIO (precio 0) ni los marcados
+    // "no enviar a Hacienda". Igual quedan en la venta y en el ticket.
+    const items = allItems.filter((it: any) =>
+      Number(it.unit_price) > 0 && !prodMap.get(it.product_id)?.exclude_from_fe);
     const defaultCabys = String(cfg.default_cabys ?? '').replace(/\D/g, '') || null;
     const lines: FELine[] = items.map((it: any) => {
       const p = prodMap.get(it.product_id) ?? {};
@@ -540,10 +544,12 @@ hacienda.post('/credit-note', async (c) => {
     const prodMap = new Map<string, any>();
     if (pids.length > 0) {
       const { data: prods } = await db.from('products')
-        .select('id, name, sku, cabys_code, iva_rate, unit_type:unit_types(abbreviation)').in('id', pids as string[]);
+        .select('id, name, sku, cabys_code, iva_rate, exclude_from_fe, unit_type:unit_types(abbreviation)').in('id', pids as string[]);
       for (const p of prods ?? []) prodMap.set((p as any).id, p);
     }
-    const lines: FELine[] = items.map((it: any) => {
+    const lines: FELine[] = items
+      .filter((it: any) => Number(it.unit_price) > 0 && !prodMap.get(it.product_id)?.exclude_from_fe)   // sin precio / marcado → no va a Hacienda
+      .map((it: any) => {
       const p = prodMap.get(it.product_id) ?? {};
       return {
         product_name: p.name ?? 'Producto', sku: p.sku ?? null,
@@ -669,10 +675,12 @@ hacienda.post('/debit-note', async (c) => {
     const prodMap = new Map<string, any>();
     if (pids.length > 0) {
       const { data: prods } = await db.from('products')
-        .select('id, name, sku, cabys_code, iva_rate, unit_type:unit_types(abbreviation)').in('id', pids as string[]);
+        .select('id, name, sku, cabys_code, iva_rate, exclude_from_fe, unit_type:unit_types(abbreviation)').in('id', pids as string[]);
       for (const p of prods ?? []) prodMap.set((p as any).id, p);
     }
-    const lines: FELine[] = items.map((it: any) => {
+    const lines: FELine[] = items
+      .filter((it: any) => Number(it.unit_price) > 0 && !prodMap.get(it.product_id)?.exclude_from_fe)   // sin precio / marcado → no va a Hacienda
+      .map((it: any) => {
       const p = prodMap.get(it.product_id) ?? {};
       return {
         product_name: p.name ?? 'Producto', sku: p.sku ?? null,
@@ -1123,8 +1131,20 @@ hacienda.post('/emit-direct', async (c) => {
     const env = cfg.environment === 'sandbox' ? 'sandbox' : 'production'; // default producción
     const defaultCabys = String(cfg.default_cabys ?? '').replace(/\D/g, '') || null;
 
+    // Excluir de la FE los productos marcados "no enviar a Hacienda" (sin precio).
+    // Se mantienen en la venta (invoice_items) pero NO van en el comprobante.
+    const linePids = [...new Set(rawLines.map((l: any) => l.product_id).filter(Boolean))];
+    const excludedFe = new Set<string>();
+    if (linePids.length > 0) {
+      const { data: exProds } = await db.from('products')
+        .select('id, exclude_from_fe').in('id', linePids as string[]);
+      for (const p of (exProds ?? []) as any[]) if (p.exclude_from_fe) excludedFe.add(p.id);
+    }
+    const feRawLines = rawLines.filter((l: any) =>
+      Number(l.unit_price) > 0 && !(l.product_id && excludedFe.has(l.product_id)));
+
     // Normalizar líneas + totales.
-    const lines: FELine[] = rawLines.map((l: any) => {
+    const lines: FELine[] = feRawLines.map((l: any) => {
       const qty = Number(l.quantity) || 0;
       const price = Number(l.unit_price) || 0;
       const sub = Math.round(qty * price * 100) / 100;

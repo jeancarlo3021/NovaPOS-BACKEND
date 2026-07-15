@@ -41,6 +41,55 @@ reports.get('/sales', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+// GET /delivery — ventas por DELIVERY agrupadas por SEMANA (lunes-domingo).
+// Devuelve total vendido, comisión (%) y neto por semana, y el detalle.
+reports.get('/delivery', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const from = c.req.query('from');
+    const to   = endOfDay(c.req.query('to'));
+
+    let q = db.from('invoices')
+      .select('id, invoice_number, customer_name, total, delivery_commission_pct, delivery_net, issued_at')
+      .eq('tenant_id', tenantId).eq('is_delivery', true).neq('status', 'cancelled')
+      .order('issued_at', { ascending: false }).limit(5000);
+    if (from) q = q.gte('issued_at', from);
+    if (to)   q = q.lte('issued_at', to);
+    const { data, error } = await q;
+    if (error) throw new Error(error.message);
+    const rows = (data ?? []) as any[];
+
+    // Lunes (YYYY-MM-DD) de la semana de una fecha.
+    const weekMonday = (iso: string): string => {
+      const d = new Date(iso);
+      const day = (d.getDay() + 6) % 7;   // 0 = lunes
+      d.setDate(d.getDate() - day);
+      return d.toISOString().slice(0, 10);
+    };
+
+    const netOf = (r: any) => Number(r.delivery_net ?? r.total ?? 0);
+    const total = rows.reduce((s, r) => s + Number(r.total ?? 0), 0);
+    const net = rows.reduce((s, r) => s + netOf(r), 0);
+
+    const byWeek: Record<string, { week: string; count: number; total: number; net: number }> = {};
+    for (const r of rows) {
+      const wk = weekMonday(r.issued_at ?? new Date().toISOString());
+      if (!byWeek[wk]) byWeek[wk] = { week: wk, count: 0, total: 0, net: 0 };
+      byWeek[wk].count++;
+      byWeek[wk].total += Number(r.total ?? 0);
+      byWeek[wk].net += netOf(r);
+    }
+    const weeks = Object.values(byWeek)
+      .map(w => ({ ...w, commission: w.total - w.net }))
+      .sort((a, b) => (a.week < b.week ? 1 : -1));
+
+    return ok(c, {
+      count: rows.length, total, net, commission: total - net,
+      weeks, invoices: rows,
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // GET /vouchers — comprobantes de PAGOS y ANULACIONES en un rango.
 // Devuelve cada factura con su medio de pago, comprobante (voucher), moneda,
 // clave FE, y si fue anulada (con su Nota de Crédito). El front lo separa en
