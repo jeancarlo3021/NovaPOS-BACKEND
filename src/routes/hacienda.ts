@@ -819,11 +819,10 @@ hacienda.get('/invoices', async (c) => {
 // proveedor (manual/XML) en `received_documents`; a futuro, por webhook.
 
 // GET /received — bandeja de comprobantes recibidos (desde nuestra tabla).
+// La recepción se alimenta por CORREO (cron): ya NO depende de Alanube.
 hacienda.get('/received', async (c) => {
   try {
     const tenantId = c.get('tenantId');
-    const cfg = await loadFEConfig(tenantId);
-    if (cfg.fe_provider !== 'alanube') return fail(c, 'La recepción de comprobantes está disponible con Alanube.', 409);
 
     const { data, error } = await db.from('received_documents')
       .select('*').eq('tenant_id', tenantId)
@@ -833,11 +832,28 @@ hacienda.get('/received', async (c) => {
       if (/received_documents/.test(error.message)) return ok(c, []);
       throw new Error(error.message);
     }
+    // Normaliza las líneas del XML (raw.lines usa subtotal) al formato del front
+    // (items: { detail, quantity, unit_price, total }).
+    const normItems = (d: any) => {
+      const lines = d.raw?.lines ?? d.items;
+      if (!Array.isArray(lines)) return null;
+      return lines.map((l: any) => ({
+        detail: l.detail ?? l.Detalle ?? '',
+        quantity: Number(l.quantity ?? l.Cantidad ?? 1),
+        unit: l.unit ?? null,
+        unit_price: Number(l.unit_price ?? l.PrecioUnitario ?? 0),
+        total: Number(l.total ?? l.subtotal ?? l.SubTotal ?? 0),
+      }));
+    };
     return ok(c, (data ?? []).map((d: any) => ({
       id: d.id, clave: d.clave, issuer_name: d.issuer_name, issuer_id: d.issuer_id,
       document_type: d.document_type, date: d.doc_date, total: Number(d.total ?? 0),
       tax: Number(d.tax ?? 0), ack_status: d.ack_status,
-      kind: d.kind ?? null, items: d.items ?? null,
+      source: d.source ?? null, email_from: d.email_from ?? null,
+      purchase_id: d.purchase_id ?? null,
+      // Si vino por correo ya tiene borrador de compra → se marca como 'compra'.
+      kind: d.kind ?? (d.purchase_id ? 'compra' : null),
+      items: normItems(d),
     })));
   } catch (err: any) {
     return fail(c, err.message, 500);

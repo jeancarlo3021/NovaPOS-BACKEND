@@ -50,7 +50,7 @@ reports.get('/delivery', async (c) => {
     const to   = endOfDay(c.req.query('to'));
 
     let q = db.from('invoices')
-      .select('id, invoice_number, customer_name, total, delivery_commission_pct, delivery_net, issued_at')
+      .select('id, invoice_number, customer_name, total, subtotal, tax_amount, delivery_commission_pct, delivery_net, delivery_platform, issued_at')
       .eq('tenant_id', tenantId).eq('is_delivery', true).neq('status', 'cancelled')
       .order('issued_at', { ascending: false }).limit(5000);
     if (from) q = q.gte('issued_at', from);
@@ -68,24 +68,46 @@ reports.get('/delivery', async (c) => {
     };
 
     const netOf = (r: any) => Number(r.delivery_net ?? r.total ?? 0);
+    // IVA de la factura; si no viniera, se deriva del total (total - base).
+    const ivaOf = (r: any) => Number(r.tax_amount ?? Math.max(0, Number(r.total ?? 0) - Number(r.subtotal ?? 0)));
     const total = rows.reduce((s, r) => s + Number(r.total ?? 0), 0);
     const net = rows.reduce((s, r) => s + netOf(r), 0);
+    const iva = rows.reduce((s, r) => s + ivaOf(r), 0);
 
-    const byWeek: Record<string, { week: string; count: number; total: number; net: number }> = {};
+    const acc = () => ({ count: 0, total: 0, net: 0, iva: 0 });
+    const finalize = <T extends { total: number; net: number; iva: number }>(g: T) =>
+      ({ ...g, commission: g.total - g.net, netNoIva: g.net - g.iva });
+
+    const byWeek: Record<string, { week: string; count: number; total: number; net: number; iva: number }> = {};
     for (const r of rows) {
       const wk = weekMonday(r.issued_at ?? new Date().toISOString());
-      if (!byWeek[wk]) byWeek[wk] = { week: wk, count: 0, total: 0, net: 0 };
+      if (!byWeek[wk]) byWeek[wk] = { week: wk, ...acc() };
       byWeek[wk].count++;
       byWeek[wk].total += Number(r.total ?? 0);
       byWeek[wk].net += netOf(r);
+      byWeek[wk].iva += ivaOf(r);
     }
     const weeks = Object.values(byWeek)
-      .map(w => ({ ...w, commission: w.total - w.net }))
+      .map(finalize)
       .sort((a, b) => (a.week < b.week ? 1 : -1));
 
+    // Desglose por PLATAFORMA (Uber, Didi, PedidosYa, Otro, o "Sin plataforma").
+    const byPlatform: Record<string, { platform: string; count: number; total: number; net: number; iva: number }> = {};
+    for (const r of rows) {
+      const pl = (r.delivery_platform && String(r.delivery_platform).trim()) || 'Sin plataforma';
+      if (!byPlatform[pl]) byPlatform[pl] = { platform: pl, ...acc() };
+      byPlatform[pl].count++;
+      byPlatform[pl].total += Number(r.total ?? 0);
+      byPlatform[pl].net += netOf(r);
+      byPlatform[pl].iva += ivaOf(r);
+    }
+    const platforms = Object.values(byPlatform)
+      .map(finalize)
+      .sort((a, b) => b.total - a.total);
+
     return ok(c, {
-      count: rows.length, total, net, commission: total - net,
-      weeks, invoices: rows,
+      count: rows.length, total, net, iva, commission: total - net, netNoIva: net - iva,
+      weeks, platforms, invoices: rows,
     });
   } catch (err: any) { return fail(c, err.message, 500); }
 });

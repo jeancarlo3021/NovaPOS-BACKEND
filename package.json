@@ -13,13 +13,17 @@
     "@supabase/supabase-js": "^2.45.0",
     "@types/pdfkit": "^0.17.6",
     "dotenv": "^16.4.0",
+    "fast-xml-parser": "^4.5.0",
     "hono": "^4.6.0",
+    "imapflow": "^1.0.164",
+    "mailparser": "^3.7.1",
     "pdfkit": "^0.19.1",
     "resend": "^6.12.4",
     "zod": "^3.23.0"
   },
   "devDependencies": {
     "@playwright/test": "^1.49.0",
+    "@types/mailparser": "^3.4.5",
     "@types/node": "^22.0.0",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0"

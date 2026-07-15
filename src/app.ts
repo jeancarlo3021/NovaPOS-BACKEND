@@ -5,6 +5,7 @@ import { auth } from './middleware/auth.js';
 import { enforceActiveTenant } from './middleware/tenantStatus.js';
 import authRoutes      from './routes/auth.js';
 import webhooks        from './routes/webhooks.js';
+import cron            from './routes/cron.js';
 import products        from './routes/products.js';
 import categories      from './routes/categories.js';
 import unitTypes       from './routes/unitTypes.js';
@@ -67,6 +68,9 @@ app.route('/auth', authRoutes);
 
 // Webhooks entrantes (Alanube) — públicos, validados por secreto propio
 app.route('/webhooks', webhooks);
+
+// Cron externo (cron-job.org) — público, protegido por CRON_SECRET
+app.route('/cron', cron);
 
 const api = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 api.use('*', auth);
