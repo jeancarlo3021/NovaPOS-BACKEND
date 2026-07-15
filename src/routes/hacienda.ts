@@ -228,8 +228,8 @@ function mapAlanubeStatus(s: any): string {
 
 /** Consulta el estado de un documento en Alanube por su id (ULID). Devuelve
  *  también la clave real de Hacienda (50 díg) si ya está disponible. */
-async function alanubeDocStatus(docId: string): Promise<{ status: string; clave: string | null; raw: any }> {
-  const doc: any = await alanube.getDocument(docId);
+async function alanubeDocStatus(client: ReturnType<typeof alanube.forEnv>, docId: string): Promise<{ status: string; clave: string | null; raw: any }> {
+  const doc: any = await client.getDocument(docId);
   const d = doc?.ticket ?? doc?.invoice ?? doc?.creditNote ?? doc?.document ?? doc?.data ?? doc;
   const rawStatus = d?.status ?? deepFind(doc, /(^status$|estado|indEstado|situacion)/i, 20);
   const clave = d?.key ?? d?.clave ?? deepFind(doc, /(clave|^key$)/i, 40) ?? null;
@@ -258,7 +258,7 @@ hacienda.post('/refresh-status', async (c) => {
     if (provider === 'alanube') {
       const docId = (inv as any).fe_consecutivo;
       if (!docId) return fail(c, 'No hay id de documento de Alanube para consultar. Volvé a emitir.', 422);
-      const r = await alanubeDocStatus(docId);
+      const r = await alanubeDocStatus(alanube.forEnv(cfg.environment), docId);
       fe_status = r.status; indEstado = r.status;
       patch.fe_status = fe_status;
       // Si ya llegó la clave real de Hacienda (50 díg) y aún guardábamos el ULID,
@@ -306,7 +306,7 @@ hacienda.post('/refresh-pending', async (c) => {
         const patch: Record<string, any> = { updated_at: new Date().toISOString() };
         if (provider === 'alanube') {
           if (!inv.fe_consecutivo) continue;   // sin id de Alanube no podemos consultar
-          const r = await alanubeDocStatus(inv.fe_consecutivo);
+          const r = await alanubeDocStatus(alanube.forEnv(cfg.environment), inv.fe_consecutivo);
           fe_status = r.status;
           if (r.clave && /^\d{50}$/.test(String(r.clave)) && r.clave !== inv.fe_clave) patch.fe_clave = r.clave;
         } else {
@@ -438,7 +438,7 @@ hacienda.post('/emit', async (c) => {
       }
       let resp: any;
       try {
-        resp = await alanube.emitDocument(kind as any, doc, cfg.alanube_company_id);
+        resp = await alanube.forEnv(cfg.environment).emitDocument(kind as any, doc, cfg.alanube_company_id);
       } catch (e: any) {
         return await failFE(e instanceof AlanubeError ? e.message : (e?.message ?? 'Error emitiendo con Alanube'));
       }
@@ -589,7 +589,7 @@ hacienda.post('/credit-note', async (c) => {
       });
       let resp: any;
       try {
-        resp = await alanube.emitDocument('credit-note', doc, cfg.alanube_company_id);
+        resp = await alanube.forEnv(cfg.environment).emitDocument('credit-note', doc, cfg.alanube_company_id);
       } catch (e: any) {
         return fail(c, e instanceof AlanubeError ? e.message : (e?.message ?? 'Error emitiendo NC con Alanube'), 422);
       }
@@ -718,7 +718,7 @@ hacienda.post('/debit-note', async (c) => {
       });
       let resp: any;
       try {
-        resp = await alanube.emitDocument('debit-note', doc, cfg.alanube_company_id);
+        resp = await alanube.forEnv(cfg.environment).emitDocument('debit-note', doc, cfg.alanube_company_id);
       } catch (e: any) {
         return fail(c, e instanceof AlanubeError ? e.message : (e?.message ?? 'Error emitiendo ND con Alanube'), 422);
       }
@@ -879,7 +879,7 @@ hacienda.post('/received/confirm', async (c) => {
 
     let resp: any;
     try {
-      resp = await alanube.sendReceiverMessage(payload, cfg.alanube_company_id);
+      resp = await alanube.forEnv(cfg.environment).sendReceiverMessage(payload, cfg.alanube_company_id);
     } catch (e: any) {
       return fail(c, e instanceof AlanubeError ? e.message : (e?.message ?? 'Error enviando el mensaje receptor'), 422);
     }
@@ -1219,7 +1219,7 @@ hacienda.post('/emit-direct', async (c) => {
         numberOfDocument: inv.invoice_number,
       });
       try {
-        const resp: any = await alanube.emitDocument(kind as any, doc, cfg.alanube_company_id);
+        const resp: any = await alanube.forEnv(cfg.environment).emitDocument(kind as any, doc, cfg.alanube_company_id);
         const docObj = resp?.ticket ?? resp?.invoice ?? resp?.document ?? resp?.data ?? resp;
         const docId = docObj?.id ?? deepFind(resp, /(^id$|_id$|documentId$)/i, 10) ?? null;
         const clave = docObj?.key ?? docObj?.clave ?? deepFind(resp, /(clave|^key$)/i, 40) ?? null;

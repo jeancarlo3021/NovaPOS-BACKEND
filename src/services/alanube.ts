@@ -19,18 +19,36 @@ const DEFAULT_BASE: Record<string, string> = {
 
 export type AlanubeEnv = 'sandbox' | 'production';
 
-function alanubeEnv(): AlanubeEnv {
-  return (process.env.ALANUBE_ENV || '').trim() === 'production' ? 'production' : 'sandbox';
+/** Normaliza cualquier valor a 'sandbox' (QA) | 'production'. */
+export function normalizeEnv(e?: string | null): AlanubeEnv {
+  const v = String(e ?? '').trim().toLowerCase();
+  return v === 'production' || v === 'prod' || v === 'produccion' || v === 'producción' ? 'production' : 'sandbox';
 }
 
-function baseUrl(): string {
-  const override = (process.env.ALANUBE_BASE_URL || '').trim().replace(/\/+$/, '');
-  return override || DEFAULT_BASE[alanubeEnv()];
+/** Ambiente global por defecto (fallback si el tenant no define el suyo). */
+function defaultEnv(): AlanubeEnv {
+  return normalizeEnv(process.env.ALANUBE_ENV);
 }
 
-function token(): string {
-  const t = (process.env.ALANUBE_API_TOKEN || '').trim();
-  if (!t) throw new AlanubeError('Falta ALANUBE_API_TOKEN en el servidor. Configurá la variable de entorno.', 500);
+/** Base URL del ambiente. Solo override ESPECÍFICO por ambiente; el genérico
+ *  `ALANUBE_BASE_URL` se ignora a propósito (apuntaba a sandbox y contaminaba
+ *  producción). Sin override específico se usa la URL oficial de cada ambiente. */
+function baseUrlFor(env: AlanubeEnv): string {
+  const override = env === 'production'
+    ? process.env.ALANUBE_BASE_URL_PRODUCTION
+    : (process.env.ALANUBE_BASE_URL_SANDBOX || process.env.ALANUBE_BASE_URL_QA);
+  return (override || '').trim().replace(/\/+$/, '') || DEFAULT_BASE[env];
+}
+
+/** Token del ambiente. Producción usa SOLO `ALANUBE_API_TOKEN_PRODUCTION` (el
+ *  legacy `ALANUBE_API_TOKEN` era el de sandbox y no debe usarse en prod).
+ *  Sandbox/QA usa el suyo, con fallback al legacy. */
+function tokenFor(env: AlanubeEnv): string {
+  const specific = env === 'production'
+    ? process.env.ALANUBE_API_TOKEN_PRODUCTION
+    : (process.env.ALANUBE_API_TOKEN_SANDBOX || process.env.ALANUBE_API_TOKEN_QA || process.env.ALANUBE_API_TOKEN);
+  const t = (specific || '').trim();
+  if (!t) throw new AlanubeError(`Falta el token de Alanube para el ambiente ${env}. Configurá ALANUBE_API_TOKEN_${env === 'production' ? 'PRODUCTION' : 'SANDBOX'} en el servidor.`, 500);
   return t;
 }
 
@@ -45,20 +63,20 @@ const fetchWithTimeout: typeof fetch = (input, init) => {
   return fetch(input, { ...init, signal: ctrl.signal }).finally(() => clearTimeout(timer));
 };
 
-/** Llamada base al API de Alanube (Bearer + JSON). Expone errores de red y de API. */
-async function alanubeFetch<T = any>(path: string, init: RequestInit = {}): Promise<T> {
-  const url = `${baseUrl()}${path.startsWith('/') ? path : `/${path}`}`;
+/** Llamada base al API de Alanube (Bearer + JSON) en un ambiente dado. */
+async function alanubeFetch<T = any>(base: string, tok: string, path: string, init: RequestInit = {}): Promise<T> {
+  const url = `${base}${path.startsWith('/') ? path : `/${path}`}`;
   const res = await fetchWithTimeout(url, {
     ...init,
     headers: {
       'Content-Type': 'application/json',
-      Authorization: `Bearer ${token()}`,
+      Authorization: `Bearer ${tok}`,
       ...(init.headers ?? {}),
     },
   }).catch((err) => {
     const cause = (err as any)?.cause;
     const detail = cause?.code || cause?.message || err?.message || 'fetch failed';
-    throw new AlanubeError(`No se pudo conectar con Alanube (${baseUrl()}): ${detail}`);
+    throw new AlanubeError(`No se pudo conectar con Alanube (${base}): ${detail}`);
   });
 
   const text = await res.text().catch(() => '');
@@ -91,66 +109,66 @@ async function alanubeFetch<T = any>(path: string, init: RequestInit = {}): Prom
   return body as T;
 }
 
-export const alanube = {
-  env: alanubeEnv,
-  baseUrl,
-  /** Verifica que el token y el ambiente funcionen (lista empresas de la cuenta). */
-  ping: () => alanubeFetch('/companies', { method: 'GET' }),
-  /** Crea/registra una empresa (emisor) en Alanube. CONFIRMADO: POST /cri/v1/companies. */
-  createCompany: (payload: Record<string, any>) =>
-    alanubeFetch('/companies', { method: 'POST', body: JSON.stringify(payload) }),
+// Paths de emisión CRI por tipo de documento (versionados /v44).
+const EMIT_PATH: Record<string, string> = {
+  invoice: '/invoices/v44',
+  ticket: '/tickets/v44',
+  'credit-note': '/credit-notes/v44',
+  'debit-note': '/debit-notes/v44',
+};
 
-  /** Actualiza una empresa existente (ej. para activar el webhook de recepción).
-   *  El método/path no está documentado; probamos PUT y luego PATCH. */
-  updateCompany: async (id: string, payload: Record<string, any>) => {
-    try {
-      return await alanubeFetch(`/companies/${id}`, { method: 'PUT', body: JSON.stringify(payload) });
-    } catch (e: any) {
-      if (e instanceof AlanubeError && (e.status === 404 || e.status === 405)) {
-        return await alanubeFetch(`/companies/${id}`, { method: 'PATCH', body: JSON.stringify(payload) });
+/** Cliente Alanube atado a UN ambiente (sandbox/QA o producción). */
+function clientFor(env: AlanubeEnv) {
+  const base = baseUrlFor(env);
+  const tok = tokenFor(env);
+  const f = <T = any>(path: string, init: RequestInit = {}) => alanubeFetch<T>(base, tok, path, init);
+
+  return {
+    env,
+    baseUrl: () => base,
+    ping: () => f('/companies', { method: 'GET' }),
+    createCompany: (payload: Record<string, any>) =>
+      f('/companies', { method: 'POST', body: JSON.stringify(payload) }),
+    updateCompany: async (id: string, payload: Record<string, any>) => {
+      try {
+        return await f(`/companies/${id}`, { method: 'PUT', body: JSON.stringify(payload) });
+      } catch (e: any) {
+        if (e instanceof AlanubeError && (e.status === 404 || e.status === 405)) {
+          return await f(`/companies/${id}`, { method: 'PATCH', body: JSON.stringify(payload) });
+        }
+        throw e;
       }
-      throw e;
-    }
-  },
-  /** Emite factura electrónica. Sigue el patrón versionado (POST /purchase-invoices/v44
-   *  está confirmado; ventas debería ser /invoices/v44 — confirmar en la doc CRI). */
-  emitVoucher: (payload: Record<string, any>) =>
-    alanubeFetch('/invoices/v44', { method: 'POST', body: JSON.stringify(payload) }),
-  /** Emite un documento electrónico por tipo (path versionado /v44). CRI:
-   *  invoice → factura electrónica (01) · ticket → tiquete electrónico (04) ·
-   *  credit-note → nota de crédito (03). Los paths están en un solo lugar. */
-  emitDocument: (kind: 'invoice' | 'ticket' | 'credit-note' | 'debit-note', payload: Record<string, any>, companyId?: string) => {
-    const path: Record<string, string> = {
-      invoice: '/invoices/v44',
-      ticket: '/tickets/v44',
-      'credit-note': '/credit-notes/v44',
-      'debit-note': '/debit-notes/v44',
-    };
-    // Cuenta multi-empresa: indicamos la empresa emisora con un header.
-    // (nombre del header POR CONFIRMAR con Alanube; si requiere el id en el path,
-    //  se cambia acá en un solo lugar: `/companies/${companyId}${path[kind]}`.)
-    const headers = companyId ? { 'X-Company-Id': companyId } : undefined;
-    return alanubeFetch(path[kind], { method: 'POST', body: JSON.stringify(payload), headers });
-  },
-  /** Consulta el estado de un documento por su id (ULID). PATH a confirmar. */
-  getDocument: (id: string) =>
-    alanubeFetch(`/documents/${id}`, { method: 'GET' }),
+    },
+    emitDocument: (kind: 'invoice' | 'ticket' | 'credit-note' | 'debit-note', payload: Record<string, any>, companyId?: string) => {
+      const headers = companyId ? { 'X-Company-Id': companyId } : undefined;
+      return f(EMIT_PATH[kind], { method: 'POST', body: JSON.stringify(payload), headers });
+    },
+    getDocument: (id: string) => f(`/documents/${id}`, { method: 'GET' }),
+    sendReceiverMessage: (payload: Record<string, any>, companyId?: string) => {
+      const headers = companyId ? { 'X-Company-Id': companyId } : undefined;
+      return f('/receiver-messages', { method: 'POST', body: JSON.stringify(payload), headers });
+    },
+    getReceiverMessage: (id: string, companyId?: string) => {
+      const headers = companyId ? { 'X-Company-Id': companyId } : undefined;
+      return f(`/receiver-messages/${id}`, { method: 'GET', headers });
+    },
+  };
+}
 
-  // ── RECEPCIÓN / Mensaje Receptor (CRI) ───────────────────────────────────────
-  // CONFIRMADO en la doc CRI (developer.alanube.co/v1.0-CRI):
-  //   POST /cri/v1/receiver-messages        → enviar aceptación(1)/parcial(2)/rechazo(3)
-  //   GET  /cri/v1/receiver-messages/{id}    → consultar el mensaje receptor
-  // NO hay endpoint de "listar recibidos" en CRI (eso es solo DOM). En CRI, los
-  // comprobantes de proveedores llegan por WEBHOOK; el body top-level del mensaje
-  // es: { idDoc, sender, receiver, information, totals }.
-  /** Envía el Mensaje Receptor (aceptación 1 / aceptación parcial 2 / rechazo 3). */
-  sendReceiverMessage: (payload: Record<string, any>, companyId?: string) => {
-    const headers = companyId ? { 'X-Company-Id': companyId } : undefined;
-    return alanubeFetch('/receiver-messages', { method: 'POST', body: JSON.stringify(payload), headers });
-  },
-  /** Consulta un Mensaje Receptor por su id. */
-  getReceiverMessage: (id: string, companyId?: string) => {
-    const headers = companyId ? { 'X-Company-Id': companyId } : undefined;
-    return alanubeFetch(`/receiver-messages/${id}`, { method: 'GET', headers });
-  },
+export type AlanubeClient = ReturnType<typeof clientFor>;
+
+/** Resuelve el ambiente: valor explícito del tenant o, si no hay, el global. */
+function resolveEnv(env?: string | null): AlanubeEnv {
+  const v = String(env ?? '').trim().toLowerCase();
+  if (v === 'production' || v === 'prod' || v === 'produccion' || v === 'producción') return 'production';
+  if (v === 'sandbox' || v === 'qa' || v === 'test' || v === 'testing' || v === 'pruebas') return 'sandbox';
+  return defaultEnv();   // sin valor explícito → ALANUBE_ENV global
+}
+
+export const alanube = {
+  normalizeEnv,
+  /** Ambiente global por defecto (si un tenant no define el suyo). */
+  defaultEnv,
+  /** Cliente para el ambiente de un tenant: alanube.forEnv(cfg.environment). */
+  forEnv: (env?: string | null): AlanubeClient => clientFor(resolveEnv(env)),
 };

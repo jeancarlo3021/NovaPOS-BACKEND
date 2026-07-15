@@ -803,9 +803,11 @@ admin.get('/tenants/:id/fe-certificate-url', async (c) => {
 // No hay GET de listado en CRI, así que probamos POST /companies con body vacío:
 //   401/403 → token inválido · 400/422 → token OK (llegó a la validación) · 2xx → OK.
 admin.get('/alanube/ping', async (c) => {
-  const env = alanube.env(); const url = alanube.baseUrl();
+  // ?env=production|sandbox para probar cualquiera de los dos ambientes.
+  const client = alanube.forEnv(c.req.query('env') ?? alanube.defaultEnv());
+  const env = client.env; const url = client.baseUrl();
   try {
-    await alanube.createCompany({});
+    await client.createCompany({});
     return ok(c, { ok: true, authenticated: true, env, base_url: url, note: 'Conexión y token OK' });
   } catch (err: any) {
     const status = err instanceof AlanubeError ? err.status : 500;
@@ -924,21 +926,23 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
     if (dlErr || !file) return fail(c, `No se pudo leer el certificado del Storage: ${dlErr?.message ?? 'vacío'}`, 500);
     const p12Base64 = Buffer.from(await file.arrayBuffer()).toString('base64');
 
+    // Ambiente del TENANT (producción o QA/sandbox según su config FE).
+    const client = alanube.forEnv(cfg.environment);
     const payload = buildAlanubeCompanyPayload(cfg, p12Base64);
-    const result: any = await alanube.createCompany(payload);
+    const result: any = await client.createCompany(payload);
 
     // Guardar el id de la empresa devuelto por Alanube para emitir después.
     // Buscamos en las rutas comunes y, si no, escaneamos en profundidad cualquier
     // clave `id`/`*Id`/`_id` con valor string (el nombre exacto varía por país).
     const companyId = findCompanyId(result);
-    cfg.alanube_env = alanube.env();
+    cfg.alanube_env = client.env;
     cfg.alanube_registered_at = new Date().toISOString();
     cfg.alanube_company_raw = result;   // respuesta cruda (para depurar el nombre del id)
     if (companyId) cfg.alanube_company_id = companyId;
     await db.from('settings').upsert({
       tenant_id: id, type: 'electronic-invoice', config: cfg, updated_at: new Date().toISOString(),
     }, { onConflict: 'tenant_id,type' });
-    return ok(c, { ok: true, company_id: companyId, env: alanube.env(), result });
+    return ok(c, { ok: true, company_id: companyId, env: client.env, result });
   } catch (err: any) {
     const status = err instanceof AlanubeError ? err.status : 500;
     return fail(c, err.message, status);
@@ -963,7 +967,7 @@ admin.put('/tenants/:id/alanube/company', async (c) => {
     const payload = buildAlanubeCompanyPayload(cfg, p12Base64);
     // Al ACTUALIZAR, Alanube no acepta `type` (solo se define al crear).
     delete (payload as any).type;
-    const result: any = await alanube.updateCompany(String(cfg.alanube_company_id), payload);
+    const result: any = await alanube.forEnv(cfg.environment).updateCompany(String(cfg.alanube_company_id), payload);
 
     cfg.alanube_updated_at = new Date().toISOString();
     cfg.alanube_webhook_active = !!payload.webhooks;
