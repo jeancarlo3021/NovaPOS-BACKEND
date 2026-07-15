@@ -865,7 +865,7 @@ function buildAlanubeCompanyPayload(cfg: Record<string, any>, p12Base64: string)
   if (cfg.emisor_commercial_name) payload.tradeName = String(cfg.emisor_commercial_name).trim();
   if (activity) payload.economicActivities = [activity];
   if (email) payload.emails = [email];
-  if (phone) payload.phone = { countryCode: '506', number: phone };
+  if (phone) payload.phone = { countryCode: '506', phoneNumber: phone };
 
   // Webhook de RECEPCIÓN: Alanube nos avisa cuando un proveedor emite un
   // comprobante hacia esta cédula, y lo guardamos en la bandeja.
