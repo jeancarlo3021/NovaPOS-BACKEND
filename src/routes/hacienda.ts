@@ -277,6 +277,9 @@ function mapEstado(ind: string): string {
 function cleanHaciendaError(raw: any): string | null {
   const s = String(raw ?? '').trim();
   if (!s) return null;
+  // Hacienda devuelve "." (o vacío) cuando ACEPTA sin observaciones: NO es un error.
+  // Cualquier respuesta sin letras (solo puntos/ceros/comas) se trata como "sin error".
+  if (!/[a-zA-ZáéíóúñÁÉÍÓÚÑ]/.test(s)) return null;
   // Cada error viene como:  -99, ""mensaje"", 0, 0
   const msgs: string[] = [];
   const re = /(-?\d+)\s*,\s*""([\s\S]*?)""\s*,/g;
@@ -1052,28 +1055,47 @@ hacienda.post('/received/confirm', async (c) => {
 
     // Mensaje Receptor a Hacienda vía Alanube — OPCIONAL (best-effort). Si el
     // tenant no usa Alanube o falla, igual se marca aceptado/rechazado localmente.
+    // Estructura confirmada contra el OAS de CRI (createReceiverMessage).
     let mrId: string | null = null;
-    if (cfg.fe_provider === 'alanube' && cfg.alanube_company_id) {
+    const isSandboxEnv = String(cfg.environment ?? 'production') === 'sandbox';
+    const senderCompanyId = (isSandboxEnv ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id;
+    if (cfg.fe_provider === 'alanube' && senderCompanyId) {
+      const m5 = (n: any) => (Math.round(Number(n || 0) * 1e5) / 1e5).toFixed(5);
+      const issuerId = String(d.issuer_id ?? '').replace(/\D/g, '');
+      // Tipo de identificación del EMISOR original (proveedor): 9 díg = física, 10 = jurídica.
+      const issuerType = issuerId.length === 9 ? '01' : issuerId.length >= 10 ? '02' : '02';
+      // Consecutivo del mensaje receptor (por tenant): cantidad de MR ya enviados + 1.
+      const { count: mrCount } = await db.from('received_documents')
+        .select('id', { count: 'exact', head: true })
+        .eq('tenant_id', tenantId).not('ack_id', 'is', null);
+      const totalDoc = Number(d.total ?? 0);
+      const taxDoc = Number(d.tax ?? 0);
       const payload: Record<string, any> = {
-        idDoc: {
-          key: d.clave,
-          headquarters: String(cfg.sucursal ?? '1').replace(/\D/g, '').padStart(3, '0').slice(-3),
-          terminal: String(cfg.terminal ?? '1').replace(/\D/g, '').padStart(5, '0').slice(-5),
-        },
-        sender: { identificationNumber: String(d.issuer_id ?? '').replace(/\D/g, '') },
+        idDoc: { key: String(d.clave ?? '').replace(/\D/g, '') },
+        sender: { identification: { identificationType: issuerType, identificationNumber: issuerId } },
         receiver: {
-          identificationType: cfg.emisor_identification_type ?? '02',
-          identificationNumber: String(cfg.emisor_identification ?? '').replace(/\D/g, ''),
+          id: String(senderCompanyId),
+          consecutiveNumber: {
+            headquarters: String(cfg.sucursal ?? '1').replace(/\D/g, '').padStart(3, '0').slice(-3),
+            terminal: String(cfg.terminal ?? '1').replace(/\D/g, '').padStart(5, '0').slice(-5),
+            numberOfDocument: String((mrCount ?? 0) + 1),
+          },
         },
         information: {
-          message: st,
-          ...(st === '3' && reason ? { detailMessage: String(reason) } : {}),
-          economicActivity: String(cfg.economic_activity_code ?? '').trim(),
+          message: st,                                   // 1 acepta · 2 parcial · 3 rechaza
+          ...(st === '3' && reason ? { messageDetail: String(reason) } : {}),
+          activityCode: String(cfg.economic_activity_code ?? '').trim(),
+          taxCondition: '01',                            // 01 = genera crédito IVA
         },
-        totals: { totalTax: Number(d.tax ?? 0).toFixed(2), totalVoucher: Number(d.total ?? 0).toFixed(2) },
+        totals: {
+          totalTaxCredit: m5(taxDoc),                    // IVA acreditable
+          totalApplicableExpense: m5(totalDoc - taxDoc), // gasto aplicable (neto)
+          totalTax: m5(taxDoc),
+          totalVoucher: m5(totalDoc),
+        },
       };
       try {
-        const resp = await alanube.forEnv(cfg.environment).sendReceiverMessage(payload, cfg.alanube_company_id);
+        const resp = await alanube.forEnv(cfg.environment).sendReceiverMessage(payload, String(senderCompanyId));
         mrId = resp?.id ?? deepFind(resp, /(^id$|_id$)/i, 40) ?? null;
       } catch (e: any) {
         messages.push(`⚠️ No se pudo enviar el mensaje a Hacienda (Alanube): ${e?.message ?? 'error'}. Se marcó localmente.`);
