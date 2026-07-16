@@ -862,6 +862,31 @@ admin.get('/alanube/ping', async (c) => {
   }
 });
 
+// GET /tenants/:id/alanube/verify — DIAGNÓSTICO: ¿la empresa que usa la emisión
+// existe en la cuenta/ambiente que apunta el token? Consulta GET /companies/{id}
+// con el MISMO ambiente + company_id que usaría la emisión.
+admin.get('/tenants/:id/alanube/verify', async (c) => {
+  try {
+    const { id } = c.req.param();
+    const { data: row } = await db.from('settings').select('config')
+      .eq('tenant_id', id).eq('type', 'electronic-invoice').maybeSingle();
+    const cfg: Record<string, any> = { ...((row as any)?.config ?? {}) };
+    const isSandbox = String(cfg.environment ?? 'production') === 'sandbox';
+    const companyId = (isSandbox ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id;
+    const client = alanube.forEnv(cfg.environment);
+    const out: any = { environment: client.env, base_url: client.baseUrl(), company_id: companyId ?? null };
+    if (!companyId) return ok(c, { ...out, exists: false, note: 'No hay company_id guardado para este ambiente.' });
+    try {
+      const company = await client.getCompany(String(companyId));
+      return ok(c, { ...out, exists: true, api_status: company?.company?.apiStatus ?? company?.apiStatus ?? null });
+    } catch (e: any) {
+      const status = e instanceof AlanubeError ? e.status : 500;
+      return ok(c, { ...out, exists: false, error: e?.message, status,
+        note: status === 404 ? 'La empresa NO existe en este ambiente/cuenta. El token de emisión apunta a otra cuenta o la empresa se creó en otro ambiente.' : undefined });
+    }
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // ── Alanube: dar de alta la empresa (emisor) — Paso 3 ─────────────────────────
 // Construye el payload de POST /cri/v1/companies desde la config FE del tenant:
 //  · datos del emisor (nombre, identificación, dirección, actividad, email)
