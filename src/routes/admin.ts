@@ -1402,7 +1402,9 @@ admin.get('/fe-log', async (c) => {
       const s = search.replace(/[%,]/g, ' ');
       q = q.or(`customer_name.ilike.%${s}%,fe_consecutivo.ilike.%${s}%,fe_clave.ilike.%${s}%,invoice_number.ilike.%${s}%`);
     }
-    let { data, error } = await q;
+    const res = await q;
+    let data: any = res.data;
+    let error: any = res.error;
     // Si las columnas fe_request/fe_response aún no existen (migración 55 sin correr),
     // reintenta sin ellas.
     if (error && /fe_request|fe_response/.test(error.message)) {
@@ -1415,7 +1417,8 @@ admin.get('/fe-log', async (c) => {
       if (from)     q2 = q2.gte('created_at', from);
       if (to)       q2 = q2.lte('created_at', endOfDay(to));
       if (search) { const s = search.replace(/[%,]/g, ' '); q2 = q2.or(`customer_name.ilike.%${s}%,fe_consecutivo.ilike.%${s}%,fe_clave.ilike.%${s}%,invoice_number.ilike.%${s}%`); }
-      ({ data, error } = await q2);
+      const res2 = await q2;
+      data = res2.data; error = res2.error;
     }
     if (error) throw new Error(error.message);
     const rows = (data ?? []) as any[];
@@ -1431,6 +1434,53 @@ admin.get('/fe-log', async (c) => {
     const errors = rows.filter(r => String(r.fe_status).toLowerCase() === 'error').length;
     return ok(c, {
       count: rows.length, errors,
+      rows: rows.map(r => ({ ...r, business_name: nameById.get(r.tenant_id) ?? '—' })),
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// GET /reception-log — BITÁCORA de comprobantes RECIBIDOS (recepción) de todas
+// las empresas: proveedor, total y estado de aceptación ante Hacienda.
+// Filtros: ?tenant_id= · ?search= (proveedor/clave) · ?from= ?to= · ?status= (accepted/rejected/pending)
+admin.get('/reception-log', async (c) => {
+  try {
+    const tenantId = c.req.query('tenant_id');
+    const search = (c.req.query('search') || '').trim();
+    const from = c.req.query('from');
+    const to = c.req.query('to');
+    const status = c.req.query('status');
+    const limit = Math.min(Number(c.req.query('limit') || 500), 2000);
+
+    let q = db.from('received_documents')
+      .select('id, tenant_id, clave, issuer_name, issuer_id, document_type, doc_date, total, tax, ack_status, source, purchase_id, created_at')
+      .order('created_at', { ascending: false })
+      .limit(limit);
+    if (tenantId) q = q.eq('tenant_id', tenantId);
+    if (status)   q = q.eq('ack_status', status);
+    if (from)     q = q.gte('created_at', from);
+    if (to)       q = q.lte('created_at', endOfDay(to));
+    if (search) {
+      const s = search.replace(/[%,]/g, ' ');
+      q = q.or(`issuer_name.ilike.%${s}%,issuer_id.ilike.%${s}%,clave.ilike.%${s}%`);
+    }
+    const { data, error } = await q;
+    if (error) {
+      if (/received_documents/.test(error.message)) return ok(c, { count: 0, accepted: 0, rejected: 0, pending: 0, rows: [] });
+      throw new Error(error.message);
+    }
+    const rows = (data ?? []) as any[];
+
+    const tenantIds = [...new Set(rows.map(r => r.tenant_id))];
+    const nameById = new Map<string, string>();
+    if (tenantIds.length) {
+      const { data: ts } = await db.from('tenants').select('id, name').in('id', tenantIds);
+      for (const t of (ts ?? []) as any[]) nameById.set(t.id, t.name);
+    }
+    const st = (s: any) => String(s ?? '').toLowerCase();
+    const accepted = rows.filter(r => st(r.ack_status).includes('accept') || r.ack_status === '1').length;
+    const rejected = rows.filter(r => st(r.ack_status).includes('reject') || r.ack_status === '3').length;
+    return ok(c, {
+      count: rows.length, accepted, rejected, pending: rows.length - accepted - rejected,
       rows: rows.map(r => ({ ...r, business_name: nameById.get(r.tenant_id) ?? '—' })),
     });
   } catch (err: any) { return fail(c, err.message, 500); }
