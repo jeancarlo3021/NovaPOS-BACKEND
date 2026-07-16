@@ -60,6 +60,11 @@ app.get('/health', (c) => c.json({
     service_key:   !!process.env.SUPABASE_SERVICE_ROLE_KEY,
     anon_key:      !!process.env.SUPABASE_ANON_KEY,
     frontend_url:  process.env.FRONTEND_URL ?? '(not set)',
+    // Diagnóstico de recepción por correo: ¿están cargadas las variables?
+    cron_secret:   !!process.env.CRON_SECRET,
+    imap_host:     !!process.env.IMAP_HOST,
+    imap_user:     !!process.env.IMAP_USER,
+    imap_pass:     !!process.env.IMAP_PASS,
   },
 }));
 
