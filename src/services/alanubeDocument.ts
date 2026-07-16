@@ -58,10 +58,13 @@ const padN = (s: any, n: number) => String(s ?? '').replace(/\D/g, '').padStart(
 const prov1 = (s: any) => (String(s ?? '').replace(/\D/g, '').replace(/^0+/, '') || '').slice(0, 1);
 const pad2 = (s: any) => { const d = String(s ?? '').replace(/\D/g, ''); return d ? d.padStart(2, '0').slice(-2) : ''; };
 
-function fechaCR(issuedAt?: string): string {
-  let d = issuedAt ? new Date(issuedAt) : new Date();
-  if (isNaN(d.getTime()) || d.getTime() > Date.now()) d = new Date();
-  return new Date(d.getTime() - 6 * 60 * 60 * 1000).toISOString().replace(/\.\d{3}Z$/, '-06:00');
+function fechaCR(_issuedAt?: string): string {
+  // Siempre la hora ACTUAL del servidor (UTC), representada en zona Costa Rica
+  // (-06:00, sin horario de verano). Ignoramos el issued_at de la factura porque
+  // llegaba desfasado ~6 h; la fecha de emisión debe ser el momento real de emitir.
+  const nowUtc = Date.now();
+  const cr = new Date(nowUtc - 6 * 60 * 60 * 1000);   // reloj de pared de Costa Rica
+  return cr.toISOString().replace(/\.\d{3}Z$/, '-06:00');
 }
 
 export function buildAlanubeDocument(
