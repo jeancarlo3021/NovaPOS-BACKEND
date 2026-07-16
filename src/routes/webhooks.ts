@@ -43,14 +43,41 @@ webhooks.post('/alanube', async (c) => {
 
     const body = await c.req.json().catch(() => ({}));
     const event = String(body?.event ?? body?.type ?? '').toLowerCase();
-    // Solo nos interesan las recepciones; el resto se ignora con 200.
-    if (event && !event.includes('reception') && !event.includes('recep')) {
-      return ok(c, { ignored: true, event });
-    }
 
     const d: any = body?.document ?? body?.data ?? body?.payload ?? body;
     const clave = d?.key ?? d?.clave ?? deepFind(body, /(clave|^key$)/i, 50);
     if (!clave) return ok(c, { ignored: true, reason: 'sin clave' });
+    const claveDigits = String(clave).replace(/\D/g, '');
+    const docId = d?.id ?? deepFind(body, /(^id$|documentId)/i, 40);
+
+    // ── Estado de EMISIÓN: si la clave/id corresponde a una factura que emitimos,
+    //    actualizamos su fe_status (Aceptado/Rechazado) — llega por el webhook.
+    const rawStatus = d?.haciendaStatus ?? d?.indEstado ?? d?.status
+      ?? deepFind(body, /(indEstado|haciendaStatus|^status$|estado)/i, 30);
+    const mapStatus = (s: any): string => {
+      const t = String(s ?? '').toUpperCase().trim();
+      if (t.includes('ACCEPT') || t.includes('ACEPT') || t.includes('APROB') || t === '1') return 'accepted';
+      if (t.includes('REJECT') || t.includes('RECHAZ') || t === '2') return 'rejected';
+      if (t.includes('ERROR') || t.includes('FAIL')) return 'error';
+      return 'sent';
+    };
+    if (!event.includes('recep')) {
+      const feStatus = mapStatus(rawStatus);
+      const filters = [claveDigits ? `fe_clave.eq.${claveDigits}` : null, docId ? `fe_consecutivo.eq.${docId}` : null].filter(Boolean).join(',');
+      if (filters) {
+        let res = await db.from('invoices')
+          .update({ fe_status: feStatus, fe_response: body, updated_at: new Date().toISOString() })
+          .or(filters).select('id');
+        if (res.error && /fe_response/.test(res.error.message)) {   // migración 55 sin correr
+          res = await db.from('invoices')
+            .update({ fe_status: feStatus, updated_at: new Date().toISOString() })
+            .or(filters).select('id');
+        }
+        if (res.data && res.data.length) return ok(c, { ok: true, kind: 'emission', fe_status: feStatus });
+      }
+      // No matcheó ninguna factura emitida y no es recepción → se ignora.
+      if (event && !event.includes('recep')) return ok(c, { ignored: true, event });
+    }
 
     // El tenant se resuelve por la cédula RECEPTORA del documento.
     const receiverId = String(
