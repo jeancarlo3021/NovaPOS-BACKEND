@@ -738,48 +738,86 @@ admin.put('/tenants/:id/fe-config', async (c) => {
 // ── Certificado criptográfico (.p12) por empresa — Supabase Storage PRIVADO ─────
 const FE_CERT_BUCKET = 'fe-certificates';
 
+// Certificado .p12 del ambiente activo del tenant (con fallback al legacy).
+function resolveCert(cfg: Record<string, any>): { path: string; filename?: string } | null {
+  const isSandbox = String(cfg.environment ?? 'production') === 'sandbox';
+  const cert = (isSandbox ? cfg.certificate_sandbox : cfg.certificate_production) ?? cfg.certificate;
+  return cert?.path ? cert : null;
+}
+
 // POST /tenants/:id/fe-certificate — sube el .p12 (base64) a Storage y guarda
 // metadata + PIN/clave en la config FE. body: { file_base64, filename, p12_password, hacienda_pin }.
 admin.post('/tenants/:id/fe-certificate', async (c) => {
   try {
     const { id } = c.req.param();
     const body = await c.req.json();
-    const { file_base64, filename, p12_password, hacienda_pin } = body ?? {};
+    const { file_base64, filename, p12_password, hacienda_pin, environment } = body ?? {};
     if (!file_base64) return fail(c, 'Falta el archivo del certificado (.p12)', 422);
     const buf = Buffer.from(String(file_base64).replace(/^data:[^;]*;base64,/, ''), 'base64');
     if (buf.length === 0) return fail(c, 'El archivo del certificado está vacío', 422);
 
+    // Ambiente del .p12: producción o QA/sandbox (cada uno su archivo).
+    const env: 'production' | 'sandbox' = environment === 'sandbox' ? 'sandbox' : 'production';
+
     // Bucket privado (idempotente).
     await db.storage.createBucket(FE_CERT_BUCKET, { public: false }).catch(() => {});
-    const path = `${id}/certificado.p12`;
+    const path = `${id}/certificado-${env}.p12`;
     const { error: upErr } = await db.storage.from(FE_CERT_BUCKET)
       .upload(path, buf, { contentType: 'application/x-pkcs12', upsert: true });
     if (upErr) throw new Error(upErr.message);
 
-    // Metadata + secretos en la config FE (electronic-invoice).
+    // Metadata + secretos en la config FE (electronic-invoice), por ambiente.
     const { data: row } = await db.from('settings').select('config')
       .eq('tenant_id', id).eq('type', 'electronic-invoice').maybeSingle();
     const cfg: Record<string, any> = { ...((row as any)?.config ?? {}) };
-    cfg.certificate = { path, filename: filename || 'certificado.p12', uploaded_at: new Date().toISOString() };
-    if (p12_password !== undefined) cfg.p12_password = String(p12_password);
+    const certMeta = { path, filename: filename || `certificado-${env}.p12`, uploaded_at: new Date().toISOString() };
+    if (env === 'sandbox') {
+      cfg.certificate_sandbox = certMeta;
+      if (p12_password !== undefined) cfg.p12_password_sandbox = String(p12_password);
+    } else {
+      cfg.certificate_production = certMeta;
+      if (p12_password !== undefined) cfg.p12_password_production = String(p12_password);
+    }
+    // Compat: mantené `certificate`/`p12_password` apuntando al de producción.
+    if (env === 'production') {
+      cfg.certificate = certMeta;
+      if (p12_password !== undefined) cfg.p12_password = String(p12_password);
+    }
     if (hacienda_pin !== undefined) cfg.hacienda_pin = String(hacienda_pin);
     await db.from('settings').upsert({
       tenant_id: id, type: 'electronic-invoice', config: cfg, updated_at: new Date().toISOString(),
     }, { onConflict: 'tenant_id,type' });
 
-    return ok(c, { ok: true, certificate: cfg.certificate });
+    return ok(c, { ok: true, certificate: certMeta });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
-// DELETE /tenants/:id/fe-certificate — borra el archivo y limpia metadata/secretos.
+// DELETE /tenants/:id/fe-certificate?environment=production|sandbox — borra el
+// .p12 de ese ambiente. Sin `environment` borra todo (compat).
 admin.delete('/tenants/:id/fe-certificate', async (c) => {
   try {
     const { id } = c.req.param();
-    await db.storage.from(FE_CERT_BUCKET).remove([`${id}/certificado.p12`]).catch(() => {});
+    const environment = c.req.query('environment');
     const { data: row } = await db.from('settings').select('config')
       .eq('tenant_id', id).eq('type', 'electronic-invoice').maybeSingle();
     const cfg: Record<string, any> = { ...((row as any)?.config ?? {}) };
-    delete cfg.certificate; delete cfg.p12_password; delete cfg.hacienda_pin;
+
+    if (environment === 'sandbox') {
+      await db.storage.from(FE_CERT_BUCKET).remove([`${id}/certificado-sandbox.p12`]).catch(() => {});
+      delete cfg.certificate_sandbox; delete cfg.p12_password_sandbox;
+    } else if (environment === 'production') {
+      await db.storage.from(FE_CERT_BUCKET).remove([`${id}/certificado-production.p12`, `${id}/certificado.p12`]).catch(() => {});
+      delete cfg.certificate_production; delete cfg.p12_password_production;
+      delete cfg.certificate; delete cfg.p12_password;
+    } else {
+      // Sin ambiente: limpia todo (compat con el flujo viejo).
+      await db.storage.from(FE_CERT_BUCKET).remove([
+        `${id}/certificado.p12`, `${id}/certificado-production.p12`, `${id}/certificado-sandbox.p12`,
+      ]).catch(() => {});
+      delete cfg.certificate; delete cfg.p12_password; delete cfg.hacienda_pin;
+      delete cfg.certificate_production; delete cfg.p12_password_production;
+      delete cfg.certificate_sandbox; delete cfg.p12_password_sandbox;
+    }
     await db.from('settings').upsert({
       tenant_id: id, type: 'electronic-invoice', config: cfg, updated_at: new Date().toISOString(),
     }, { onConflict: 'tenant_id,type' });
@@ -927,11 +965,15 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
     // Validaciones mínimas antes de llamar a Alanube.
     if (!cfg.emisor_name) return fail(c, 'Falta el nombre del emisor (Datos de FE).', 422);
     if (!cfg.emisor_identification) return fail(c, 'Falta la identificación del emisor.', 422);
-    if (!cfg.certificate?.path) return fail(c, 'Falta subir el certificado .p12 (Datos de FE).', 422);
-    if (!cfg.atv_username) return fail(c, 'Falta el usuario de API de ATV (Datos de FE).', 422);
+    // Usuario ATV: acepta el del ambiente elegido o el legacy.
+    const prodEnv = String(cfg.environment ?? 'production') !== 'sandbox';
+    const cert = resolveCert(cfg);
+    if (!cert) return fail(c, `Falta subir el certificado .p12 de ${prodEnv ? 'Producción' : 'QA/Sandbox'} (Datos de FE).`, 422);
+    const atvUserSet = (prodEnv ? cfg.atv_username_production : cfg.atv_username_sandbox) ?? cfg.atv_username;
+    if (!atvUserSet) return fail(c, `Falta el usuario de API de ATV para ${prodEnv ? 'Producción' : 'QA/Sandbox'} (Datos de FE).`, 422);
 
     // Bajar el .p12 de Storage y pasarlo a base64 (sin prefijo data:).
-    const { data: file, error: dlErr } = await db.storage.from(FE_CERT_BUCKET).download(cfg.certificate.path);
+    const { data: file, error: dlErr } = await db.storage.from(FE_CERT_BUCKET).download(cert.path);
     if (dlErr || !file) return fail(c, `No se pudo leer el certificado del Storage: ${dlErr?.message ?? 'vacío'}`, 500);
     const p12Base64 = Buffer.from(await file.arrayBuffer()).toString('base64');
 
@@ -947,7 +989,12 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
     cfg.alanube_env = client.env;
     cfg.alanube_registered_at = new Date().toISOString();
     cfg.alanube_company_raw = result;   // respuesta cruda (para depurar el nombre del id)
-    if (companyId) cfg.alanube_company_id = companyId;
+    if (companyId) {
+      cfg.alanube_company_id = companyId;   // legacy/compat
+      // Guardar en el campo del ambiente donde se creó (producción vs sandbox).
+      if (client.env === 'sandbox') cfg.alanube_company_id_sandbox = companyId;
+      else cfg.alanube_company_id_production = companyId;
+    }
     await db.from('settings').upsert({
       tenant_id: id, type: 'electronic-invoice', config: cfg, updated_at: new Date().toISOString(),
     }, { onConflict: 'tenant_id,type' });
@@ -966,10 +1013,14 @@ admin.put('/tenants/:id/alanube/company', async (c) => {
     const { data: row } = await db.from('settings').select('config')
       .eq('tenant_id', id).eq('type', 'electronic-invoice').maybeSingle();
     const cfg: Record<string, any> = { ...((row as any)?.config ?? {}) };
-    if (!cfg.alanube_company_id) return fail(c, 'La empresa no está registrada en Alanube todavía. Usá «Crear empresa».', 422);
-    if (!cfg.certificate?.path) return fail(c, 'Falta el certificado .p12 (Datos de FE).', 422);
+    // ID de empresa SEGÚN AMBIENTE (con fallback al legacy).
+    const isSandbox = String(cfg.environment ?? 'production') === 'sandbox';
+    const companyId = (isSandbox ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id;
+    if (!companyId) return fail(c, `La empresa no está registrada en Alanube (${isSandbox ? 'QA/Sandbox' : 'Producción'}) todavía. Usá «Crear empresa».`, 422);
+    const cert = resolveCert(cfg);
+    if (!cert) return fail(c, `Falta el certificado .p12 de ${isSandbox ? 'QA/Sandbox' : 'Producción'} (Datos de FE).`, 422);
 
-    const { data: file, error: dlErr } = await db.storage.from(FE_CERT_BUCKET).download(cfg.certificate.path);
+    const { data: file, error: dlErr } = await db.storage.from(FE_CERT_BUCKET).download(cert.path);
     if (dlErr || !file) return fail(c, `No se pudo leer el certificado del Storage: ${dlErr?.message ?? 'vacío'}`, 500);
     const p12Base64 = Buffer.from(await file.arrayBuffer()).toString('base64');
 
@@ -977,14 +1028,14 @@ admin.put('/tenants/:id/alanube/company', async (c) => {
     const payload = buildAlanubeCompanyPayload(cfg, p12Base64, client.env);
     // Al ACTUALIZAR, Alanube no acepta `type` (solo se define al crear).
     delete (payload as any).type;
-    const result: any = await client.updateCompany(String(cfg.alanube_company_id), payload);
+    const result: any = await client.updateCompany(String(companyId), payload);
 
     cfg.alanube_updated_at = new Date().toISOString();
     cfg.alanube_webhook_active = !!payload.webhooks;
     await db.from('settings').upsert({
       tenant_id: id, type: 'electronic-invoice', config: cfg, updated_at: new Date().toISOString(),
     }, { onConflict: 'tenant_id,type' });
-    return ok(c, { ok: true, company_id: cfg.alanube_company_id, webhook_active: !!payload.webhooks, result });
+    return ok(c, { ok: true, company_id: companyId, webhook_active: !!payload.webhooks, result });
   } catch (err: any) {
     const status = err instanceof AlanubeError ? err.status : 500;
     return fail(c, err.message, status);

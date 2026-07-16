@@ -90,6 +90,12 @@ async function loadFEConfig(tenantId: string): Promise<any> {
     ? (cfg.api_key_emisor_sandbox || cfg.api_key_emisor)
     : (cfg.api_key_emisor_production || cfg.api_key_emisor);
   cfg.api_key_emisor = String(byEnv || '').trim();
+  // ID de empresa de Alanube SEGÚN AMBIENTE (con fallback al legacy), para que
+  // todos los handlers usen el companyId correcto con `cfg.alanube_company_id`.
+  const companyByEnv = env === 'sandbox'
+    ? (cfg.alanube_company_id_sandbox || cfg.alanube_company_id)
+    : (cfg.alanube_company_id_production || cfg.alanube_company_id);
+  cfg.alanube_company_id = companyByEnv ? String(companyByEnv).trim() : '';
   return cfg;
 }
 
