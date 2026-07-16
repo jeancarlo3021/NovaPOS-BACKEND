@@ -7,10 +7,11 @@ import { fetchAndProcessReceivedEmails } from '../services/receivedEmails.js';
 const cron = new Hono();
 
 function authorized(c: any): boolean {
-  const secret = process.env.CRON_SECRET;
+  // Recortamos espacios/saltos de línea (Vercel suele colar un \n al pegar el valor).
+  const secret = (process.env.CRON_SECRET ?? '').trim();
   if (!secret) return false;                       // sin secreto configurado, se rechaza todo
-  const header = c.req.header('x-cron-secret') || c.req.header('authorization')?.replace(/^Bearer\s+/i, '');
-  const query  = c.req.query('token');
+  const header = (c.req.header('x-cron-secret') || c.req.header('authorization')?.replace(/^Bearer\s+/i, '') || '').trim();
+  const query  = (c.req.query('token') ?? '').trim();
   return header === secret || query === secret;
 }
 
