@@ -140,12 +140,10 @@ function clientFor(env: AlanubeEnv) {
         throw e;
       }
     },
-    emitDocument: (kind: 'invoice' | 'ticket' | 'credit-note' | 'debit-note', payload: Record<string, any>, companyId?: string) => {
-      // CRI identifica la empresa por QUERY `?idCompany=` (no en body ni header):
-      // el body no acepta props extra y el header lo ignora. Necesario cuando hay
-      // más de una empresa en la cuenta.
-      const path = companyId ? `${EMIT_PATH[kind]}?idCompany=${encodeURIComponent(companyId)}` : EMIT_PATH[kind];
-      return f(path, { method: 'POST', body: JSON.stringify(payload) });
+    emitDocument: (kind: 'invoice' | 'ticket' | 'credit-note' | 'debit-note', _payload: Record<string, any>, _companyId?: string) => {
+      // CRI emite SIEMPRE con la empresa 'main' de la cuenta: NO hay parámetro
+      // idCompany (ni body, ni header, ni query). El companyId se ignora acá.
+      return f(EMIT_PATH[kind], { method: 'POST', body: JSON.stringify(_payload) });
     },
     // Consulta el ESTATUS FISCAL de un documento. Alanube usa el patrón
     //   GET /{recurso-fiscal}/{id}/idCompany/{companyId}
@@ -182,9 +180,8 @@ function clientFor(env: AlanubeEnv) {
       }
       throw lastErr ?? new AlanubeError('Documento no encontrado', 404);
     },
-    sendReceiverMessage: (payload: Record<string, any>, companyId?: string) => {
-      const path = companyId ? `/receiver-messages?idCompany=${encodeURIComponent(companyId)}` : '/receiver-messages';
-      return f(path, { method: 'POST', body: JSON.stringify(payload) });
+    sendReceiverMessage: (payload: Record<string, any>, _companyId?: string) => {
+      return f('/receiver-messages', { method: 'POST', body: JSON.stringify(payload) });
     },
     getReceiverMessage: (id: string, companyId?: string) => {
       const headers = companyId ? { idCompany: companyId, 'X-Company-Id': companyId } : undefined;

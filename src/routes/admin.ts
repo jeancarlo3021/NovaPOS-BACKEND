@@ -919,9 +919,11 @@ function buildAlanubeCompanyPayload(cfg: Record<string, any>, p12Base64: string,
     name: String(cfg.emisor_name ?? '').trim(),
     identificationType: String(cfg.emisor_identification_type ?? '02'),
     identificationNumber: String(cfg.emisor_identification ?? '').replace(/\D/g, ''),
-    // La cuenta Alanube solo admite UNA empresa 'main'; cada emisor/tenant va
-    // como 'associated'. Se puede forzar con cfg.alanube_company_type.
-    type: (cfg.alanube_company_type === 'main' ? 'main' : 'associated'),
+    // CRI EMITE SIEMPRE con la empresa 'main' (no hay parámetro idCompany en la
+    // emisión), así que la empresa emisora del tenant DEBE crearse como 'main'.
+    // (En CRI cada emisor necesita su propia cuenta/token de Alanube.)
+    // Se puede forzar 'associated' con cfg.alanube_company_type === 'associated'.
+    type: (cfg.alanube_company_type === 'associated' ? 'associated' : 'main'),
     address: {
       province: String(cfg.emisor_province_code ?? '').trim(),
       canton: String(cfg.emisor_canton_code ?? '').trim(),
