@@ -272,6 +272,34 @@ function mapEstado(ind: string): string {
   return 'sent';   // procesando / recibido
 }
 
+/** Limpia el governmentResponse de Hacienda (texto crudo con códigos) y devuelve
+ *  los mensajes de error en una lista legible. */
+function cleanHaciendaError(raw: any): string | null {
+  const s = String(raw ?? '').trim();
+  if (!s) return null;
+  // Cada error viene como:  -99, ""mensaje"", 0, 0
+  const msgs: string[] = [];
+  const re = /(-?\d+)\s*,\s*""([\s\S]*?)""\s*,/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(s)) !== null) {
+    const msg = m[2].replace(/\s+/g, ' ').trim();
+    if (msg) msgs.push(msg);
+  }
+  if (msgs.length) return msgs.map((x, i) => `${i + 1}. ${x}`).join('\n');
+  // Sin códigos: devolvemos el texto tal cual (limpiando saltos).
+  return s.replace(/\s+/g, ' ').trim();
+}
+
+/** Tipo de documento (columna) → kind de Alanube para consultar el recurso. */
+function feKindOf(documentType?: string | null): 'invoice' | 'ticket' | 'credit-note' | 'debit-note' {
+  switch (String(documentType ?? '')) {
+    case 'factura_electronica': return 'invoice';
+    case 'nota_credito':        return 'credit-note';
+    case 'nota_debito':         return 'debit-note';
+    default:                    return 'ticket';   // tiquete_electronico y otros
+  }
+}
+
 /** Mapea el status de Alanube / Hacienda a fe_status. */
 function mapAlanubeStatus(s: any): string {
   const t = String(s ?? '').toUpperCase().trim();
@@ -287,15 +315,17 @@ function mapAlanubeStatus(s: any): string {
 
 /** Consulta el estado de un documento en Alanube por su id (ULID). Devuelve
  *  también la clave real de Hacienda (50 díg) y el estado CRUDO (para depurar). */
-async function alanubeDocStatus(client: ReturnType<typeof alanube.forEnv>, docId: string, opts?: { kind?: 'invoice' | 'ticket' | 'credit-note' | 'debit-note'; companyId?: string }): Promise<{ status: string; rawStatus: any; clave: string | null; raw: any }> {
+async function alanubeDocStatus(client: ReturnType<typeof alanube.forEnv>, docId: string, opts?: { kind?: 'invoice' | 'ticket' | 'credit-note' | 'debit-note'; companyId?: string }): Promise<{ status: string; rawStatus: any; clave: string | null; error: string | null; raw: any }> {
   const doc: any = await client.getDocument(docId, opts);
-  const d = doc?.ticket ?? doc?.invoice ?? doc?.creditNote ?? doc?.document ?? doc?.data ?? doc;
-  // El estado de HACIENDA puede venir en varios nombres; priorizamos el de Hacienda
-  // sobre el ciclo de vida interno de Alanube.
-  const rawStatus = d?.haciendaStatus ?? d?.indEstado ?? d?.stateHacienda ?? d?.hacienda?.status
-    ?? d?.status ?? deepFind(doc, /(indEstado|haciendaStatus|^status$|estado|situacion)/i, 20);
+  const d = doc?.document ?? doc?.invoice ?? doc?.ticket ?? doc?.creditNote ?? doc?.debitNote ?? doc?.data ?? doc;
+  // En CRI el estado de HACIENDA viene en `legalStatus` (ACCEPTED/REJECTED); el
+  // `status` es el ciclo de vida de Alanube (REGISTERED/FINISHED). Priorizamos legalStatus.
+  const rawStatus = d?.legalStatus ?? d?.haciendaStatus ?? d?.indEstado ?? d?.hacienda?.status
+    ?? deepFind(doc, /(legalStatus|indEstado|haciendaStatus)/i, 20)
+    ?? d?.status ?? deepFind(doc, /(^status$|estado|situacion)/i, 20);
   const clave = d?.key ?? d?.clave ?? deepFind(doc, /(clave|^key$)/i, 40) ?? null;
-  return { status: mapAlanubeStatus(rawStatus), rawStatus, clave, raw: doc };
+  const rawErr = d?.governmentResponse ?? d?.errorMessage ?? deepFind(doc, /(governmentResponse|errorMessage)/i, 5000) ?? null;
+  return { status: mapAlanubeStatus(rawStatus), rawStatus, clave, error: cleanHaciendaError(rawErr), raw: doc };
 }
 
 // POST /refresh-status — consulta el estatus de una factura por su Clave y lo GUARDA.
@@ -320,12 +350,10 @@ hacienda.post('/refresh-status', async (c) => {
     if (provider === 'alanube') {
       const docId = (inv as any).fe_consecutivo;
       if (!docId) return fail(c, 'No hay id de documento de Alanube para consultar. Volvé a emitir.', 422);
-      const kind = (inv as any).document_type === 'factura_electronica' ? 'invoice'
-        : (inv as any).document_type === 'nota_credito' ? 'credit-note'
-        : (inv as any).document_type === 'nota_debito' ? 'debit-note' : 'ticket';
-      const r = await alanubeDocStatus(alanube.forEnv(cfg.environment), docId, { kind: kind as any, companyId: cfg.alanube_company_id });
-      fe_status = r.status; indEstado = r.rawStatus;
+      const r = await alanubeDocStatus(alanube.forEnv(cfg.environment), docId, { kind: feKindOf((inv as any).document_type) });
+      fe_status = r.status; indEstado = r.rawStatus; errDetail = r.error;
       patch.fe_status = fe_status;
+      patch.fe_error = r.error;    // motivo del rechazo de Hacienda (si lo hay)
       patch.fe_response = r.raw;   // guardar la respuesta cruda para la bitácora
       // Si ya llegó la clave real de Hacienda (50 díg) y aún guardábamos el ULID,
       // la persistimos para mostrar clave y consecutivo correctos.
@@ -345,6 +373,8 @@ hacienda.post('/refresh-status', async (c) => {
       const { fe_response, fe_request, ...rest } = patch;   // migración 55 sin correr
       upd = await db.from('invoices').update(rest).eq('id', invoice_id).eq('tenant_id', tenantId);
     }
+    // Al ACEPTARSE, enviar automáticamente el comprobante completo al cliente.
+    if (fe_status === 'accepted') autoSendComprobanteToCustomer(tenantId, invoice_id);
 
     return ok(c, { fe_status, ind_estado: indEstado, error: errDetail });
   } catch (err: any) {
@@ -365,7 +395,7 @@ hacienda.post('/refresh-pending', async (c) => {
     const env = cfg.environment === 'sandbox' ? 'sandbox' : 'production'; // default producción
 
     const { data: pend } = await db.from('invoices')
-      .select('id, fe_clave, fe_consecutivo')
+      .select('id, fe_clave, fe_consecutivo, document_type')
       .eq('tenant_id', tenantId).eq('fe_status', 'sent').not('fe_clave', 'is', null)
       .order('issued_at', { ascending: false }).limit(60);
 
@@ -376,8 +406,11 @@ hacienda.post('/refresh-pending', async (c) => {
         const patch: Record<string, any> = { updated_at: new Date().toISOString() };
         if (provider === 'alanube') {
           if (!inv.fe_consecutivo) continue;   // sin id de Alanube no podemos consultar
-          const r = await alanubeDocStatus(alanube.forEnv(cfg.environment), inv.fe_consecutivo);
+          const kind = feKindOf(inv.document_type);
+          const r = await alanubeDocStatus(alanube.forEnv(cfg.environment), inv.fe_consecutivo, { kind });
           fe_status = r.status;
+          patch.fe_error = r.error;    // motivo del rechazo (si lo hay)
+          patch.fe_response = r.raw;   // respuesta cruda para depurar el estado
           if (r.clave && /^\d{50}$/.test(String(r.clave)) && r.clave !== inv.fe_clave) patch.fe_clave = r.clave;
         } else {
           const data = await consultaEstatus(env, cfg.api_key_emisor, inv.fe_clave);
@@ -389,6 +422,8 @@ hacienda.post('/refresh-pending', async (c) => {
           patch.fe_status = fe_status;
           await db.from('invoices').update(patch).eq('id', inv.id).eq('tenant_id', tenantId);
           updated++;
+          // Al ACEPTARSE, enviar el comprobante completo al cliente.
+          if (fe_status === 'accepted') autoSendComprobanteToCustomer(tenantId, inv.id);
         }
       } catch { /* seguir con los demás */ }
     }
@@ -506,6 +541,10 @@ hacienda.post('/emit', async (c) => {
         tipoDoc,
         headquarters: cfg.sucursal, terminal: cfg.terminal,
         numberOfDocument: (inv as any).invoice_number,
+        // Empresa emisora en Alanube según el ambiente (para que emita el tenant y
+        // no la 'main' de la cuenta). Sin id, Alanube usa la main por defecto.
+        senderId: (String(cfg.environment ?? 'production') === 'sandbox'
+          ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id,
       });
       if (debug) {
         return ok(c, { provider: 'alanube', environment: env, kind, company_id: cfg.alanube_company_id, payload: doc });
@@ -536,6 +575,10 @@ hacienda.post('/emit', async (c) => {
         sale_condition: (inv as any).payment_method === 'credit' ? '02' : '01',
         updated_at: new Date().toISOString(),
       }).eq('id', invoice_id).eq('tenant_id', tenantId);
+
+      // El correo al cliente se envía AUTOMÁTICAMENTE al ACEPTARSE (con los dos
+      // XML + PDF), no al emitir — la respuesta de Hacienda aún no existe acá.
+
       return ok(c, { ok: true, provider: 'alanube', clave, alanube_doc_id: docId, alanube_status: alanubeStatus, tipo: tipoDoc, response: resp });
     }
 
@@ -659,6 +702,10 @@ hacienda.post('/credit-note', async (c) => {
         tipoDoc: '03',
         headquarters: cfg.sucursal, terminal: cfg.terminal,
         numberOfDocument: (inv as any).invoice_number,
+        // Empresa emisora en Alanube según el ambiente (para que emita el tenant y
+        // no la 'main' de la cuenta). Sin id, Alanube usa la main por defecto.
+        senderId: (String(cfg.environment ?? 'production') === 'sandbox'
+          ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id,
         reference: {
           documentType: tipoOriginal,
           number: (inv as any).fe_clave,
@@ -790,6 +837,10 @@ hacienda.post('/debit-note', async (c) => {
         tipoDoc: '02',
         headquarters: cfg.sucursal, terminal: cfg.terminal,
         numberOfDocument: (inv as any).invoice_number,
+        // Empresa emisora en Alanube según el ambiente (para que emita el tenant y
+        // no la 'main' de la cuenta). Sin id, Alanube usa la main por defecto.
+        senderId: (String(cfg.environment ?? 'production') === 'sandbox'
+          ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id,
         reference: {
           documentType: tipoOriginal,
           number: (inv as any).fe_clave,
@@ -1382,11 +1433,37 @@ hacienda.post('/received/upload', async (c) => {
 
 // POST /resend-email — reenvía la info del comprobante a OTRO correo.
 // body: { invoice_id, email }
-/** Arma y envía el correo del comprobante electrónico. Adjunta el XML si existe. */
+// Baja de Alanube el XML del comprobante, el XML de respuesta de Hacienda y el
+// PDF, y arma los adjuntos del correo. Tolerante a fallos (devuelve lo que haya).
+async function alanubeAttachments(cfg: any, docId: string | null | undefined, kind: any, clave: string): Promise<Array<{ filename: string; content: string }>> {
+  const out: Array<{ filename: string; content: string }> = [];
+  if (!docId) return out;
+  try {
+    const resp: any = await alanube.forEnv(cfg.environment).getDocument(String(docId), { kind, documents: 'xml,xmlHacienda,pdf' });
+    const d = resp?.invoice ?? resp?.ticket ?? resp?.creditNote ?? resp?.debitNote ?? resp?.document ?? resp?.data ?? resp;
+    const base = String(clave || docId);
+    // Convierte a base64: XML crudo → base64; URL → se ignora; base64 → tal cual.
+    const asB64 = (v: any): string | null => {
+      if (!v || typeof v !== 'string') return null;
+      const s = v.trim();
+      if (!s || /^https?:\/\//i.test(s)) return null;
+      return s.startsWith('<') ? Buffer.from(s, 'utf8').toString('base64') : s;
+    };
+    const xml = asB64(d?.xml ?? deepFind(resp, /^xml$/i, 8_000_000));
+    const xmlHac = asB64(d?.xmlHacienda ?? deepFind(resp, /xmlhacienda/i, 8_000_000));
+    const pdf = asB64(d?.pdf ?? deepFind(resp, /^pdf$/i, 12_000_000));
+    if (xml) out.push({ filename: `${base}.xml`, content: xml });
+    if (xmlHac) out.push({ filename: `${base}-respuesta-hacienda.xml`, content: xmlHac });
+    if (pdf) out.push({ filename: `${base}.pdf`, content: pdf });
+  } catch (e: any) { console.warn('[FE email] no se pudieron bajar adjuntos:', e?.message); }
+  return out;
+}
+
+/** Arma y envía el correo del comprobante electrónico con XML/PDF adjuntos. */
 async function sendComprobanteEmail(to: string, i: {
   invoice_number: string; fe_clave: string; fe_consecutivo?: string | null;
   fe_status?: string | null; total?: number | null; customer_name?: string | null; fe_xml?: string | null;
-}): Promise<void> {
+}, attachments?: Array<{ filename: string; content: string }>): Promise<void> {
   const estado = i.fe_status === 'accepted' ? 'Aceptado' : i.fe_status === 'rejected' ? 'Rechazado' : 'En proceso';
   const html = `
     <div style="font-family:sans-serif;font-size:14px;color:#222">
@@ -1397,10 +1474,36 @@ async function sendComprobanteEmail(to: string, i: {
       <p><b>Clave:</b> ${i.fe_clave}</p>
       <p><b>Total:</b> ₡${Number(i.total ?? 0).toLocaleString('es-CR')}</p>
     </div>`;
-  const attachments = i.fe_xml
-    ? [{ filename: `${i.fe_clave}.xml`, content: Buffer.from(String(i.fe_xml), 'utf8').toString('base64') }]
-    : undefined;
-  await sendEmail({ to, subject: `Comprobante electrónico ${i.invoice_number}`, html, attachments });
+  // Adjuntos: los pasados (Alanube) o, si no hay, el fe_xml guardado.
+  let atts = attachments && attachments.length ? attachments : undefined;
+  if (!atts && i.fe_xml) {
+    atts = [{ filename: `${i.fe_clave}.xml`, content: Buffer.from(String(i.fe_xml), 'utf8').toString('base64') }];
+  }
+  await sendEmail({ to, subject: `Comprobante electrónico ${i.invoice_number}`, html, attachments: atts });
+}
+
+// Envía AUTOMÁTICAMENTE el comprobante COMPLETO (XML + respuesta de Hacienda +
+// PDF) al correo del cliente. Se llama al ACEPTARSE la factura. Marca la factura
+// para no reenviar (fe_emailed) en cada refresco.
+export async function autoSendComprobanteToCustomer(tenantId: string, invoiceId: string): Promise<void> {
+  try {
+    const cfg = await loadFEConfig(tenantId);
+    const { data: inv } = await db.from('invoices')
+      .select('invoice_number, fe_clave, fe_consecutivo, fe_status, fe_xml, total, customer_name, customer_id, document_type, fe_emailed')
+      .eq('id', invoiceId).eq('tenant_id', tenantId).maybeSingle();
+    if (!inv || (inv as any).fe_emailed) return;   // ya se envió
+    let email: string | null = null;
+    if ((inv as any).customer_id) {
+      const { data: cust } = await db.from('customers').select('email').eq('id', (inv as any).customer_id).maybeSingle();
+      email = (cust as any)?.email ?? null;
+    }
+    if (!email) return;   // sin correo del cliente, no se envía
+    const atts = cfg.fe_provider === 'alanube'
+      ? await alanubeAttachments(cfg, (inv as any).fe_consecutivo, feKindOf((inv as any).document_type), (inv as any).fe_clave)
+      : undefined;
+    await sendComprobanteEmail(email, inv as any, atts);
+    await db.from('invoices').update({ fe_emailed: true }).eq('id', invoiceId).eq('tenant_id', tenantId).then(() => {}, () => {});
+  } catch (e: any) { console.warn('[FE email auto-accept] no se pudo enviar:', e?.message); }
 }
 
 hacienda.post('/resend-email', async (c) => {
@@ -1410,12 +1513,17 @@ hacienda.post('/resend-email', async (c) => {
     if (!invoice_id || !email) return fail(c, 'Falta invoice_id o email', 422);
 
     const { data: inv } = await db.from('invoices')
-      .select('invoice_number, fe_clave, fe_consecutivo, fe_status, fe_xml, total, customer_name')
+      .select('invoice_number, fe_clave, fe_consecutivo, fe_status, fe_xml, total, customer_name, document_type')
       .eq('id', invoice_id).eq('tenant_id', tenantId).maybeSingle();
     if (!inv) return fail(c, 'Factura no encontrada', 404);
     if (!(inv as any).fe_clave) return fail(c, 'La factura no fue emitida electrónicamente', 422);
 
-    await sendComprobanteEmail(email, inv as any);
+    // Con Alanube, bajamos XML + respuesta de Hacienda + PDF para adjuntar.
+    const cfg = await loadFEConfig(tenantId);
+    const attachments = cfg.fe_provider === 'alanube'
+      ? await alanubeAttachments(cfg, (inv as any).fe_consecutivo, feKindOf((inv as any).document_type), (inv as any).fe_clave)
+      : undefined;
+    await sendComprobanteEmail(email, inv as any, attachments);
     return ok(c, { ok: true });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
@@ -1565,8 +1673,10 @@ hacienda.post('/emit-direct', async (c) => {
         const alanubeStatus = docObj?.status ?? null;
         await db.from('invoices').update({
           fe_clave: clave ?? docId, fe_consecutivo: docId, fe_status: 'sent', fe_situacion: '1', fe_error: null,
+          fe_request: doc, fe_response: resp,
           updated_at: new Date().toISOString(),
         }).eq('id', inv.id).eq('tenant_id', tenantId);
+        // El correo al cliente sale automáticamente al ACEPTARSE (dos XML + PDF).
         return ok(c, { ok: true, provider: 'alanube', invoice_id: inv.id, invoice_number: inv.invoice_number, clave, alanube_doc_id: docId, alanube_status: alanubeStatus, tipo: tipoDoc });
       } catch (emitErr: any) {
         const msg = emitErr instanceof AlanubeError ? emitErr.message : (emitErr?.message ?? 'Error emitiendo con Alanube');

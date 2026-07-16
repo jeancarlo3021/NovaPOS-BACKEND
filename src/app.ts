@@ -68,6 +68,9 @@ app.get('/health', (c) => c.json({
     // Tokens de Alanube por ambiente (para diagnosticar "Company not found").
     alanube_token_production: !!process.env.ALANUBE_API_TOKEN_PRODUCTION,
     alanube_token_sandbox:    !!process.env.ALANUBE_API_TOKEN_SANDBOX,
+    // Correo (Resend) — para diagnosticar "no llega el correo".
+    resend_api_key: !!process.env.RESEND_API_KEY,
+    email_from:     process.env.EMAIL_FROM ?? '(default onboarding@resend.dev)',
   },
 }));
 

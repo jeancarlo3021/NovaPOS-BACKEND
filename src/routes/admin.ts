@@ -897,6 +897,11 @@ admin.get('/tenants/:id/alanube/verify', async (c) => {
 // NOTA: los nombres de los sub-objetos `certificate` y `token` siguen las
 // convenciones CRI de Alanube; si el sandbox reporta un campo distinto, se
 // ajusta SOLO en `buildAlanubeCompanyPayload`.
+// Normalización de códigos de ubicación Hacienda (deben coincidir con Tributación
+// o se rechaza con -37): provincia = 1 dígito (1-7), cantón/distrito = 2 dígitos.
+const provDigit = (s: any) => (String(s ?? '').replace(/\D/g, '').replace(/^0+/, '') || '').slice(0, 1);
+const pad2Code = (s: any) => { const d = String(s ?? '').replace(/\D/g, ''); return d ? d.padStart(2, '0').slice(-2) : ''; };
+
 function buildAlanubeCompanyPayload(cfg: Record<string, any>, p12Base64: string, env: 'sandbox' | 'production' = 'production') {
   const others = String(cfg.emisor_address ?? '').trim();
   const activity = String(cfg.economic_activity_code ?? '').trim();
@@ -925,9 +930,9 @@ function buildAlanubeCompanyPayload(cfg: Record<string, any>, p12Base64: string,
     // Se puede forzar 'associated' con cfg.alanube_company_type === 'associated'.
     type: (cfg.alanube_company_type === 'associated' ? 'associated' : 'main'),
     address: {
-      province: String(cfg.emisor_province_code ?? '').trim(),
-      canton: String(cfg.emisor_canton_code ?? '').trim(),
-      district: String(cfg.emisor_district_code ?? '').trim(),
+      province: provDigit(cfg.emisor_province_code),
+      canton: pad2Code(cfg.emisor_canton_code),
+      district: pad2Code(cfg.emisor_district_code),
       otrasSenas: others,
     },
     // Certificado de firma (.p12) — clave criptográfica + su PIN/contraseña.
@@ -987,6 +992,41 @@ function findCompanyId(result: any): string | null {
   return walk(result);
 }
 
+// Recupera el id de la empresa del tenant en Alanube cuando no quedó guardado en
+// la config. CRI NO tiene un endpoint para listar la empresa 'main', así que:
+//   1) verificamos los ids que YA tengamos guardados (sandbox/producción/legacy/
+//      respuesta cruda) contra GET /companies/{id} en el ambiente actual, y
+//   2) como respaldo, buscamos por cédula en GET /companies/associated.
+async function findExistingCompanyId(client: any, cfg: Record<string, any>): Promise<string | null> {
+  const cedula = String(cfg.emisor_identification ?? '').replace(/\D/g, '');
+
+  // 1) Ids candidatos ya conocidos → verificar que existan en este ambiente.
+  const candidates = [
+    cfg.alanube_company_id_sandbox, cfg.alanube_company_id_production,
+    cfg.alanube_company_id, findCompanyId(cfg.alanube_company_raw),
+  ].filter((v, i, a) => v && a.indexOf(v) === i) as string[];
+  for (const cid of candidates) {
+    try {
+      const co: any = await client.getCompany(String(cid));
+      const found = findCompanyId(co?.company ?? co);
+      if (found) return found;
+    } catch { /* no existe en este ambiente → seguir */ }
+  }
+
+  // 2) Respaldo: buscar por cédula entre las empresas asociadas.
+  try {
+    const list: any = await client.getAssociated(100);
+    const arr: any[] = Array.isArray(list) ? list
+      : (list?.data ?? list?.companies ?? list?.results ?? list?.rows ?? []);
+    const co = (arr ?? []).find((x: any) =>
+      String(x?.identificationNumber ?? x?.identification?.identificationNumber ?? '').replace(/\D/g, '') === cedula
+    );
+    if (co) return findCompanyId(co);
+  } catch { /* sin lista de asociadas */ }
+
+  return null;
+}
+
 // POST /tenants/:id/alanube/company — crea/da de alta la empresa en Alanube.
 admin.post('/tenants/:id/alanube/company', async (c) => {
   const { id } = c.req.param();
@@ -1013,7 +1053,41 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
     // Ambiente del TENANT (producción o QA/sandbox según su config FE).
     const client = alanube.forEnv(cfg.environment);
     const payload = buildAlanubeCompanyPayload(cfg, p12Base64, client.env);
-    const result: any = await client.createCompany(payload);
+
+    // En CRI cada cuenta/token solo admite UNA empresa 'main'. Si ya existe (por un
+    // alta previa), Alanube responde "already has main company". En ese caso NO
+    // fallamos: buscamos la empresa existente en la cuenta y la ACTUALIZAMOS con la
+    // config corregida (dirección, certificado, etc.) — así «Crear empresa» es
+    // idempotente y no deja al usuario trabado.
+    let result: any;
+    let updatedExisting = false;
+    try {
+      result = await client.createCompany(payload);
+    } catch (e: any) {
+      const msg = String(e?.message ?? '');
+      const alreadyMain = e instanceof AlanubeError
+        && (e.status === 400 || e.status === 409)
+        && /already has (a )?main company|ya tiene.*empresa|main company/i.test(msg);
+      if (!alreadyMain) throw e;
+
+      // Ya existe la 'main' en la cuenta: la ubicamos y la actualizamos.
+      const existingId = await findExistingCompanyId(client, cfg);
+      if (!existingId) {
+        // La cuenta ya tiene su empresa principal pero no logramos ubicar su id por
+        // API (CRI no lista la 'main'). No hace falta para EMITIR —la emisión usa la
+        // main de la cuenta automáticamente—; solo para actualizar sus datos.
+        return fail(c, 'Esta cuenta de Alanube ya tiene su empresa principal registrada. '
+          + 'No necesitás crearla de nuevo: podés emitir directamente. Para corregir la '
+          + 'dirección del emisor, pegá el ID de la empresa (lo ves en el panel de Alanube) '
+          + 'en Datos de FE y usá «Actualizar empresa».', 409);
+      }
+
+      const updPayload: Record<string, any> = { ...payload };
+      delete updPayload.type;     // 'type' solo se define al crear
+      result = await client.updateCompany(String(existingId), updPayload);
+      if (!findCompanyId(result)) result = { ...result, id: existingId };
+      updatedExisting = true;
+    }
 
     // Guardar el id de la empresa devuelto por Alanube para emitir después.
     // Buscamos en las rutas comunes y, si no, escaneamos en profundidad cualquier
@@ -1031,7 +1105,7 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
     await db.from('settings').upsert({
       tenant_id: id, type: 'electronic-invoice', config: cfg, updated_at: new Date().toISOString(),
     }, { onConflict: 'tenant_id,type' });
-    return ok(c, { ok: true, company_id: companyId, env: client.env, result });
+    return ok(c, { ok: true, company_id: companyId, env: client.env, updated_existing: updatedExisting, result });
   } catch (err: any) {
     const status = err instanceof AlanubeError ? err.status : 500;
     return fail(c, err.message, status);
@@ -1048,8 +1122,6 @@ admin.put('/tenants/:id/alanube/company', async (c) => {
     const cfg: Record<string, any> = { ...((row as any)?.config ?? {}) };
     // ID de empresa SEGÚN AMBIENTE (con fallback al legacy).
     const isSandbox = String(cfg.environment ?? 'production') === 'sandbox';
-    const companyId = (isSandbox ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id;
-    if (!companyId) return fail(c, `La empresa no está registrada en Alanube (${isSandbox ? 'QA/Sandbox' : 'Producción'}) todavía. Usá «Crear empresa».`, 422);
     const cert = resolveCert(cfg);
     if (!cert) return fail(c, `Falta el certificado .p12 de ${isSandbox ? 'QA/Sandbox' : 'Producción'} (Datos de FE).`, 422);
 
@@ -1058,6 +1130,15 @@ admin.put('/tenants/:id/alanube/company', async (c) => {
     const p12Base64 = Buffer.from(await file.arrayBuffer()).toString('base64');
 
     const client = alanube.forEnv(cfg.environment);
+    // Si el id no quedó guardado en la config, lo recuperamos de la cuenta de Alanube.
+    let companyId = (isSandbox ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id;
+    if (!companyId) {
+      companyId = await findExistingCompanyId(client, cfg);
+      if (!companyId) return fail(c, `La empresa no está registrada en Alanube (${isSandbox ? 'QA/Sandbox' : 'Producción'}) todavía. Usá «Crear empresa».`, 422);
+      // Guardar el id recuperado para la próxima.
+      if (isSandbox) cfg.alanube_company_id_sandbox = companyId; else cfg.alanube_company_id_production = companyId;
+      cfg.alanube_company_id = companyId;
+    }
     const payload = buildAlanubeCompanyPayload(cfg, p12Base64, client.env);
     // Al ACTUALIZAR, Alanube no acepta `type` (solo se define al crear).
     delete (payload as any).type;

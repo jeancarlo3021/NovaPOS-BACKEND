@@ -52,8 +52,14 @@ function rateCode(tarifa: number): string {
 }
 
 const r2 = (n: number) => Math.round(Number(n || 0) * 100) / 100;
-// Alanube CRI espera los montos como STRING numérico.
-const money = (n: number) => r2(n).toFixed(2);
+// Redondeo a 5 decimales (precisión que valida Alanube). NO redondear el IVA a 2
+// decimales: Alanube exige `amount == taxableBase × fee` EXACTO (ej. 10619.47 ×
+// 13% = 1380.5311, no 1380.53) y `amountTotalLine == amountTotal + taxNet`.
+const r5 = (n: number) => Math.round(Number(n || 0) * 1e5) / 1e5;
+// Alanube CRI espera los montos como STRING con EXACTAMENTE 5 decimales
+// (patrón `^[0-9]{1,13}(\.[0-9]{5})?$`).
+const money = (n: number) => r5(n).toFixed(5);
+const qty = (n: number) => Number(n || 0).toFixed(3);   // cantidad: 3 decimales
 const padN = (s: any, n: number) => String(s ?? '').replace(/\D/g, '').padStart(n, '0').slice(-n);
 const prov1 = (s: any) => (String(s ?? '').replace(/\D/g, '').replace(/^0+/, '') || '').slice(0, 1);
 const pad2 = (s: any) => { const d = String(s ?? '').replace(/\D/g, ''); return d ? d.padStart(2, '0').slice(-2) : ''; };
@@ -77,6 +83,8 @@ export function buildAlanubeDocument(
     headquarters?: string;      // sucursal
     terminal?: string;
     numberOfDocument?: string;  // consecutivo interno
+    senderId?: string;          // id de la empresa emisora en Alanube (sender.id).
+                                // Sin esto, Alanube emite con la empresa 'main' de la cuenta.
     // Para nota de crédito (03): referencia al documento que anula.
     reference?: {
       documentType: string;     // tipo del doc original (01/04)
@@ -90,7 +98,14 @@ export function buildAlanubeDocument(
   const condicionVenta = inv.payment_method === 'credit' ? '02' : '01';
   const medioPago = MEDIO_PAGO[inv.payment_method ?? 'cash'] ?? '01';
 
-  let totalTaxedGoods = 0, totalExemptGoods = 0, totalTax = 0, totalSale = 0;
+  // Acumuladores del RESUMEN, separando MERCANCÍA vs SERVICIO. Hacienda clasifica
+  // cada línea por su CABYS (no por la unidad): el primer dígito 0-4 = mercancía,
+  // 5-9 = servicio (construcciones y servicios en la clasificación CPC/CABYS).
+  let totalServicesTaxable = 0, totalExemptServices = 0;
+  let totalTaxedGoods = 0, totalExemptGoods = 0;
+  let totalTax = 0, totalSale = 0;
+  // Desglose de impuesto por código de tarifa (TotalDesgloseImpuesto).
+  const taxByRate: Record<string, number> = {};
 
   // Enfoque PRECIO EFECTIVO (igual que Facturemos): el descuento se absorbe en el
   // precio unitario, así amountTotal == subTotal y no hay que declarar descuento.
@@ -101,16 +116,28 @@ export function buildAlanubeDocument(
     const neto = r2(l.subtotal);                             // subtotal (con descuento, sin IVA)
     const precioEfectivo = cantidad > 0 ? neto / cantidad : neto;  // precio unitario neto
     const montoTotal = r2(precioEfectivo * cantidad);        // == neto (por redondeo)
-    const impuesto = r2(montoTotal * (tarifa / 100));
-    const lineTotal = r2(montoTotal + impuesto);
+    // IVA y total de línea a PRECISIÓN PLENA (5 dec), sin redondear a 2: así
+    // cuadran las validaciones exactas de Alanube (amount = base × fee, etc.).
+    const impuesto = r5(montoTotal * (tarifa / 100));
+    const lineTotal = r5(montoTotal + impuesto);
 
-    if (tarifa > 0) totalTaxedGoods += montoTotal; else totalExemptGoods += montoTotal;
+    const cabys = String(l.cabys_code ?? '').replace(/\D/g, '');
+    const esServicio = cabys.length > 0 && cabys[0] >= '5';   // CABYS 5-9 = servicio
+    if (tarifa > 0) {
+      if (esServicio) totalServicesTaxable += montoTotal; else totalTaxedGoods += montoTotal;
+      const fc = rateCode(tarifa);
+      taxByRate[fc] = (taxByRate[fc] ?? 0) + impuesto;
+    } else {
+      if (esServicio) totalExemptServices += montoTotal; else totalExemptGoods += montoTotal;
+    }
     totalTax += impuesto;
     totalSale += montoTotal;
 
     const item: Record<string, any> = {
-      code: String(l.cabys_code ?? '').replace(/\D/g, ''),   // CABYS
-      quantity: String(cantidad),
+      code: cabys,                                            // CABYS
+      quantity: qty(cantidad),
+      // Unidad de medida del catálogo Hacienda (la clasificación mercancía/servicio
+      // del RESUMEN la hacemos arriba por el CABYS).
       unitMeasurement: haciendaUnit(l.unit),
       detail: l.product_name,
       unitPrice: precioEfectivo.toFixed(5),                  // 5 decimales para cuadrar el total
@@ -119,7 +146,8 @@ export function buildAlanubeDocument(
       taxableBase: money(montoTotal),
       taxNet: money(impuesto),
       amountTotalLine: money(lineTotal),
-      taxes: [{ code: '01', feeCode: rateCode(tarifa), fee: String(tarifa), amount: money(impuesto) }],
+      // taxes: code=01 (IVA), feeCode=código de tarifa (08=13%), fee=porcentaje "13.00".
+      taxes: [{ code: '01', feeCode: rateCode(tarifa), fee: Number(tarifa).toFixed(2), amount: money(impuesto) }],
     };
     if (l.sku) item.commercialCode = [{ typeCode: '04', code: String(l.sku) }];
     return item;
@@ -128,10 +156,6 @@ export function buildAlanubeDocument(
   const saleCondition: Record<string, any> = { id: condicionVenta };
   if (condicionVenta === '02') saleCondition.creditTerm = '30';
 
-  // NOTA: la emisión de factura/tiquete ya fue ACEPTADA por Alanube con ESTA
-  // estructura exacta (sin `currency` — default CRC; con `senderEconomicActivity`
-  // dentro de header). NO agregar `currency`/`sender` top-level sin confirmarlo
-  // contra el sandbox: el validador CRI rechaza propiedades desconocidas.
   const payload: Record<string, any> = {
     header: {
       issueDate: fechaCR(inv.issued_at),
@@ -145,18 +169,39 @@ export function buildAlanubeDocument(
       senderEconomicActivity: String(emisor.economic_activity_code ?? '').trim(),
     },
     itemDetails,
-    totals: {
-      totalExemptServices: money(0),
-      totalTaxedGoods: money(totalTaxedGoods),
-      totalExemptGoods: money(totalExemptGoods),
-      totalExempt: money(totalExemptGoods),
-      totalSale: money(totalSale),
-      totalDiscounts: money(0),
-      totalNetSale: money(totalSale),
-      totalTax: money(totalTax),
-      totalVoucher: money(totalSale + totalTax),
-    },
+    totals: buildTotals(),
   };
+
+  // sender.id → indica EXPLÍCITAMENTE con qué empresa emitir (confirmado en el
+  // ejemplo oficial de createInvoice). Sin esto, Alanube usa la empresa 'main' de
+  // la cuenta, que puede NO ser la del tenant.
+  if (opts.senderId) payload.sender = { id: String(opts.senderId) };
+
+  // Resumen de la factura. Hacienda EXIGE el desglose completo (servicios/mercancías
+  // gravados, total gravado, total impuesto y TotalDesgloseImpuesto) cuando hay
+  // líneas gravadas; solo incluimos los campos con monto > 0 para no confundir.
+  function buildTotals(): Record<string, any> {
+    const t: Record<string, any> = {};
+    if (totalServicesTaxable > 0) t.totalServicesTaxable = money(totalServicesTaxable);
+    if (totalExemptServices > 0) t.totalExemptServices = money(totalExemptServices);
+    if (totalTaxedGoods > 0) t.totalTaxedGoods = money(totalTaxedGoods);
+    if (totalExemptGoods > 0) t.totalExemptGoods = money(totalExemptGoods);
+    const totalTaxable = totalServicesTaxable + totalTaxedGoods;   // total gravado
+    if (totalTaxable > 0) t.totalTaxable = money(totalTaxable);
+    const totalExempt = totalExemptServices + totalExemptGoods;
+    if (totalExempt > 0) t.totalExempt = money(totalExempt);
+    t.totalSale = money(totalSale);                 // suma de líneas sin IVA
+    t.totalNetSale = money(totalSale);              // venta neta (sin descuentos)
+    if (totalTax > 0) {
+      t.totalTax = money(totalTax);                 // total impuesto
+      // TotalDesgloseImpuesto: un renglón por código de tarifa cobrado.
+      t.totalTaxBreakdown = Object.entries(taxByRate).map(([feeCode, amt]) => ({
+        code: '01', feeCode, totalTaxAmount: money(amt),
+      }));
+    }
+    t.totalVoucher = money(totalSale + totalTax);   // total del comprobante (con IVA)
+    return t;
+  }
 
   // Receptor: obligatorio para factura (01); opcional en tiquete (04).
   if (receptor && (receptor.identification || receptor.name)) {

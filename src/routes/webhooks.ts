@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
+import { autoSendComprobanteToCustomer } from './hacienda.js';
 
 // Rutas PÚBLICAS para webhooks entrantes (Alanube nos llama; no hay sesión).
 // Se monta FUERA del middleware de auth. Se valida por un secreto compartido.
@@ -67,13 +68,19 @@ webhooks.post('/alanube', async (c) => {
       if (filters) {
         let res = await db.from('invoices')
           .update({ fe_status: feStatus, fe_response: body, updated_at: new Date().toISOString() })
-          .or(filters).select('id');
+          .or(filters).select('id, tenant_id');
         if (res.error && /fe_response/.test(res.error.message)) {   // migración 55 sin correr
           res = await db.from('invoices')
             .update({ fe_status: feStatus, updated_at: new Date().toISOString() })
-            .or(filters).select('id');
+            .or(filters).select('id, tenant_id');
         }
-        if (res.data && res.data.length) return ok(c, { ok: true, kind: 'emission', fe_status: feStatus });
+        if (res.data && res.data.length) {
+          // Al ACEPTARSE, enviar automáticamente el comprobante completo al cliente.
+          if (feStatus === 'accepted') {
+            for (const row of res.data as any[]) autoSendComprobanteToCustomer(row.tenant_id, row.id);
+          }
+          return ok(c, { ok: true, kind: 'emission', fe_status: feStatus });
+        }
       }
       // No matcheó ninguna factura emitida y no es recepción → se ignora.
       if (event && !event.includes('recep')) return ok(c, { ignored: true, event });

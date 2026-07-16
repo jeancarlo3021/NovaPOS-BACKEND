@@ -126,7 +126,10 @@ function clientFor(env: AlanubeEnv) {
   return {
     env,
     baseUrl: () => base,
-    ping: () => f('/companies', { method: 'GET' }),
+    // CRI NO tiene un endpoint para listar/consultar la empresa 'main' sin su id.
+    // Solo existe GET /companies/associated (empresas asociadas; `limit` obligatorio)
+    // y GET /companies/{id}.
+    getAssociated: (limit = 100) => f(`/companies/associated?limit=${limit}`, { method: 'GET' }),
     getCompany: (id: string) => f(`/companies/${id}`, { method: 'GET' }),
     createCompany: (payload: Record<string, any>) =>
       f('/companies', { method: 'POST', body: JSON.stringify(payload) }),
@@ -145,34 +148,22 @@ function clientFor(env: AlanubeEnv) {
       // idCompany (ni body, ni header, ni query). El companyId se ignora acá.
       return f(EMIT_PATH[kind], { method: 'POST', body: JSON.stringify(_payload) });
     },
-    // Consulta el ESTATUS FISCAL de un documento. Alanube usa el patrón
-    //   GET /{recurso-fiscal}/{id}/idCompany/{companyId}
-    // (el companyId va en la URL, y el recurso de consulta es `fiscal-*`, distinto
-    // al de emisión). Probamos varios recursos según el tipo hasta que uno responda.
-    getDocument: async (id: string, opts?: { kind?: 'invoice' | 'ticket' | 'credit-note' | 'debit-note'; companyId?: string }) => {
-      const cid = opts?.companyId;
-      // Recurso "fiscal" por tipo (consulta de estatus).
-      const fiscalRes: Record<string, string> = {
-        invoice: 'fiscal-invoices', ticket: 'fiscal-tickets',
-        'credit-note': 'fiscal-credit-notes', 'debit-note': 'fiscal-debit-notes',
+    // Consulta el ESTATUS de un documento en CRI:
+    //   GET /cri/v1/{recurso}/{id}   (recurso = invoices|tickets|credit-notes|
+    //   debit-notes, SIN /v44; id = ULID). Probamos según el tipo.
+    getDocument: async (id: string, opts?: { kind?: 'invoice' | 'ticket' | 'credit-note' | 'debit-note'; companyId?: string; documents?: string }) => {
+      const res: Record<string, string> = {
+        invoice: 'invoices', ticket: 'tickets',
+        'credit-note': 'credit-notes', 'debit-note': 'debit-notes',
       };
       const order = opts?.kind
-        ? [opts.kind, ...Object.keys(fiscalRes).filter(k => k !== opts.kind)]
-        : Object.keys(fiscalRes);
-      const candidates: string[] = [];
-      if (cid) {
-        for (const k of order) candidates.push(`/${fiscalRes[k]}/${id}/idCompany/${cid}`);
-        // Variantes por si el recurso fiscal no aplica: emisión + idCompany.
-        for (const k of order) candidates.push(`${EMIT_PATH[k]}/${id}/idCompany/${cid}`);
-      }
-      // Últimos recursos (sin companyId en URL).
-      candidates.push(`/documents/${id}`);
-      for (const k of order) candidates.push(`${EMIT_PATH[k]}/${id}`);
-
-      const headers = cid ? { idCompany: cid, 'X-Company-Id': cid } : undefined;
+        ? [opts.kind, ...Object.keys(res).filter(k => k !== opts.kind)]
+        : Object.keys(res);
+      // ?documents=xml,xmlHacienda,pdf para traer los archivos del comprobante.
+      const qs = opts?.documents ? `?documents=${encodeURIComponent(opts.documents)}` : '';
       let lastErr: any = null;
-      for (const path of [...new Set(candidates)]) {
-        try { return await f(path, { method: 'GET', headers }); }
+      for (const k of order) {
+        try { return await f(`/${res[k]}/${id}${qs}`, { method: 'GET' }); }
         catch (e: any) {
           if (e instanceof AlanubeError && (e.status === 404 || e.status === 400)) { lastErr = e; continue; }
           throw e;
