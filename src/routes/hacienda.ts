@@ -649,7 +649,9 @@ hacienda.post('/credit-note', async (c) => {
     const cfg = await loadFEConfig(tenantId);
     const provider = cfg.fe_provider === 'alanube' ? 'alanube' : 'facturemos';
     if (provider === 'facturemos' && !cfg.api_key_emisor) return fail(c, 'Falta configurar la ApiKey del emisor', 422);
-    if (provider === 'alanube' && !cfg.alanube_company_id) return fail(c, 'La empresa no está dada de alta en Alanube.', 422);
+    const alanubeCompanyId = (String(cfg.environment ?? 'production') === 'sandbox'
+      ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id;
+    if (provider === 'alanube' && !alanubeCompanyId) return fail(c, 'La empresa no está dada de alta en Alanube.', 422);
     const env = cfg.environment === 'sandbox' ? 'sandbox' : 'production'; // default producción
 
     const { data: inv } = await db.from('invoices')
@@ -785,7 +787,9 @@ hacienda.post('/debit-note', async (c) => {
     const cfg = await loadFEConfig(tenantId);
     const provider = cfg.fe_provider === 'alanube' ? 'alanube' : 'facturemos';
     if (provider === 'facturemos' && !cfg.api_key_emisor) return fail(c, 'Falta configurar la ApiKey del emisor', 422);
-    if (provider === 'alanube' && !cfg.alanube_company_id) return fail(c, 'La empresa no está dada de alta en Alanube.', 422);
+    const alanubeCompanyId = (String(cfg.environment ?? 'production') === 'sandbox'
+      ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id;
+    if (provider === 'alanube' && !alanubeCompanyId) return fail(c, 'La empresa no está dada de alta en Alanube.', 422);
     const env = cfg.environment === 'sandbox' ? 'sandbox' : 'production';
 
     const { data: inv } = await db.from('invoices')
@@ -1576,7 +1580,9 @@ hacienda.post('/emit-direct', async (c) => {
     if (!cfg.enabled) return fail(c, 'La facturación electrónica no está activada', 409);
     const provider = cfg.fe_provider === 'alanube' ? 'alanube' : 'facturemos';
     if (provider === 'facturemos' && !cfg.api_key_emisor) return fail(c, 'Falta configurar la ApiKey del emisor', 422);
-    if (provider === 'alanube' && !cfg.alanube_company_id) return fail(c, 'La empresa no está dada de alta en Alanube.', 422);
+    const alanubeCompanyId = (String(cfg.environment ?? 'production') === 'sandbox'
+      ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id;
+    if (provider === 'alanube' && !alanubeCompanyId) return fail(c, 'La empresa no está dada de alta en Alanube.', 422);
     const env = cfg.environment === 'sandbox' ? 'sandbox' : 'production'; // default producción
     const defaultCabys = String(cfg.default_cabys ?? '').replace(/\D/g, '') || null;
 
@@ -1686,6 +1692,9 @@ hacienda.post('/emit-direct', async (c) => {
         tipoDoc,
         headquarters: cfg.sucursal, terminal: cfg.terminal,
         numberOfDocument: inv.invoice_number,
+        // Empresa emisora del tenant (si no, Alanube usa la 'main' de la cuenta).
+        senderId: (String(cfg.environment ?? 'production') === 'sandbox'
+          ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id,
       });
       try {
         const resp: any = await alanube.forEnv(cfg.environment).emitDocument(kind as any, doc, cfg.alanube_company_id);
