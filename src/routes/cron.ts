@@ -19,7 +19,8 @@ function authorized(c: any): boolean {
 const handler = async (c: any) => {
   if (!authorized(c)) return fail(c, 'No autorizado', 401);
   try {
-    const summary = await fetchAndProcessReceivedEmails();
+    const debug = c.req.query('debug') === '1';
+    const summary = await fetchAndProcessReceivedEmails({ debug });
     return ok(c, { ok: true, ...summary });
   } catch (err: any) {
     return fail(c, err?.message ?? 'Error al procesar correos', 500);

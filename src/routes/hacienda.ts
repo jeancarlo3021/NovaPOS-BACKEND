@@ -7,6 +7,55 @@ import { alanube, AlanubeError } from '../services/alanube.js';
 import { buildAlanubeDocument } from '../services/alanubeDocument.js';
 import { endOfDay } from '../utils/dateRange.js';
 import { sendEmail } from '../services/emailService.js';
+import { parseHaciendaXml } from '../services/receivedEmails.js';
+
+// Próximo consecutivo de orden de compra (mismo formato que el POS: PO-XXXX).
+async function nextPurchaseNumber(tenantId: string): Promise<string> {
+  const { data } = await db.from('purchases').select('purchase_number').eq('tenant_id', tenantId).limit(5000);
+  let max = 0;
+  for (const r of (data ?? []) as any[]) {
+    const suffix = String(r.purchase_number ?? '').split('-').pop();
+    const n = suffix ? parseInt(suffix, 10) : NaN;
+    if (!isNaN(n) && n > max) max = n;
+  }
+  return `PO-${String(max + 1).padStart(4, '0')}`;
+}
+
+// Líneas de un recibido: usa raw.lines / items; si faltan pero hay XML, re-parsea.
+function linesFromDoc(d: any): any[] {
+  let lines = Array.isArray(d.raw?.lines) ? d.raw.lines : (Array.isArray(d.items) ? d.items : []);
+  if ((!lines || lines.length === 0) && d.xml) {
+    const parsed = parseHaciendaXml(String(d.xml));
+    if (parsed?.lines?.length) lines = parsed.lines;
+  }
+  return lines ?? [];
+}
+
+// Empareja líneas del comprobante con productos del tenant (por CABYS o nombre).
+async function matchLines(tenantId: string, lines: any[]): Promise<any[]> {
+  const { data: products } = await db.from('products')
+    .select('id, name, cabys_code').eq('tenant_id', tenantId).limit(5000);
+  const byCabys = new Map<string, any>(), byName = new Map<string, any>();
+  for (const p of (products ?? []) as any[]) {
+    if (p.cabys_code) byCabys.set(String(p.cabys_code), p);
+    if (p.name) byName.set(String(p.name).trim().toLowerCase(), p);
+  }
+  return lines.map((l: any) => {
+    const cabys = String(l.cabys ?? l.CodigoCABYS ?? '');
+    const detail = String(l.detail ?? l.Detalle ?? '');
+    const match = (cabys && byCabys.get(cabys)) || byName.get(detail.trim().toLowerCase()) || null;
+    return {
+      detail,
+      quantity: Number(l.quantity ?? l.Cantidad ?? 1),
+      unit_price: Number(l.unit_price ?? l.PrecioUnitario ?? 0),
+      total: Number(l.total ?? l.subtotal ?? l.SubTotal ?? 0),
+      cabys: cabys || null,
+      product_id: match?.id ?? null,
+      product_name: match?.name ?? null,
+      exists: !!match,
+    };
+  });
+}
 
 const hacienda = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
@@ -843,16 +892,26 @@ hacienda.get('/received', async (c) => {
         unit: l.unit ?? null,
         unit_price: Number(l.unit_price ?? l.PrecioUnitario ?? 0),
         total: Number(l.total ?? l.subtotal ?? l.SubTotal ?? 0),
+        cabys: l.cabys ?? l.CodigoCABYS ?? null,
+        code: l.code ?? null,
       }));
     };
+    // Números de orden de compra (consecutivo PO-XXXX) de los recibidos ligados.
+    const purchaseIds = [...new Set((data ?? []).map((d: any) => d.purchase_id).filter(Boolean))];
+    const poNumber = new Map<string, string>();
+    if (purchaseIds.length) {
+      const { data: pos } = await db.from('purchases').select('id, purchase_number').in('id', purchaseIds);
+      for (const p of (pos ?? []) as any[]) poNumber.set(p.id, p.purchase_number);
+    }
     return ok(c, (data ?? []).map((d: any) => ({
       id: d.id, clave: d.clave, issuer_name: d.issuer_name, issuer_id: d.issuer_id,
       document_type: d.document_type, date: d.doc_date, total: Number(d.total ?? 0),
       tax: Number(d.tax ?? 0), ack_status: d.ack_status,
       source: d.source ?? null, email_from: d.email_from ?? null,
       purchase_id: d.purchase_id ?? null,
-      // Si vino por correo ya tiene borrador de compra → se marca como 'compra'.
-      kind: d.kind ?? (d.purchase_id ? 'compra' : null),
+      purchase_number: d.purchase_id ? (poNumber.get(d.purchase_id) ?? null) : null,
+      // 'compra' solo si el usuario lo confirmó (kind); NO por tener borrador.
+      kind: d.kind ?? null,
       items: normItems(d),
     })));
   } catch (err: any) {
@@ -870,48 +929,88 @@ hacienda.post('/received/confirm', async (c) => {
     const st = String(state) === '3' ? '3' : '1';
 
     const cfg = await loadFEConfig(tenantId);
-    if (cfg.fe_provider !== 'alanube') return fail(c, 'La recepción de comprobantes está disponible con Alanube.', 409);
-    if (!cfg.alanube_company_id) return fail(c, 'La empresa no está dada de alta en Alanube.', 422);
-
     const { data: doc } = await db.from('received_documents')
       .select('*').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
     if (!doc) return fail(c, 'Comprobante recibido no encontrado', 404);
-
-    // Mensaje Receptor CRI: { idDoc, sender, receiver, information, totals }.
-    // Nombres nested best-guess — se afinan contra la validación del sandbox.
     const d = doc as any;
-    const totalTax = Number(d.tax ?? 0);
-    const total = Number(d.total ?? 0);
-    const payload: Record<string, any> = {
-      idDoc: {
-        key: d.clave,
-        headquarters: String(cfg.sucursal ?? '1').replace(/\D/g, '').padStart(3, '0').slice(-3),
-        terminal: String(cfg.terminal ?? '1').replace(/\D/g, '').padStart(5, '0').slice(-5),
-      },
-      sender: { identificationNumber: String(d.issuer_id ?? '').replace(/\D/g, '') },
-      receiver: {
-        identificationType: cfg.emisor_identification_type ?? '02',
-        identificationNumber: String(cfg.emisor_identification ?? '').replace(/\D/g, ''),
-      },
-      information: {
-        message: st,                                   // 1 aceptación, 3 rechazo
-        ...(st === '3' && reason ? { detailMessage: String(reason) } : {}),
-        economicActivity: String(cfg.economic_activity_code ?? '').trim(),
-      },
-      totals: { totalTax: totalTax.toFixed(2), totalVoucher: total.toFixed(2) },
-    };
 
-    let resp: any;
-    try {
-      resp = await alanube.forEnv(cfg.environment).sendReceiverMessage(payload, cfg.alanube_company_id);
-    } catch (e: any) {
-      return fail(c, e instanceof AlanubeError ? e.message : (e?.message ?? 'Error enviando el mensaje receptor'), 422);
+    const messages: string[] = [];
+    let createdCount = 0;
+
+    // Al ACEPTAR: recién ahora se crean los productos pendientes (los nuevos del
+    // comprobante) y se agregan a la orden de compra ligada.
+    if (st === '1') {
+      const pending: any[] = Array.isArray(d.raw?.pending_products) ? d.raw.pending_products : [];
+      const noInventory = !!d.raw?.no_inventory;   // no afectar el stock
+      const purchaseItems: any[] = [];
+      for (const p of pending) {
+        const { data: np, error: npErr } = await db.from('products').insert({
+          tenant_id: tenantId,
+          name: p.detail || 'Producto',
+          cabys_code: p.cabys || null,
+          cost_price: Number(p.unit_price) || 0,
+          unit_price: Number(p.unit_price) || 0,
+          stock_quantity: 0,
+          tracks_stock: !noInventory,               // si "no añadir al inventario", no rastrea stock
+        }).select('id').single();
+        if (npErr) { messages.push(`No se pudo crear "${p.detail}": ${npErr.message}`); continue; }
+        createdCount++;
+        purchaseItems.push({
+          product_id: (np as any).id,
+          quantity: Number(p.quantity) || 1,
+          unit_price: Number(p.unit_price) || 0,
+          subtotal: (Number(p.quantity) || 1) * (Number(p.unit_price) || 0),
+        });
+      }
+      if (createdCount) messages.push(`➕ ${createdCount} producto(s) creado(s).`);
+      // Agregar los productos nuevos a la orden de compra ligada.
+      if (purchaseItems.length && d.purchase_id) {
+        await db.from('purchase_items').insert(purchaseItems.map(pi => ({ ...pi, purchase_id: d.purchase_id }))).then(() => {});
+        const { data: ex } = await db.from('purchases').select('total_amount').eq('id', d.purchase_id).eq('tenant_id', tenantId).maybeSingle();
+        const add = purchaseItems.reduce((s, pi) => s + pi.subtotal, 0);
+        await db.from('purchases').update({ total_amount: Number((ex as any)?.total_amount ?? 0) + add, updated_at: new Date().toISOString() })
+          .eq('id', d.purchase_id).eq('tenant_id', tenantId);
+        messages.push(`🧾 ${purchaseItems.length} artículo(s) agregado(s) a la orden de compra.`);
+      }
     }
-    const mrId = resp?.id ?? deepFind(resp, /(^id$|_id$)/i, 40) ?? null;
+
+    // Mensaje Receptor a Hacienda vía Alanube — OPCIONAL (best-effort). Si el
+    // tenant no usa Alanube o falla, igual se marca aceptado/rechazado localmente.
+    let mrId: string | null = null;
+    if (cfg.fe_provider === 'alanube' && cfg.alanube_company_id) {
+      const payload: Record<string, any> = {
+        idDoc: {
+          key: d.clave,
+          headquarters: String(cfg.sucursal ?? '1').replace(/\D/g, '').padStart(3, '0').slice(-3),
+          terminal: String(cfg.terminal ?? '1').replace(/\D/g, '').padStart(5, '0').slice(-5),
+        },
+        sender: { identificationNumber: String(d.issuer_id ?? '').replace(/\D/g, '') },
+        receiver: {
+          identificationType: cfg.emisor_identification_type ?? '02',
+          identificationNumber: String(cfg.emisor_identification ?? '').replace(/\D/g, ''),
+        },
+        information: {
+          message: st,
+          ...(st === '3' && reason ? { detailMessage: String(reason) } : {}),
+          economicActivity: String(cfg.economic_activity_code ?? '').trim(),
+        },
+        totals: { totalTax: Number(d.tax ?? 0).toFixed(2), totalVoucher: Number(d.total ?? 0).toFixed(2) },
+      };
+      try {
+        const resp = await alanube.forEnv(cfg.environment).sendReceiverMessage(payload, cfg.alanube_company_id);
+        mrId = resp?.id ?? deepFind(resp, /(^id$|_id$)/i, 40) ?? null;
+      } catch (e: any) {
+        messages.push(`⚠️ No se pudo enviar el mensaje a Hacienda (Alanube): ${e?.message ?? 'error'}. Se marcó localmente.`);
+      }
+    }
+
+    // Limpiar pendientes y marcar el estado.
+    const newRaw = { ...(d.raw ?? {}), pending_products: [] };
     await db.from('received_documents').update({
-      ack_status: st === '1' ? 'accepted' : 'rejected', ack_id: mrId, updated_at: new Date().toISOString(),
+      ack_status: st === '1' ? 'accepted' : 'rejected', ack_id: mrId, raw: newRaw, updated_at: new Date().toISOString(),
     }).eq('id', id).eq('tenant_id', tenantId);
-    return ok(c, { ok: true, state: st, mr_id: mrId, response: resp });
+
+    return ok(c, { ok: true, state: st, mr_id: mrId, created: createdCount, messages });
   } catch (err: any) {
     const status = err instanceof AlanubeError ? err.status : 500;
     return fail(c, err.message, status);
@@ -1015,6 +1114,185 @@ hacienda.post('/received/to-purchase', async (c) => {
     await db.from('received_documents').update({ kind: 'compra', updated_at: new Date().toISOString() })
       .eq('id', id).eq('tenant_id', tenantId);
     return ok(c, { ok: true, purchase_id: (purchase as any).id, supplier_id: supplierId }, 201);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// GET /received/:id/match — para el modal de "Compra": trae el comprobante con
+// sus líneas ya emparejadas a productos existentes (por CABYS o por nombre), más
+// las órdenes de compra PENDIENTES del proveedor para poder relacionarlas.
+hacienda.get('/received/:id/match', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { id } = c.req.param();
+    const { data: doc } = await db.from('received_documents')
+      .select('*').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+    if (!doc) return fail(c, 'Comprobante no encontrado', 404);
+    const d = doc as any;
+    const lines: any[] = linesFromDoc(d);
+
+    // Proveedor (por cédula o nombre) para filtrar sus órdenes.
+    let supplierId: string | null = null;
+    if (d.issuer_id) {
+      const { data: s } = await db.from('suppliers').select('id').eq('tenant_id', tenantId).eq('tax_id', d.issuer_id).maybeSingle();
+      supplierId = (s as any)?.id ?? null;
+    }
+    if (!supplierId && d.issuer_name) {
+      const { data: s } = await db.from('suppliers').select('id').eq('tenant_id', tenantId).ilike('name', d.issuer_name).maybeSingle();
+      supplierId = (s as any)?.id ?? null;
+    }
+
+    const matchedLines = await matchLines(tenantId, lines);
+
+    // Órdenes de compra pendientes del proveedor (para relacionar).
+    let orders: any[] = [];
+    if (supplierId) {
+      const { data: os } = await db.from('purchases')
+        .select('id, purchase_number, purchase_date, total_amount, status')
+        .eq('tenant_id', tenantId).eq('supplier_id', supplierId)
+        .in('status', ['pending', 'ordered']).order('purchase_date', { ascending: false }).limit(50);
+      orders = (os ?? []) as any[];
+    }
+
+    return ok(c, {
+      id: d.id, clave: d.clave, issuer_name: d.issuer_name, issuer_id: d.issuer_id,
+      total: Number(d.total ?? 0), supplier_id: supplierId,
+      lines: matchedLines, orders,
+      linked_purchase_id: d.purchase_id ?? null,
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// POST /received/reconcile — aplica la conciliación desde el modal de "Compra":
+//  · crea/actualiza productos (CABYS + precio de costo) de las líneas,
+//  · crea una orden de compra nueva o agrega las líneas a una existente,
+//  · marca el recibido como 'compra' y lo liga a esa compra.
+// body: { id, purchase_id?, items: [{ detail, quantity, unit_price, cabys?,
+//         product_id?, action: 'update'|'create'|'skip' }] }
+hacienda.post('/received/reconcile', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const body = await c.req.json().catch(() => ({}));
+    const { id, purchase_id, items, no_inventory } = body as {
+      id: string; purchase_id?: string; no_inventory?: boolean;
+      items?: Array<{ detail: string; quantity: number; unit_price: number; cabys?: string | null; product_id?: string | null; action: 'update' | 'create' | 'skip' }>;
+    };
+    if (!id) return fail(c, 'Falta el id', 422);
+
+    const { data: doc } = await db.from('received_documents')
+      .select('*').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+    if (!doc) return fail(c, 'Comprobante no encontrado', 404);
+    const d = doc as any;
+
+    // Si el front no mandó items (o vinieron vacíos), los re-derivamos del XML.
+    // Esto arregla el "0 artículos" cuando la bandeja no tenía las líneas.
+    let workItems = Array.isArray(items) ? items : [];
+    if (workItems.length === 0) {
+      const matched = await matchLines(tenantId, linesFromDoc(d));
+      workItems = matched.map((m: any) => ({
+        detail: m.detail, quantity: m.quantity, unit_price: m.unit_price,
+        cabys: m.cabys, product_id: m.product_id, action: (m.exists ? 'update' : 'create') as 'update' | 'create',
+      }));
+    }
+
+    // Proveedor: por cédula/nombre o se crea (resiliente a tax_id inexistente).
+    let supplierId: string | null = null;
+    if (d.issuer_id) {
+      const { data: s } = await db.from('suppliers').select('id').eq('tenant_id', tenantId).eq('tax_id', d.issuer_id).maybeSingle();
+      supplierId = (s as any)?.id ?? null;
+    }
+    if (!supplierId && d.issuer_name) {
+      const { data: s } = await db.from('suppliers').select('id').eq('tenant_id', tenantId).ilike('name', d.issuer_name).maybeSingle();
+      supplierId = (s as any)?.id ?? null;
+    }
+    if (!supplierId) {
+      const name = d.issuer_name || `Proveedor ${d.issuer_id ?? ''}`.trim();
+      let ins = await db.from('suppliers').insert({ tenant_id: tenantId, name, tax_id: d.issuer_id ?? null }).select('id').single();
+      if (ins.error && /tax_id/.test(ins.error.message)) ins = await db.from('suppliers').insert({ tenant_id: tenantId, name }).select('id').single();
+      if (ins.error) throw new Error(ins.error.message);
+      supplierId = (ins.data as any).id;
+    }
+
+    const messages: string[] = [];
+    let updated = 0;
+    const purchaseItems: any[] = [];
+    const pending: any[] = [];   // productos NUEVOS: se crean al ACEPTAR en Hacienda
+
+    for (const it of workItems) {
+      if (it.action === 'skip') continue;
+      const productId = it.product_id ?? null;
+
+      if (it.action === 'update' && productId) {
+        // Producto existente: actualizar CABYS/precio y agregarlo a la orden ahora.
+        const upd: any = { updated_at: new Date().toISOString() };
+        if (it.cabys) upd.cabys_code = it.cabys;
+        if (Number(it.unit_price) > 0) upd.cost_price = Number(it.unit_price);
+        const { error: uErr } = await db.from('products').update(upd).eq('id', productId).eq('tenant_id', tenantId);
+        if (uErr) { messages.push(`No se pudo actualizar "${it.detail}": ${uErr.message}`); }
+        else { updated++; messages.push(`✏️ Actualizado (CABYS/precio): ${it.detail}`); }
+        purchaseItems.push({
+          product_id: productId,
+          quantity: Number(it.quantity) || 1,
+          unit_price: Number(it.unit_price) || 0,
+          subtotal: (Number(it.quantity) || 1) * (Number(it.unit_price) || 0),
+        });
+      } else if (it.action === 'create') {
+        // Producto NUEVO: por defecto se DIFIERE hasta aceptar en Hacienda.
+        pending.push({ detail: it.detail, quantity: Number(it.quantity) || 1, unit_price: Number(it.unit_price) || 0, cabys: it.cabys ?? null });
+      }
+    }
+    if (pending.length) messages.push(`🕓 ${pending.length} producto(s) nuevo(s) se crearán al ACEPTAR el comprobante en Hacienda.`);
+
+    // Orden de compra: relacionar existente o crear nueva.
+    let purchaseId = purchase_id ?? null;
+    let purchaseNumber = '';
+    if (purchaseId) {
+      // Agregar las líneas a la orden existente y recalcular el total.
+      if (purchaseItems.length) {
+        const { error: iErr } = await db.from('purchase_items').insert(purchaseItems.map(pi => ({ ...pi, purchase_id: purchaseId })));
+        if (iErr) throw new Error(iErr.message);
+      }
+      const { data: existing } = await db.from('purchases').select('total_amount, purchase_number').eq('id', purchaseId).eq('tenant_id', tenantId).maybeSingle();
+      purchaseNumber = String((existing as any)?.purchase_number ?? '');
+      const addTotal = purchaseItems.reduce((s, pi) => s + pi.subtotal, 0);
+      await db.from('purchases').update({
+        total_amount: Number((existing as any)?.total_amount ?? 0) + addTotal,
+        updated_at: new Date().toISOString(),
+      }).eq('id', purchaseId).eq('tenant_id', tenantId);
+      messages.push(`🔗 ${purchaseItems.length} artículo(s) agregado(s) a la orden ${purchaseNumber}.`);
+    } else {
+      const total = purchaseItems.reduce((s, pi) => s + pi.subtotal, 0) || Number(d.total ?? 0);
+      purchaseNumber = await nextPurchaseNumber(tenantId);
+      const { data: np, error: pErr } = await db.from('purchases').insert({
+        tenant_id: tenantId,
+        supplier_id: supplierId,
+        purchase_number: purchaseNumber,
+        purchase_date: (d.doc_date ? String(d.doc_date).slice(0, 10) : new Date().toISOString().slice(0, 10)),
+        total_amount: total,
+        status: 'pending',
+        notes: `Recepción por correo · ${d.issuer_name ?? ''} · Clave ${d.clave}`,
+      }).select('id').single();
+      if (pErr) throw new Error(pErr.message);
+      purchaseId = (np as any).id;
+      if (purchaseItems.length) {
+        const { error: iErr } = await db.from('purchase_items').insert(purchaseItems.map(pi => ({ ...pi, purchase_id: purchaseId })));
+        if (iErr) throw new Error(iErr.message);
+      }
+      messages.push(`🧾 Orden de compra ${purchaseNumber} creada con ${purchaseItems.length} artículo(s).`);
+    }
+
+    // Guardar los productos pendientes (para crearlos al aceptar en Hacienda),
+    // ligados a esta orden. Resiliente si la columna purchase_id no existe aún.
+    const newRaw = { ...(d.raw ?? {}), pending_products: pending, no_inventory: !!no_inventory };
+    let upd = await db.from('received_documents')
+      .update({ kind: 'compra', purchase_id: purchaseId, raw: newRaw, updated_at: new Date().toISOString() })
+      .eq('id', id).eq('tenant_id', tenantId);
+    if (upd.error && /purchase_id/.test(upd.error.message)) {
+      upd = await db.from('received_documents')
+        .update({ kind: 'compra', raw: newRaw, updated_at: new Date().toISOString() })
+        .eq('id', id).eq('tenant_id', tenantId);
+    }
+
+    return ok(c, { ok: true, purchase_id: purchaseId, purchase_number: purchaseNumber, pending: pending.length, updated, messages }, 201);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

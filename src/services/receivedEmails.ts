@@ -19,7 +19,39 @@
 import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
 import { XMLParser } from 'fast-xml-parser';
+import AdmZip from 'adm-zip';
 import { db } from '../db/client.js';
+
+// Detecta si un texto parece un comprobante electrónico de Hacienda.
+const looksLikeFE = (s: string) => /<\??\s*(FacturaElectronica|TiqueteElectronico|NotaCreditoElectronica|NotaDebitoElectronica|FacturaElectronicaCompra|FacturaElectronicaExportacion)/i.test(s);
+
+// Saca todos los XML de comprobante que haya en un adjunto: reconoce .xml,
+// application/xml, octet-stream con contenido XML, y .zip con XML adentro.
+function xmlsFromAttachment(att: any): string[] {
+  const out: string[] = [];
+  if (!att?.content) return out;
+  const name = (att.filename || '').toLowerCase();
+  const ct = (att.contentType || '').toLowerCase();
+  // ZIP: descomprimir y sacar los .xml de adentro.
+  if (name.endsWith('.zip') || ct.includes('zip')) {
+    try {
+      const zip = new AdmZip(att.content as Buffer);
+      for (const entry of zip.getEntries()) {
+        if (entry.entryName.toLowerCase().endsWith('.xml')) {
+          const txt = entry.getData().toString('utf8');
+          if (looksLikeFE(txt)) out.push(txt);
+        }
+      }
+    } catch { /* zip corrupto → se ignora */ }
+    return out;
+  }
+  // Cualquier otro adjunto: intentar leerlo como texto y ver si es XML de Hacienda.
+  const txt = (att.content as Buffer).toString('utf8');
+  if (name.endsWith('.xml') || ct.includes('xml') || looksLikeFE(txt)) {
+    out.push(txt);
+  }
+  return out;
+}
 
 // ── Tipos ────────────────────────────────────────────────────────────────────
 interface ParsedLine {
@@ -28,6 +60,8 @@ interface ParsedLine {
   unit_price: number;
   subtotal: number;
   tax: number;
+  cabys: string;                // código CABYS de la línea (para actualizar el producto)
+  code: string;                 // código comercial del proveedor (si trae)
 }
 interface ParsedDoc {
   clave: string;
@@ -77,12 +111,21 @@ export function parseHaciendaXml(xml: string): ParsedDoc | null {
   // Líneas de detalle (una o varias).
   const detalle = root.DetalleServicio?.LineaDetalle;
   const rawLines: any[] = Array.isArray(detalle) ? detalle : detalle ? [detalle] : [];
+  // Código comercial del proveedor: <CodigoComercial><Codigo>… (puede venir array).
+  const commercialCode = (l: any): string => {
+    const cc = l.CodigoComercial;
+    if (!cc) return str(l.Codigo);
+    const first = Array.isArray(cc) ? cc[0] : cc;
+    return str(first?.Codigo ?? first);
+  };
   const lines: ParsedLine[] = rawLines.map(l => ({
     detail: str(l.Detalle),
     quantity: num(l.Cantidad) || 1,
     unit_price: num(l.PrecioUnitario),
     subtotal: num(l.SubTotal ?? l.MontoTotal),
     tax: num(l.Impuesto?.Monto ?? (Array.isArray(l.Impuesto) ? l.Impuesto.reduce((s: number, i: any) => s + num(i.Monto), 0) : 0)),
+    cabys: str(l.CodigoCABYS ?? l.Codigo?.Codigo),   // v4.3+: CodigoCABYS
+    code: commercialCode(l),
   }));
 
   return {
@@ -116,39 +159,6 @@ async function loadTenantByReceiverIndex(): Promise<Map<string, string>> {
   return idx;
 }
 
-// ── Proveedor: buscar por cédula (tax_id) o crear ────────────────────────────
-async function findOrCreateSupplier(tenantId: string, issuer: { name: string; id: string }): Promise<string | null> {
-  if (issuer.id) {
-    const { data: found } = await db.from('suppliers')
-      .select('id').eq('tenant_id', tenantId).eq('tax_id', issuer.id).maybeSingle();
-    if (found?.id) return found.id;
-  }
-  const { data: created, error } = await db.from('suppliers')
-    .insert({ tenant_id: tenantId, name: issuer.name || `Proveedor ${issuer.id || ''}`.trim(), tax_id: issuer.id || null })
-    .select('id').single();
-  if (error) { console.warn('[recepción] no se pudo crear proveedor:', error.message); return null; }
-  return created.id;
-}
-
-// ── Borrador de compra desde el comprobante ──────────────────────────────────
-async function createPurchaseDraft(tenantId: string, doc: ParsedDoc, supplierId: string): Promise<string | null> {
-  const purchaseNumber = `REC-${(doc.clave || Date.now().toString()).slice(-10)}`;
-  const notes = `Recepción automática por correo · ${doc.issuer.name} · Clave ${doc.clave}\n`
-    + doc.lines.map(l => `• ${l.quantity} × ${l.detail} = ₡${l.subtotal}`).join('\n');
-  const { data, error } = await db.from('purchases')
-    .insert({
-      tenant_id: tenantId,
-      supplier_id: supplierId,
-      purchase_number: purchaseNumber,
-      purchase_date: doc.date ?? new Date().toISOString(),
-      status: 'pending',                 // borrador — se revisa y recibe manualmente
-      total_amount: doc.total,
-      notes,
-    })
-    .select('id').single();
-  if (error) { console.warn('[recepción] no se pudo crear compra:', error.message); return null; }
-  return data.id;
-}
 
 // ── Procesa UN comprobante XML ───────────────────────────────────────────────
 async function processXml(
@@ -167,8 +177,9 @@ async function processXml(
     .select('id').eq('tenant_id', tenantId).eq('clave', doc.clave).maybeSingle();
   if (existing?.id) return 'dup';
 
-  const supplierId = await findOrCreateSupplier(tenantId, doc.issuer);
-  const purchaseId = supplierId ? await createPurchaseDraft(tenantId, doc, supplierId) : null;
+  // El cron SOLO registra el comprobante en la bandeja. El proveedor y la orden
+  // de compra se crean recién cuando el usuario confirma que es una "compra".
+  const purchaseId = null;
 
   const { error } = await db.from('received_documents').insert({
     tenant_id: tenantId,
@@ -206,10 +217,15 @@ async function processXml(
 export interface ReceiveSummary {
   scanned: number; processed: number; duplicates: number;
   noTenant: number; skipped: number; errors: number;
+  debug?: any[];
 }
 
 // ── Entrada principal: lee el buzón y procesa ────────────────────────────────
-export async function fetchAndProcessReceivedEmails(): Promise<ReceiveSummary> {
+// `debug` devuelve, por cada correo, sus adjuntos (nombre, tipo, tamaño) y si se
+// detectó XML — para diagnosticar por qué un correo no entra a la bandeja.
+export async function fetchAndProcessReceivedEmails(opts?: { debug?: boolean }): Promise<ReceiveSummary> {
+  const debug = !!opts?.debug;
+  const debugInfo: any[] = [];
   const summary: ReceiveSummary = { scanned: 0, processed: 0, duplicates: 0, noTenant: 0, skipped: 0, errors: 0 };
 
   const host = process.env.IMAP_HOST;
@@ -243,15 +259,24 @@ export async function fetchAndProcessReceivedEmails(): Promise<ReceiveSummary> {
           if (!msg || !msg.source) { summary.skipped++; continue; }
           const parsed = await simpleParser(msg.source as Buffer);
 
-          // Adjuntos XML + cuerpo que sea XML directo.
+          // Adjuntos XML (incluye octet-stream, .zip) + cuerpo que sea XML directo.
           const xmls: string[] = [];
           for (const att of (parsed.attachments || [])) {
-            const name = (att.filename || '').toLowerCase();
-            const isXml = name.endsWith('.xml') || att.contentType === 'text/xml' || att.contentType === 'application/xml';
-            if (isXml && att.content) xmls.push(att.content.toString('utf8'));
+            for (const x of xmlsFromAttachment(att)) xmls.push(x);
           }
-          if (xmls.length === 0 && parsed.text && parsed.text.includes('<FacturaElectronica')) {
-            xmls.push(parsed.text);
+          for (const body of [parsed.text, parsed.html].filter(Boolean) as string[]) {
+            if (looksLikeFE(body)) xmls.push(body);
+          }
+
+          if (debug) {
+            debugInfo.push({
+              subject: parsed.subject,
+              from: parsed.from?.text,
+              attachments: (parsed.attachments || []).map(a => ({
+                filename: a.filename, contentType: a.contentType, size: a.size,
+              })),
+              xmlFound: xmls.length,
+            });
           }
 
           const emailFrom = parsed.from?.text || '';
@@ -266,7 +291,8 @@ export async function fetchAndProcessReceivedEmails(): Promise<ReceiveSummary> {
           }
           // Marcar como leído solo si el correo tenía algún comprobante relevante
           // (así los correos sin XML se quedan sin leer por si hay que revisarlos).
-          if (anyRelevant) {
+          // En modo debug NO se marca, para poder re-ejecutar la prueba.
+          if (anyRelevant && !debug) {
             await client.messageFlagsAdd(String(uid), ['\\Seen'], { uid: true });
           }
         } catch (e: any) {
@@ -281,5 +307,6 @@ export async function fetchAndProcessReceivedEmails(): Promise<ReceiveSummary> {
     await client.logout().catch(() => {});
   }
 
+  if (debug) summary.debug = debugInfo;
   return summary;
 }
