@@ -141,7 +141,9 @@ function clientFor(env: AlanubeEnv) {
       }
     },
     emitDocument: (kind: 'invoice' | 'ticket' | 'credit-note' | 'debit-note', payload: Record<string, any>, companyId?: string) => {
-      const headers = companyId ? { 'X-Company-Id': companyId } : undefined;
+      // Alanube CRI identifica la empresa por header `idCompany`. Mandamos también
+      // `X-Company-Id` por compat, por si el ambiente usa el otro nombre.
+      const headers = companyId ? { idCompany: companyId, 'X-Company-Id': companyId } : undefined;
       return f(EMIT_PATH[kind], { method: 'POST', body: JSON.stringify(payload), headers });
     },
     // Consulta el ESTATUS FISCAL de un documento. Alanube usa el patrón
@@ -168,7 +170,7 @@ function clientFor(env: AlanubeEnv) {
       candidates.push(`/documents/${id}`);
       for (const k of order) candidates.push(`${EMIT_PATH[k]}/${id}`);
 
-      const headers = cid ? { 'X-Company-Id': cid } : undefined;
+      const headers = cid ? { idCompany: cid, 'X-Company-Id': cid } : undefined;
       let lastErr: any = null;
       for (const path of [...new Set(candidates)]) {
         try { return await f(path, { method: 'GET', headers }); }
@@ -180,11 +182,11 @@ function clientFor(env: AlanubeEnv) {
       throw lastErr ?? new AlanubeError('Documento no encontrado', 404);
     },
     sendReceiverMessage: (payload: Record<string, any>, companyId?: string) => {
-      const headers = companyId ? { 'X-Company-Id': companyId } : undefined;
+      const headers = companyId ? { idCompany: companyId, 'X-Company-Id': companyId } : undefined;
       return f('/receiver-messages', { method: 'POST', body: JSON.stringify(payload), headers });
     },
     getReceiverMessage: (id: string, companyId?: string) => {
-      const headers = companyId ? { 'X-Company-Id': companyId } : undefined;
+      const headers = companyId ? { idCompany: companyId, 'X-Company-Id': companyId } : undefined;
       return f(`/receiver-messages/${id}`, { method: 'GET', headers });
     },
   };
