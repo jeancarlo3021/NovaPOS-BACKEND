@@ -3,6 +3,7 @@ import { db, anonClient } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
 import { sendEmail, paymentReceiptEmailHtml, customInvoiceEmailHtml, planFeatureLabels } from '../services/emailService.js';
 import { alanube, AlanubeError } from '../services/alanube.js';
+import { endOfDay } from '../utils/dateRange.js';
 
 const admin = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
@@ -774,16 +775,18 @@ admin.post('/tenants/:id/fe-certificate', async (c) => {
     if (env === 'sandbox') {
       cfg.certificate_sandbox = certMeta;
       if (p12_password !== undefined) cfg.p12_password_sandbox = String(p12_password);
+      if (hacienda_pin !== undefined) cfg.hacienda_pin_sandbox = String(hacienda_pin);
     } else {
       cfg.certificate_production = certMeta;
       if (p12_password !== undefined) cfg.p12_password_production = String(p12_password);
+      if (hacienda_pin !== undefined) cfg.hacienda_pin_production = String(hacienda_pin);
     }
     // Compat: mantené `certificate`/`p12_password` apuntando al de producción.
     if (env === 'production') {
       cfg.certificate = certMeta;
       if (p12_password !== undefined) cfg.p12_password = String(p12_password);
+      if (hacienda_pin !== undefined) cfg.hacienda_pin = String(hacienda_pin);
     }
-    if (hacienda_pin !== undefined) cfg.hacienda_pin = String(hacienda_pin);
     await db.from('settings').upsert({
       tenant_id: id, type: 'electronic-invoice', config: cfg, updated_at: new Date().toISOString(),
     }, { onConflict: 'tenant_id,type' });
@@ -878,11 +881,14 @@ function buildAlanubeCompanyPayload(cfg: Record<string, any>, p12Base64: string,
   // Credenciales POR AMBIENTE (con fallback a las genéricas). Las de producción y
   // pruebas de Hacienda son distintas.
   const prod = env === 'production';
-  const atvUser = String((prod ? cfg.atv_username_production : cfg.atv_username_sandbox) ?? cfg.atv_username ?? '').trim();
+  const atvUser = String((prod ? cfg.atv_username_production : cfg.atv_username_sandbox) || cfg.atv_username || '').trim();
   // La contraseña ATV es su PROPIO valor (NO el PIN del certificado — eran cosas
   // distintas y el fallback anterior causaba "Invalid credentials").
-  const atvPass = String((prod ? cfg.atv_password_production : cfg.atv_password_sandbox) ?? cfg.atv_password ?? '');
-  const p12Pass = String((prod ? cfg.p12_password_production : cfg.p12_password_sandbox) ?? cfg.p12_password ?? cfg.hacienda_pin ?? '');
+  const atvPass = String((prod ? cfg.atv_password_production : cfg.atv_password_sandbox) || cfg.atv_password || '');
+  const p12Pass = String(
+    (prod ? cfg.p12_password_production : cfg.p12_password_sandbox)
+    || (prod ? cfg.hacienda_pin_production : cfg.hacienda_pin_sandbox)
+    || cfg.p12_password || cfg.hacienda_pin || '');
 
   const payload: Record<string, any> = {
     name: String(cfg.emisor_name ?? '').trim(),
@@ -1367,6 +1373,52 @@ admin.put('/tenants/:id/feature-overrides', async (c) => {
     }, { onConflict: 'tenant_id,type' });
     if (error) throw new Error(error.message);
     return ok(c, { ok: true, overrides });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// GET /fe-log — BITÁCORA de facturas electrónicas de TODAS las empresas.
+// Para monitoreo del super-admin: ver emisiones y detectar errores rápido.
+// Filtros: ?tenant_id= (una empresa) · ?search= (cliente/consecutivo/clave/factura)
+//          · ?from= ?to= (fecha) · ?status= (error/accepted/sent/rejected)
+admin.get('/fe-log', async (c) => {
+  try {
+    const tenantId = c.req.query('tenant_id');
+    const search = (c.req.query('search') || '').trim();
+    const from = c.req.query('from');
+    const to = c.req.query('to');
+    const status = c.req.query('status');
+    const limit = Math.min(Number(c.req.query('limit') || 500), 2000);
+
+    let q = db.from('invoices')
+      .select('id, tenant_id, invoice_number, customer_name, total, issued_at, created_at, document_type, fe_clave, fe_consecutivo, fe_status, fe_error')
+      .not('fe_status', 'is', null)                 // solo comprobantes electrónicos
+      .order('created_at', { ascending: false })
+      .limit(limit);
+    if (tenantId) q = q.eq('tenant_id', tenantId);
+    if (status)   q = q.eq('fe_status', status);
+    if (from)     q = q.gte('created_at', from);
+    if (to)       q = q.lte('created_at', endOfDay(to));
+    if (search) {
+      const s = search.replace(/[%,]/g, ' ');
+      q = q.or(`customer_name.ilike.%${s}%,fe_consecutivo.ilike.%${s}%,fe_clave.ilike.%${s}%,invoice_number.ilike.%${s}%`);
+    }
+    const { data, error } = await q;
+    if (error) throw new Error(error.message);
+    const rows = (data ?? []) as any[];
+
+    // Nombre del negocio (empresa) por tenant.
+    const tenantIds = [...new Set(rows.map(r => r.tenant_id))];
+    const nameById = new Map<string, string>();
+    if (tenantIds.length) {
+      const { data: ts } = await db.from('tenants').select('id, name').in('id', tenantIds);
+      for (const t of (ts ?? []) as any[]) nameById.set(t.id, t.name);
+    }
+    // Contadores rápidos.
+    const errors = rows.filter(r => String(r.fe_status).toLowerCase() === 'error').length;
+    return ok(c, {
+      count: rows.length, errors,
+      rows: rows.map(r => ({ ...r, business_name: nameById.get(r.tenant_id) ?? '—' })),
+    });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
