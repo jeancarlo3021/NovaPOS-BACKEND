@@ -143,7 +143,41 @@ function clientFor(env: AlanubeEnv) {
       const headers = companyId ? { 'X-Company-Id': companyId } : undefined;
       return f(EMIT_PATH[kind], { method: 'POST', body: JSON.stringify(payload), headers });
     },
-    getDocument: (id: string) => f(`/documents/${id}`, { method: 'GET' }),
+    // Consulta el ESTATUS FISCAL de un documento. Alanube usa el patrón
+    //   GET /{recurso-fiscal}/{id}/idCompany/{companyId}
+    // (el companyId va en la URL, y el recurso de consulta es `fiscal-*`, distinto
+    // al de emisión). Probamos varios recursos según el tipo hasta que uno responda.
+    getDocument: async (id: string, opts?: { kind?: 'invoice' | 'ticket' | 'credit-note' | 'debit-note'; companyId?: string }) => {
+      const cid = opts?.companyId;
+      // Recurso "fiscal" por tipo (consulta de estatus).
+      const fiscalRes: Record<string, string> = {
+        invoice: 'fiscal-invoices', ticket: 'fiscal-tickets',
+        'credit-note': 'fiscal-credit-notes', 'debit-note': 'fiscal-debit-notes',
+      };
+      const order = opts?.kind
+        ? [opts.kind, ...Object.keys(fiscalRes).filter(k => k !== opts.kind)]
+        : Object.keys(fiscalRes);
+      const candidates: string[] = [];
+      if (cid) {
+        for (const k of order) candidates.push(`/${fiscalRes[k]}/${id}/idCompany/${cid}`);
+        // Variantes por si el recurso fiscal no aplica: emisión + idCompany.
+        for (const k of order) candidates.push(`${EMIT_PATH[k]}/${id}/idCompany/${cid}`);
+      }
+      // Últimos recursos (sin companyId en URL).
+      candidates.push(`/documents/${id}`);
+      for (const k of order) candidates.push(`${EMIT_PATH[k]}/${id}`);
+
+      const headers = cid ? { 'X-Company-Id': cid } : undefined;
+      let lastErr: any = null;
+      for (const path of [...new Set(candidates)]) {
+        try { return await f(path, { method: 'GET', headers }); }
+        catch (e: any) {
+          if (e instanceof AlanubeError && (e.status === 404 || e.status === 400)) { lastErr = e; continue; }
+          throw e;
+        }
+      }
+      throw lastErr ?? new AlanubeError('Documento no encontrado', 404);
+    },
     sendReceiverMessage: (payload: Record<string, any>, companyId?: string) => {
       const headers = companyId ? { 'X-Company-Id': companyId } : undefined;
       return f('/receiver-messages', { method: 'POST', body: JSON.stringify(payload), headers });

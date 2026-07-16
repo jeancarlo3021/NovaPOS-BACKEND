@@ -287,8 +287,8 @@ function mapAlanubeStatus(s: any): string {
 
 /** Consulta el estado de un documento en Alanube por su id (ULID). Devuelve
  *  también la clave real de Hacienda (50 díg) y el estado CRUDO (para depurar). */
-async function alanubeDocStatus(client: ReturnType<typeof alanube.forEnv>, docId: string): Promise<{ status: string; rawStatus: any; clave: string | null; raw: any }> {
-  const doc: any = await client.getDocument(docId);
+async function alanubeDocStatus(client: ReturnType<typeof alanube.forEnv>, docId: string, opts?: { kind?: 'invoice' | 'ticket' | 'credit-note' | 'debit-note'; companyId?: string }): Promise<{ status: string; rawStatus: any; clave: string | null; raw: any }> {
+  const doc: any = await client.getDocument(docId, opts);
   const d = doc?.ticket ?? doc?.invoice ?? doc?.creditNote ?? doc?.document ?? doc?.data ?? doc;
   // El estado de HACIENDA puede venir en varios nombres; priorizamos el de Hacienda
   // sobre el ciclo de vida interno de Alanube.
@@ -311,7 +311,7 @@ hacienda.post('/refresh-status', async (c) => {
     const env = cfg.environment === 'sandbox' ? 'sandbox' : 'production'; // default producción
 
     const { data: inv } = await db.from('invoices')
-      .select('id, fe_clave, fe_consecutivo').eq('id', invoice_id).eq('tenant_id', tenantId).maybeSingle();
+      .select('id, fe_clave, fe_consecutivo, document_type').eq('id', invoice_id).eq('tenant_id', tenantId).maybeSingle();
     if (!(inv as any)?.fe_clave) return fail(c, 'La factura no fue emitida', 422);
 
     let fe_status = 'sent';
@@ -320,7 +320,10 @@ hacienda.post('/refresh-status', async (c) => {
     if (provider === 'alanube') {
       const docId = (inv as any).fe_consecutivo;
       if (!docId) return fail(c, 'No hay id de documento de Alanube para consultar. Volvé a emitir.', 422);
-      const r = await alanubeDocStatus(alanube.forEnv(cfg.environment), docId);
+      const kind = (inv as any).document_type === 'factura_electronica' ? 'invoice'
+        : (inv as any).document_type === 'nota_credito' ? 'credit-note'
+        : (inv as any).document_type === 'nota_debito' ? 'debit-note' : 'ticket';
+      const r = await alanubeDocStatus(alanube.forEnv(cfg.environment), docId, { kind: kind as any, companyId: cfg.alanube_company_id });
       fe_status = r.status; indEstado = r.rawStatus;
       patch.fe_status = fe_status;
       patch.fe_response = r.raw;   // guardar la respuesta cruda para la bitácora
