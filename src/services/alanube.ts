@@ -139,9 +139,21 @@ function clientFor(env: AlanubeEnv) {
         throw e;
       }
     },
-    emitDocument: (kind: 'invoice' | 'ticket' | 'credit-note' | 'debit-note', payload: Record<string, any>, companyId?: string) => {
+    emitDocument: async (kind: 'invoice' | 'ticket' | 'credit-note' | 'debit-note', payload: Record<string, any>, companyId?: string) => {
       const headers = companyId ? { 'X-Company-Id': companyId } : undefined;
-      return f(EMIT_PATH[kind], { method: 'POST', body: JSON.stringify(payload), headers });
+      const body = JSON.stringify(payload);
+      try {
+        // 1) Forma actual: companyId por header.
+        return await f(EMIT_PATH[kind], { method: 'POST', body, headers });
+      } catch (e: any) {
+        // 2) Si Alanube no encuentra la empresa, reintenta con el companyId EN LA URL
+        //    (patrón /idCompany/{id}, igual que la consulta de estatus).
+        const notFound = e instanceof AlanubeError && (e.status === 404 || /company not found|not found/i.test(e.message || ''));
+        if (companyId && notFound) {
+          return await f(`${EMIT_PATH[kind]}/idCompany/${companyId}`, { method: 'POST', body, headers });
+        }
+        throw e;
+      }
     },
     // Consulta el ESTATUS FISCAL de un documento. Alanube usa el patrón
     //   GET /{recurso-fiscal}/{id}/idCompany/{companyId}

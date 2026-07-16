@@ -65,6 +65,9 @@ app.get('/health', (c) => c.json({
     imap_host:     !!process.env.IMAP_HOST,
     imap_user:     !!process.env.IMAP_USER,
     imap_pass:     !!process.env.IMAP_PASS,
+    // Tokens de Alanube por ambiente (para diagnosticar "Company not found").
+    alanube_token_production: !!process.env.ALANUBE_API_TOKEN_PRODUCTION,
+    alanube_token_sandbox:    !!process.env.ALANUBE_API_TOKEN_SANDBOX,
   },
 }));
 
