@@ -272,23 +272,30 @@ function mapEstado(ind: string): string {
   return 'sent';   // procesando / recibido
 }
 
-/** Mapea el status de Alanube (REGISTERED/ACCEPTED/REJECTED…) a fe_status. */
+/** Mapea el status de Alanube / Hacienda a fe_status. */
 function mapAlanubeStatus(s: any): string {
-  const t = String(s ?? '').toUpperCase();
-  if (t.includes('ACCEPT') || t.includes('ACEPT')) return 'accepted';
-  if (t.includes('REJECT') || t.includes('RECHAZ')) return 'rejected';
-  if (t.includes('ERROR')) return 'error';
-  return 'sent';   // REGISTERED / PENDING / PROCESSING…
+  const t = String(s ?? '').toUpperCase().trim();
+  if (!t) return 'sent';
+  // Aceptado: strings o Ind_estado de Hacienda = "1" (aceptado).
+  if (t.includes('ACCEPT') || t.includes('ACEPT') || t.includes('APROB') || t.includes('APPROV')
+    || t === 'DELIVERED' || t === 'COMPLETED' || t === 'DONE' || t === '1') return 'accepted';
+  // Rechazado: strings o Ind_estado = "2".
+  if (t.includes('REJECT') || t.includes('RECHAZ') || t.includes('DENIED') || t === '2') return 'rejected';
+  if (t.includes('ERROR') || t.includes('FAIL')) return 'error';
+  return 'sent';   // REGISTERED / PENDING / PROCESSING / RECEIVED / "3" (recibido)…
 }
 
 /** Consulta el estado de un documento en Alanube por su id (ULID). Devuelve
- *  también la clave real de Hacienda (50 díg) si ya está disponible. */
-async function alanubeDocStatus(client: ReturnType<typeof alanube.forEnv>, docId: string): Promise<{ status: string; clave: string | null; raw: any }> {
+ *  también la clave real de Hacienda (50 díg) y el estado CRUDO (para depurar). */
+async function alanubeDocStatus(client: ReturnType<typeof alanube.forEnv>, docId: string): Promise<{ status: string; rawStatus: any; clave: string | null; raw: any }> {
   const doc: any = await client.getDocument(docId);
   const d = doc?.ticket ?? doc?.invoice ?? doc?.creditNote ?? doc?.document ?? doc?.data ?? doc;
-  const rawStatus = d?.status ?? deepFind(doc, /(^status$|estado|indEstado|situacion)/i, 20);
+  // El estado de HACIENDA puede venir en varios nombres; priorizamos el de Hacienda
+  // sobre el ciclo de vida interno de Alanube.
+  const rawStatus = d?.haciendaStatus ?? d?.indEstado ?? d?.stateHacienda ?? d?.hacienda?.status
+    ?? d?.status ?? deepFind(doc, /(indEstado|haciendaStatus|^status$|estado|situacion)/i, 20);
   const clave = d?.key ?? d?.clave ?? deepFind(doc, /(clave|^key$)/i, 40) ?? null;
-  return { status: mapAlanubeStatus(rawStatus), clave, raw: doc };
+  return { status: mapAlanubeStatus(rawStatus), rawStatus, clave, raw: doc };
 }
 
 // POST /refresh-status — consulta el estatus de una factura por su Clave y lo GUARDA.
@@ -314,8 +321,9 @@ hacienda.post('/refresh-status', async (c) => {
       const docId = (inv as any).fe_consecutivo;
       if (!docId) return fail(c, 'No hay id de documento de Alanube para consultar. Volvé a emitir.', 422);
       const r = await alanubeDocStatus(alanube.forEnv(cfg.environment), docId);
-      fe_status = r.status; indEstado = r.status;
+      fe_status = r.status; indEstado = r.rawStatus;
       patch.fe_status = fe_status;
+      patch.fe_response = r.raw;   // guardar la respuesta cruda para la bitácora
       // Si ya llegó la clave real de Hacienda (50 díg) y aún guardábamos el ULID,
       // la persistimos para mostrar clave y consecutivo correctos.
       if (r.clave && /^\d{50}$/.test(String(r.clave)) && r.clave !== (inv as any).fe_clave) {
@@ -329,7 +337,11 @@ hacienda.post('/refresh-status', async (c) => {
       patch.fe_xml = data?.Respuesta_xml ?? null;
       patch.fe_error = data?.Error ?? null;
     }
-    await db.from('invoices').update(patch).eq('id', invoice_id).eq('tenant_id', tenantId);
+    let upd = await db.from('invoices').update(patch).eq('id', invoice_id).eq('tenant_id', tenantId);
+    if (upd.error && /fe_response|fe_request/.test(upd.error.message)) {
+      const { fe_response, fe_request, ...rest } = patch;   // migración 55 sin correr
+      upd = await db.from('invoices').update(rest).eq('id', invoice_id).eq('tenant_id', tenantId);
+    }
 
     return ok(c, { fe_status, ind_estado: indEstado, error: errDetail });
   } catch (err: any) {
@@ -499,6 +511,8 @@ hacienda.post('/emit', async (c) => {
       try {
         resp = await alanube.forEnv(cfg.environment).emitDocument(kind as any, doc, cfg.alanube_company_id);
       } catch (e: any) {
+        // Guardar el JSON enviado para poder verlo en la bitácora aunque falle.
+        await db.from('invoices').update({ fe_request: doc }).eq('id', invoice_id).eq('tenant_id', tenantId).then(() => {}, () => {});
         return await failFE(e instanceof AlanubeError ? e.message : (e?.message ?? 'Error emitiendo con Alanube'));
       }
       // La respuesta viene envuelta según el tipo: { ticket|invoice|creditNote: {
@@ -513,6 +527,8 @@ hacienda.post('/emit', async (c) => {
         fe_status: 'sent',
         fe_situacion: '1',
         fe_error: null,
+        fe_request: doc,                    // JSON enviado (para la bitácora)
+        fe_response: resp,                  // respuesta de Alanube/Hacienda
         document_type: tipoDoc === '01' ? 'factura_electronica' : 'tiquete_electronico',
         sale_condition: (inv as any).payment_method === 'credit' ? '02' : '01',
         updated_at: new Date().toISOString(),

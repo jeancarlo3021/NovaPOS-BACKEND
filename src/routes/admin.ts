@@ -1390,7 +1390,7 @@ admin.get('/fe-log', async (c) => {
     const limit = Math.min(Number(c.req.query('limit') || 500), 2000);
 
     let q = db.from('invoices')
-      .select('id, tenant_id, invoice_number, customer_name, total, issued_at, created_at, document_type, fe_clave, fe_consecutivo, fe_status, fe_error')
+      .select('id, tenant_id, invoice_number, customer_name, total, issued_at, created_at, document_type, fe_clave, fe_consecutivo, fe_status, fe_error, fe_request, fe_response')
       .not('fe_status', 'is', null)                 // solo comprobantes electrónicos
       .order('created_at', { ascending: false })
       .limit(limit);
@@ -1402,7 +1402,21 @@ admin.get('/fe-log', async (c) => {
       const s = search.replace(/[%,]/g, ' ');
       q = q.or(`customer_name.ilike.%${s}%,fe_consecutivo.ilike.%${s}%,fe_clave.ilike.%${s}%,invoice_number.ilike.%${s}%`);
     }
-    const { data, error } = await q;
+    let { data, error } = await q;
+    // Si las columnas fe_request/fe_response aún no existen (migración 55 sin correr),
+    // reintenta sin ellas.
+    if (error && /fe_request|fe_response/.test(error.message)) {
+      let q2 = db.from('invoices')
+        .select('id, tenant_id, invoice_number, customer_name, total, issued_at, created_at, document_type, fe_clave, fe_consecutivo, fe_status, fe_error')
+        .not('fe_status', 'is', null)
+        .order('created_at', { ascending: false }).limit(limit);
+      if (tenantId) q2 = q2.eq('tenant_id', tenantId);
+      if (status)   q2 = q2.eq('fe_status', status);
+      if (from)     q2 = q2.gte('created_at', from);
+      if (to)       q2 = q2.lte('created_at', endOfDay(to));
+      if (search) { const s = search.replace(/[%,]/g, ' '); q2 = q2.or(`customer_name.ilike.%${s}%,fe_consecutivo.ilike.%${s}%,fe_clave.ilike.%${s}%,invoice_number.ilike.%${s}%`); }
+      ({ data, error } = await q2);
+    }
     if (error) throw new Error(error.message);
     const rows = (data ?? []) as any[];
 
