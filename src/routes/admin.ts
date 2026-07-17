@@ -158,21 +158,21 @@ admin.get('/invoices-monthly', async (c) => {
 
     let sel: any = await db
       .from('invoices')
-      .select('tenant_id, status, issued_at, route_id, document_type, fe_clave')
+      .select('tenant_id, status, issued_at, route_id, document_type, fe_clave, fe_status')
       .gte('issued_at', periodStart)
       .lt('issued_at', periodEnd);
     // Si las columnas fe_clave/document_type no existen aún, reintenta sin ellas.
-    if (sel.error && /fe_clave|document_type/.test(sel.error.message)) {
+    if (sel.error && /fe_clave|document_type|fe_status/.test(sel.error.message)) {
       sel = await db.from('invoices').select('tenant_id, status, issued_at, route_id')
         .gte('issued_at', periodStart).lt('issued_at', periodEnd);
     }
     if (sel.error) throw new Error(sel.error.message);
 
     // Un comprobante es ELECTRÓNICO solo si REALMENTE se emitió a Hacienda (tiene
-    // clave). NO basta con que el document_type sea electrónico: ese campo guarda
-    // lo que el usuario SELECCIONÓ, y si la emisión falla / el negocio no emite,
-    // queda como 'tiquete_electronico' sin clave → sería un tiquete CORRIENTE.
-    const isElectronic = (r: any) => !!r.fe_clave;
+    // clave) y NO fue rechazado / con error. NO basta con que el document_type sea
+    // electrónico: ese campo guarda lo que el usuario SELECCIONÓ. Un electrónico
+    // rechazado no es válido → cuenta como corriente (la venta igual ocurrió).
+    const isElectronic = (r: any) => !!r.fe_clave && r.fe_status !== 'rejected' && r.fe_status !== 'error';
 
     const electronic: Record<string, number> = {};
     const corriente: Record<string, number> = {};
@@ -1446,21 +1446,26 @@ admin.get('/fe-quotas', async (c) => {
       // (factura/tiquete + NC + ND), separando por PROVEEDOR. El proveedor se
       // deduce del consecutivo: Alanube usa un ULID (con letras), Facturemos uno
       // numérico. Así se puede aislar la parte de Alanube y compararla con su reporte.
+      // Se EXCLUYEN los comprobantes RECHAZADOS/ERROR (no consumen bolsa).
+      const failed = (s: any) => s === 'rejected' || s === 'error';
       let sel: any = await db.from('invoices')
-        .select('fe_consecutivo, fe_clave, fe_nc_clave, fe_nd_clave')
+        .select('fe_consecutivo, fe_clave, fe_status, fe_nc_clave, fe_nc_status, fe_nd_clave, fe_nd_status')
         .eq('tenant_id', r.tenant_id).gte('created_at', start)
         .or('fe_clave.not.is.null,fe_nc_clave.not.is.null,fe_nd_clave.not.is.null');
-      if (sel.error && /fe_nc_clave|fe_nd_clave/.test(sel.error.message)) {
-        sel = await db.from('invoices').select('fe_consecutivo, fe_clave')
+      if (sel.error) {   // columnas NC/ND (o status) sin migrar → intento mínimo
+        sel = await db.from('invoices').select('fe_consecutivo, fe_clave, fe_status')
           .eq('tenant_id', r.tenant_id).gte('created_at', start).not('fe_clave', 'is', null);
       }
       let docs = 0, ncs = 0, nds = 0, usedAlanube = 0, usedFacturemos = 0;
       for (const row of (sel.data ?? []) as any[]) {
         const isAlanube = /[A-Za-z]/.test(String(row.fe_consecutivo ?? ''));
-        const inRow = (row.fe_clave ? 1 : 0) + (row.fe_nc_clave ? 1 : 0) + (row.fe_nd_clave ? 1 : 0);
-        if (row.fe_clave) docs++;
-        if (row.fe_nc_clave) ncs++;
-        if (row.fe_nd_clave) nds++;
+        const okDoc = row.fe_clave && !failed(row.fe_status);
+        const okNc = row.fe_nc_clave && !failed(row.fe_nc_status);
+        const okNd = row.fe_nd_clave && !failed(row.fe_nd_status);
+        const inRow = (okDoc ? 1 : 0) + (okNc ? 1 : 0) + (okNd ? 1 : 0);
+        if (okDoc) docs++;
+        if (okNc) ncs++;
+        if (okNd) nds++;
         if (isAlanube) usedAlanube += inRow; else usedFacturemos += inRow;
       }
       const used = docs + ncs + nds;
@@ -1565,7 +1570,7 @@ admin.get('/fe-log', async (c) => {
     const limit = Math.min(Number(c.req.query('limit') || 500), 2000);
 
     let q = db.from('invoices')
-      .select('id, tenant_id, invoice_number, customer_name, total, issued_at, created_at, document_type, fe_clave, fe_consecutivo, fe_status, fe_error, fe_request, fe_response')
+      .select('id, tenant_id, invoice_number, customer_name, total, issued_at, created_at, document_type, fe_clave, fe_consecutivo, fe_status, fe_error, fe_emailed, fe_request, fe_response')
       .not('fe_status', 'is', null)                 // solo comprobantes electrónicos
       .order('created_at', { ascending: false })
       .limit(limit);
@@ -1582,7 +1587,7 @@ admin.get('/fe-log', async (c) => {
     let error: any = res.error;
     // Si las columnas fe_request/fe_response aún no existen (migración 55 sin correr),
     // reintenta sin ellas.
-    if (error && /fe_request|fe_response/.test(error.message)) {
+    if (error && /fe_request|fe_response|fe_emailed/.test(error.message)) {
       let q2 = db.from('invoices')
         .select('id, tenant_id, invoice_number, customer_name, total, issued_at, created_at, document_type, fe_clave, fe_consecutivo, fe_status, fe_error')
         .not('fe_status', 'is', null)

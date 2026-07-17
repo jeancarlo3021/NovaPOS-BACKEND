@@ -168,7 +168,7 @@ reports.get('/taxes', async (c) => {
     // Ambiente: 'production' (default, excluye pruebas) · 'sandbox' (solo QA) · 'all'.
     const environment = String(c.req.query('environment') || 'production');
 
-    const sel = 'id, invoice_number, customer_name, total, subtotal, tax_amount, issued_at, status, fe_clave, fe_nc_clave, fe_environment';
+    const sel = 'id, invoice_number, customer_name, total, subtotal, tax_amount, issued_at, status, fe_clave, fe_status, fe_nc_clave, fe_environment';
     // Dos consultas (más robusto que un .or con is-not-null):
     //  1) Ventas VÁLIDAS (no anuladas).
     //  2) Facturas con NOTA DE CRÉDITO (aunque estén anuladas).
@@ -189,7 +189,7 @@ reports.get('/taxes', async (c) => {
     // Si la columna fe_environment aún no existe (migración 57 sin correr), reintenta
     // sin el filtro/columna de ambiente (muestra todo).
     if ((rVentas.error && /fe_environment/.test(rVentas.error.message)) || (rNc.error && /fe_environment/.test(rNc.error.message))) {
-      const sel2 = 'id, invoice_number, customer_name, total, subtotal, tax_amount, issued_at, status, fe_clave, fe_nc_clave';
+      const sel2 = 'id, invoice_number, customer_name, total, subtotal, tax_amount, issued_at, status, fe_clave, fe_status, fe_nc_clave';
       let v = db.from('invoices').select(sel2).eq('tenant_id', tenantId).neq('status', 'cancelled');
       let n = db.from('invoices').select(sel2).eq('tenant_id', tenantId).not('fe_nc_clave', 'is', null);
       if (from) { v = v.gte('issued_at', from); n = n.gte('issued_at', from); }
@@ -199,11 +199,16 @@ reports.get('/taxes', async (c) => {
     if (rVentas.error) throw new Error(rVentas.error.message);
     if (rNc.error)     throw new Error(rNc.error.message);
 
+    // Una factura ELECTRÓNICA que Hacienda RECHAZÓ o dio ERROR no es un comprobante
+    // válido → no debe aparecer en el reporte de impuestos. Las corrientes (sin
+    // fe_clave) y las aceptadas/en proceso sí cuentan.
+    const feFailed = (r: any) => !!r.fe_clave && (r.fe_status === 'rejected' || r.fe_status === 'error');
+
     // Ventas GROSS = válidas ∪ las que tienen NC (por id, sin duplicar). Toda venta
     // emitida cuenta como débito positivo; su NC (si tiene) resta aparte.
     const salesById = new Map<string, any>();
-    for (const r of (rVentas.data ?? []) as any[]) salesById.set(r.id, r);
-    for (const r of (rNc.data ?? []) as any[]) salesById.set(r.id, r);
+    for (const r of (rVentas.data ?? []) as any[]) { if (!feFailed(r)) salesById.set(r.id, r); }
+    for (const r of (rNc.data ?? []) as any[]) { if (!feFailed(r)) salesById.set(r.id, r); }
 
     const invoices: Array<{ kind: 'venta' | 'nc'; invoice_number: string; customer_name: string; issued_at: string; month: string; base: number; iva: number; total: number; electronic: boolean }> = [];
     const mkRow = (r: any, kind: 'venta' | 'nc') => {

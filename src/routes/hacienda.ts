@@ -43,7 +43,11 @@ async function matchLines(tenantId: string, lines: any[]): Promise<any[]> {
   return lines.map((l: any) => {
     const cabys = String(l.cabys ?? l.CodigoCABYS ?? '');
     const detail = String(l.detail ?? l.Detalle ?? '');
-    const match = (cabys && byCabys.get(cabys)) || byName.get(detail.trim().toLowerCase()) || null;
+    // Coincidencia PRIMERO por CÓDIGO CABYS (igual al producto interno); si no,
+    // por nombre. Si el código no coincide → se crea como nuevo.
+    const byCode = cabys ? byCabys.get(cabys) : null;
+    const byNombre = byCode ? null : byName.get(detail.trim().toLowerCase());
+    const match = byCode || byNombre || null;
     return {
       detail,
       quantity: Number(l.quantity ?? l.Cantidad ?? 1),
@@ -53,6 +57,7 @@ async function matchLines(tenantId: string, lines: any[]): Promise<any[]> {
       product_id: match?.id ?? null,
       product_name: match?.name ?? null,
       exists: !!match,
+      matched_by: byCode ? 'cabys' : byNombre ? 'name' : null,   // cómo coincidió
     };
   });
 }
@@ -153,22 +158,26 @@ async function computeFeQuota(tenantId: string) {
     startISO = (t as any)?.subscription?.started_at ?? (t as any)?.created_at ?? new Date().toISOString();
   }
 
-  // Comprobantes emitidos DESDE el inicio de la bolsa vigente. Cada CLAVE de
-  // Hacienda cuenta 1: factura/tiquete (fe_clave) + nota de crédito (fe_nc_clave)
-  // + nota de débito (fe_nd_clave). Una misma fila puede tener varias (ej. factura
-  // + su NC), y cada una es un comprobante distinto.
-  const countByClave = async (col: 'fe_clave' | 'fe_nc_clave' | 'fe_nd_clave') => {
-    const { count, error } = await db.from('invoices')
-      .select('id', { count: 'exact', head: true }).eq('tenant_id', tenantId)
-      .not(col, 'is', null).gte('created_at', startISO);
-    if (error) return 0;   // columna aún no existe (migración pendiente) → 0
-    return count ?? 0;
-  };
-  const [usedDocs, usedNc, usedNd] = await Promise.all([
-    countByClave('fe_clave'), countByClave('fe_nc_clave'), countByClave('fe_nd_clave'),
-  ]);
+  // Comprobantes emitidos DESDE el inicio de la bolsa. Cada CLAVE cuenta 1:
+  // factura/tiquete (fe_clave) + NC (fe_nc_clave) + ND (fe_nd_clave). Se EXCLUYEN
+  // los RECHAZADOS/ERROR (no consumen bolsa: no son comprobantes válidos).
+  const failed = (s: any) => s === 'rejected' || s === 'error';
+  let feRows: any = await db.from('invoices')
+    .select('fe_clave, fe_status, fe_nc_clave, fe_nc_status, fe_nd_clave, fe_nd_status')
+    .eq('tenant_id', tenantId).gte('created_at', startISO)
+    .or('fe_clave.not.is.null,fe_nc_clave.not.is.null,fe_nd_clave.not.is.null');
+  if (feRows.error) {   // columnas NC/ND (o su status) sin migrar → intento mínimo
+    feRows = await db.from('invoices').select('fe_clave, fe_status')
+      .eq('tenant_id', tenantId).gte('created_at', startISO).not('fe_clave', 'is', null);
+  }
+  let usedDocs = 0, usedNc = 0, usedNd = 0;
+  for (const r of (feRows.data ?? []) as any[]) {
+    if (r.fe_clave && !failed(r.fe_status)) usedDocs++;
+    if (r.fe_nc_clave && !failed(r.fe_nc_status)) usedNc++;
+    if (r.fe_nd_clave && !failed(r.fe_nd_status)) usedNd++;
+  }
 
-  const used = usedDocs + usedNc + usedNd;                  // facturas + tiquetes + NC + ND
+  const used = usedDocs + usedNc + usedNd;                  // facturas + tiquetes + NC + ND (sin rechazados)
   const available = included > 0 ? included - used : null;  // null = ilimitado
   const overage = included > 0 ? Math.max(0, used - included) : 0;
 
@@ -937,15 +946,19 @@ hacienda.get('/invoices', async (c) => {
       if (to)   q = q.lte('issued_at', endOfDay(to));
       return q;
     };
-    const base = 'id, invoice_number, customer_name, total, issued_at, document_type, payment_method, status, fe_clave, fe_consecutivo, fe_status, fe_error';
+    const base = 'id, invoice_number, customer_name, total, issued_at, document_type, payment_method, status, fe_clave, fe_consecutivo, fe_status, fe_error, fe_emailed';
     // Intento con columnas de NC y ND; si alguna no existe (migración sin correr),
     // reintentamos con menos columnas.
+    const baseNoEmail = base.replace(', fe_emailed', '');
     let { data, error } = await buildQuery(`${base}, fe_nc_clave, fe_nc_status, fe_nd_clave, fe_nd_status`);
     if (error && /fe_nd_/.test(error.message)) {
       ({ data, error } = await buildQuery(`${base}, fe_nc_clave, fe_nc_status`));   // sin ND
     }
     if (error && /fe_nc_/.test(error.message)) {
       ({ data, error } = await buildQuery(base));   // sin NC ni ND
+    }
+    if (error && /fe_emailed/.test(error.message)) {
+      ({ data, error } = await buildQuery(baseNoEmail));   // sin fe_emailed (migración 56)
     }
     if (error) throw new Error(error.message);
     return ok(c, data ?? []);
@@ -1324,40 +1337,56 @@ hacienda.post('/received/reconcile', async (c) => {
     }
 
     const messages: string[] = [];
-    let updated = 0;
+    let updated = 0, created = 0;
+    const noInventory = !!no_inventory;
     const purchaseItems: any[] = [];
-    const pending: any[] = [];   // productos NUEVOS: se crean al ACEPTAR en Hacienda
 
     for (const it of workItems) {
       if (it.action === 'skip') continue;
-      const productId = it.product_id ?? null;
+      let productId = it.product_id ?? null;
+      const qty = Number(it.quantity) || 1;
+      const price = Number(it.unit_price) || 0;
 
       if (it.action === 'update' && productId) {
-        // Producto existente: actualizar CABYS/precio y agregarlo a la orden ahora.
+        // Producto que COINCIDE (por código/nombre): actualizar CABYS/precio.
         const upd: any = { updated_at: new Date().toISOString() };
         if (it.cabys) upd.cabys_code = it.cabys;
-        if (Number(it.unit_price) > 0) upd.cost_price = Number(it.unit_price);
+        if (price > 0) upd.cost_price = price;
         const { error: uErr } = await db.from('products').update(upd).eq('id', productId).eq('tenant_id', tenantId);
-        if (uErr) { messages.push(`No se pudo actualizar "${it.detail}": ${uErr.message}`); }
+        if (uErr) { messages.push(`⚠️ No se pudo actualizar "${it.detail}": ${uErr.message}`); }
         else { updated++; messages.push(`✏️ Actualizado (CABYS/precio): ${it.detail}`); }
-        purchaseItems.push({
-          product_id: productId,
-          quantity: Number(it.quantity) || 1,
-          unit_price: Number(it.unit_price) || 0,
-          subtotal: (Number(it.quantity) || 1) * (Number(it.unit_price) || 0),
-        });
-      } else if (it.action === 'create') {
-        // Producto NUEVO: por defecto se DIFIERE hasta aceptar en Hacienda.
-        pending.push({ detail: it.detail, quantity: Number(it.quantity) || 1, unit_price: Number(it.unit_price) || 0, cabys: it.cabys ?? null });
+      } else {
+        // Producto NUEVO (el código NO coincide con ninguno interno): se CREA ahora
+        // y se agrega a la orden de una vez (antes se difería y la orden quedaba vacía).
+        const { data: np, error: cErr } = await db.from('products').insert({
+          tenant_id: tenantId,
+          name: it.detail || 'Producto',
+          cabys_code: it.cabys || null,
+          cost_price: price, unit_price: price,
+          stock_quantity: 0, tracks_stock: !noInventory,
+        }).select('id').single();
+        if (cErr) { messages.push(`⚠️ No se pudo crear "${it.detail}": ${cErr.message}`); continue; }
+        productId = (np as any).id;
+        created++;
+        messages.push(`➕ Creado como NUEVO: ${it.detail}`);
+      }
+
+      if (productId) {
+        purchaseItems.push({ product_id: productId, quantity: qty, unit_price: price, subtotal: qty * price });
       }
     }
-    if (pending.length) messages.push(`🕓 ${pending.length} producto(s) nuevo(s) se crearán al ACEPTAR el comprobante en Hacienda.`);
 
     // Orden de compra: relacionar existente o crear nueva.
     let purchaseId = purchase_id ?? null;
     let purchaseNumber = '';
     if (purchaseId) {
-      // Agregar las líneas a la orden existente y recalcular el total.
+      // RECARGA idempotente: si se re-procesa la MISMA orden ya ligada a este
+      // documento, se limpian sus items antes de re-insertar (evita duplicados y
+      // rellena órdenes que quedaron vacías). Si es OTRA orden elegida, se agrega.
+      const isReload = String(purchaseId) === String(d.purchase_id ?? '');
+      if (isReload) {
+        await db.from('purchase_items').delete().eq('purchase_id', purchaseId);
+      }
       if (purchaseItems.length) {
         const { error: iErr } = await db.from('purchase_items').insert(purchaseItems.map(pi => ({ ...pi, purchase_id: purchaseId })));
         if (iErr) throw new Error(iErr.message);
@@ -1366,10 +1395,12 @@ hacienda.post('/received/reconcile', async (c) => {
       purchaseNumber = String((existing as any)?.purchase_number ?? '');
       const addTotal = purchaseItems.reduce((s, pi) => s + pi.subtotal, 0);
       await db.from('purchases').update({
-        total_amount: Number((existing as any)?.total_amount ?? 0) + addTotal,
+        total_amount: isReload ? addTotal : Number((existing as any)?.total_amount ?? 0) + addTotal,
         updated_at: new Date().toISOString(),
       }).eq('id', purchaseId).eq('tenant_id', tenantId);
-      messages.push(`🔗 ${purchaseItems.length} artículo(s) agregado(s) a la orden ${purchaseNumber}.`);
+      messages.push(isReload
+        ? `🔄 Orden ${purchaseNumber} recargada con ${purchaseItems.length} artículo(s).`
+        : `🔗 ${purchaseItems.length} artículo(s) agregado(s) a la orden ${purchaseNumber}.`);
     } else {
       const total = purchaseItems.reduce((s, pi) => s + pi.subtotal, 0) || Number(d.total ?? 0);
       purchaseNumber = await nextPurchaseNumber(tenantId);
@@ -1391,9 +1422,13 @@ hacienda.post('/received/reconcile', async (c) => {
       messages.push(`🧾 Orden de compra ${purchaseNumber} creada con ${purchaseItems.length} artículo(s).`);
     }
 
-    // Guardar los productos pendientes (para crearlos al aceptar en Hacienda),
-    // ligados a esta orden. Resiliente si la columna purchase_id no existe aún.
-    const newRaw = { ...(d.raw ?? {}), pending_products: pending, no_inventory: !!no_inventory };
+    // Resumen para el total a registrar.
+    const totalReg = purchaseItems.reduce((s, pi) => s + pi.subtotal, 0);
+    messages.unshift(`💰 Total registrado ₡${totalReg.toLocaleString('es-CR')} · ${updated} coincidencia(s) con CABYS/precio actualizado · ${created} producto(s) nuevo(s) creado(s).`);
+
+    // Ya no se difieren productos: se crean/actualizan al conciliar (arriba). Se
+    // deja pending_products vacío. Resiliente si la columna purchase_id no existe.
+    const newRaw = { ...(d.raw ?? {}), pending_products: [], no_inventory: !!no_inventory };
     let upd = await db.from('received_documents')
       .update({ kind: 'compra', purchase_id: purchaseId, raw: newRaw, updated_at: new Date().toISOString() })
       .eq('id', id).eq('tenant_id', tenantId);
@@ -1403,7 +1438,7 @@ hacienda.post('/received/reconcile', async (c) => {
         .eq('id', id).eq('tenant_id', tenantId);
     }
 
-    return ok(c, { ok: true, purchase_id: purchaseId, purchase_number: purchaseNumber, pending: pending.length, updated, messages }, 201);
+    return ok(c, { ok: true, purchase_id: purchaseId, purchase_number: purchaseNumber, updated, created, items: purchaseItems.length, total: totalReg, messages }, 201);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
@@ -1587,7 +1622,9 @@ hacienda.post('/resend-email', async (c) => {
           (String(cfg.environment ?? 'production') === 'sandbox' ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id)
       : undefined;
     await sendComprobanteEmail(email, inv as any, attachments);
-    return ok(c, { ok: true });
+    // Marca que el comprobante ya se envió por correo (para el check en la bitácora).
+    await db.from('invoices').update({ fe_emailed: true }).eq('id', invoice_id).eq('tenant_id', tenantId).then(() => {}, () => {});
+    return ok(c, { ok: true, attachments: attachments?.length ?? 0 });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
