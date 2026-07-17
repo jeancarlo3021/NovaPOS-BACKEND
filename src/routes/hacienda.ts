@@ -54,12 +54,21 @@ async function matchLines(tenantId: string, lines: any[]): Promise<any[]> {
       unit_price: Number(l.unit_price ?? l.PrecioUnitario ?? 0),
       total: Number(l.total ?? l.subtotal ?? l.SubTotal ?? 0),
       cabys: cabys || null,
+      code: String(l.code ?? l.Codigo ?? '').trim() || null,   // código comercial del XML
       product_id: match?.id ?? null,
       product_name: match?.name ?? null,
       exists: !!match,
       matched_by: byCode ? 'cabys' : byNombre ? 'name' : null,   // cómo coincidió
     };
   });
+}
+
+// SKU autogenerado para productos creados desde la recepción (la columna sku es
+// NOT NULL). Formato legible + sufijo aleatorio para no chocar.
+function genReceptionSku(detail: string): string {
+  const base = String(detail || '').replace(/[^A-Za-z0-9]/g, '').slice(0, 8).toUpperCase() || 'PROD';
+  const rnd = Math.random().toString(36).slice(2, 7).toUpperCase();
+  return `REC-${base}-${rnd}`;
 }
 
 const hacienda = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
@@ -1052,6 +1061,7 @@ hacienda.post('/received/confirm', async (c) => {
         const { data: np, error: npErr } = await db.from('products').insert({
           tenant_id: tenantId,
           name: p.detail || 'Producto',
+          sku: genReceptionSku(p.detail),
           cabys_code: p.cabys || null,
           cost_price: Number(p.unit_price) || 0,
           unit_price: Number(p.unit_price) || 0,
@@ -1318,6 +1328,15 @@ hacienda.post('/received/reconcile', async (c) => {
       }));
     }
 
+    // Código COMERCIAL del proveedor (CodigoComercial del XML) por línea → se usa
+    // como SKU del producto nuevo. Mapeado por detalle para no depender del front.
+    const codeByDetail = new Map<string, string>();
+    for (const l of linesFromDoc(d)) {
+      const det = String(l.detail ?? l.Detalle ?? '').trim().toLowerCase();
+      const code = String(l.code ?? l.Codigo ?? '').trim();
+      if (det && code) codeByDetail.set(det, code);
+    }
+
     // Proveedor: por cédula/nombre o se crea (resiliente a tax_id inexistente).
     let supplierId: string | null = null;
     if (d.issuer_id) {
@@ -1358,13 +1377,21 @@ hacienda.post('/received/reconcile', async (c) => {
       } else {
         // Producto NUEVO (el código NO coincide con ninguno interno): se CREA ahora
         // y se agrega a la orden de una vez (antes se difería y la orden quedaba vacía).
-        const { data: np, error: cErr } = await db.from('products').insert({
+        // SKU = código comercial del XML si viene; si no, autogenerado.
+        const xmlCode = codeByDetail.get(String(it.detail ?? '').trim().toLowerCase()) || '';
+        const baseProd = {
           tenant_id: tenantId,
           name: it.detail || 'Producto',
           cabys_code: it.cabys || null,
           cost_price: price, unit_price: price,
           stock_quantity: 0, tracks_stock: !noInventory,
-        }).select('id').single();
+        };
+        let ins = await db.from('products').insert({ ...baseProd, sku: xmlCode || genReceptionSku(it.detail) }).select('id').single();
+        // Si el código del XML choca con un SKU ya existente, reintenta con uno único.
+        if (ins.error && xmlCode && /duplicate|unique|sku/i.test(ins.error.message)) {
+          ins = await db.from('products').insert({ ...baseProd, sku: genReceptionSku(it.detail) }).select('id').single();
+        }
+        const np = ins.data; const cErr = ins.error;
         if (cErr) { messages.push(`⚠️ No se pudo crear "${it.detail}": ${cErr.message}`); continue; }
         productId = (np as any).id;
         created++;
