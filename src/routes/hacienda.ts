@@ -31,34 +31,41 @@ function linesFromDoc(d: any): any[] {
   return lines ?? [];
 }
 
-// Empareja líneas del comprobante con productos del tenant (por CABYS o nombre).
+// Empareja líneas del comprobante con productos del tenant (por CABYS, código/SKU
+// o nombre). Ignora los productos ocultos (soft-deleted).
 async function matchLines(tenantId: string, lines: any[]): Promise<any[]> {
-  const { data: products } = await db.from('products')
-    .select('id, name, cabys_code').eq('tenant_id', tenantId).limit(5000);
-  const byCabys = new Map<string, any>(), byName = new Map<string, any>();
-  for (const p of (products ?? []) as any[]) {
+  let sel: any = await db.from('products')
+    .select('id, name, cabys_code, sku').eq('tenant_id', tenantId).is('deleted_at', null).limit(5000);
+  if (sel.error && /deleted_at/.test(sel.error.message ?? '')) {   // migración 58 sin correr
+    sel = await db.from('products').select('id, name, cabys_code, sku').eq('tenant_id', tenantId).limit(5000);
+  }
+  const products = sel.data ?? [];
+  const byCabys = new Map<string, any>(), bySku = new Map<string, any>(), byName = new Map<string, any>();
+  for (const p of products as any[]) {
     if (p.cabys_code) byCabys.set(String(p.cabys_code), p);
+    if (p.sku) bySku.set(String(p.sku).trim().toLowerCase(), p);
     if (p.name) byName.set(String(p.name).trim().toLowerCase(), p);
   }
   return lines.map((l: any) => {
     const cabys = String(l.cabys ?? l.CodigoCABYS ?? '');
+    const code = String(l.code ?? l.Codigo ?? '').trim();
     const detail = String(l.detail ?? l.Detalle ?? '');
-    // Coincidencia PRIMERO por CÓDIGO CABYS (igual al producto interno); si no,
-    // por nombre. Si el código no coincide → se crea como nuevo.
-    const byCode = cabys ? byCabys.get(cabys) : null;
-    const byNombre = byCode ? null : byName.get(detail.trim().toLowerCase());
-    const match = byCode || byNombre || null;
+    // Coincidencia por: 1) CABYS, 2) código comercial == SKU interno, 3) nombre.
+    const mCabys = cabys ? byCabys.get(cabys) : null;
+    const mSku = !mCabys && code ? bySku.get(code.toLowerCase()) : null;
+    const mName = !mCabys && !mSku ? byName.get(detail.trim().toLowerCase()) : null;
+    const match = mCabys || mSku || mName || null;
     return {
       detail,
       quantity: Number(l.quantity ?? l.Cantidad ?? 1),
       unit_price: Number(l.unit_price ?? l.PrecioUnitario ?? 0),
       total: Number(l.total ?? l.subtotal ?? l.SubTotal ?? 0),
       cabys: cabys || null,
-      code: String(l.code ?? l.Codigo ?? '').trim() || null,   // código comercial del XML
+      code: code || null,   // código comercial del XML
       product_id: match?.id ?? null,
       product_name: match?.name ?? null,
       exists: !!match,
-      matched_by: byCode ? 'cabys' : byNombre ? 'name' : null,   // cómo coincidió
+      matched_by: mCabys ? 'cabys' : mSku ? 'sku' : mName ? 'name' : null,   // cómo coincidió
     };
   });
 }

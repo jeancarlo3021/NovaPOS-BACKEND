@@ -36,20 +36,29 @@ products.get('/', async (c) => {
     // Paginamos para traer TODOS los productos: Supabase corta en 1000 filas por
     // defecto, así que un catálogo grande (importado por Excel) no aparecía completo.
     const PAGE = 1000;
-    const all: any[] = [];
-    for (let from = 0; ; from += PAGE) {
-      let query = db.from('products').select('*').eq('tenant_id', tenantId).order('name')
-        .range(from, from + PAGE - 1);
-      if (search)   query = query.or(`name.ilike.%${search}%,sku.ilike.%${search}%,sku2.ilike.%${search}%`);
-      if (category) query = query.eq('category_id', category);
-      const { data, error } = await query;
-      if (error) throw new Error(error.message);
-      const chunk = data ?? [];
-      all.push(...chunk);
-      if (chunk.length < PAGE) break;   // última página
-    }
+    // Trae todo paginado; `filterDeleted` oculta los soft-deleted (deleted_at).
+    const fetchAll = async (filterDeleted: boolean): Promise<{ data?: any[]; error?: any }> => {
+      const all: any[] = [];
+      for (let from = 0; ; from += PAGE) {
+        let query = db.from('products').select('*').eq('tenant_id', tenantId).order('name')
+          .range(from, from + PAGE - 1);
+        if (filterDeleted) query = query.is('deleted_at', null);
+        if (search)   query = query.or(`name.ilike.%${search}%,sku.ilike.%${search}%,sku2.ilike.%${search}%`);
+        if (category) query = query.eq('category_id', category);
+        const { data, error } = await query;
+        if (error) return { error };
+        const chunk = data ?? [];
+        all.push(...chunk);
+        if (chunk.length < PAGE) break;   // última página
+      }
+      return { data: all };
+    };
+    // Si la columna deleted_at no existe aún (migración 58 sin correr), reintenta sin filtro.
+    let res = await fetchAll(true);
+    if (res.error && /deleted_at/.test(res.error.message ?? '')) res = await fetchAll(false);
+    if (res.error) throw new Error(res.error.message);
 
-    return ok(c, all);
+    return ok(c, res.data);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
@@ -104,9 +113,33 @@ products.delete('/:id', async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const { id } = c.req.param();
+    // Intento de borrado real.
     const { error } = await db.from('products').delete().eq('id', id).eq('tenant_id', tenantId);
-    if (error) throw new Error(error.message);
-    return ok(c, { deleted: true });
+    if (!error) return ok(c, { deleted: true });
+
+    // Si el producto tiene compras/ventas asociadas (FK), NO se puede borrar sin
+    // perder el historial → SOFT-DELETE: se OCULTA marcando deleted_at.
+    const fk = /foreign key|violates|purchase_items|invoice_items|_fkey|23503/i.test(error.message ?? '');
+    if (fk) {
+      // Se LIBERA el código (sku) al ocultar, para que se pueda volver a usar en un
+      // producto nuevo sin chocar con el constraint único. El original queda con un
+      // sufijo para conservar la referencia en el historial.
+      const { data: prod } = await db.from('products').select('sku, sku2').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+      const suffix = `#x${Date.now().toString(36)}`;
+      const freedSku = prod?.sku ? String(prod.sku).slice(0, 40) + suffix : `del${suffix}`;
+      const soft = await db.from('products')
+        .update({ deleted_at: new Date().toISOString(), sku: freedSku, sku2: null })
+        .eq('id', id).eq('tenant_id', tenantId);
+      if (soft.error) {
+        // La columna deleted_at no existe (migración 58 sin correr).
+        if (/deleted_at/.test(soft.error.message)) {
+          return fail(c, 'El producto tiene compras o ventas asociadas y no se puede eliminar. (Corré la migración 58 para poder ocultarlo.)', 409);
+        }
+        throw new Error(soft.error.message);
+      }
+      return ok(c, { deleted: true, soft: true });
+    }
+    throw new Error(error.message);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
