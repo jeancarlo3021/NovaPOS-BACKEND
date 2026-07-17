@@ -156,33 +156,52 @@ admin.get('/invoices-monthly', async (c) => {
     const periodStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
     const periodEnd   = new Date(now.getFullYear(), now.getMonth() + 1, 1).toISOString();
 
-    const { data, error } = await db
+    let sel: any = await db
       .from('invoices')
-      .select('tenant_id, status, issued_at, route_id')
+      .select('tenant_id, status, issued_at, route_id, document_type, fe_clave')
       .gte('issued_at', periodStart)
       .lt('issued_at', periodEnd);
-    if (error) throw new Error(error.message);
+    // Si las columnas fe_clave/document_type no existen aún, reintenta sin ellas.
+    if (sel.error && /fe_clave|document_type/.test(sel.error.message)) {
+      sel = await db.from('invoices').select('tenant_id, status, issued_at, route_id')
+        .gte('issued_at', periodStart).lt('issued_at', periodEnd);
+    }
+    if (sel.error) throw new Error(sel.error.message);
 
-    const counts: Record<string, number> = {};
+    // Un comprobante es ELECTRÓNICO solo si REALMENTE se emitió a Hacienda (tiene
+    // clave). NO basta con que el document_type sea electrónico: ese campo guarda
+    // lo que el usuario SELECCIONÓ, y si la emisión falla / el negocio no emite,
+    // queda como 'tiquete_electronico' sin clave → sería un tiquete CORRIENTE.
+    const isElectronic = (r: any) => !!r.fe_clave;
+
+    const electronic: Record<string, number> = {};
+    const corriente: Record<string, number> = {};
     const distCounts: Record<string, number> = {};
-    for (const row of data ?? []) {
-      if ((row as any).status === 'cancelled') continue;
-      const tid = (row as any).tenant_id as string;
-      if ((row as any).route_id) {
-        // Factura de distribución: cuenta SOLO en distribución, no en las corrientes.
+    for (const row of (sel.data ?? []) as any[]) {
+      if (row.status === 'cancelled') continue;
+      const tid = row.tenant_id as string;
+      if (row.route_id) {
+        // Factura de distribución: cuenta SOLO en distribución.
         distCounts[tid] = (distCounts[tid] ?? 0) + 1;
+      } else if (isElectronic(row)) {
+        electronic[tid] = (electronic[tid] ?? 0) + 1;
       } else {
-        // Factura corriente (POS).
-        counts[tid] = (counts[tid] ?? 0) + 1;
+        corriente[tid] = (corriente[tid] ?? 0) + 1;
       }
     }
-    const tids = new Set([...Object.keys(counts), ...Object.keys(distCounts)]);
-    const out = Array.from(tids).map((tenant_id) => ({
-      tenant_id,
-      count: counts[tenant_id] ?? 0,
-      distribution_count: distCounts[tenant_id] ?? 0,
-      period_start: periodStart, period_end: periodEnd,
-    }));
+    const tids = new Set([...Object.keys(electronic), ...Object.keys(corriente), ...Object.keys(distCounts)]);
+    const out = Array.from(tids).map((tenant_id) => {
+      const el = electronic[tenant_id] ?? 0;
+      const co = corriente[tenant_id] ?? 0;
+      return {
+        tenant_id,
+        count: el + co,                       // total no-distribución (compat)
+        electronic_count: el,                 // facturas/tiquetes electrónicos
+        corriente_count: co,                  // tiquetes corrientes
+        distribution_count: distCounts[tenant_id] ?? 0,
+        period_start: periodStart, period_end: periodEnd,
+      };
+    });
     return ok(c, out);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
@@ -1423,17 +1442,33 @@ admin.get('/fe-quotas', async (c) => {
           .eq('id', r.tenant_id).maybeSingle();
         start = (t as any)?.subscription?.started_at ?? (t as any)?.created_at ?? new Date().toISOString();
       }
-      const [{ count: docs }, { count: ncs }] = await Promise.all([
-        db.from('invoices').select('id', { count: 'exact', head: true })
-          .eq('tenant_id', r.tenant_id).not('fe_clave', 'is', null).gte('created_at', start),
-        db.from('invoices').select('id', { count: 'exact', head: true })
-          .eq('tenant_id', r.tenant_id).not('fe_nc_clave', 'is', null).gte('created_at', start),
-      ]);
-      const used = (docs ?? 0) + (ncs ?? 0);
+      // Traemos las filas con alguna clave de Hacienda y contamos cada comprobante
+      // (factura/tiquete + NC + ND), separando por PROVEEDOR. El proveedor se
+      // deduce del consecutivo: Alanube usa un ULID (con letras), Facturemos uno
+      // numérico. Así se puede aislar la parte de Alanube y compararla con su reporte.
+      let sel: any = await db.from('invoices')
+        .select('fe_consecutivo, fe_clave, fe_nc_clave, fe_nd_clave')
+        .eq('tenant_id', r.tenant_id).gte('created_at', start)
+        .or('fe_clave.not.is.null,fe_nc_clave.not.is.null,fe_nd_clave.not.is.null');
+      if (sel.error && /fe_nc_clave|fe_nd_clave/.test(sel.error.message)) {
+        sel = await db.from('invoices').select('fe_consecutivo, fe_clave')
+          .eq('tenant_id', r.tenant_id).gte('created_at', start).not('fe_clave', 'is', null);
+      }
+      let docs = 0, ncs = 0, nds = 0, usedAlanube = 0, usedFacturemos = 0;
+      for (const row of (sel.data ?? []) as any[]) {
+        const isAlanube = /[A-Za-z]/.test(String(row.fe_consecutivo ?? ''));
+        const inRow = (row.fe_clave ? 1 : 0) + (row.fe_nc_clave ? 1 : 0) + (row.fe_nd_clave ? 1 : 0);
+        if (row.fe_clave) docs++;
+        if (row.fe_nc_clave) ncs++;
+        if (row.fe_nd_clave) nds++;
+        if (isAlanube) usedAlanube += inRow; else usedFacturemos += inRow;
+      }
+      const used = docs + ncs + nds;
       const extraFee = Number(cfg.fe_extra_fee ?? 0);          // ₡ por comprobante extra (del plan)
       const overage = Math.max(0, used - included);            // comprobantes sobre la bolsa
       result[r.tenant_id] = {
         included, used, available: included - used,
+        used_alanube: usedAlanube, used_facturemos: usedFacturemos,
         overage, extra_fee: extraFee, extra_charge: overage * extraFee,
         quota_start: start,
         expires_at: new Date(new Date(start).getTime() + YEAR_MS).toISOString(),
@@ -1488,6 +1523,38 @@ admin.put('/tenants/:id/feature-overrides', async (c) => {
 // Para monitoreo del super-admin: ver emisiones y detectar errores rápido.
 // Filtros: ?tenant_id= (una empresa) · ?search= (cliente/consecutivo/clave/factura)
 //          · ?from= ?to= (fecha) · ?status= (error/accepted/sent/rejected)
+// GET /alanube/reports/emissions — reportes de Alanube (conteo de comprobantes
+// por empresa y por usuario en un rango de fechas). Usa el token del ambiente
+// (cuenta), así que devuelve TODAS las empresas de la cuenta = todos los tenants.
+admin.get('/alanube/reports/emissions', async (c) => {
+  try {
+    const env = c.req.query('env') === 'sandbox' ? 'sandbox' : 'production';
+    const from = c.req.query('from');
+    const until = c.req.query('until');
+    if (!from || !until) return fail(c, 'Indicá el rango de fechas (desde/hasta).', 422);
+    const legalStatus = c.req.query('legalStatus') || undefined;   // ACCEPTED/REJECTED
+    const status = c.req.query('status') || undefined;
+    const client = alanube.forEnv(env);
+    const [perCompany, byUser] = await Promise.allSettled([
+      client.reportEmissionsPerCompany(from, until, { legalStatus, status }),
+      client.reportEmissionsByUser(from, until, legalStatus || 'ACCEPTED'),
+    ]);
+    const unwrap = (r: PromiseSettledResult<any>) => {
+      if (r.status === 'fulfilled') return r.value?.data ?? r.value ?? [];
+      // 404 / "no data" = simplemente NO hubo emisiones en el rango → lista vacía,
+      // no es un error que mostrar.
+      const msg = r.reason instanceof Error ? r.reason.message : 'error';
+      const st = r.reason instanceof AlanubeError ? r.reason.status : 0;
+      if (st === 404 || /no data|not found|sin datos|no se encontr/i.test(msg)) return [];
+      return { error: msg };
+    };
+    return ok(c, { env, from, until, per_company: unwrap(perCompany), by_user: unwrap(byUser) });
+  } catch (err: any) {
+    const st = err instanceof AlanubeError ? err.status : 500;
+    return fail(c, err.message, st);
+  }
+});
+
 admin.get('/fe-log', async (c) => {
   try {
     const tenantId = c.req.query('tenant_id');
@@ -1559,18 +1626,29 @@ admin.get('/reception-log', async (c) => {
     const status = c.req.query('status');
     const limit = Math.min(Number(c.req.query('limit') || 500), 2000);
 
-    let q = db.from('received_documents')
+    // Filtros comunes (empresa, fechas, búsqueda) reutilizados por la lista y por
+    // los conteos de KPI.
+    const applyFilters = (q: any) => {
+      if (tenantId) q = q.eq('tenant_id', tenantId);
+      if (from)     q = q.gte('created_at', from);
+      if (to)       q = q.lte('created_at', endOfDay(to));
+      if (search) {
+        const s = search.replace(/[%,]/g, ' ');
+        q = q.or(`issuer_name.ilike.%${s}%,issuer_id.ilike.%${s}%,clave.ilike.%${s}%`);
+      }
+      return q;
+    };
+
+    let q = applyFilters(db.from('received_documents')
       .select('id, tenant_id, clave, issuer_name, issuer_id, document_type, doc_date, total, tax, ack_status, source, purchase_id, created_at')
       .order('created_at', { ascending: false })
-      .limit(limit);
-    if (tenantId) q = q.eq('tenant_id', tenantId);
-    if (status)   q = q.eq('ack_status', status);
-    if (from)     q = q.gte('created_at', from);
-    if (to)       q = q.lte('created_at', endOfDay(to));
-    if (search) {
-      const s = search.replace(/[%,]/g, ' ');
-      q = q.or(`issuer_name.ilike.%${s}%,issuer_id.ilike.%${s}%,clave.ilike.%${s}%`);
-    }
+      .limit(limit));
+    // La bitácora muestra SOLO comprobantes con respuesta FINAL de Hacienda
+    // (aceptados / rechazados / error); los pendientes se ocultan salvo que se
+    // filtre explícitamente por ese estado.
+    if (status) q = q.eq('ack_status', status);
+    else        q = q.neq('ack_status', 'pending');
+
     const { data, error } = await q;
     if (error) {
       if (/received_documents/.test(error.message)) return ok(c, { count: 0, accepted: 0, rejected: 0, pending: 0, rows: [] });
@@ -1584,11 +1662,21 @@ admin.get('/reception-log', async (c) => {
       const { data: ts } = await db.from('tenants').select('id, name').in('id', tenantIds);
       for (const t of (ts ?? []) as any[]) nameById.set(t.id, t.name);
     }
-    const st = (s: any) => String(s ?? '').toLowerCase();
-    const accepted = rows.filter(r => st(r.ack_status).includes('accept') || r.ack_status === '1').length;
-    const rejected = rows.filter(r => st(r.ack_status).includes('reject') || r.ack_status === '3').length;
+
+    // KPIs por estado (independientes del filtro de la lista) — conteos exactos.
+    const countBy = async (states: string[]) => {
+      const { count } = await applyFilters(
+        db.from('received_documents').select('id', { count: 'exact', head: true }),
+      ).in('ack_status', states);
+      return count ?? 0;
+    };
+    const [accepted, rejected, pending] = await Promise.all([
+      countBy(['accepted', '1']),
+      countBy(['rejected', 'error', '3']),
+      countBy(['pending']),
+    ]);
     return ok(c, {
-      count: rows.length, accepted, rejected, pending: rows.length - accepted - rejected,
+      count: accepted + rejected + pending, accepted, rejected, pending,
       rows: rows.map(r => ({ ...r, business_name: nameById.get(r.tenant_id) ?? '—' })),
     });
   } catch (err: any) { return fail(c, err.message, 500); }

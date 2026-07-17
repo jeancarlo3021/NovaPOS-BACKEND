@@ -165,8 +165,10 @@ reports.get('/taxes', async (c) => {
     const tenantId = c.get('tenantId');
     const from = c.req.query('from');
     const to   = endOfDay(c.req.query('to'));
+    // Ambiente: 'production' (default, excluye pruebas) · 'sandbox' (solo QA) · 'all'.
+    const environment = String(c.req.query('environment') || 'production');
 
-    const sel = 'id, invoice_number, customer_name, total, subtotal, tax_amount, issued_at, status, fe_clave, fe_nc_clave';
+    const sel = 'id, invoice_number, customer_name, total, subtotal, tax_amount, issued_at, status, fe_clave, fe_nc_clave, fe_environment';
     // Dos consultas (más robusto que un .or con is-not-null):
     //  1) Ventas VÁLIDAS (no anuladas).
     //  2) Facturas con NOTA DE CRÉDITO (aunque estén anuladas).
@@ -174,7 +176,26 @@ reports.get('/taxes', async (c) => {
     let qNc     = db.from('invoices').select(sel).eq('tenant_id', tenantId).not('fe_nc_clave', 'is', null);
     if (from) { qVentas = qVentas.gte('issued_at', from); qNc = qNc.gte('issued_at', from); }
     if (to)   { qVentas = qVentas.lte('issued_at', to);   qNc = qNc.lte('issued_at', to); }
-    const [rVentas, rNc] = await Promise.all([qVentas, qNc]);
+    // Filtro por ambiente. 'production' incluye las filas SIN ambiente (ventas
+    // corrientes y facturas históricas = reales). 'sandbox' solo las de prueba.
+    if (environment === 'sandbox') {
+      qVentas = qVentas.eq('fe_environment', 'sandbox');
+      qNc     = qNc.eq('fe_environment', 'sandbox');
+    } else if (environment !== 'all') {   // production (default)
+      qVentas = qVentas.or('fe_environment.is.null,fe_environment.neq.sandbox');
+      qNc     = qNc.or('fe_environment.is.null,fe_environment.neq.sandbox');
+    }
+    let [rVentas, rNc]: [any, any] = await Promise.all([qVentas, qNc]);
+    // Si la columna fe_environment aún no existe (migración 57 sin correr), reintenta
+    // sin el filtro/columna de ambiente (muestra todo).
+    if ((rVentas.error && /fe_environment/.test(rVentas.error.message)) || (rNc.error && /fe_environment/.test(rNc.error.message))) {
+      const sel2 = 'id, invoice_number, customer_name, total, subtotal, tax_amount, issued_at, status, fe_clave, fe_nc_clave';
+      let v = db.from('invoices').select(sel2).eq('tenant_id', tenantId).neq('status', 'cancelled');
+      let n = db.from('invoices').select(sel2).eq('tenant_id', tenantId).not('fe_nc_clave', 'is', null);
+      if (from) { v = v.gte('issued_at', from); n = n.gte('issued_at', from); }
+      if (to)   { v = v.lte('issued_at', to);   n = n.lte('issued_at', to); }
+      [rVentas, rNc] = await Promise.all([v, n]);
+    }
     if (rVentas.error) throw new Error(rVentas.error.message);
     if (rNc.error)     throw new Error(rNc.error.message);
 

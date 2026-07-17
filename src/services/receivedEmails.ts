@@ -146,14 +146,19 @@ export function parseHaciendaXml(xml: string): ParsedDoc | null {
   };
 }
 
+// Cédula normalizada a SOLO dígitos (para comparar sin importar guiones/ceros).
+const cedulaDigits = (v: any): string => str(v).replace(/\D/g, '');
+
 // ── Mapeo receptor → tenant ──────────────────────────────────────────────────
 // Busca el tenant cuya config de FE tenga `emisor_identification` == cédula del
-// receptor. Cachea todas las configs en una sola query por corrida.
+// receptor (comparando solo dígitos). Cachea todas las configs en una query.
+// SEGURIDAD: un comprobante SOLO se asigna al tenant cuya cédula coincide con la
+// del RECEPTOR del XML; si ninguna coincide, no se guarda (nunca a otro negocio).
 async function loadTenantByReceiverIndex(): Promise<Map<string, string>> {
   const idx = new Map<string, string>();
   const { data } = await db.from('settings').select('tenant_id, config').eq('type', 'electronic-invoice');
   for (const row of (data ?? []) as any[]) {
-    const ced = str(row.config?.emisor_identification);
+    const ced = cedulaDigits(row.config?.emisor_identification);
     if (ced) idx.set(ced, row.tenant_id);
   }
   return idx;
@@ -169,7 +174,7 @@ async function processXml(
   const doc = parseHaciendaXml(xml);
   if (!doc || !doc.clave) return 'skip';
 
-  const tenantId = tenantIndex.get(doc.receiver.id);
+  const tenantId = tenantIndex.get(cedulaDigits(doc.receiver.id));
   if (!tenantId) return 'no-tenant';       // ninguna empresa con esa cédula de receptor
 
   // ¿Ya está en la bandeja? (unique tenant_id + clave)

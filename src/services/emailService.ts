@@ -22,13 +22,19 @@ export async function sendEmail(input: SendEmailInput): Promise<{ id: string }> 
   if (!resend) {
     throw new Error('Email no configurado: falta RESEND_API_KEY en el servidor.');
   }
+  // Resend adjunta de forma confiable con Buffer; nuestro `content` viene en
+  // base64, así que lo decodificamos (evita adjuntos vacíos/corruptos).
+  const attachments = input.attachments?.map(a => ({
+    filename: a.filename,
+    content: Buffer.from(a.content, 'base64'),
+  }));
   const { data, error } = await resend.emails.send({
     from: FROM,
     to: input.to,
     subject: input.subject,
     html: input.html,
     replyTo: input.replyTo,
-    attachments: input.attachments,
+    attachments,
   });
   if (error) throw new Error(error.message || 'Error al enviar el correo');
   return { id: data?.id ?? '' };

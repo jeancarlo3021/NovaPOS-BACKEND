@@ -131,6 +131,12 @@ function clientFor(env: AlanubeEnv) {
     // y GET /companies/{id}.
     getAssociated: (limit = 100) => f(`/companies/associated?limit=${limit}`, { method: 'GET' }),
     getCompany: (id: string) => f(`/companies/${id}`, { method: 'GET' }),
+    // PDF del comprobante en BASE64 (endpoint dedicado). documentType:
+    // invoice|ticket|credit-note|debit-note|purchase-invoice|export-invoice.
+    getDocumentPdf: (idDocument: string, documentType: string, idCompany: string) => {
+      const qs = new URLSearchParams({ idDocument, documentType, idCompany });
+      return f(`/document-files/pdf?${qs.toString()}`, { method: 'GET' });
+    },
     createCompany: (payload: Record<string, any>) =>
       f('/companies', { method: 'POST', body: JSON.stringify(payload) }),
     updateCompany: async (id: string, payload: Record<string, any>) => {
@@ -177,6 +183,19 @@ function clientFor(env: AlanubeEnv) {
     getReceiverMessage: (id: string, companyId?: string) => {
       const headers = companyId ? { idCompany: companyId, 'X-Company-Id': companyId } : undefined;
       return f(`/receiver-messages/${id}`, { method: 'GET', headers });
+    },
+    // ── Reportes de emisión (a nivel de cuenta/token) ──────────────────────────
+    // Devuelven el CONTEO de documentos por tipo (facturas, tiquetes, notas, etc.)
+    // en un rango de fechas. dateFrom/dateUntil son OBLIGATORIOS (YYYY-MM-DD).
+    reportEmissionsPerCompany: (from: string, until: string, opts?: { legalStatus?: string; status?: string }) => {
+      const qs = new URLSearchParams({ dateFrom: from, dateUntil: until });
+      if (opts?.legalStatus) qs.set('legalStatus', opts.legalStatus);
+      if (opts?.status) qs.set('status', opts.status);
+      return f(`/reports/emissions-per-company?${qs.toString()}`, { method: 'GET' });
+    },
+    reportEmissionsByUser: (from: string, until: string, legalStatus: string) => {
+      const qs = new URLSearchParams({ dateFrom: from, dateUntil: until, legalStatus });
+      return f(`/reports/emissions-by-user?${qs.toString()}`, { method: 'GET' });
     },
   };
 }

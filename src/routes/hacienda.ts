@@ -153,21 +153,28 @@ async function computeFeQuota(tenantId: string) {
     startISO = (t as any)?.subscription?.started_at ?? (t as any)?.created_at ?? new Date().toISOString();
   }
 
-  // Comprobantes emitidos DESDE el inicio de la bolsa vigente.
-  const { count: usedDocs } = await db.from('invoices')
-    .select('id', { count: 'exact', head: true }).eq('tenant_id', tenantId)
-    .not('fe_clave', 'is', null).gte('created_at', startISO);
-  const { count: usedNc } = await db.from('invoices')
-    .select('id', { count: 'exact', head: true }).eq('tenant_id', tenantId)
-    .not('fe_nc_clave', 'is', null).gte('created_at', startISO);
+  // Comprobantes emitidos DESDE el inicio de la bolsa vigente. Cada CLAVE de
+  // Hacienda cuenta 1: factura/tiquete (fe_clave) + nota de crédito (fe_nc_clave)
+  // + nota de débito (fe_nd_clave). Una misma fila puede tener varias (ej. factura
+  // + su NC), y cada una es un comprobante distinto.
+  const countByClave = async (col: 'fe_clave' | 'fe_nc_clave' | 'fe_nd_clave') => {
+    const { count, error } = await db.from('invoices')
+      .select('id', { count: 'exact', head: true }).eq('tenant_id', tenantId)
+      .not(col, 'is', null).gte('created_at', startISO);
+    if (error) return 0;   // columna aún no existe (migración pendiente) → 0
+    return count ?? 0;
+  };
+  const [usedDocs, usedNc, usedNd] = await Promise.all([
+    countByClave('fe_clave'), countByClave('fe_nc_clave'), countByClave('fe_nd_clave'),
+  ]);
 
-  const used = (usedDocs ?? 0) + (usedNc ?? 0);             // facturas + tiquetes + NC
+  const used = usedDocs + usedNc + usedNd;                  // facturas + tiquetes + NC + ND
   const available = included > 0 ? included - used : null;  // null = ilimitado
   const overage = included > 0 ? Math.max(0, used - included) : 0;
 
   return {
     included, extra_fee: extraFee, quota_start: startISO, months_elapsed: 1,
-    used, used_docs: usedDocs ?? 0, used_nc: usedNc ?? 0,
+    used, used_docs: usedDocs, used_nc: usedNc, used_nd: usedNd,
     available,
     overage,
     extra_charge: extraFee * overage,
@@ -571,6 +578,7 @@ hacienda.post('/emit', async (c) => {
         fe_consecutivo: docId,              // id ULID de Alanube (para consultar estado)
         fe_status: 'sent',
         fe_situacion: '1',
+        fe_environment: env,                // ambiente (production/sandbox) del comprobante
         fe_error: null,
         fe_request: doc,                    // JSON enviado (para la bitácora)
         fe_response: resp,                  // respuesta de Alanube/Hacienda
@@ -616,6 +624,7 @@ hacienda.post('/emit', async (c) => {
       fe_consecutivo: consec,
       fe_status: 'sent',
       fe_situacion: '1',
+      fe_environment: env,
       document_type: tipoDoc === '01' ? 'factura_electronica' : 'tiquete_electronico',
       sale_condition: (inv as any).payment_method === 'credit' ? '02' : '01',
       updated_at: new Date().toISOString(),
@@ -1461,27 +1470,53 @@ hacienda.post('/received/upload', async (c) => {
 // body: { invoice_id, email }
 // Baja de Alanube el XML del comprobante, el XML de respuesta de Hacienda y el
 // PDF, y arma los adjuntos del correo. Tolerante a fallos (devuelve lo que haya).
-async function alanubeAttachments(cfg: any, docId: string | null | undefined, kind: any, clave: string): Promise<Array<{ filename: string; content: string }>> {
+// Baja el contenido de una URL (XML/PDF que Alanube entrega como enlace) y lo
+// devuelve en base64. null si falla.
+async function fetchToBase64(url: string): Promise<string | null> {
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    const buf = Buffer.from(await r.arrayBuffer());
+    return buf.length ? buf.toString('base64') : null;
+  } catch { return null; }
+}
+
+// Convierte un valor del comprobante a base64: URL → se descarga; XML crudo →
+// base64; ya-base64 → tal cual.
+async function toB64(v: any): Promise<string | null> {
+  if (!v || typeof v !== 'string') return null;
+  const s = v.trim();
+  if (!s) return null;
+  if (/^https?:\/\//i.test(s)) return await fetchToBase64(s);
+  return s.startsWith('<') ? Buffer.from(s, 'utf8').toString('base64') : s;
+}
+
+async function alanubeAttachments(cfg: any, docId: string | null | undefined, kind: any, clave: string, companyId?: string | null): Promise<Array<{ filename: string; content: string }>> {
   const out: Array<{ filename: string; content: string }> = [];
   if (!docId) return out;
+  const client = alanube.forEnv(cfg.environment);
+  const base = String(clave || docId);
+
+  // 1) XML original + XML de respuesta de Hacienda. CRI los devuelve como URL en
+  //    los campos xml / xmlHacienda (separador de guiones). Hay que descargarlos.
   try {
-    const resp: any = await alanube.forEnv(cfg.environment).getDocument(String(docId), { kind, documents: 'xml,xmlHacienda,pdf' });
+    const resp: any = await client.getDocument(String(docId), { kind, documents: 'xml-xmlHacienda' });
     const d = resp?.invoice ?? resp?.ticket ?? resp?.creditNote ?? resp?.debitNote ?? resp?.document ?? resp?.data ?? resp;
-    const base = String(clave || docId);
-    // Convierte a base64: XML crudo → base64; URL → se ignora; base64 → tal cual.
-    const asB64 = (v: any): string | null => {
-      if (!v || typeof v !== 'string') return null;
-      const s = v.trim();
-      if (!s || /^https?:\/\//i.test(s)) return null;
-      return s.startsWith('<') ? Buffer.from(s, 'utf8').toString('base64') : s;
-    };
-    const xml = asB64(d?.xml ?? deepFind(resp, /^xml$/i, 8_000_000));
-    const xmlHac = asB64(d?.xmlHacienda ?? deepFind(resp, /xmlhacienda/i, 8_000_000));
-    const pdf = asB64(d?.pdf ?? deepFind(resp, /^pdf$/i, 12_000_000));
+    const xml = await toB64(d?.xml ?? deepFind(resp, /^xml$/i, 8_000_000));
+    const xmlHac = await toB64(d?.xmlHacienda ?? deepFind(resp, /xmlhacienda/i, 8_000_000));
     if (xml) out.push({ filename: `${base}.xml`, content: xml });
     if (xmlHac) out.push({ filename: `${base}-respuesta-hacienda.xml`, content: xmlHac });
-    if (pdf) out.push({ filename: `${base}.pdf`, content: pdf });
-  } catch (e: any) { console.warn('[FE email] no se pudieron bajar adjuntos:', e?.message); }
+  } catch (e: any) { console.warn('[FE email] XML no disponible:', e?.message); }
+
+  // 2) PDF por el endpoint dedicado (base64). Requiere idCompany.
+  try {
+    if (companyId) {
+      const r: any = await client.getDocumentPdf(String(docId), String(kind), String(companyId));
+      const pdf = await toB64(r?.pdf ?? deepFind(r, /^pdf$/i, 12_000_000));
+      if (pdf) out.push({ filename: `${base}.pdf`, content: pdf });
+    }
+  } catch (e: any) { console.warn('[FE email] PDF no disponible:', e?.message); }
+
   return out;
 }
 
@@ -1525,7 +1560,8 @@ export async function autoSendComprobanteToCustomer(tenantId: string, invoiceId:
     }
     if (!email) return;   // sin correo del cliente, no se envía
     const atts = cfg.fe_provider === 'alanube'
-      ? await alanubeAttachments(cfg, (inv as any).fe_consecutivo, feKindOf((inv as any).document_type), (inv as any).fe_clave)
+      ? await alanubeAttachments(cfg, (inv as any).fe_consecutivo, feKindOf((inv as any).document_type), (inv as any).fe_clave,
+          (String(cfg.environment ?? 'production') === 'sandbox' ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id)
       : undefined;
     await sendComprobanteEmail(email, inv as any, atts);
     await db.from('invoices').update({ fe_emailed: true }).eq('id', invoiceId).eq('tenant_id', tenantId).then(() => {}, () => {});
@@ -1547,10 +1583,36 @@ hacienda.post('/resend-email', async (c) => {
     // Con Alanube, bajamos XML + respuesta de Hacienda + PDF para adjuntar.
     const cfg = await loadFEConfig(tenantId);
     const attachments = cfg.fe_provider === 'alanube'
-      ? await alanubeAttachments(cfg, (inv as any).fe_consecutivo, feKindOf((inv as any).document_type), (inv as any).fe_clave)
+      ? await alanubeAttachments(cfg, (inv as any).fe_consecutivo, feKindOf((inv as any).document_type), (inv as any).fe_clave,
+          (String(cfg.environment ?? 'production') === 'sandbox' ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id)
       : undefined;
     await sendComprobanteEmail(email, inv as any, attachments);
     return ok(c, { ok: true });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// GET /fe-pdf/:id — devuelve el PDF que genera ALANUBE (en base64) para abrirlo
+// tal cual desde el botón "PDF". Solo aplica a comprobantes emitidos con Alanube.
+hacienda.get('/fe-pdf/:id', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { id } = c.req.param();
+    const { data: inv } = await db.from('invoices')
+      .select('fe_consecutivo, fe_clave, document_type')
+      .eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+    if (!inv) return fail(c, 'Factura no encontrada', 404);
+    const docId = (inv as any).fe_consecutivo;
+    if (!docId) return fail(c, 'Este comprobante no tiene documento en Alanube', 404);
+
+    const cfg = await loadFEConfig(tenantId);
+    const companyId = (String(cfg.environment ?? 'production') === 'sandbox'
+      ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id;
+    if (!companyId) return fail(c, 'La empresa no está registrada en Alanube', 422);
+    const resp: any = await alanube.forEnv(cfg.environment)
+      .getDocumentPdf(String(docId), feKindOf((inv as any).document_type), String(companyId));
+    const pdf = await toB64(resp?.pdf ?? deepFind(resp, /^pdf$/i, 12_000_000));
+    if (!pdf) return fail(c, 'PDF no disponible en Alanube todavía', 404);
+    return ok(c, { pdf, filename: `${(inv as any).fe_clave || id}.pdf` });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
@@ -1703,7 +1765,7 @@ hacienda.post('/emit-direct', async (c) => {
         const clave = docObj?.key ?? docObj?.clave ?? deepFind(resp, /(clave|^key$)/i, 40) ?? null;
         const alanubeStatus = docObj?.status ?? null;
         await db.from('invoices').update({
-          fe_clave: clave ?? docId, fe_consecutivo: docId, fe_status: 'sent', fe_situacion: '1', fe_error: null,
+          fe_clave: clave ?? docId, fe_consecutivo: docId, fe_status: 'sent', fe_situacion: '1', fe_environment: env, fe_error: null,
           fe_request: doc, fe_response: resp,
           updated_at: new Date().toISOString(),
         }).eq('id', inv.id).eq('tenant_id', tenantId);
@@ -1725,7 +1787,7 @@ hacienda.post('/emit-direct', async (c) => {
       const clave = typeof resp === 'string' ? resp : (resp?.Clave ?? resp?.clave ?? null);
       const consec = typeof resp === 'object' ? (resp?.Consecutivo ?? resp?.NumeroConsecutivo ?? null) : null;
       await db.from('invoices').update({
-        fe_clave: clave, fe_consecutivo: consec, fe_status: 'sent', fe_situacion: '1',
+        fe_clave: clave, fe_consecutivo: consec, fe_status: 'sent', fe_situacion: '1', fe_environment: env,
         updated_at: new Date().toISOString(),
       }).eq('id', inv.id).eq('tenant_id', tenantId);
       return ok(c, { ok: true, invoice_id: inv.id, invoice_number: inv.invoice_number, clave, consecutivo: consec, tipo: tipoDoc });
