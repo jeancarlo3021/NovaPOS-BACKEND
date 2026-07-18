@@ -296,6 +296,31 @@ function friendlyFEError(raw: string): string {
   return m;
 }
 
+/** Traduce los errores de validación de Alanube (400) a mensajes claros. */
+function friendlyAlanubeError(raw: string): string {
+  const s = String(raw || '');
+  // Detalle después de "Alanube respondió 400 — ..." (o el mensaje entero).
+  const detail = s.replace(/^alanube respondi[oó]\s*\d+\s*[—:-]\s*/i, '').trim();
+  const l = detail.toLowerCase();
+  const map: Array<[RegExp, string]> = [
+    [/otrassenas.*at least 5|otrassenas.*5 characters/i, 'La dirección del cliente (otras señas) debe tener al menos 5 caracteres. Completá la dirección del cliente.'],
+    [/receiver\.address|address\.(province|canton|district)/i, 'La dirección del cliente es inválida (provincia/cantón/distrito/señas). Revisá los datos del cliente.'],
+    [/receiver\.identification|identificationnumber|identificationtype/i, 'La identificación del cliente (cédula) no corresponde al tipo seleccionado (física/jurídica/DIMEX).'],
+    [/receiver\.email|receiver\.name/i, 'Faltan o son inválidos los datos del cliente (nombre o correo).'],
+    [/sendereconomicactivity|economicactivity/i, 'La actividad económica del emisor es inválida o falta en los Datos de FE.'],
+    [/company not found|sender\.id|main company/i, 'La empresa emisora no está registrada en Alanube en este ambiente. Volvé a crear/activar la empresa.'],
+    [/totaltaxbreakdown|totals\.|totaltaxable|totaltax/i, 'Hay un descuadre en los totales del comprobante. Revisá precios e IVA de las líneas.'],
+    [/cabys|itemdetails\.\d+\.code/i, 'Un producto tiene un código CABYS inválido o vacío. Asignáselo en Inventario.'],
+    [/unitmeasurement/i, 'La unidad de medida de un producto no es válida para Hacienda.'],
+    [/amount.*not equal|taxablebase.*fee|amounttotalline/i, 'Los montos de una línea no cuadran (base × IVA). Revisá el precio o la tarifa del producto.'],
+    [/consecutiv|numberofdocument/i, 'Problema con la numeración consecutiva del comprobante.'],
+    [/at least (\d+) characters/i, 'Un dato del comprobante es más corto de lo permitido.'],
+    [/invalid credentials|unauthorized|token/i, 'Error de autenticación con Alanube. Revisá el token del ambiente.'],
+  ];
+  for (const [re, friendly] of map) if (re.test(l)) return `${friendly}\n(Detalle técnico: ${detail})`;
+  return detail ? `Alanube rechazó el comprobante: ${detail}` : s;
+}
+
 /** Mapea el Ind_estado de Hacienda a nuestro fe_status. */
 function mapEstado(ind: string): string {
   const s = String(ind ?? '').toLowerCase();
@@ -590,7 +615,7 @@ hacienda.post('/emit', async (c) => {
       } catch (e: any) {
         // Guardar el JSON enviado para poder verlo en la bitácora aunque falle.
         await db.from('invoices').update({ fe_request: doc }).eq('id', invoice_id).eq('tenant_id', tenantId).then(() => {}, () => {});
-        return await failFE(e instanceof AlanubeError ? e.message : (e?.message ?? 'Error emitiendo con Alanube'));
+        return await failFE(e instanceof AlanubeError ? friendlyAlanubeError(e.message) : (e?.message ?? 'Error emitiendo con Alanube'));
       }
       // La respuesta viene envuelta según el tipo: { ticket|invoice|creditNote: {
       //   id (ULID), key (clave 50 díg de Hacienda), status } }.
@@ -757,7 +782,7 @@ hacienda.post('/credit-note', async (c) => {
       try {
         resp = await alanube.forEnv(cfg.environment).emitDocument('credit-note', doc, cfg.alanube_company_id);
       } catch (e: any) {
-        return fail(c, e instanceof AlanubeError ? e.message : (e?.message ?? 'Error emitiendo NC con Alanube'), 422);
+        return fail(c, e instanceof AlanubeError ? friendlyAlanubeError(e.message) : (e?.message ?? 'Error emitiendo NC con Alanube'), 422);
       }
       const docObj = resp?.creditNote ?? resp?.document ?? resp?.data ?? resp;
       const ncId = docObj?.id ?? deepFind(resp, /(^id$|_id$|documentId$)/i, 10) ?? null;
@@ -894,7 +919,7 @@ hacienda.post('/debit-note', async (c) => {
       try {
         resp = await alanube.forEnv(cfg.environment).emitDocument('debit-note', doc, cfg.alanube_company_id);
       } catch (e: any) {
-        return fail(c, e instanceof AlanubeError ? e.message : (e?.message ?? 'Error emitiendo ND con Alanube'), 422);
+        return fail(c, e instanceof AlanubeError ? friendlyAlanubeError(e.message) : (e?.message ?? 'Error emitiendo ND con Alanube'), 422);
       }
       const docObj = resp?.debitNote ?? resp?.document ?? resp?.data ?? resp;
       const ndId = docObj?.id ?? deepFind(resp, /(^id$|_id$|documentId$)/i, 10) ?? null;
@@ -962,7 +987,7 @@ hacienda.get('/invoices', async (c) => {
       if (to)   q = q.lte('issued_at', endOfDay(to));
       return q;
     };
-    const base = 'id, invoice_number, customer_name, total, issued_at, document_type, payment_method, status, fe_clave, fe_consecutivo, fe_status, fe_error, fe_emailed';
+    const base = 'id, invoice_number, customer_name, total, issued_at, created_at, document_type, payment_method, status, fe_clave, fe_consecutivo, fe_status, fe_error, fe_emailed';
     // Intento con columnas de NC y ND; si alguna no existe (migración sin correr),
     // reintentamos con menos columnas.
     const baseNoEmail = base.replace(', fe_emailed', '');
@@ -1789,7 +1814,9 @@ hacienda.post('/emit-direct', async (c) => {
         customer_name: b.customer?.name ?? null,
         document_type: docType,
         notes: b.notes ?? null,
-        issued_at: b.issued_at ?? new Date().toISOString(),
+        // Hora de Costa Rica como "wall clock" (sin zona), igual que el POS, para
+        // que la bitácora/FE facturas la muestren en hora CR (no UTC +6h).
+        issued_at: b.issued_at ?? new Date(Date.now() - 6 * 3600 * 1000).toISOString().replace('Z', ''),
       }).select().single();
       if (!res.error) { inv = res.data; break; }
       invErr = res.error;
@@ -1840,10 +1867,13 @@ hacienda.post('/emit-direct', async (c) => {
           fe_request: doc, fe_response: resp,
           updated_at: new Date().toISOString(),
         }).eq('id', inv.id).eq('tenant_id', tenantId);
+        // Consecutivo REAL de Hacienda (20 díg) embebido en la clave (pos 22-41).
+        const claveDig = String(clave ?? '').replace(/\D/g, '');
+        const consecutivo = claveDig.length === 50 ? claveDig.slice(21, 41) : null;
         // El correo al cliente sale automáticamente al ACEPTARSE (dos XML + PDF).
-        return ok(c, { ok: true, provider: 'alanube', invoice_id: inv.id, invoice_number: inv.invoice_number, clave, alanube_doc_id: docId, alanube_status: alanubeStatus, tipo: tipoDoc });
+        return ok(c, { ok: true, provider: 'alanube', invoice_id: inv.id, invoice_number: inv.invoice_number, clave, consecutivo, alanube_doc_id: docId, alanube_status: alanubeStatus, tipo: tipoDoc });
       } catch (emitErr: any) {
-        const msg = emitErr instanceof AlanubeError ? emitErr.message : (emitErr?.message ?? 'Error emitiendo con Alanube');
+        const msg = emitErr instanceof AlanubeError ? friendlyAlanubeError(emitErr.message) : (emitErr?.message ?? 'Error emitiendo con Alanube');
         await db.from('invoices').update({ fe_status: 'error', fe_error: msg }).eq('id', inv.id).eq('tenant_id', tenantId);
         return fail(c, msg, 422);
       }

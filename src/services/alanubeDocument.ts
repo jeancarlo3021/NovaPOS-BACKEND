@@ -216,11 +216,15 @@ export function buildAlanubeDocument(
     }
     if (receptor.email) rec.email = receptor.email;
     if (receptor.province_code) {
+      // Alanube/Hacienda exige `otrasSenas` con AL MENOS 5 caracteres cuando se
+      // envía la dirección. Si el cliente no tiene detalle, se usa un valor por
+      // defecto válido en vez de dejarlo vacío (que da error 400).
+      const otras = String(receptor.address ?? '').trim();
       rec.address = {
         province: prov1(receptor.province_code),
         canton: pad2(receptor.canton_code),
         district: pad2(receptor.district_code),
-        otrasSenas: receptor.address ?? '',
+        otrasSenas: otras.length >= 5 ? otras : 'Sin otras señas',
       };
     }
     payload.receiver = rec;

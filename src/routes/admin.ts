@@ -152,19 +152,34 @@ admin.get('/users-lite', async (c) => {
 // Respuesta: [{ tenant_id, count, period_start, period_end }]
 admin.get('/invoices-monthly', async (c) => {
   try {
-    const now = new Date();
-    const periodStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
-    const periodEnd   = new Date(now.getFullYear(), now.getMonth() + 1, 1).toISOString();
+    // Mes actual en HORA COSTA RICA (UTC-6, sin horario de verano): del día 1 a las
+    // 00:00 CR hasta el 1° del mes siguiente 00:00 CR. Como issued_at se guarda en
+    // UTC, 00:00 CR = 06:00 UTC.
+    const crNow = new Date(Date.now() - 6 * 3600 * 1000);
+    const y = crNow.getUTCFullYear(), m = crNow.getUTCMonth();
+    const periodStart = new Date(Date.UTC(y, m, 1, 6, 0, 0)).toISOString();
+    const periodEnd   = new Date(Date.UTC(y, m + 1, 1, 6, 0, 0)).toISOString();
 
-    let sel: any = await db
-      .from('invoices')
-      .select('tenant_id, status, issued_at, route_id, document_type, fe_clave, fe_status')
-      .gte('issued_at', periodStart)
-      .lt('issued_at', periodEnd);
+    // ⚠️ Paginado: Supabase devuelve máx 1000 filas por query. Con muchos
+    // comprobantes en el mes se truncaba y SUBCONTABA. Traemos TODO por páginas.
+    const PAGE = 1000;
+    const fetchAll = async (cols: string): Promise<{ data?: any[]; error?: any }> => {
+      const all: any[] = [];
+      for (let from = 0; ; from += PAGE) {
+        const { data, error } = await db.from('invoices').select(cols)
+          .gte('issued_at', periodStart).lt('issued_at', periodEnd)
+          .order('id', { ascending: true }).range(from, from + PAGE - 1);
+        if (error) return { error };
+        const chunk = data ?? [];
+        all.push(...chunk);
+        if (chunk.length < PAGE) break;   // última página
+      }
+      return { data: all };
+    };
+    let sel = await fetchAll('tenant_id, status, issued_at, route_id, document_type, fe_clave, fe_status');
     // Si las columnas fe_clave/document_type no existen aún, reintenta sin ellas.
-    if (sel.error && /fe_clave|document_type|fe_status/.test(sel.error.message)) {
-      sel = await db.from('invoices').select('tenant_id, status, issued_at, route_id')
-        .gte('issued_at', periodStart).lt('issued_at', periodEnd);
+    if (sel.error && /fe_clave|document_type|fe_status/.test(sel.error.message ?? '')) {
+      sel = await fetchAll('tenant_id, status, issued_at, route_id');
     }
     if (sel.error) throw new Error(sel.error.message);
 
@@ -174,28 +189,31 @@ admin.get('/invoices-monthly', async (c) => {
     // rechazado no es válido → cuenta como corriente (la venta igual ocurrió).
     const isElectronic = (r: any) => !!r.fe_clave && r.fe_status !== 'rejected' && r.fe_status !== 'error';
 
+    const total: Record<string, number> = {};   // facturas del mes SIN anuladas NI distribución
     const electronic: Record<string, number> = {};
     const corriente: Record<string, number> = {};
     const distCounts: Record<string, number> = {};
     for (const row of (sel.data ?? []) as any[]) {
-      if (row.status === 'cancelled') continue;
+      if (row.status === 'cancelled') continue;   // anuladas NO cuentan
       const tid = row.tenant_id as string;
-      if (row.route_id) {
-        // Factura de distribución: cuenta SOLO en distribución.
+      if (row.route_id) {                         // distribución va aparte, NO en el total
         distCounts[tid] = (distCounts[tid] ?? 0) + 1;
-      } else if (isElectronic(row)) {
+        continue;
+      }
+      total[tid] = (total[tid] ?? 0) + 1;         // solo no-anuladas y no-distribución
+      if (isElectronic(row)) {
         electronic[tid] = (electronic[tid] ?? 0) + 1;
       } else {
         corriente[tid] = (corriente[tid] ?? 0) + 1;
       }
     }
-    const tids = new Set([...Object.keys(electronic), ...Object.keys(corriente), ...Object.keys(distCounts)]);
+    const tids = new Set([...Object.keys(total), ...Object.keys(electronic), ...Object.keys(corriente), ...Object.keys(distCounts)]);
     const out = Array.from(tids).map((tenant_id) => {
       const el = electronic[tenant_id] ?? 0;
       const co = corriente[tenant_id] ?? 0;
       return {
         tenant_id,
-        count: el + co,                       // total no-distribución (compat)
+        count: total[tenant_id] ?? 0,         // TODAS las facturas del mes (CR)
         electronic_count: el,                 // facturas/tiquetes electrónicos
         corriente_count: co,                  // tiquetes corrientes
         distribution_count: distCounts[tenant_id] ?? 0,

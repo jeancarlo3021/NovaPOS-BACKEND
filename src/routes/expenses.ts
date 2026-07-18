@@ -153,9 +153,14 @@ expenses.get('/categories', async (c) => {
         tenant_id: tenantId, name: cat.name, color: cat.color, icon: cat.icon,
         general_category_id: cat.id, is_general: true,
       }));
-      const { data: seeded } = await db.from('expense_categories')
-        .insert(rows).select();
-      return ok(c, seeded ?? []);
+      let seededRes = await db.from('expense_categories').insert(rows).select();
+      // Si la columna general_category_id sigue siendo UUID (migración 59 sin
+      // correr), reintenta sin ese campo para no romper el sembrado.
+      if (seededRes.error && /uuid|general_category_id/i.test(seededRes.error.message)) {
+        const rows2 = rows.map(({ general_category_id, ...r }) => r);
+        seededRes = await db.from('expense_categories').insert(rows2).select();
+      }
+      return ok(c, seededRes.data ?? []);
     }
     return ok(c, data ?? []);
   } catch {
@@ -196,7 +201,7 @@ expenses.post('/categories/from-general', async (c) => {
       return ok(c, existing, 200);
     }
 
-    const { data, error } = await db
+    let ins = await db
       .from('expense_categories')
       .insert({
         tenant_id: tenantId, general_category_id, is_general: true,
@@ -204,9 +209,14 @@ expenses.post('/categories/from-general', async (c) => {
       })
       .select()
       .single();
-
-    if (error) throw new Error(error.message);
-    return ok(c, data, 201);
+    // Si general_category_id es UUID (migración 59 pendiente), reintenta sin él.
+    if (ins.error && /uuid|general_category_id/i.test(ins.error.message)) {
+      ins = await db.from('expense_categories')
+        .insert({ tenant_id: tenantId, is_general: true, name: general.name, color: general.color, icon: general.icon })
+        .select().single();
+    }
+    if (ins.error) throw new Error(ins.error.message);
+    return ok(c, ins.data, 201);
   } catch (err: any) {
     return fail(c, err.message, 500);
   }
