@@ -1714,11 +1714,19 @@ hacienda.get('/fe-pdf/:id', async (c) => {
 
 /** Próximo consecutivo simple (000001…). */
 async function nextInvoiceNumber(tenantId: string, offset = 0): Promise<string> {
-  const { data } = await db.from('invoices').select('invoice_number').eq('tenant_id', tenantId);
+  // Paginado: sin esto, con >1000 facturas el máximo salía bajo → número duplicado.
+  const PAGE = 1000;
   let maxSeq = 0;
-  for (const r of (data ?? []) as any[]) {
-    const s = String(r.invoice_number ?? '').trim();
-    if (/^\d{1,6}$/.test(s)) maxSeq = Math.max(maxSeq, parseInt(s, 10));
+  for (let from = 0; ; from += PAGE) {
+    const { data, error } = await db.from('invoices').select('invoice_number')
+      .eq('tenant_id', tenantId).order('id', { ascending: true }).range(from, from + PAGE - 1);
+    if (error) break;
+    const chunk = (data ?? []) as any[];
+    for (const r of chunk) {
+      const s = String(r.invoice_number ?? '').trim();
+      if (/^\d{1,6}$/.test(s)) maxSeq = Math.max(maxSeq, parseInt(s, 10));
+    }
+    if (chunk.length < PAGE) break;
   }
   return String(maxSeq + 1 + offset).padStart(6, '0');
 }

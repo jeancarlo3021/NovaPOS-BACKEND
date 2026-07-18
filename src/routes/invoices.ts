@@ -67,18 +67,23 @@ const InvoiceSchema = z.object({
 // número de secuencia ya usado por el tenant (los dígitos finales de cualquier
 // formato) y le suma 1. `attemptOffset` permite reintentar ante colisión.
 async function nextInvoiceNumber(tenantId: string, attemptOffset = 0): Promise<string> {
-  const { data } = await db.from('invoices')
-    .select('invoice_number')
-    .eq('tenant_id', tenantId);
-
-  // Solo consecutivos SIMPLES (1-6 dígitos puros). Ignoramos números con fecha,
-  // claves de FE o formatos largos para que el consecutivo no salte.
+  // ⚠️ Paginado: Supabase trae máx 1000 filas por query. Con miles de facturas,
+  // sin paginar/ordenar el máximo salía MÁS BAJO que el real → número DUPLICADO.
+  // Solo consecutivos SIMPLES (1-6 dígitos puros); se ignoran fechas/claves de FE.
+  const PAGE = 1000;
   let maxSeq = 0;
-  for (const r of (data ?? []) as any[]) {
-    const s = String(r.invoice_number ?? '').trim();
-    if (/^\d{1,6}$/.test(s)) maxSeq = Math.max(maxSeq, parseInt(s, 10));
+  for (let from = 0; ; from += PAGE) {
+    const { data, error } = await db.from('invoices')
+      .select('invoice_number').eq('tenant_id', tenantId)
+      .order('id', { ascending: true }).range(from, from + PAGE - 1);
+    if (error) break;
+    const chunk = (data ?? []) as any[];
+    for (const r of chunk) {
+      const s = String(r.invoice_number ?? '').trim();
+      if (/^\d{1,6}$/.test(s)) maxSeq = Math.max(maxSeq, parseInt(s, 10));
+    }
+    if (chunk.length < PAGE) break;
   }
-
   return String(maxSeq + 1 + attemptOffset).padStart(6, '0');
 }
 
