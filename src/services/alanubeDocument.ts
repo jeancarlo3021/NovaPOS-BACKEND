@@ -114,8 +114,12 @@ export function buildAlanubeDocument(
     const tarifa = Number(l.iva_rate ?? 0);
     const cantidad = Number(l.quantity);
     const neto = r2(l.subtotal);                             // subtotal (con descuento, sin IVA)
-    const precioEfectivo = cantidad > 0 ? neto / cantidad : neto;  // precio unitario neto
-    const montoTotal = r2(precioEfectivo * cantidad);        // == neto (por redondeo)
+    // Precio unitario a 5 decimales = EXACTAMENTE el que enviamos en unitPrice.
+    const precioEfectivo = r5(cantidad > 0 ? neto / cantidad : neto);
+    // amountTotal DEBE ser precioEfectivo × cantidad (así lo recalcula Alanube).
+    // Se deriva del MISMO precio ya redondeado para que cuadre a 5 decimales y no
+    // aparezca el "5198.03 != 5198.03001".
+    const montoTotal = r5(precioEfectivo * cantidad);
     // IVA y total de línea a PRECISIÓN PLENA (5 dec), sin redondear a 2: así
     // cuadran las validaciones exactas de Alanube (amount = base × fee, etc.).
     const impuesto = r5(montoTotal * (tarifa / 100));
