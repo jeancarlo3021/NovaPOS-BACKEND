@@ -19,6 +19,8 @@ const CustomerSchema = z.object({
   address:             z.string().optional().nullable(),
   economic_activity_code: z.string().optional().nullable(),
   zone:                z.string().optional().nullable(),
+  lat:                 z.number().optional().nullable(),
+  lng:                 z.number().optional().nullable(),
   notes:               z.string().optional().nullable(),
   is_active:           z.boolean().optional(),
   credit_enabled:      z.boolean().optional(),

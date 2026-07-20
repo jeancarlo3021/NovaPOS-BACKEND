@@ -168,36 +168,42 @@ reports.get('/taxes', async (c) => {
     // Ambiente: 'production' (default, excluye pruebas) · 'sandbox' (solo QA) · 'all'.
     const environment = String(c.req.query('environment') || 'production');
 
-    const sel = 'id, invoice_number, customer_name, total, subtotal, tax_amount, issued_at, status, fe_clave, fe_status, fe_nc_clave, fe_environment';
-    // Dos consultas (más robusto que un .or con is-not-null):
+    const sel = 'id, invoice_number, customer_name, total, subtotal, tax_amount, issued_at, status, document_type, fe_clave, fe_status, fe_nc_clave, fe_nd_clave, fe_environment';
+    // Tres consultas (más robusto que un .or con is-not-null):
     //  1) Ventas VÁLIDAS (no anuladas).
     //  2) Facturas con NOTA DE CRÉDITO (aunque estén anuladas).
+    //  3) Facturas con NOTA DE DÉBITO.
     let qVentas = db.from('invoices').select(sel).eq('tenant_id', tenantId).neq('status', 'cancelled');
     let qNc     = db.from('invoices').select(sel).eq('tenant_id', tenantId).not('fe_nc_clave', 'is', null);
-    if (from) { qVentas = qVentas.gte('issued_at', from); qNc = qNc.gte('issued_at', from); }
-    if (to)   { qVentas = qVentas.lte('issued_at', to);   qNc = qNc.lte('issued_at', to); }
+    let qNd     = db.from('invoices').select(sel).eq('tenant_id', tenantId).not('fe_nd_clave', 'is', null);
+    if (from) { qVentas = qVentas.gte('issued_at', from); qNc = qNc.gte('issued_at', from); qNd = qNd.gte('issued_at', from); }
+    if (to)   { qVentas = qVentas.lte('issued_at', to);   qNc = qNc.lte('issued_at', to);   qNd = qNd.lte('issued_at', to); }
     // Filtro por ambiente. 'production' incluye las filas SIN ambiente (ventas
     // corrientes y facturas históricas = reales). 'sandbox' solo las de prueba.
     if (environment === 'sandbox') {
       qVentas = qVentas.eq('fe_environment', 'sandbox');
       qNc     = qNc.eq('fe_environment', 'sandbox');
+      qNd     = qNd.eq('fe_environment', 'sandbox');
     } else if (environment !== 'all') {   // production (default)
       qVentas = qVentas.or('fe_environment.is.null,fe_environment.neq.sandbox');
       qNc     = qNc.or('fe_environment.is.null,fe_environment.neq.sandbox');
+      qNd     = qNd.or('fe_environment.is.null,fe_environment.neq.sandbox');
     }
-    let [rVentas, rNc]: [any, any] = await Promise.all([qVentas, qNc]);
-    // Si la columna fe_environment aún no existe (migración 57 sin correr), reintenta
-    // sin el filtro/columna de ambiente (muestra todo).
-    if ((rVentas.error && /fe_environment/.test(rVentas.error.message)) || (rNc.error && /fe_environment/.test(rNc.error.message))) {
+    let [rVentas, rNc, rNd]: [any, any, any] = await Promise.all([qVentas, qNc, qNd]);
+    // Si columnas nuevas aún no existen (migraciones sin correr), reintenta con el
+    // set mínimo (muestra todo, sin ND ni ambiente).
+    if ([rVentas, rNc, rNd].some(r => r.error && /fe_environment|fe_nd_clave|document_type/.test(r.error.message))) {
       const sel2 = 'id, invoice_number, customer_name, total, subtotal, tax_amount, issued_at, status, fe_clave, fe_status, fe_nc_clave';
       let v = db.from('invoices').select(sel2).eq('tenant_id', tenantId).neq('status', 'cancelled');
       let n = db.from('invoices').select(sel2).eq('tenant_id', tenantId).not('fe_nc_clave', 'is', null);
       if (from) { v = v.gte('issued_at', from); n = n.gte('issued_at', from); }
       if (to)   { v = v.lte('issued_at', to);   n = n.lte('issued_at', to); }
       [rVentas, rNc] = await Promise.all([v, n]);
+      rNd = { data: [], error: null };
     }
     if (rVentas.error) throw new Error(rVentas.error.message);
     if (rNc.error)     throw new Error(rNc.error.message);
+    if (rNd.error)     rNd = { data: [], error: null };   // ND opcional
 
     // Una factura ELECTRÓNICA que Hacienda RECHAZÓ o dio ERROR no es un comprobante
     // válido → no debe aparecer en el reporte de impuestos. Las corrientes (sin
@@ -210,25 +216,51 @@ reports.get('/taxes', async (c) => {
     for (const r of (rVentas.data ?? []) as any[]) { if (!feFailed(r)) salesById.set(r.id, r); }
     for (const r of (rNc.data ?? []) as any[]) { if (!feFailed(r)) salesById.set(r.id, r); }
 
-    const invoices: Array<{ kind: 'venta' | 'nc'; invoice_number: string; customer_name: string; issued_at: string; month: string; base: number; iva: number; total: number; electronic: boolean }> = [];
-    const mkRow = (r: any, kind: 'venta' | 'nc') => {
+    const invoices: Array<{ kind: 'venta' | 'nc' | 'nd'; document_type: string; invoice_number: string; customer_name: string; issued_at: string; month: string; base: number; iva: number; total: number; electronic: boolean }> = [];
+    const mkRow = (r: any, kind: 'venta' | 'nc' | 'nd') => {
       const month = String(r.issued_at ?? '').slice(0, 7) || 'sin-fecha';
       const sales = Number(r.total ?? 0);
       const iva = Number(r.tax_amount ?? 0);
       const base = Number(r.subtotal ?? (sales - iva));
-      const sign = kind === 'nc' ? -1 : 1;
+      const sign = kind === 'nc' ? -1 : 1;   // NC resta; venta y ND suman
+      // Tipo de documento para poder separar tiquete vs factura electrónica.
+      const dt = kind === 'nc' ? 'nota_credito' : kind === 'nd' ? 'nota_debito'
+        : (r.document_type || (r.fe_clave ? 'factura_electronica' : 'ticket'));
       invoices.push({
-        kind, invoice_number: r.invoice_number ?? '', customer_name: r.customer_name ?? '',
+        kind, document_type: dt,
+        invoice_number: r.invoice_number ?? '', customer_name: r.customer_name ?? '',
         issued_at: r.issued_at ?? '', month,
         base: base * sign, iva: iva * sign, total: sales * sign,
-        electronic: kind === 'nc' ? true : !!r.fe_clave,
+        electronic: kind === 'venta' ? !!r.fe_clave : true,
       });
     };
     for (const r of salesById.values()) mkRow(r, 'venta');
-    for (const r of (rNc.data ?? []) as any[]) mkRow(r, 'nc');
+    for (const r of (rNc.data ?? []) as any[]) if (!feFailed(r)) mkRow(r, 'nc');
+    for (const r of (rNd.data ?? []) as any[]) if (!feFailed(r)) mkRow(r, 'nd');
     invoices.sort((a, b) => (a.issued_at || '').localeCompare(b.issued_at || ''));
 
-    return ok(c, { invoices });
+    // ── Compras (crédito fiscal): comprobantes electrónicos recibidos de proveedores.
+    let purchases: Array<{ clave: string; issuer_name: string; issuer_id: string; document_type: string; doc_date: string; month: string; base: number; iva: number; total: number }> = [];
+    try {
+      let qp = db.from('received_documents')
+        .select('clave, issuer_name, issuer_id, document_type, doc_date, total, tax')
+        .eq('tenant_id', tenantId).neq('ack_status', 'rejected');
+      if (from) qp = qp.gte('doc_date', from);
+      if (to)   qp = qp.lte('doc_date', to);
+      const rp: any = await qp;
+      purchases = ((rp.data ?? []) as any[]).map(p => {
+        const total = Number(p.total ?? 0);
+        const iva = Number(p.tax ?? 0);
+        return {
+          clave: p.clave ?? '', issuer_name: p.issuer_name ?? '', issuer_id: p.issuer_id ?? '',
+          document_type: p.document_type ?? '', doc_date: p.doc_date ?? '',
+          month: String(p.doc_date ?? '').slice(0, 7) || 'sin-fecha',
+          base: total - iva, iva, total,
+        };
+      }).sort((a, b) => (a.doc_date || '').localeCompare(b.doc_date || ''));
+    } catch { purchases = []; }
+
+    return ok(c, { invoices, purchases });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

@@ -86,6 +86,130 @@ routing.get('/trucks', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+// ── Rastreo en tiempo real ──────────────────────────────────────────────────
+
+// POST /ping-location — el repartidor reporta su posición (upsert).
+// body: { lat, lng, speed?, heading?, accuracy?, battery?, route_id? }
+// El truck_id se deriva de la ruta activa (warehouse tipo 'truck' de esa ruta).
+routing.post('/ping-location', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const driverId = c.get('userId');
+    const b = await c.req.json().catch(() => ({}));
+    const lat = Number(b?.lat), lng = Number(b?.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return fail(c, 'lat/lng inválidos', 422);
+
+    // Ruta: la enviada, o la ruta abierta/en curso más reciente del repartidor hoy.
+    let routeId: string | null = b?.route_id ?? null;
+    let truckId: string | null = null;
+    if (!routeId) {
+      const today = new Date().toISOString().slice(0, 10);
+      const { data: r } = await db.from('routes')
+        .select('id, warehouse_id').eq('tenant_id', tenantId).eq('driver_id', driverId)
+        .eq('route_date', today).in('status', ['open', 'in_progress', 'loaded'])
+        .order('created_at', { ascending: false }).limit(1).maybeSingle();
+      routeId = (r as any)?.id ?? null;
+      truckId = (r as any)?.warehouse_id ?? null;
+    } else {
+      const { data: r } = await db.from('routes').select('warehouse_id')
+        .eq('id', routeId).eq('tenant_id', tenantId).maybeSingle();
+      truckId = (r as any)?.warehouse_id ?? null;
+    }
+    // Si no hay ruta/camión, usamos el driverId como truck_id (fallback estable).
+    if (!truckId) truckId = driverId;
+
+    const { error } = await db.from('truck_positions').upsert({
+      tenant_id: tenantId, truck_id: truckId, route_id: routeId, driver_id: driverId,
+      lat, lng,
+      speed: Number.isFinite(Number(b?.speed)) ? Number(b.speed) : null,
+      heading: Number.isFinite(Number(b?.heading)) ? Number(b.heading) : null,
+      accuracy: Number.isFinite(Number(b?.accuracy)) ? Number(b.accuracy) : null,
+      battery: Number.isFinite(Number(b?.battery)) ? Math.round(Number(b.battery)) : null,
+      recorded_at: new Date().toISOString(),
+    }, { onConflict: 'tenant_id,truck_id' });
+    if (error) throw new Error(error.message);
+    return ok(c, { saved: true, truck_id: truckId, route_id: routeId });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// GET /live — camiones activos con su última posición, ruta, chofer y avance.
+// ?minutes=30 → solo posiciones reportadas en los últimos N minutos (default 30).
+routing.get('/live', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const minutes = Math.max(1, Math.min(1440, Number(c.req.query('minutes')) || 30));
+    const since = new Date(Date.now() - minutes * 60_000).toISOString();
+
+    const { data: pos, error } = await db.from('truck_positions')
+      .select('truck_id, route_id, driver_id, lat, lng, speed, heading, accuracy, battery, recorded_at')
+      .eq('tenant_id', tenantId).gte('recorded_at', since);
+    if (error) throw new Error(error.message);
+    const positions = (pos ?? []) as any[];
+    if (positions.length === 0) return ok(c, { trucks: [], stops: [] });
+
+    // Nombres de camión (warehouses) y chofer (users).
+    const truckIds  = [...new Set(positions.map(p => p.truck_id).filter(Boolean))];
+    const driverIds = [...new Set(positions.map(p => p.driver_id).filter(Boolean))];
+    const routeIds  = [...new Set(positions.map(p => p.route_id).filter(Boolean))] as string[];
+
+    const truckName = new Map<string, string>();
+    if (truckIds.length) {
+      const { data: ws } = await db.from('warehouses').select('id, name, code').in('id', truckIds as string[]);
+      for (const w of ws ?? []) truckName.set((w as any).id, (w as any).name || (w as any).code || 'Camión');
+    }
+    const driverName = new Map<string, string>();
+    if (driverIds.length) {
+      const { data: us } = await db.from('users').select('id, full_name, email, ticket_alias').in('id', driverIds as string[]);
+      for (const u of us ?? []) driverName.set((u as any).id, (u as any).ticket_alias || (u as any).full_name || (u as any).email || 'Repartidor');
+    }
+
+    // Avance de paradas + ventas por ruta.
+    const stopCount = new Map<string, { total: number; done: number }>();
+    let stopsRows: any[] = [];
+    if (routeIds.length) {
+      const { data: stops } = await db.from('route_stops')
+        .select('route_id, customer_id, seq, lat, lng, status').in('route_id', routeIds);
+      stopsRows = (stops ?? []) as any[];
+      for (const s of stopsRows) {
+        const k = s.route_id;
+        stopCount.set(k, stopCount.get(k) ?? { total: 0, done: 0 });
+        const cur = stopCount.get(k)!;
+        cur.total++;
+        if (s.status && s.status !== 'pending') cur.done++;
+      }
+    }
+    const salesTotal = new Map<string, number>();
+    if (routeIds.length) {
+      const { data: sales } = await db.from('invoices')
+        .select('route_id, total, status').eq('tenant_id', tenantId).in('route_id', routeIds);
+      for (const s of (sales ?? []) as any[]) {
+        if (s.status === 'cancelled') continue;
+        salesTotal.set(s.route_id, (salesTotal.get(s.route_id) ?? 0) + Number(s.total ?? 0));
+      }
+    }
+
+    const trucks = positions.map(p => ({
+      truck_id: p.truck_id,
+      truck_name: truckName.get(p.truck_id) ?? 'Camión',
+      driver_id: p.driver_id,
+      driver_name: p.driver_id ? (driverName.get(p.driver_id) ?? 'Repartidor') : 'Sin chofer',
+      route_id: p.route_id,
+      lat: p.lat, lng: p.lng,
+      speed: p.speed, heading: p.heading, accuracy: p.accuracy, battery: p.battery,
+      recorded_at: p.recorded_at,
+      stops_total: p.route_id ? (stopCount.get(p.route_id)?.total ?? 0) : 0,
+      stops_done:  p.route_id ? (stopCount.get(p.route_id)?.done ?? 0) : 0,
+      sales_total: p.route_id ? (salesTotal.get(p.route_id) ?? 0) : 0,
+    }));
+    // Paradas con coordenadas (para pintar los pines de clientes).
+    const stops = stopsRows
+      .filter(s => Number.isFinite(Number(s.lat)) && Number.isFinite(Number(s.lng)))
+      .map(s => ({ route_id: s.route_id, customer_id: s.customer_id, seq: s.seq, lat: s.lat, lng: s.lng, status: s.status }));
+
+    return ok(c, { trucks, stops });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // Consecutivo único por tenant (mismo esquema que el POS: 000001, 000002, ...).
 // IMPORTANTE: solo contamos números consecutivos SIMPLES (1-6 dígitos puros).
 // Si tomáramos los dígitos finales de cualquier factura, una clave de FE o un
@@ -281,6 +405,21 @@ routing.get('/:id', async (c) => {
 });
 
 // POST / — crear ruta { warehouse_id, driver_id, modality, route_date, notes, stops:[{customer_id, seq, lat, lng}] }
+// Rellena lat/lng de las paradas desde la ubicación del cliente (opción A).
+async function fillStopCoords(tenantId: string, rows: any[]): Promise<any[]> {
+  const need = [...new Set(rows.filter(r => r.lat == null || r.lng == null).map(r => r.customer_id).filter(Boolean))];
+  if (need.length === 0) return rows;
+  const { data: cs } = await db.from('customers').select('id, lat, lng').eq('tenant_id', tenantId).in('id', need as string[]);
+  const m = new Map((cs ?? []).map((c: any) => [c.id, c]));
+  for (const r of rows) {
+    if (r.customer_id && (r.lat == null || r.lng == null)) {
+      const c = m.get(r.customer_id);
+      if (c) { r.lat = r.lat ?? c.lat; r.lng = r.lng ?? c.lng; }
+    }
+  }
+  return rows;
+}
+
 routing.post('/', async (c) => {
   try {
     const tenantId = c.get('tenantId');
@@ -312,10 +451,10 @@ routing.post('/', async (c) => {
 
     const stops = Array.isArray(b.stops) ? b.stops : [];
     if (stops.length > 0) {
-      const rows = stops.map((s: any, i: number) => ({
+      const rows = await fillStopCoords(tenantId, stops.map((s: any, i: number) => ({
         tenant_id: tenantId, route_id: route.id, customer_id: s.customer_id,
         seq: s.seq ?? i, lat: s.lat ?? null, lng: s.lng ?? null,
-      }));
+      })));
       const { error: se } = await db.from('route_stops').insert(rows);
       if (se) console.warn('[routing] stops insert:', se.message);
     }
@@ -332,10 +471,10 @@ routing.put('/:id/stops', async (c) => {
     const stops = Array.isArray(b.stops) ? b.stops : [];
     await db.from('route_stops').delete().eq('route_id', id).eq('tenant_id', tenantId);
     if (stops.length > 0) {
-      const rows = stops.map((s: any, i: number) => ({
+      const rows = await fillStopCoords(tenantId, stops.map((s: any, i: number) => ({
         tenant_id: tenantId, route_id: id, customer_id: s.customer_id,
         seq: s.seq ?? i, lat: s.lat ?? null, lng: s.lng ?? null,
-      }));
+      })));
       const { error } = await db.from('route_stops').insert(rows);
       if (error) throw new Error(error.message);
     }
