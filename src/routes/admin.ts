@@ -4,6 +4,8 @@ import { ok, fail } from '../utils/response.js';
 import { sendEmail, paymentReceiptEmailHtml, customInvoiceEmailHtml, planFeatureLabels } from '../services/emailService.js';
 import { alanube, AlanubeError } from '../services/alanube.js';
 import { endOfDay } from '../utils/dateRange.js';
+import { whatsappEnabled, sendTemplate, normalizePhone } from '../services/whatsapp.js';
+import { notifyPaymentDue, businessContact } from '../services/whatsappNotify.js';
 
 const admin = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
@@ -1702,6 +1704,84 @@ admin.get('/reception-log', async (c) => {
       count: accepted + rejected + pending, accepted, rejected, pending,
       rows: rows.map(r => ({ ...r, business_name: nameById.get(r.tenant_id) ?? '—' })),
     });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// ─── WhatsApp: recordatorios de pago (super-admin) ──────────────────────────
+
+// Días restantes de la suscripción activa (más reciente) de un tenant.
+async function subscriptionDaysLeft(tenantId: string): Promise<number | null> {
+  const { data: sub } = await db.from('subscriptions')
+    .select('ends_at').eq('tenant_id', tenantId)
+    .order('created_at', { ascending: false }).limit(1).maybeSingle();
+  const endsAt = (sub as any)?.ends_at;
+  if (!endsAt) return null;
+  const ms = new Date(endsAt).getTime() - Date.now();
+  return Math.max(0, Math.ceil(ms / 86_400_000));
+}
+
+// GET /whatsapp/status — ¿está configurado el envío por WhatsApp?
+admin.get('/whatsapp/status', (c) => ok(c, { enabled: whatsappEnabled() }));
+
+// POST /whatsapp/test — envía la plantilla de prueba `hello_world` (Meta la trae
+// pre-aprobada) para verificar token/número. body: { to } (número destino).
+// En sandbox el destino debe estar registrado como "número de prueba" en Meta.
+admin.post('/whatsapp/test', async (c) => {
+  try {
+    if (!whatsappEnabled()) return fail(c, 'WhatsApp no configurado (falta WHATSAPP_TOKEN en .env)', 400);
+    const { to } = await c.req.json().catch(() => ({}));
+    const phone = normalizePhone(to);
+    if (!phone) return fail(c, 'Número destino inválido', 422);
+    const r = await sendTemplate(phone, 'hello_world', [], 'en_US');
+    if (!r.ok) return fail(c, r.error || 'No se pudo enviar', 502);
+    return ok(c, { sent: true, phone, id: r.id });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// POST /whatsapp/payment-reminder — recordatorio de pago a UN negocio.
+// body: { tenantId, days? }  (si no se pasa days, se calcula de la suscripción)
+admin.post('/whatsapp/payment-reminder', async (c) => {
+  try {
+    if (!whatsappEnabled()) return fail(c, 'WhatsApp no configurado (falta WHATSAPP_TOKEN)', 400);
+    const { tenantId, days } = await c.req.json();
+    if (!tenantId) return fail(c, 'tenantId requerido', 422);
+    const d = Number.isFinite(Number(days)) ? Number(days) : (await subscriptionDaysLeft(tenantId) ?? 0);
+    const { phone } = await businessContact(tenantId);
+    if (!phone) return fail(c, 'El negocio no tiene teléfono de WhatsApp (emisor_phone)', 422);
+    const r = await notifyPaymentDue(tenantId, d);
+    if (!r.ok) return fail(c, r.error || 'No se pudo enviar', 502);
+    return ok(c, { sent: true, phone, days: d, id: r.id });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// POST /whatsapp/payment-reminders-bulk — a todos los negocios que vencen pronto.
+// body: { withinDays?=7 }
+admin.post('/whatsapp/payment-reminders-bulk', async (c) => {
+  try {
+    if (!whatsappEnabled()) return fail(c, 'WhatsApp no configurado (falta WHATSAPP_TOKEN)', 400);
+    const body = await c.req.json().catch(() => ({}));
+    const within = Number.isFinite(Number(body?.withinDays)) ? Number(body.withinDays) : 7;
+    const limit = new Date(Date.now() + within * 86_400_000).toISOString();
+
+    // Suscripciones activas que vencen dentro de la ventana.
+    const { data: subs } = await db.from('subscriptions')
+      .select('tenant_id, ends_at')
+      .eq('status', 'active')
+      .lte('ends_at', limit)
+      .gte('ends_at', new Date().toISOString());
+    const list = Array.isArray(subs) ? subs : [];
+
+    let sent = 0, skipped = 0, failed = 0;
+    const details: any[] = [];
+    for (const s of list) {
+      const tid = (s as any).tenant_id;
+      const ms = new Date((s as any).ends_at).getTime() - Date.now();
+      const d = Math.max(0, Math.ceil(ms / 86_400_000));
+      const r = await notifyPaymentDue(tid, d);
+      if (r.ok) sent++; else if (r.skipped) skipped++; else failed++;
+      details.push({ tenantId: tid, days: d, ok: r.ok, skipped: r.skipped, error: r.error });
+    }
+    return ok(c, { total: list.length, sent, skipped, failed, details });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

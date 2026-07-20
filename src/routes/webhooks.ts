@@ -120,4 +120,43 @@ webhooks.post('/alanube', async (c) => {
   }
 });
 
+// ─── WhatsApp (Meta Cloud API) ──────────────────────────────────────────────
+
+// GET /webhooks/whatsapp — verificación del webhook (handshake de Meta).
+// Meta llama con hub.mode=subscribe, hub.verify_token y hub.challenge.
+// Si el token coincide con WHATSAPP_VERIFY_TOKEN, devolvemos el challenge en texto plano.
+webhooks.get('/whatsapp', (c) => {
+  const mode = c.req.query('hub.mode');
+  const token = c.req.query('hub.verify_token');
+  const challenge = c.req.query('hub.challenge') ?? '';
+  const expected = (process.env.WHATSAPP_VERIFY_TOKEN || '').trim();
+  if (mode === 'subscribe' && expected && token === expected) {
+    return c.text(challenge, 200);   // Meta espera el challenge tal cual, en texto.
+  }
+  return c.text('Forbidden', 403);
+});
+
+// POST /webhooks/whatsapp — eventos entrantes (estados de entrega y mensajes del
+// cliente). Por ahora solo se registran en el log; el envío es saliente por plantilla.
+webhooks.post('/whatsapp', async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    // Estructura: entry[].changes[].value.{statuses[]|messages[]}
+    const changes = body?.entry?.flatMap((e: any) => e?.changes ?? []) ?? [];
+    for (const ch of changes) {
+      const v = ch?.value ?? {};
+      for (const st of v.statuses ?? []) {
+        console.log('[wa] status', st?.status, st?.id, st?.recipient_id, st?.errors?.[0]?.title ?? '');
+      }
+      for (const m of v.messages ?? []) {
+        console.log('[wa] message from', m?.from, m?.type, m?.text?.body ?? '');
+      }
+    }
+    // Meta requiere 200 rápido; si no, reintenta y puede deshabilitar el webhook.
+    return c.text('EVENT_RECEIVED', 200);
+  } catch {
+    return c.text('EVENT_RECEIVED', 200);
+  }
+});
+
 export default webhooks;

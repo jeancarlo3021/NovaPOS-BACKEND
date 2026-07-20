@@ -8,6 +8,7 @@ import { buildAlanubeDocument } from '../services/alanubeDocument.js';
 import { endOfDay } from '../utils/dateRange.js';
 import { sendEmail } from '../services/emailService.js';
 import { parseHaciendaXml } from '../services/receivedEmails.js';
+import { notifyFeError, notifyQuotaLow } from '../services/whatsappNotify.js';
 
 // Próximo consecutivo de orden de compra (mismo formato que el POS: PO-XXXX).
 async function nextPurchaseNumber(tenantId: string): Promise<string> {
@@ -206,6 +207,22 @@ async function computeFeQuota(tenantId: string) {
   };
 }
 
+// Umbrales de "comprobantes por acabarse": se avisa al CRUZAR cada uno (una vez
+// por umbral, no en cada emisión). Solo aplica a bolsas limitadas (included > 0).
+const QUOTA_ALERT_THRESHOLDS = [50, 20, 10, 5, 1];
+
+// Aviso de cuota baja tras una emisión exitosa (fire-and-forget). Como cada
+// emisión baja `available` en ~1, notificar cuando cae exactamente en un umbral
+// dispara ~una vez por umbral.
+async function maybeNotifyQuotaLow(tenantId: string): Promise<void> {
+  try {
+    const q = await computeFeQuota(tenantId);
+    if (q.included > 0 && q.available !== null && QUOTA_ALERT_THRESHOLDS.includes(q.available)) {
+      void notifyQuotaLow(tenantId, q.available, q.included).catch(() => {});
+    }
+  } catch { /* ignore */ }
+}
+
 // GET /quota — cuota de comprobantes del plan (para Mi Plan y avisos).
 hacienda.get('/quota', async (c) => {
   try { return ok(c, await computeFeQuota(c.get('tenantId'))); }
@@ -401,7 +418,7 @@ hacienda.post('/refresh-status', async (c) => {
     const env = cfg.environment === 'sandbox' ? 'sandbox' : 'production'; // default producción
 
     const { data: inv } = await db.from('invoices')
-      .select('id, fe_clave, fe_consecutivo, document_type').eq('id', invoice_id).eq('tenant_id', tenantId).maybeSingle();
+      .select('id, invoice_number, fe_clave, fe_consecutivo, document_type').eq('id', invoice_id).eq('tenant_id', tenantId).maybeSingle();
     if (!(inv as any)?.fe_clave) return fail(c, 'La factura no fue emitida', 422);
 
     let fe_status = 'sent';
@@ -435,6 +452,11 @@ hacienda.post('/refresh-status', async (c) => {
     }
     // Al ACEPTARSE, enviar automáticamente el comprobante completo al cliente.
     if (fe_status === 'accepted') autoSendComprobanteToCustomer(tenantId, invoice_id);
+    // Si Hacienda RECHAZÓ, avisar al dueño por WhatsApp (fire-and-forget).
+    if (fe_status === 'rejected' || fe_status === 'error') {
+      const docLabel = `#${(inv as any)?.invoice_number ?? invoice_id}`;
+      void notifyFeError(tenantId, docLabel, String(errDetail || 'Comprobante rechazado por Hacienda')).catch(() => {});
+    }
 
     return ok(c, { fe_status, ind_estado: indEstado, error: errDetail });
   } catch (err: any) {
@@ -547,6 +569,9 @@ hacienda.post('/emit', async (c) => {
         await db.from('invoices').update({ fe_status: 'error', fe_error: msg })
           .eq('id', invoice_id!).eq('tenant_id', tenantId);
       } catch { /* ignore */ }
+      // Aviso al dueño por WhatsApp (fire-and-forget, no bloquea la respuesta).
+      const docLabel = `#${(inv as any)?.invoice_number ?? invoice_id}`;
+      void notifyFeError(tenantId, docLabel, msg).catch(() => {});
       return fail(c, msg, 422);
     };
 
@@ -640,6 +665,7 @@ hacienda.post('/emit', async (c) => {
       // El correo al cliente se envía AUTOMÁTICAMENTE al ACEPTARSE (con los dos
       // XML + PDF), no al emitir — la respuesta de Hacienda aún no existe acá.
 
+      void maybeNotifyQuotaLow(tenantId);
       return ok(c, { ok: true, provider: 'alanube', clave, alanube_doc_id: docId, alanube_status: alanubeStatus, tipo: tipoDoc, response: resp });
     }
 
@@ -680,6 +706,7 @@ hacienda.post('/emit', async (c) => {
       updated_at: new Date().toISOString(),
     }).eq('id', invoice_id).eq('tenant_id', tenantId);
 
+    void maybeNotifyQuotaLow(tenantId);
     return ok(c, { ok: true, clave, consecutivo: consec, tipo: tipoDoc, response: resp });
   } catch (err: any) {
     const status = err instanceof FacturemosError ? err.status : 500;
