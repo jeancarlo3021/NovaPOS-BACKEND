@@ -69,7 +69,9 @@ async function matchLines(tenantId: string, lines: any[]): Promise<any[]> {
       detail,
       quantity: Number(l.quantity ?? l.Cantidad ?? 1),
       unit_price: Number(l.unit_price ?? l.PrecioUnitario ?? 0),
-      total: Number(l.total ?? l.subtotal ?? l.SubTotal ?? 0),
+      // Total de línea = NETO (con descuento). Priorizamos SubTotal sobre
+      // total/MontoTotal (que suelen ser el BRUTO, antes del descuento).
+      total: Number(l.subtotal ?? l.SubTotal ?? l.total ?? l.MontoTotal ?? 0),
       cabys: cabys || null,
       code: code || null,   // código comercial del XML
       product_id: match?.id ?? null,
@@ -1075,11 +1077,12 @@ hacienda.get('/received', async (c) => {
       const lines = d.raw?.lines ?? d.items;
       if (!Array.isArray(lines)) return null;
       return lines.map((l: any) => ({
-        detail: l.detail ?? l.Detalle ?? '',
+        detail: cleanReceptionDetail(l.detail ?? l.Detalle),
         quantity: Number(l.quantity ?? l.Cantidad ?? 1),
         unit: l.unit ?? null,
         unit_price: Number(l.unit_price ?? l.PrecioUnitario ?? 0),
-        total: Number(l.total ?? l.subtotal ?? l.SubTotal ?? 0),
+        // NETO (con descuento): SubTotal antes que total/MontoTotal (bruto).
+        total: Number(l.subtotal ?? l.SubTotal ?? l.total ?? l.MontoTotal ?? 0),
         cabys: l.cabys ?? l.CodigoCABYS ?? null,
         code: l.code ?? null,
       }));
@@ -1449,13 +1452,16 @@ hacienda.post('/received/reconcile', async (c) => {
       const price = Math.round((consistent ? rawUnit : fromTotal) * 100) / 100;
 
       if (it.action === 'update' && productId) {
-        // Producto que COINCIDE (por código/nombre): actualizar CABYS/precio.
+        // Producto que COINCIDE (por código/nombre): actualizar CABYS/precio/nombre.
         const upd: any = { updated_at: new Date().toISOString() };
         if (it.cabys) upd.cabys_code = it.cabys;
         if (price > 0) upd.cost_price = price;
+        // Sobrescribir el NOMBRE con el del comprobante (limpio) si viene uno nuevo.
+        const newName = cleanReceptionDetail(it.detail);
+        if (newName) upd.name = newName;
         const { error: uErr } = await db.from('products').update(upd).eq('id', productId).eq('tenant_id', tenantId);
         if (uErr) { messages.push(`⚠️ No se pudo actualizar "${it.detail}": ${uErr.message}`); }
-        else { updated++; messages.push(`✏️ Actualizado (CABYS/precio): ${it.detail}`); }
+        else { updated++; messages.push(`✏️ Actualizado (nombre/CABYS/precio): ${newName || it.detail}`); }
       } else {
         // Producto NUEVO (el código NO coincide con ninguno interno): se CREA ahora
         // y se agrega a la orden de una vez (antes se difería y la orden quedaba vacía).
