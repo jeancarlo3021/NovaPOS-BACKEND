@@ -5,6 +5,7 @@ import { sendEmail, paymentReceiptEmailHtml, customInvoiceEmailHtml, planFeature
 import { alanube, AlanubeError } from '../services/alanube.js';
 import { endOfDay } from '../utils/dateRange.js';
 import { whatsappEnabled, sendTemplate, normalizePhone } from '../services/whatsapp.js';
+import { refreshInvoiceStatus } from './hacienda.js';
 import { notifyPaymentDue, businessContact } from '../services/whatsappNotify.js';
 
 const admin = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
@@ -926,6 +927,63 @@ admin.get('/tenants/:id/alanube/verify', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+// GET /tenants/:id/fe-test — PROBAR CONEXIÓN: diagnóstico completo de FE para un
+// tenant. Revisa token, empresa dada de alta y si está LISTA para emitir (apiStatus).
+// Explica por qué los comprobantes se quedan en "sent" (empresa no activa / cuenta
+// distinta / credenciales ATV).
+admin.get('/tenants/:id/fe-test', async (c) => {
+  try {
+    const { id } = c.req.param();
+    const { data: row } = await db.from('settings').select('config')
+      .eq('tenant_id', id).eq('type', 'electronic-invoice').maybeSingle();
+    const cfg: Record<string, any> = { ...((row as any)?.config ?? {}) };
+    const enabled = !!cfg.enabled;
+    const provider = cfg.fe_provider === 'alanube' ? 'alanube' : 'facturemos';
+    const checks: Array<{ label: string; ok: boolean; detail?: string }> = [];
+    const add = (label: string, okv: boolean, detail?: string) => checks.push({ label, ok: okv, detail });
+
+    add('Facturación electrónica activada', enabled, enabled ? undefined : 'Actívala en Datos de FE');
+
+    if (provider === 'alanube') {
+      const isSandbox = String(cfg.environment ?? 'production') === 'sandbox';
+      const companyId = (isSandbox ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id;
+      const client = alanube.forEnv(cfg.environment);
+
+      // 1) Token del ambiente válido.
+      let tokenOk = false;
+      try { await client.createCompany({}); tokenOk = true; }
+      catch (e: any) { const st = e instanceof AlanubeError ? e.status : 0; tokenOk = (st === 400 || st === 422); }
+      add(`Token de Alanube (${client.env})`, tokenOk, tokenOk ? 'Conexión OK' : 'Token inválido o sin permisos (401/403)');
+
+      // 2) Empresa dada de alta.
+      add('Empresa dada de alta (company_id)', !!companyId, companyId ? String(companyId) : 'Usá «Crear empresa en Alanube»');
+
+      // 3) La empresa existe en ESA cuenta/ambiente + está lista para emitir.
+      if (companyId) {
+        try {
+          const company: any = await client.getCompany(String(companyId));
+          const apiStatus = company?.company?.apiStatus ?? company?.apiStatus ?? null;
+          const st = String(apiStatus ?? '').toUpperCase();
+          const ready = st.includes('ACTIVE') || st.includes('PRODUCTION') || st.includes('READY') || st === 'ON';
+          add('Empresa existe en Alanube', true, `apiStatus: ${apiStatus ?? '—'}`);
+          add('Empresa lista para emitir a Hacienda', ready,
+            ready ? undefined : `apiStatus=${apiStatus ?? '—'}. Revisá el certificado .p12 y las credenciales ATV de la empresa en Alanube — mientras no esté activa, los comprobantes quedan en «sent».`);
+        } catch (e: any) {
+          const st = e instanceof AlanubeError ? e.status : 500;
+          add('Empresa existe en Alanube', false,
+            st === 404 ? 'La empresa NO existe en este ambiente/cuenta. El token apunta a otra cuenta o la empresa se creó en otro ambiente.' : (e?.message ?? 'error'));
+        }
+      }
+      const allOk = checks.every(x => x.ok);
+      return ok(c, { provider, environment: client.env, company_id: companyId ?? null, ok: allOk, checks });
+    }
+
+    // Facturemos.
+    add('ApiKey del emisor', !!cfg.api_key_emisor, cfg.api_key_emisor ? 'Configurada' : 'Falta la ApiKey del emisor');
+    return ok(c, { provider, ok: checks.every(x => x.ok), checks });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // ── Alanube: dar de alta la empresa (emisor) — Paso 3 ─────────────────────────
 // Construye el payload de POST /cri/v1/companies desde la config FE del tenant:
 //  · datos del emisor (nombre, identificación, dirección, actividad, email)
@@ -1566,18 +1624,39 @@ admin.get('/alanube/reports/emissions', async (c) => {
     ]);
     const unwrap = (r: PromiseSettledResult<any>) => {
       if (r.status === 'fulfilled') return r.value?.data ?? r.value ?? [];
-      // 404 / "no data" = simplemente NO hubo emisiones en el rango → lista vacía,
-      // no es un error que mostrar.
+      // Estos casos NO son errores que mostrar, solo "sin datos":
+      //  · 404 / "no data" / RPT002 = no hubo emisiones en el rango.
+      //  · 403 / Forbidden = el plan/token de Alanube no habilita ese reporte.
       const msg = r.reason instanceof Error ? r.reason.message : 'error';
       const st = r.reason instanceof AlanubeError ? r.reason.status : 0;
-      if (st === 404 || /no data|not found|sin datos|no se encontr/i.test(msg)) return [];
+      if (st === 404 || st === 403 || /no data|not found|sin datos|no se encontr|forbidden|rpt\d+/i.test(msg)) return [];
       return { error: msg };
     };
-    return ok(c, { env, from, until, per_company: unwrap(perCompany), by_user: unwrap(byUser) });
+    const perC = unwrap(perCompany);
+    const byU = unwrap(byUser);
+    return ok(c, {
+      env, from, until,
+      per_company: perC, by_user: byU,
+      // Bandera para que el frontend sepa que el token trae datos aunque un reporte
+      // esté vacío/forbidden.
+      has_data: (Array.isArray(perC) && perC.length > 0) || (Array.isArray(byU) && byU.length > 0),
+    });
   } catch (err: any) {
     const st = err instanceof AlanubeError ? err.status : 500;
     return fail(c, err.message, st);
   }
+});
+
+// POST /fe-refresh/:id — REINTENTO: re-consulta el estado de una factura en Hacienda
+// (para el botón de reintento en la bitácora). Resuelve el tenant de la factura.
+admin.post('/fe-refresh/:id', async (c) => {
+  try {
+    const { id } = c.req.param();
+    const { data: inv } = await db.from('invoices').select('tenant_id').eq('id', id).maybeSingle();
+    if (!inv) return fail(c, 'Factura no encontrada', 404);
+    const r = await refreshInvoiceStatus((inv as any).tenant_id, id);
+    return ok(c, r);
+  } catch (err: any) { return fail(c, err.message, 500); }
 });
 
 admin.get('/fe-log', async (c) => {

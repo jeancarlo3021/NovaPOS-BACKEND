@@ -165,8 +165,12 @@ function clientFor(env: AlanubeEnv) {
       const order = opts?.kind
         ? [opts.kind, ...Object.keys(res).filter(k => k !== opts.kind)]
         : Object.keys(res);
-      // ?documents=xml,xmlHacienda,pdf para traer los archivos del comprobante.
-      const qs = opts?.documents ? `?documents=${encodeURIComponent(opts.documents)}` : '';
+      // idCompany: OBLIGATORIO para empresas 'associated' (si no, Alanube responde
+      // "document not found"). ?documents=xml,xmlHacienda,pdf trae los archivos.
+      const params = new URLSearchParams();
+      if (opts?.documents) params.set('documents', opts.documents);
+      if (opts?.companyId) params.set('idCompany', String(opts.companyId));
+      const qs = params.toString() ? `?${params.toString()}` : '';
       let lastErr: any = null;
       for (const k of order) {
         try { return await f(`/${res[k]}/${id}${qs}`, { method: 'GET' }); }

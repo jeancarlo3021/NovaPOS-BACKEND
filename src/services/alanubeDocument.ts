@@ -219,15 +219,18 @@ export function buildAlanubeDocument(
       };
     }
     if (receptor.email) rec.email = receptor.email;
-    if (receptor.province_code) {
-      // Alanube/Hacienda exige `otrasSenas` con AL MENOS 5 caracteres cuando se
-      // envía la dirección. Si el cliente no tiene detalle, se usa un valor por
-      // defecto válido en vez de dejarlo vacío (que da error 400).
+    // La dirección del receptor es OPCIONAL en Hacienda. Solo la enviamos si la
+    // ubicación está COMPLETA (provincia + cantón + distrito). Una dirección
+    // parcial (ej. solo provincia) genera la observación -37 de Hacienda.
+    const prov = prov1(receptor.province_code);
+    const cant = pad2(receptor.canton_code);
+    const dist = pad2(receptor.district_code);
+    if (prov && cant && dist) {
+      // Hacienda exige `otrasSenas` con AL MENOS 5 caracteres cuando se envía la
+      // dirección; si el cliente no tiene detalle, se usa un valor por defecto.
       const otras = String(receptor.address ?? '').trim();
       rec.address = {
-        province: prov1(receptor.province_code),
-        canton: pad2(receptor.canton_code),
-        district: pad2(receptor.district_code),
+        province: prov, canton: cant, district: dist,
         otrasSenas: otras.length >= 5 ? otras : 'Sin otras señas',
       };
     }

@@ -34,6 +34,15 @@ function linesFromDoc(d: any): any[] {
 
 // Empareja líneas del comprobante con productos del tenant (por CABYS, código/SKU
 // o nombre). Ignora los productos ocultos (soft-deleted).
+// Algunos proveedores meten datos internos en el <Detalle> separados por ';'
+// (ej. "Casco KOV RACING L;32100.98;24;;P001688;24396.74"). Nos quedamos con el
+// NOMBRE real: todo lo anterior al primer ';' seguido de un número.
+function cleanReceptionDetail(s: any): string {
+  const str = String(s ?? '').trim();
+  const m = str.match(/^(.*?);\s*\d/);
+  return (m ? m[1] : str).trim();
+}
+
 async function matchLines(tenantId: string, lines: any[]): Promise<any[]> {
   let sel: any = await db.from('products')
     .select('id, name, cabys_code, sku').eq('tenant_id', tenantId).is('deleted_at', null).limit(5000);
@@ -50,7 +59,7 @@ async function matchLines(tenantId: string, lines: any[]): Promise<any[]> {
   return lines.map((l: any) => {
     const cabys = String(l.cabys ?? l.CodigoCABYS ?? '');
     const code = String(l.code ?? l.Codigo ?? '').trim();
-    const detail = String(l.detail ?? l.Detalle ?? '');
+    const detail = cleanReceptionDetail(l.detail ?? l.Detalle);
     // Coincidencia por: 1) CABYS, 2) código comercial == SKU interno, 3) nombre.
     const mCabys = cabys ? byCabys.get(cabys) : null;
     const mSku = !mCabys && code ? bySku.get(code.toLowerCase()) : null;
@@ -367,6 +376,13 @@ function cleanHaciendaError(raw: any): string | null {
   return s.replace(/\s+/g, ' ').trim();
 }
 
+/** company_id de Alanube del tenant según el ambiente. Necesario para consultar
+ *  documentos de empresas 'associated' (?idCompany=). */
+function feCompanyId(cfg: any): string | undefined {
+  const isSandbox = String(cfg?.environment ?? 'production') === 'sandbox';
+  return (isSandbox ? cfg?.alanube_company_id_sandbox : cfg?.alanube_company_id_production) ?? cfg?.alanube_company_id ?? undefined;
+}
+
 /** Tipo de documento (columna) → kind de Alanube para consultar el recurso. */
 function feKindOf(documentType?: string | null): 'invoice' | 'ticket' | 'credit-note' | 'debit-note' {
   switch (String(documentType ?? '')) {
@@ -405,60 +421,59 @@ async function alanubeDocStatus(client: ReturnType<typeof alanube.forEnv>, docId
   return { status: mapAlanubeStatus(rawStatus), rawStatus, clave, error: cleanHaciendaError(rawErr), raw: doc };
 }
 
+// Consulta el estatus de UNA factura en Hacienda y lo GUARDA. Reutilizable desde
+// la ruta del tenant y desde el panel admin (reintento por fila en la bitácora).
+export async function refreshInvoiceStatus(tenantId: string, invoiceId: string): Promise<{ fe_status: string; ind_estado: any; error: any }> {
+  const cfg = await loadFEConfig(tenantId);
+  const provider = cfg.fe_provider === 'alanube' ? 'alanube' : 'facturemos';
+  if (provider === 'facturemos' && !cfg.api_key_emisor) throw new Error('Falta configurar la ApiKey del emisor');
+  const env = cfg.environment === 'sandbox' ? 'sandbox' : 'production'; // default producción
+
+  const { data: inv } = await db.from('invoices')
+    .select('id, invoice_number, fe_clave, fe_consecutivo, document_type').eq('id', invoiceId).eq('tenant_id', tenantId).maybeSingle();
+  if (!(inv as any)?.fe_clave) throw new Error('La factura no fue emitida');
+
+  let fe_status = 'sent';
+  const patch: Record<string, any> = { updated_at: new Date().toISOString() };
+  let indEstado: any = null, errDetail: any = null;
+  if (provider === 'alanube') {
+    const docId = (inv as any).fe_consecutivo;
+    if (!docId) throw new Error('No hay id de documento de Alanube para consultar. Volvé a emitir.');
+    const r = await alanubeDocStatus(alanube.forEnv(cfg.environment), docId, { kind: feKindOf((inv as any).document_type), companyId: feCompanyId(cfg) });
+    fe_status = r.status; indEstado = r.rawStatus; errDetail = r.error;
+    patch.fe_status = fe_status;
+    patch.fe_error = r.error;
+    patch.fe_response = r.raw;
+    if (r.clave && /^\d{50}$/.test(String(r.clave)) && r.clave !== (inv as any).fe_clave) {
+      patch.fe_clave = r.clave;
+    }
+  } else {
+    const data = await consultaEstatus(env, cfg.api_key_emisor, (inv as any).fe_clave);
+    fe_status = mapEstado(data?.Ind_estado);
+    indEstado = data?.Ind_estado ?? null; errDetail = data?.Error ?? null;
+    patch.fe_status = fe_status;
+    patch.fe_xml = data?.Respuesta_xml ?? null;
+    patch.fe_error = data?.Error ?? null;
+  }
+  let upd = await db.from('invoices').update(patch).eq('id', invoiceId).eq('tenant_id', tenantId);
+  if (upd.error && /fe_response|fe_request/.test(upd.error.message)) {
+    const { fe_response, fe_request, ...rest } = patch;   // migración 55 sin correr
+    upd = await db.from('invoices').update(rest).eq('id', invoiceId).eq('tenant_id', tenantId);
+  }
+  if (fe_status === 'accepted') autoSendComprobanteToCustomer(tenantId, invoiceId);
+  if (fe_status === 'rejected' || fe_status === 'error') {
+    const docLabel = `#${(inv as any)?.invoice_number ?? invoiceId}`;
+    void notifyFeError(tenantId, docLabel, String(errDetail || 'Comprobante rechazado por Hacienda')).catch(() => {});
+  }
+  return { fe_status, ind_estado: indEstado, error: errDetail };
+}
+
 // POST /refresh-status — consulta el estatus de una factura por su Clave y lo GUARDA.
 hacienda.post('/refresh-status', async (c) => {
   try {
-    const tenantId = c.get('tenantId');
     const { invoice_id } = await c.req.json().catch(() => ({}));
     if (!invoice_id) return fail(c, 'Falta invoice_id', 422);
-
-    const cfg = await loadFEConfig(tenantId);
-    const provider = cfg.fe_provider === 'alanube' ? 'alanube' : 'facturemos';
-    if (provider === 'facturemos' && !cfg.api_key_emisor) return fail(c, 'Falta configurar la ApiKey del emisor', 422);
-    const env = cfg.environment === 'sandbox' ? 'sandbox' : 'production'; // default producción
-
-    const { data: inv } = await db.from('invoices')
-      .select('id, invoice_number, fe_clave, fe_consecutivo, document_type').eq('id', invoice_id).eq('tenant_id', tenantId).maybeSingle();
-    if (!(inv as any)?.fe_clave) return fail(c, 'La factura no fue emitida', 422);
-
-    let fe_status = 'sent';
-    const patch: Record<string, any> = { updated_at: new Date().toISOString() };
-    let indEstado: any = null, errDetail: any = null;
-    if (provider === 'alanube') {
-      const docId = (inv as any).fe_consecutivo;
-      if (!docId) return fail(c, 'No hay id de documento de Alanube para consultar. Volvé a emitir.', 422);
-      const r = await alanubeDocStatus(alanube.forEnv(cfg.environment), docId, { kind: feKindOf((inv as any).document_type) });
-      fe_status = r.status; indEstado = r.rawStatus; errDetail = r.error;
-      patch.fe_status = fe_status;
-      patch.fe_error = r.error;    // motivo del rechazo de Hacienda (si lo hay)
-      patch.fe_response = r.raw;   // guardar la respuesta cruda para la bitácora
-      // Si ya llegó la clave real de Hacienda (50 díg) y aún guardábamos el ULID,
-      // la persistimos para mostrar clave y consecutivo correctos.
-      if (r.clave && /^\d{50}$/.test(String(r.clave)) && r.clave !== (inv as any).fe_clave) {
-        patch.fe_clave = r.clave;
-      }
-    } else {
-      const data = await consultaEstatus(env, cfg.api_key_emisor, (inv as any).fe_clave);
-      fe_status = mapEstado(data?.Ind_estado);
-      indEstado = data?.Ind_estado ?? null; errDetail = data?.Error ?? null;
-      patch.fe_status = fe_status;
-      patch.fe_xml = data?.Respuesta_xml ?? null;
-      patch.fe_error = data?.Error ?? null;
-    }
-    let upd = await db.from('invoices').update(patch).eq('id', invoice_id).eq('tenant_id', tenantId);
-    if (upd.error && /fe_response|fe_request/.test(upd.error.message)) {
-      const { fe_response, fe_request, ...rest } = patch;   // migración 55 sin correr
-      upd = await db.from('invoices').update(rest).eq('id', invoice_id).eq('tenant_id', tenantId);
-    }
-    // Al ACEPTARSE, enviar automáticamente el comprobante completo al cliente.
-    if (fe_status === 'accepted') autoSendComprobanteToCustomer(tenantId, invoice_id);
-    // Si Hacienda RECHAZÓ, avisar al dueño por WhatsApp (fire-and-forget).
-    if (fe_status === 'rejected' || fe_status === 'error') {
-      const docLabel = `#${(inv as any)?.invoice_number ?? invoice_id}`;
-      void notifyFeError(tenantId, docLabel, String(errDetail || 'Comprobante rechazado por Hacienda')).catch(() => {});
-    }
-
-    return ok(c, { fe_status, ind_estado: indEstado, error: errDetail });
+    return ok(c, await refreshInvoiceStatus(c.get('tenantId'), invoice_id));
   } catch (err: any) {
     const status = err instanceof FacturemosError ? err.status : 500;
     return fail(c, err.message, status);
@@ -489,7 +504,7 @@ hacienda.post('/refresh-pending', async (c) => {
         if (provider === 'alanube') {
           if (!inv.fe_consecutivo) continue;   // sin id de Alanube no podemos consultar
           const kind = feKindOf(inv.document_type);
-          const r = await alanubeDocStatus(alanube.forEnv(cfg.environment), inv.fe_consecutivo, { kind });
+          const r = await alanubeDocStatus(alanube.forEnv(cfg.environment), inv.fe_consecutivo, { kind, companyId: feCompanyId(cfg) });
           fe_status = r.status;
           patch.fe_error = r.error;    // motivo del rechazo (si lo hay)
           patch.fe_response = r.raw;   // respuesta cruda para depurar el estado
@@ -1367,7 +1382,7 @@ hacienda.post('/received/reconcile', async (c) => {
     const body = await c.req.json().catch(() => ({}));
     const { id, purchase_id, items, no_inventory } = body as {
       id: string; purchase_id?: string; no_inventory?: boolean;
-      items?: Array<{ detail: string; quantity: number; unit_price: number; cabys?: string | null; product_id?: string | null; action: 'update' | 'create' | 'skip' }>;
+      items?: Array<{ detail: string; quantity: number; unit_price: number; total?: number; subtotal?: number; cabys?: string | null; product_id?: string | null; action: 'update' | 'create' | 'skip' }>;
     };
     if (!id) return fail(c, 'Falta el id', 422);
 
@@ -1391,7 +1406,7 @@ hacienda.post('/received/reconcile', async (c) => {
     // como SKU del producto nuevo. Mapeado por detalle para no depender del front.
     const codeByDetail = new Map<string, string>();
     for (const l of linesFromDoc(d)) {
-      const det = String(l.detail ?? l.Detalle ?? '').trim().toLowerCase();
+      const det = cleanReceptionDetail(l.detail ?? l.Detalle).toLowerCase();
       const code = String(l.code ?? l.Codigo ?? '').trim();
       if (det && code) codeByDetail.set(det, code);
     }
@@ -1423,7 +1438,15 @@ hacienda.post('/received/reconcile', async (c) => {
       if (it.action === 'skip') continue;
       let productId = it.product_id ?? null;
       const qty = Number(it.quantity) || 1;
-      const price = Number(it.unit_price) || 0;
+      // Costo por unidad CONFIABLE: el XML a veces trae un PrecioUnitario que NO
+      // cuadra con el total de la línea (ej. 32100.98 vs 24396.74/24=1016.53) o con
+      // hasta 19 decimales. Si el PrecioUnitario no cuadra con total÷cantidad, usamos
+      // total÷cantidad; y siempre redondeamos a 2 decimales.
+      const rawUnit = Number(it.unit_price) || 0;
+      const lineTotal = Number(it.total ?? it.subtotal) || 0;
+      const fromTotal = lineTotal > 0 && qty > 0 ? lineTotal / qty : rawUnit;
+      const consistent = rawUnit > 0 && lineTotal > 0 && Math.abs(rawUnit * qty - lineTotal) <= Math.max(1, lineTotal * 0.02);
+      const price = Math.round((consistent ? rawUnit : fromTotal) * 100) / 100;
 
       if (it.action === 'update' && productId) {
         // Producto que COINCIDE (por código/nombre): actualizar CABYS/precio.
@@ -1440,7 +1463,7 @@ hacienda.post('/received/reconcile', async (c) => {
         const xmlCode = codeByDetail.get(String(it.detail ?? '').trim().toLowerCase()) || '';
         const baseProd = {
           tenant_id: tenantId,
-          name: it.detail || 'Producto',
+          name: cleanReceptionDetail(it.detail) || 'Producto',
           cabys_code: it.cabys || null,
           cost_price: price, unit_price: price,
           stock_quantity: 0, tracks_stock: !noInventory,
