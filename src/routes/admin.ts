@@ -1799,6 +1799,34 @@ async function subscriptionDaysLeft(tenantId: string): Promise<number | null> {
   return Math.max(0, Math.ceil(ms / 86_400_000));
 }
 
+// POST /clean-product-names — limpieza masiva: quita la basura que algunos
+// proveedores meten en el <Detalle> (";número;…") de los nombres de productos
+// YA guardados. Paginado. Devuelve cuántos limpió.
+admin.post('/clean-product-names', async (c) => {
+  try {
+    const PAGE = 1000;
+    let cleaned = 0, scanned = 0;
+    for (let from = 0; ; from += PAGE) {
+      const { data, error } = await db.from('products').select('id, name')
+        .like('name', '%;%').order('id', { ascending: true }).range(from, from + PAGE - 1);
+      if (error) throw new Error(error.message);
+      const chunk = (data ?? []) as any[];
+      for (const p of chunk) {
+        scanned++;
+        const m = String(p.name ?? '').match(/^(.*?);\s*\d/);   // nombre real antes de ";<número>"
+        if (!m) continue;
+        const clean = m[1].trim();
+        if (clean && clean !== p.name) {
+          await db.from('products').update({ name: clean, updated_at: new Date().toISOString() }).eq('id', p.id);
+          cleaned++;
+        }
+      }
+      if (chunk.length < PAGE) break;
+    }
+    return ok(c, { cleaned, scanned });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // GET /whatsapp/status — ¿está configurado el envío por WhatsApp?
 admin.get('/whatsapp/status', (c) => ok(c, { enabled: whatsappEnabled() }));
 

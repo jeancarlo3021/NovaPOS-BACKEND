@@ -1456,6 +1456,7 @@ hacienda.post('/received/reconcile', async (c) => {
         const upd: any = { updated_at: new Date().toISOString() };
         if (it.cabys) upd.cabys_code = it.cabys;
         if (price > 0) upd.cost_price = price;
+        if (supplierId) upd.supplier_id = supplierId;   // proveedor del comprobante
         // Sobrescribir el NOMBRE con el del comprobante (limpio) si viene uno nuevo.
         const newName = cleanReceptionDetail(it.detail);
         if (newName) upd.name = newName;
@@ -1466,13 +1467,14 @@ hacienda.post('/received/reconcile', async (c) => {
         // Producto NUEVO (el código NO coincide con ninguno interno): se CREA ahora
         // y se agrega a la orden de una vez (antes se difería y la orden quedaba vacía).
         // SKU = código comercial del XML si viene; si no, autogenerado.
-        const xmlCode = codeByDetail.get(String(it.detail ?? '').trim().toLowerCase()) || '';
+        const xmlCode = codeByDetail.get(cleanReceptionDetail(it.detail).toLowerCase()) || '';
         const baseProd = {
           tenant_id: tenantId,
           name: cleanReceptionDetail(it.detail) || 'Producto',
           cabys_code: it.cabys || null,
           cost_price: price, unit_price: price,
           stock_quantity: 0, tracks_stock: !noInventory,
+          supplier_id: supplierId,   // proveedor del comprobante
         };
         let ins = await db.from('products').insert({ ...baseProd, sku: xmlCode || genReceptionSku(it.detail) }).select('id').single();
         // Si el código del XML choca con un SKU ya existente, reintenta con uno único.

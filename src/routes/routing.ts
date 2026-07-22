@@ -1006,11 +1006,18 @@ routing.post('/:id/close', async (c) => {
     const gastosList: Array<{ description: string; amount: number; payment_method?: string }> = [];
     let gastosTotal = 0;
     if (driverId) {
-      const { data: pays } = await db.from('accounts_receivable_payments')
-        .select('amount, method, receivable:accounts_receivable(customer_name, invoice_number)')
+      let paysRes: any = await db.from('accounts_receivable_payments')
+        .select('amount, method, voided_at, receivable:accounts_receivable(customer_name, invoice_number)')
         .eq('tenant_id', tenantId).eq('user_id', driverId)
         .gte('created_at', windowStart).lte('created_at', windowEnd);
-      for (const p of (pays ?? []) as any[]) {
+      if (paysRes.error && /voided_at|column/.test(paysRes.error.message ?? '')) {   // migración 63 sin correr
+        paysRes = await db.from('accounts_receivable_payments')
+          .select('amount, method, receivable:accounts_receivable(customer_name, invoice_number)')
+          .eq('tenant_id', tenantId).eq('user_id', driverId)
+          .gte('created_at', windowStart).lte('created_at', windowEnd);
+      }
+      for (const p of (paysRes.data ?? []) as any[]) {
+        if (p.voided_at) continue;   // los abonos ANULADOS no cuentan en el cierre
         const m = (p.method ?? 'cash') as 'cash' | 'card' | 'sinpe';
         const amt = Number(p.amount ?? 0);
         if (m === 'card' || m === 'sinpe') abonos[m] += amt; else abonos.cash += amt;

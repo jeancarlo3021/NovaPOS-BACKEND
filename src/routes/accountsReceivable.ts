@@ -204,6 +204,57 @@ accountsReceivable.post('/:id/pay', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+// POST /payments/:paymentId/void — ANULAR un abono. Solo administrador, gerente,
+// contador o propietario. Borra el abono y recalcula el saldo de la cuenta.
+const VOID_ROLES = new Set(['owner', 'admin', 'gerente', 'contador']);
+accountsReceivable.post('/payments/:paymentId/void', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const role = String(c.get('role') ?? '');
+    if (!VOID_ROLES.has(role)) {
+      return fail(c, 'Solo el administrador, gerente o contador pueden anular abonos.', 403);
+    }
+    const { paymentId } = c.req.param();
+    const { data: pay } = await db.from('accounts_receivable_payments')
+      .select('id, receivable_id, amount, voided_at').eq('id', paymentId).eq('tenant_id', tenantId).maybeSingle();
+    if (!pay) return fail(c, 'Abono no encontrado', 404);
+    if ((pay as any).voided_at) return fail(c, 'El abono ya estaba anulado', 409);
+
+    const receivableId = (pay as any).receivable_id;
+    // Borrado LÓGICO: se marca como anulado (con quién y cuándo). Si las columnas
+    // aún no existen (migración 63 sin correr), cae a borrado físico.
+    const vUpd = await db.from('accounts_receivable_payments')
+      .update({ voided_at: new Date().toISOString(), voided_by: c.get('userId') ?? null })
+      .eq('id', paymentId).eq('tenant_id', tenantId);
+    if (vUpd.error) {
+      if (/voided_at|voided_by|column/.test(vUpd.error.message)) {
+        await db.from('accounts_receivable_payments').delete().eq('id', paymentId).eq('tenant_id', tenantId);
+      } else { throw new Error(vUpd.error.message); }
+    }
+
+    // Recalcular paid_amount = SUMA de los abonos NO anulados (así el saldo vuelve
+    // EXACTO a como estaba antes de este abono, sin arrastrar errores de resta).
+    let rows: any = await db.from('accounts_receivable_payments')
+      .select('amount, voided_at').eq('receivable_id', receivableId).eq('tenant_id', tenantId);
+    if (rows.error && /voided_at|column/.test(rows.error.message ?? '')) {
+      rows = await db.from('accounts_receivable_payments')
+        .select('amount').eq('receivable_id', receivableId).eq('tenant_id', tenantId);
+    }
+    const newPaid = ((rows.data ?? []) as any[])
+      .filter(r => !r.voided_at).reduce((s, r) => s + Number(r.amount || 0), 0);
+
+    const { data: ar } = await db.from('accounts_receivable')
+      .select('total_amount').eq('id', receivableId).eq('tenant_id', tenantId).maybeSingle();
+    const total = Number((ar as any)?.total_amount ?? 0);
+    const status = newPaid <= 0 ? 'pending' : newPaid >= total ? 'paid' : 'partial';
+    await db.from('accounts_receivable')
+      .update({ paid_amount: newPaid, status, updated_at: new Date().toISOString() })
+      .eq('id', receivableId).eq('tenant_id', tenantId);
+
+    return ok(c, { voided: true, amount: (pay as any).amount, new_paid: newPaid });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 accountsReceivable.delete('/:id', async (c) => {
   try {
     const tenantId = c.get('tenantId');
