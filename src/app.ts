@@ -39,6 +39,8 @@ import email           from './routes/email.js';
 import customerPrices   from './routes/customerPrices.js';
 import routing          from './routes/routing.js';
 import cabys            from './routes/cabys.js';
+import taxWithholdings  from './routes/taxWithholdings.js';
+import recipesRoute     from './routes/recipes.js';
 import exchangeRate     from './routes/exchangeRate.js';
 
 // basePath('/api') matches Vercel's catch-all at api/[[...route]].ts
@@ -120,6 +122,8 @@ api.route('/customer-prices',   customerPrices);
 api.route('/routes',            routing);
 api.route('/cabys',             cabys);
 api.route('/exchange-rate',     exchangeRate);
+api.route('/tax-withholdings',  taxWithholdings);
+api.route('/recipes',           recipesRoute);
 
 app.route('/', api);
 

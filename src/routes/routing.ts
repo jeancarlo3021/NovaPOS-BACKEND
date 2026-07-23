@@ -788,9 +788,20 @@ routing.post('/void-sale/:invoiceId', async (c) => {
     await db.from('invoices').update({ status: 'cancelled', updated_at: new Date().toISOString() })
       .eq('id', invoiceId).eq('tenant_id', tenantId);
 
-    // Si era a crédito, anular la cuenta por cobrar ligada.
+    // Si era a crédito, anular la cuenta por cobrar ligada Y sus abonos (soft).
     if ((inv as any).payment_method === 'credit') {
-      await db.from('accounts_receivable').delete().eq('invoice_id', invoiceId).eq('tenant_id', tenantId);
+      const { data: ars } = await db.from('accounts_receivable')
+        .select('id').eq('invoice_id', invoiceId).eq('tenant_id', tenantId);
+      const arIds = ((ars ?? []) as any[]).map(r => r.id);
+      if (arIds.length) {
+        const v = await db.from('accounts_receivable_payments')
+          .update({ voided_at: new Date().toISOString() })
+          .in('receivable_id', arIds).eq('tenant_id', tenantId).is('voided_at', null);
+        if (v.error && !/voided_at|column/.test(v.error.message ?? '')) console.warn('[void-sale] abonos:', v.error.message);
+        await db.from('accounts_receivable')
+          .update({ status: 'cancelled', updated_at: new Date().toISOString() })
+          .in('id', arIds).eq('tenant_id', tenantId);
+      }
     }
 
     return ok(c, { ok: true, returned_items: (items ?? []).length });

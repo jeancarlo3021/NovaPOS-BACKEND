@@ -245,6 +245,53 @@ invoices.post('/', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+// POST /:id/to-credit — ANULAR EL PAGO de una factura pagada y dejarla A CRÉDITO
+// (con saldo pendiente en Cuentas por Cobrar), SIN anular la factura.
+// Solo administrador, gerente, contador o dueño.
+const TO_CREDIT_ROLES = new Set(['owner', 'admin', 'gerente', 'contador']);
+invoices.post('/:id/to-credit', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    if (!TO_CREDIT_ROLES.has(String(c.get('role') ?? ''))) {
+      return fail(c, 'Solo el administrador, gerente o contador pueden anular el pago.', 403);
+    }
+    const { id } = c.req.param();
+    const { data: inv } = await db.from('invoices')
+      .select('id, status, total, payment_method, cash_session_id, customer_id, customer_name, invoice_number')
+      .eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+    if (!inv) return fail(c, 'Factura no encontrada', 404);
+    if ((inv as any).status !== 'completed') return fail(c, 'Solo se puede en facturas completadas', 409);
+    if ((inv as any).payment_method === 'credit') return fail(c, 'La factura ya está a crédito', 409);
+
+    const { data: existing } = await db.from('accounts_receivable')
+      .select('id').eq('invoice_id', id).eq('tenant_id', tenantId).maybeSingle();
+    if (existing) return fail(c, 'La factura ya tiene una cuenta por cobrar', 409);
+
+    const due = new Date(Date.now() + 30 * 86_400_000).toISOString().slice(0, 10);
+    await createReceivable(tenantId, {
+      customer_id: (inv as any).customer_id, customer_name: (inv as any).customer_name,
+      invoice_id: id, invoice_number: (inv as any).invoice_number,
+      total_amount: Number((inv as any).total ?? 0), due_date: due, source: 'pos',
+      notes: 'Pago anulado — pasado a crédito',
+    });
+    await db.from('invoices')
+      .update({ payment_method: 'credit', updated_at: new Date().toISOString() })
+      .eq('id', id).eq('tenant_id', tenantId);
+    // Revertir el ingreso de caja (la venta había sumado; ahora queda a crédito).
+    if ((inv as any).cash_session_id) {
+      try {
+        await db.from('cash_movements').insert({
+          cash_session_id: (inv as any).cash_session_id, type: 'out',
+          amount: Number((inv as any).total ?? 0),
+          description: `Pago anulado (a crédito) factura ${(inv as any).invoice_number}`,
+          reference_id: id,
+        });
+      } catch (e) { console.warn('[to-credit] caja:', e); }
+    }
+    return ok(c, { ok: true, to_credit: true, total: Number((inv as any).total ?? 0) });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 invoices.post('/:id/void', async (c) => {
   try {
     const tenantId = c.get('tenantId');
@@ -306,6 +353,27 @@ invoices.post('/:id/void', async (c) => {
         console.warn('[void] no se pudo registrar movimiento de caja:', e);
       }
     }
+
+    // 5) Anular la CUENTA POR COBRAR (crédito) de esta factura y sus ABONOS:
+    //    al cancelar la factura completa, los abonos quedan anulados y la cuenta
+    //    se marca cancelada (deja de contar como saldo pendiente).
+    try {
+      const { data: ars } = await db.from('accounts_receivable')
+        .select('id').eq('tenant_id', tenantId).eq('invoice_id', id);
+      const arIds = ((ars ?? []) as any[]).map(r => r.id);
+      if (arIds.length) {
+        // Marcar abonos como anulados (soft). Fallback si migración 63 sin correr.
+        const v = await db.from('accounts_receivable_payments')
+          .update({ voided_at: new Date().toISOString() })
+          .in('receivable_id', arIds).eq('tenant_id', tenantId).is('voided_at', null);
+        if (v.error && !/voided_at|column/.test(v.error.message ?? '')) {
+          console.warn('[void] abonos:', v.error.message);
+        }
+        await db.from('accounts_receivable')
+          .update({ status: 'cancelled', updated_at: new Date().toISOString() })
+          .in('id', arIds).eq('tenant_id', tenantId);
+      }
+    } catch (e) { console.warn('[void] no se pudo anular la CxC:', e); }
 
     return ok(c, data);
   } catch (err: any) { return fail(c, err.message, 500); }
