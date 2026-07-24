@@ -511,7 +511,7 @@ reports.get('/products/sales', async (c) => {
     const invoiceIds = (invoices ?? []).map((i: any) => i.id);
 
     const { data: items } = await db.from('invoice_items')
-      .select('product_id, quantity, unit_price, subtotal')
+      .select('invoice_id, product_id, product_name, quantity, unit_price, subtotal')
       .in('invoice_id', invoiceIds.length > 0 ? invoiceIds : ['null']);
 
     const { data: products } = await db.from('products').select('id, name');
@@ -519,21 +519,27 @@ reports.get('/products/sales', async (c) => {
     const groupMap: Record<string, any> = {};
     (items ?? []).forEach((item: any) => {
       const inv = (invoices ?? []).find((i: any) => i.id === item.invoice_id);
-      if (!groupMap[item.product_id]) {
-        const product = (products ?? []).find((p: any) => p.id === item.product_id);
-        groupMap[item.product_id] = {
+      const product = (products ?? []).find((p: any) => p.id === item.product_id);
+      // Nombre autoritativo: el guardado en la venta (invoice_items.product_name),
+      // que sobrevive aunque el producto se borre o se renombre. El producto actual
+      // es solo respaldo. Agrupamos por product_id, o por nombre si no hay id (ítems
+      // manuales / product_id null) para que no colapsen todos en "desconocido".
+      const name = item.product_name || product?.name || 'Producto desconocido';
+      const key = item.product_id || `name:${name}`;
+      if (!groupMap[key]) {
+        groupMap[key] = {
           product_id: item.product_id,
-          product_name: product?.name ?? 'Producto desconocido',
+          product_name: name,
           total_qty: 0,
           total_revenue: 0,
           sales_count: 0,
           lines: [],
         };
       }
-      groupMap[item.product_id].total_qty += item.quantity;
-      groupMap[item.product_id].total_revenue += item.subtotal;
+      groupMap[key].total_qty += item.quantity;
+      groupMap[key].total_revenue += item.subtotal;
       if (inv) {
-        groupMap[item.product_id].lines.push({
+        groupMap[key].lines.push({
           invoice_number: inv.invoice_number,
           issued_at: inv.issued_at,
           customer_name: inv.customer_name,
