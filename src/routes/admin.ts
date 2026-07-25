@@ -1919,8 +1919,10 @@ async function callWorker(path: string, init?: RequestInit): Promise<Response> {
   });
 }
 
-// GET /admin/whatsapp/status — estado de la sesión (para pintar el QR / conectado).
-admin.get('/whatsapp/status', async (c) => {
+// GET /admin/whatsapp-qr/status — estado de la sesión (para pintar el QR / conectado).
+// Ojo: NO usar '/whatsapp/status' — ya existe otra ruta con ese path (Cloud API)
+// que gana por registrarse antes y devuelve otra forma.
+admin.get('/whatsapp-qr/status', async (c) => {
   if (!isAdminRole(c)) return fail(c, 'forbidden', 403);
   if (!waWorkerBase()) return ok(c, { configured: false, state: 'unconfigured', connected: false, qr: null, me: null });
   try {
@@ -1942,8 +1944,8 @@ admin.get('/whatsapp/status', async (c) => {
   }
 });
 
-// POST /admin/whatsapp/send — { to, text } envía un mensaje de prueba.
-admin.post('/whatsapp/send', async (c) => {
+// POST /admin/whatsapp-qr/send — { to, text } envía un mensaje de prueba.
+admin.post('/whatsapp-qr/send', async (c) => {
   if (!isAdminRole(c)) return fail(c, 'forbidden', 403);
   try {
     const body = await c.req.json().catch(() => ({}));
@@ -1953,8 +1955,8 @@ admin.post('/whatsapp/send', async (c) => {
   } catch (err: any) { return fail(c, err.message, 502); }
 });
 
-// POST /admin/whatsapp/logout — cierra la sesión y fuerza un QR nuevo.
-admin.post('/whatsapp/logout', async (c) => {
+// POST /admin/whatsapp-qr/logout — cierra la sesión y fuerza un QR nuevo.
+admin.post('/whatsapp-qr/logout', async (c) => {
   if (!isAdminRole(c)) return fail(c, 'forbidden', 403);
   try {
     const r = await callWorker('/logout', { method: 'POST' });
