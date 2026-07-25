@@ -1,0 +1,8 @@
+[build]
+builder = "nixpacks"
+# Sin buildCommand: Nixpacks corre `npm install` solo. El worker no tiene build.
+
+[deploy]
+startCommand = "npm start"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
