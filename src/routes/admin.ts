@@ -1925,10 +1925,20 @@ admin.get('/whatsapp/status', async (c) => {
   if (!waWorkerBase()) return ok(c, { configured: false, state: 'unconfigured', connected: false, qr: null, me: null });
   try {
     const r = await callWorker('/status');
-    const data: any = await r.json();
+    const data: any = await r.json().catch(() => ({}));
+    // El worker respondió pero rechazó el secreto → diagnóstico claro.
+    if (r.status === 401) {
+      return ok(c, { configured: true, state: 'unreachable', connected: false, qr: null, me: null,
+        error: 'El worker respondió 401: WHATSAPP_WORKER_SECRET (backend) ≠ WORKER_SECRET (worker).' });
+    }
+    if (!r.ok || !data?.state) {
+      return ok(c, { configured: true, state: 'unreachable', connected: false, qr: null, me: null,
+        error: `El worker respondió HTTP ${r.status}. Revisá WHATSAPP_WORKER_URL.` });
+    }
     return ok(c, { configured: true, ...data });
   } catch (err: any) {
-    return ok(c, { configured: true, state: 'unreachable', connected: false, qr: null, me: null, error: err.message });
+    return ok(c, { configured: true, state: 'unreachable', connected: false, qr: null, me: null,
+      error: `No se pudo conectar al worker (${err.message}). Revisá WHATSAPP_WORKER_URL y que el worker esté encendido.` });
   }
 });
 
