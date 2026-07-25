@@ -1953,4 +1953,108 @@ admin.post('/whatsapp/logout', async (c) => {
   } catch (err: any) { return fail(c, err.message, 502); }
 });
 
+// ════════════════════════════════════════════════════════════════════════════
+// Pagos de proveedores de la PLATAFORMA (ColónClick). Registro interno del Panel
+// Admin — global (no por tenant). Solo owner/admin. Tabla `vendor_payments`.
+// ════════════════════════════════════════════════════════════════════════════
+
+// GET /admin/vendor-payments — lista completa ordenada por vencimiento.
+admin.get('/vendor-payments', async (c) => {
+  if (!isAdminRole(c)) return fail(c, 'forbidden', 403);
+  try {
+    const { data, error } = await db.from('vendor_payments')
+      .select('*')
+      .order('paid', { ascending: true })
+      .order('due_date', { ascending: true, nullsFirst: false });
+    if (error) throw new Error(error.message);
+    return ok(c, data ?? []);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// POST /admin/vendor-payments — crear.
+admin.post('/vendor-payments', async (c) => {
+  if (!isAdminRole(c)) return fail(c, 'forbidden', 403);
+  try {
+    const b = await c.req.json().catch(() => ({}));
+    if (!String(b?.vendor ?? '').trim()) return fail(c, 'El proveedor es obligatorio', 400);
+    const row = {
+      vendor: String(b.vendor).trim(),
+      concept: b.concept ? String(b.concept).trim() : null,
+      amount: Number(b.amount ?? 0),
+      currency: b.currency === 'USD' ? 'USD' : 'CRC',
+      due_date: b.due_date || null,
+      paid: !!b.paid,
+      paid_date: b.paid ? (b.paid_date || new Date().toISOString().slice(0, 10)) : null,
+      recurring: b.recurring === 'monthly' || b.recurring === 'yearly' ? b.recurring : null,
+      notes: b.notes ? String(b.notes).trim() : null,
+    };
+    const { data, error } = await db.from('vendor_payments').insert(row).select('*').single();
+    if (error) throw new Error(error.message);
+    return ok(c, data);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// PUT /admin/vendor-payments/:id — editar.
+admin.put('/vendor-payments/:id', async (c) => {
+  if (!isAdminRole(c)) return fail(c, 'forbidden', 403);
+  try {
+    const id = c.req.param('id');
+    const b = await c.req.json().catch(() => ({}));
+    const patch: any = { updated_at: new Date().toISOString() };
+    if (b.vendor !== undefined) patch.vendor = String(b.vendor).trim();
+    if (b.concept !== undefined) patch.concept = b.concept ? String(b.concept).trim() : null;
+    if (b.amount !== undefined) patch.amount = Number(b.amount ?? 0);
+    if (b.currency !== undefined) patch.currency = b.currency === 'USD' ? 'USD' : 'CRC';
+    if (b.due_date !== undefined) patch.due_date = b.due_date || null;
+    if (b.recurring !== undefined) patch.recurring = (b.recurring === 'monthly' || b.recurring === 'yearly') ? b.recurring : null;
+    if (b.notes !== undefined) patch.notes = b.notes ? String(b.notes).trim() : null;
+    if (b.paid !== undefined) {
+      patch.paid = !!b.paid;
+      patch.paid_date = b.paid ? (b.paid_date || new Date().toISOString().slice(0, 10)) : null;
+    }
+    const { data, error } = await db.from('vendor_payments').update(patch).eq('id', id).select('*').single();
+    if (error) throw new Error(error.message);
+    return ok(c, data);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// POST /admin/vendor-payments/:id/pay — marcar como pagado (fecha opcional).
+admin.post('/vendor-payments/:id/pay', async (c) => {
+  if (!isAdminRole(c)) return fail(c, 'forbidden', 403);
+  try {
+    const id = c.req.param('id');
+    const b = await c.req.json().catch(() => ({}));
+    const paid_date = b?.paid_date || new Date().toISOString().slice(0, 10);
+    const { data, error } = await db.from('vendor_payments')
+      .update({ paid: true, paid_date, updated_at: new Date().toISOString() })
+      .eq('id', id).select('*').single();
+    if (error) throw new Error(error.message);
+    return ok(c, data);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// POST /admin/vendor-payments/:id/unpay — revertir a pendiente.
+admin.post('/vendor-payments/:id/unpay', async (c) => {
+  if (!isAdminRole(c)) return fail(c, 'forbidden', 403);
+  try {
+    const id = c.req.param('id');
+    const { data, error } = await db.from('vendor_payments')
+      .update({ paid: false, paid_date: null, updated_at: new Date().toISOString() })
+      .eq('id', id).select('*').single();
+    if (error) throw new Error(error.message);
+    return ok(c, data);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// DELETE /admin/vendor-payments/:id
+admin.delete('/vendor-payments/:id', async (c) => {
+  if (!isAdminRole(c)) return fail(c, 'forbidden', 403);
+  try {
+    const id = c.req.param('id');
+    const { error } = await db.from('vendor_payments').delete().eq('id', id);
+    if (error) throw new Error(error.message);
+    return ok(c, { deleted: true });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 export default admin;
