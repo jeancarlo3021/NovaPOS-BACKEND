@@ -1892,4 +1892,65 @@ admin.post('/whatsapp/payment-reminders-bulk', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+// ════════════════════════════════════════════════════════════════════════════
+// WhatsApp por QR (Baileys) — proxy al worker persistente.
+// El worker NO vive en Vercel (serverless); corre en un host siempre encendido.
+// Estas rutas reenvían al worker usando el secreto compartido (nunca llega al
+// browser). Solo admin/owner (el panel admin gestiona el número ColónClick).
+// Env: WHATSAPP_WORKER_URL, WHATSAPP_WORKER_SECRET
+// ════════════════════════════════════════════════════════════════════════════
+function waWorkerBase(): string {
+  return (process.env.WHATSAPP_WORKER_URL || '').trim().replace(/\/+$/, '');
+}
+function isAdminRole(c: any): boolean {
+  const role = c.get('role');
+  return role === 'owner' || role === 'admin';
+}
+async function callWorker(path: string, init?: RequestInit): Promise<Response> {
+  const base = waWorkerBase();
+  if (!base) throw new Error('WHATSAPP_WORKER_URL no configurado');
+  return fetch(base + path, {
+    ...init,
+    headers: {
+      'content-type': 'application/json',
+      'x-worker-secret': (process.env.WHATSAPP_WORKER_SECRET || '').trim(),
+      ...(init?.headers as Record<string, string> | undefined),
+    },
+  });
+}
+
+// GET /admin/whatsapp/status — estado de la sesión (para pintar el QR / conectado).
+admin.get('/whatsapp/status', async (c) => {
+  if (!isAdminRole(c)) return fail(c, 'forbidden', 403);
+  if (!waWorkerBase()) return ok(c, { configured: false, state: 'unconfigured', connected: false, qr: null, me: null });
+  try {
+    const r = await callWorker('/status');
+    const data: any = await r.json();
+    return ok(c, { configured: true, ...data });
+  } catch (err: any) {
+    return ok(c, { configured: true, state: 'unreachable', connected: false, qr: null, me: null, error: err.message });
+  }
+});
+
+// POST /admin/whatsapp/send — { to, text } envía un mensaje de prueba.
+admin.post('/whatsapp/send', async (c) => {
+  if (!isAdminRole(c)) return fail(c, 'forbidden', 403);
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const r = await callWorker('/send', { method: 'POST', body: JSON.stringify(body) });
+    const data: any = await r.json();
+    return c.json(data, r.status as any);
+  } catch (err: any) { return fail(c, err.message, 502); }
+});
+
+// POST /admin/whatsapp/logout — cierra la sesión y fuerza un QR nuevo.
+admin.post('/whatsapp/logout', async (c) => {
+  if (!isAdminRole(c)) return fail(c, 'forbidden', 403);
+  try {
+    const r = await callWorker('/logout', { method: 'POST' });
+    const data: any = await r.json();
+    return c.json(data, r.status as any);
+  } catch (err: any) { return fail(c, err.message, 502); }
+});
+
 export default admin;

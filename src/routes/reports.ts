@@ -59,6 +59,24 @@ reports.get('/delivery', async (c) => {
     if (error) throw new Error(error.message);
     const rows = (data ?? []) as any[];
 
+    // Comisiones configuradas en Ajustes → Delivery (fuente de verdad del %).
+    const { data: dcfg } = await db.from('settings').select('config')
+      .eq('tenant_id', tenantId).eq('type', 'delivery').maybeSingle();
+    const dc: any = dcfg?.config ?? {};
+    const settingsPct: Record<string, number> = {
+      Uber: Number(dc.uber_pct ?? 0), Didi: Number(dc.didi_pct ?? 0),
+      PedidosYa: Number(dc.pedidosya_pct ?? 0), Otro: Number(dc.otro_pct ?? 0),
+    };
+    // % de comisión de una factura: el guardado al vender; si no se capturó
+    // (ventas viejas o sin plataforma en el modal), se toma el de Ajustes según
+    // la plataforma. Así el reporte SIEMPRE refleja la comisión configurada.
+    const pctOf = (r: any) => {
+      const stored = Number(r.delivery_commission_pct ?? 0);
+      if (stored > 0) return stored;
+      const pl = (r.delivery_platform && String(r.delivery_platform).trim()) || '';
+      return Number(settingsPct[pl] ?? 0);
+    };
+
     // Lunes (YYYY-MM-DD) de la semana de una fecha.
     const weekMonday = (iso: string): string => {
       const d = new Date(iso);
@@ -66,6 +84,15 @@ reports.get('/delivery', async (c) => {
       d.setDate(d.getDate() - day);
       return d.toISOString().slice(0, 10);
     };
+
+    // Recalcula comisión/neto por fila desde el % (no del delivery_net guardado,
+    // que puede venir nulo) y deja los valores en la fila para el detalle del front.
+    for (const r of rows) {
+      const pct = pctOf(r);
+      const commission = Math.round(Number(r.total ?? 0) * pct / 100);
+      r.delivery_commission_pct = pct;
+      r.delivery_net = Number(r.total ?? 0) - commission;
+    }
 
     const netOf = (r: any) => Number(r.delivery_net ?? r.total ?? 0);
     // IVA de la factura; si no viniera, se deriva del total (total - base).
