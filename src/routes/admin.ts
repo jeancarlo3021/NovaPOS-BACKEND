@@ -1965,6 +1965,38 @@ admin.post('/whatsapp-qr/logout', async (c) => {
   } catch (err: any) { return fail(c, err.message, 502); }
 });
 
+// GET /admin/whatsapp-qr/notify-phone?tenant=... — número dedicado a avisos
+// (recordatorios de pago / errores de Hacienda) de UN negocio.
+admin.get('/whatsapp-qr/notify-phone', async (c) => {
+  if (!isAdminRole(c)) return fail(c, 'forbidden', 403);
+  const tenant = c.req.query('tenant');
+  if (!tenant) return fail(c, 'tenant requerido', 400);
+  const { data } = await db.from('settings').select('config')
+    .eq('tenant_id', tenant).eq('type', 'general').maybeSingle();
+  const cfg: any = (data as any)?.config ?? {};
+  return ok(c, { notify_phone: cfg.notify_phone ?? '', emisor_phone: cfg.emisor_phone ?? '' });
+});
+
+// POST /admin/whatsapp-qr/notify-phone { tenant, phone } — guarda el número.
+admin.post('/whatsapp-qr/notify-phone', async (c) => {
+  if (!isAdminRole(c)) return fail(c, 'forbidden', 403);
+  try {
+    const b = await c.req.json().catch(() => ({}));
+    const tenant = b?.tenant;
+    if (!tenant) return fail(c, 'tenant requerido', 400);
+    const { data } = await db.from('settings').select('config')
+      .eq('tenant_id', tenant).eq('type', 'general').maybeSingle();
+    const cfg: any = (data as any)?.config ?? {};
+    cfg.notify_phone = String(b?.phone ?? '').trim();
+    const { error } = await db.from('settings').upsert(
+      { tenant_id: tenant, type: 'general', config: cfg, updated_at: new Date().toISOString() },
+      { onConflict: 'tenant_id,type' },
+    );
+    if (error) throw new Error(error.message);
+    return ok(c, { ok: true, notify_phone: cfg.notify_phone });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // ════════════════════════════════════════════════════════════════════════════
 // Pagos de proveedores de la PLATAFORMA (ColónClick). Registro interno del Panel
 // Admin — global (no por tenant). Solo owner/admin. Tabla `vendor_payments`.

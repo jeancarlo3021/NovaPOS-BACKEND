@@ -24,7 +24,9 @@ export async function businessContact(tenantId: string): Promise<BizContact> {
     const { data: s } = await db.from('settings').select('config')
       .eq('tenant_id', tenantId).eq('type', 'general').maybeSingle();
     const cfg: any = (s as any)?.config ?? {};
-    phone = normalizePhone(cfg.emisor_phone);
+    // Preferimos el número DEDICADO a avisos (notify_phone) si está guardado;
+    // si no, el teléfono del emisor.
+    phone = normalizePhone(cfg.notify_phone || cfg.emisor_phone);
     name = String(cfg.emisor_commercial_name || cfg.emisor_name || '').trim();
   } catch { /* ignore */ }
 
