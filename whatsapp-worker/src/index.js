@@ -23,6 +23,7 @@
 
 import { Hono } from 'hono';
 import { serve } from '@hono/node-server';
+import { createClient } from '@supabase/supabase-js';
 import qrcode from 'qrcode';
 import pino from 'pino';
 import baileys, {
@@ -30,6 +31,7 @@ import baileys, {
   DisconnectReason,
   fetchLatestBaileysVersion,
 } from '@whiskeysockets/baileys';
+import { useSupabaseAuthState } from './authState.js';
 
 // Baileys exporta el default como makeWASocket.
 const makeWASocket = baileys.default ?? baileys;
@@ -37,6 +39,12 @@ const makeWASocket = baileys.default ?? baileys;
 const WORKER_SECRET = (process.env.WORKER_SECRET || '').trim();
 const PORT = Number(process.env.PORT) || 8088;
 const AUTH_DIR = process.env.AUTH_DIR || './auth';
+
+// Persistencia de la sesión: Supabase (recomendado, sobrevive sin volumen) o disco.
+const SUPABASE_URL = (process.env.SUPABASE_URL || '').trim();
+const SUPABASE_KEY = (process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+const USE_SUPABASE = !!(SUPABASE_URL && SUPABASE_KEY);
+let supabaseAuth = null;   // { state, saveCreds, clear } cuando se usa Supabase
 
 const log = pino({ level: process.env.LOG_LEVEL || 'info' });
 
@@ -59,7 +67,17 @@ async function startSock() {
   if (starting) return;
   starting = true;
   try {
-    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+    let state, saveCreds;
+    if (USE_SUPABASE) {
+      const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false } });
+      supabaseAuth = await useSupabaseAuthState(supabase, 'colonclick');
+      state = supabaseAuth.state;
+      saveCreds = supabaseAuth.saveCreds;
+    } else {
+      const mf = await useMultiFileAuthState(AUTH_DIR);
+      state = mf.state;
+      saveCreds = mf.saveCreds;
+    }
     const { version } = await fetchLatestBaileysVersion();
 
     sock = makeWASocket({
@@ -98,11 +116,13 @@ async function startSock() {
         log.warn({ code, loggedOut }, 'Conexión cerrada');
         starting = false;
         if (loggedOut) {
-          // Sesión invalidada: hay que re-escanear. No reconectamos con creds viejas.
+          // Sesión invalidada: borrar credenciales y reiniciar para un QR nuevo.
           meInfo = null;
           currentQrDataUrl = null;
+          if (supabaseAuth) { try { await supabaseAuth.clear(); } catch { /* ignore */ } }
+          setTimeout(() => { starting = false; startSock().catch(() => {}); }, 1500);
         } else {
-          // Corte transitorio → reconectar.
+          // Corte transitorio → reconectar (con las mismas credenciales).
           setTimeout(() => startSock().catch(() => {}), 2000);
         }
         return;
@@ -162,6 +182,7 @@ app.post('/send', async (c) => {
 
 app.post('/logout', async (c) => {
   try { await sock?.logout(); } catch { /* ignore */ }
+  if (supabaseAuth) { try { await supabaseAuth.clear(); } catch { /* ignore */ } }
   connState = 'close';
   meInfo = null;
   currentQrDataUrl = null;
@@ -175,7 +196,7 @@ if (!WORKER_SECRET) {
 }
 
 serve({ fetch: app.fetch, port: PORT }, () => {
-  log.info(`WhatsApp worker → http://localhost:${PORT}  (AUTH_DIR=${AUTH_DIR})`);
+  log.info(`WhatsApp worker → http://localhost:${PORT}  (persistencia: ${USE_SUPABASE ? 'Supabase (wa_sessions)' : `disco ${AUTH_DIR}`})`);
 });
 
 startSock().catch((e) => log.error({ err: String(e) }, 'startSock inicial falló'));

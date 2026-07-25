@@ -15,7 +15,18 @@ muestra el QR / estado / envío de prueba.
 |-----|-------------|
 | `WORKER_SECRET` | Secreto compartido con el backend (obligatorio). Debe coincidir con `WHATSAPP_WORKER_SECRET` del backend. |
 | `PORT` | Puerto HTTP (default `8088`). |
-| `AUTH_DIR` | Carpeta de credenciales (default `./auth`). **Apuntala a un volumen persistente.** |
+| `SUPABASE_URL` | **(Recomendado)** URL de tu Supabase. Si está + `SUPABASE_SERVICE_KEY`, la sesión se guarda en la BD (tabla `wa_sessions`) y **sobrevive reinicios sin necesitar volumen**. |
+| `SUPABASE_SERVICE_KEY` | Service-role key de Supabase (secreta). Habilita la persistencia en BD. |
+| `AUTH_DIR` | Solo si NO usás Supabase: carpeta de credenciales (default `./auth`). En ese caso **apuntala a un volumen persistente** o se pierde la sesión en cada reinicio. |
+
+## Persistencia de la sesión (que NO pida QR cada vez)
+
+Dos opciones — elegí una:
+
+- **Supabase (recomendado):** poné `SUPABASE_URL` + `SUPABASE_SERVICE_KEY`. Corré antes la migración `68_wa_sessions.sql`. La sesión se guarda en la tabla `wa_sessions` y sobrevive redeploys **sin volumen**.
+- **Disco:** dejá `AUTH_DIR=/data/auth` y montá un **Volume** en `/data`. Solo funciona si el volumen persiste entre reinicios.
+
+Si no configurás ninguna, cada reinicio pedirá re-escanear el QR.
 
 ## Correr local
 

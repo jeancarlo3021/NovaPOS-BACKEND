@@ -12,6 +12,7 @@
  */
 import { db } from '../db/client.js';
 import { sendTemplate, whatsappEnabled, normalizePhone, type WaResult } from './whatsapp.js';
+import { sendViaWorker, workerEnabled } from './whatsappWorker.js';
 
 export interface BizContact { phone: string; name: string }
 
@@ -41,27 +42,46 @@ export async function businessContact(tenantId: string): Promise<BizContact> {
   return { phone, name };
 }
 
+// Canal de envío: si hay WORKER (número vinculado por QR) se usa TEXTO LIBRE por
+// el worker (sin plantillas de Meta). Si no, se cae a la Cloud API con plantilla.
+// Si no hay ninguno, se salta.
+async function deliver(phone: string, workerText: string, template: () => WaResult | Promise<WaResult>): Promise<WaResult> {
+  if (workerEnabled()) {
+    const r = await sendViaWorker(phone, workerText);
+    if (r.ok || r.skipped) return r;
+    // Si el worker falló pero hay Cloud API, intentamos por ahí.
+    if (whatsappEnabled()) return template();
+    return r;
+  }
+  if (whatsappEnabled()) return template();
+  return { ok: false, skipped: true };
+}
+
 /** 1. Recordatorio de pago de la suscripción. */
 export async function notifyPaymentDue(tenantId: string, days: number): Promise<WaResult> {
-  if (!whatsappEnabled()) return { ok: false, skipped: true };
   const { phone, name } = await businessContact(tenantId);
   if (!phone) return { ok: false, skipped: true, error: 'Sin teléfono' };
-  return sendTemplate(phone, 'recordatorio_pago', [name, days]);
+  const cuando = days <= 0 ? 'hoy' : days === 1 ? 'mañana' : `en ${days} días`;
+  const text = `⏰ *ColónClick*\n\nHola ${name}, tu suscripción vence ${cuando}. `
+    + `Renová a tiempo para no perder el servicio (POS, facturación, etc.).\n\n¡Gracias por confiar en ColónClick!`;
+  return deliver(phone, text, () => sendTemplate(phone, 'recordatorio_pago', [name, days]));
 }
 
 /** 2. Aviso de comprobantes por acabarse. */
 export async function notifyQuotaLow(tenantId: string, remaining: number, included: number): Promise<WaResult> {
-  if (!whatsappEnabled()) return { ok: false, skipped: true };
   const { phone, name } = await businessContact(tenantId);
   if (!phone) return { ok: false, skipped: true, error: 'Sin teléfono' };
-  return sendTemplate(phone, 'documentos_por_acabarse', [name, remaining, included]);
+  const text = `📄 *ColónClick — Comprobantes electrónicos*\n\n${name}: te quedan *${remaining}* de ${included} comprobantes de tu plan. `
+    + `Cuando se acaben no podrás emitir facturas/tiquetes electrónicos. Considerá ampliar tu plan.`;
+  return deliver(phone, text, () => sendTemplate(phone, 'documentos_por_acabarse', [name, remaining, included]));
 }
 
 /** 3. Aviso de error en la facturación electrónica. */
 export async function notifyFeError(tenantId: string, docLabel: string, reason: string): Promise<WaResult> {
-  if (!whatsappEnabled()) return { ok: false, skipped: true };
   const { phone, name } = await businessContact(tenantId);
   if (!phone) return { ok: false, skipped: true, error: 'Sin teléfono' };
-  const motivo = String(reason || 'Error desconocido').slice(0, 250);
-  return sendTemplate(phone, 'error_facturacion', [name, docLabel || 'comprobante', motivo]);
+  const motivo = String(reason || 'Error desconocido').slice(0, 400);
+  const text = `⚠️ *ColónClick — Facturación electrónica*\n\n${name}: falló la emisión de *${docLabel || 'un comprobante'}*.\n\n`
+    + `Motivo: ${motivo}\n\nRevisá los datos e intentá de nuevo. Si persiste, contactá a soporte.`;
+  return deliver(phone, text, () => sendTemplate(phone, 'error_facturacion', [name, docLabel || 'comprobante', motivo]));
 }
