@@ -195,7 +195,7 @@ reports.get('/taxes', async (c) => {
     // Ambiente: 'production' (default, excluye pruebas) · 'sandbox' (solo QA) · 'all'.
     const environment = String(c.req.query('environment') || 'production');
 
-    const sel = 'id, invoice_number, customer_name, total, subtotal, tax_amount, issued_at, status, document_type, fe_clave, fe_status, fe_nc_clave, fe_nd_clave, fe_environment';
+    const sel = 'id, invoice_number, customer_name, customer_id, total, subtotal, tax_amount, issued_at, status, document_type, fe_clave, fe_status, fe_nc_clave, fe_nd_clave, fe_environment';
     // Tres consultas (más robusto que un .or con is-not-null):
     //  1) Ventas VÁLIDAS (no anuladas).
     //  2) Facturas con NOTA DE CRÉDITO (aunque estén anuladas).
@@ -220,7 +220,7 @@ reports.get('/taxes', async (c) => {
     // Si columnas nuevas aún no existen (migraciones sin correr), reintenta con el
     // set mínimo (muestra todo, sin ND ni ambiente).
     if ([rVentas, rNc, rNd].some(r => r.error && /fe_environment|fe_nd_clave|document_type/.test(r.error.message))) {
-      const sel2 = 'id, invoice_number, customer_name, total, subtotal, tax_amount, issued_at, status, fe_clave, fe_status, fe_nc_clave';
+      const sel2 = 'id, invoice_number, customer_name, customer_id, total, subtotal, tax_amount, issued_at, status, fe_clave, fe_status, fe_nc_clave';
       let v = db.from('invoices').select(sel2).eq('tenant_id', tenantId).neq('status', 'cancelled');
       let n = db.from('invoices').select(sel2).eq('tenant_id', tenantId).not('fe_nc_clave', 'is', null);
       if (from) { v = v.gte('issued_at', from); n = n.gte('issued_at', from); }
@@ -243,7 +243,7 @@ reports.get('/taxes', async (c) => {
     for (const r of (rVentas.data ?? []) as any[]) { if (!feFailed(r)) salesById.set(r.id, r); }
     for (const r of (rNc.data ?? []) as any[]) { if (!feFailed(r)) salesById.set(r.id, r); }
 
-    const invoices: Array<{ kind: 'venta' | 'nc' | 'nd'; document_type: string; invoice_number: string; customer_name: string; issued_at: string; month: string; base: number; iva: number; total: number; electronic: boolean }> = [];
+    const invoices: Array<{ kind: 'venta' | 'nc' | 'nd'; document_type: string; invoice_number: string; customer_name: string; customer_id: string | null; customer_identification: string; issued_at: string; month: string; base: number; iva: number; total: number; electronic: boolean }> = [];
     const mkRow = (r: any, kind: 'venta' | 'nc' | 'nd') => {
       const month = String(r.issued_at ?? '').slice(0, 7) || 'sin-fecha';
       const sales = Number(r.total ?? 0);
@@ -256,6 +256,7 @@ reports.get('/taxes', async (c) => {
       invoices.push({
         kind, document_type: dt,
         invoice_number: r.invoice_number ?? '', customer_name: r.customer_name ?? '',
+        customer_id: r.customer_id ?? null, customer_identification: '',
         issued_at: r.issued_at ?? '', month,
         base: base * sign, iva: iva * sign, total: sales * sign,
         electronic: kind === 'venta' ? !!r.fe_clave : true,
@@ -265,6 +266,15 @@ reports.get('/taxes', async (c) => {
     for (const r of (rNc.data ?? []) as any[]) if (!feFailed(r)) mkRow(r, 'nc');
     for (const r of (rNd.data ?? []) as any[]) if (!feFailed(r)) mkRow(r, 'nd');
     invoices.sort((a, b) => (a.issued_at || '').localeCompare(b.issued_at || ''));
+
+    // Cédula del cliente (identificación) — batch desde customers por customer_id.
+    const custIds = [...new Set(invoices.map(i => i.customer_id).filter(Boolean))] as string[];
+    if (custIds.length) {
+      const { data: custs } = await db.from('customers').select('id, identification').in('id', custIds);
+      const idMap = new Map<string, string>();
+      for (const c2 of (custs ?? []) as any[]) idMap.set(c2.id, c2.identification ?? '');
+      for (const inv of invoices) if (inv.customer_id) inv.customer_identification = idMap.get(inv.customer_id) ?? '';
+    }
 
     // ── Compras (crédito fiscal): comprobantes electrónicos recibidos de proveedores.
     let purchases: Array<{ clave: string; issuer_name: string; issuer_id: string; document_type: string; doc_date: string; month: string; base: number; iva: number; total: number }> = [];

@@ -1744,7 +1744,7 @@ admin.get('/reception-log', async (c) => {
     };
 
     let q = applyFilters(db.from('received_documents')
-      .select('id, tenant_id, clave, issuer_name, issuer_id, document_type, doc_date, total, tax, ack_status, source, purchase_id, created_at')
+      .select('id, tenant_id, clave, issuer_name, issuer_id, document_type, doc_date, total, tax, ack_status, source, kind, purchase_id, created_at')
       .order('created_at', { ascending: false })
       .limit(limit));
     // La bitácora muestra SOLO comprobantes con respuesta FINAL de Hacienda
@@ -1767,6 +1767,31 @@ admin.get('/reception-log', async (c) => {
       for (const t of (ts ?? []) as any[]) nameById.set(t.id, t.name);
     }
 
+    // Productos creados/cargados por cada compra (para ver qué generó cada factura)
+    // + el N° de orden de compra.
+    const purchaseIds = [...new Set(rows.map(r => r.purchase_id).filter(Boolean))] as string[];
+    const productsByPurchase = new Map<string, Array<{ name: string; quantity: number; unit_price: number }>>();
+    const poNumber = new Map<string, string>();
+    if (purchaseIds.length) {
+      const [{ data: pit }, { data: pos }] = await Promise.all([
+        db.from('purchase_items').select('purchase_id, product_id, quantity, unit_price').in('purchase_id', purchaseIds),
+        db.from('purchases').select('id, purchase_number').in('id', purchaseIds),
+      ]);
+      for (const p of (pos ?? []) as any[]) poNumber.set(p.id, p.purchase_number);
+      const items = (pit ?? []) as any[];
+      const pids = [...new Set(items.map(i => i.product_id).filter(Boolean))] as string[];
+      const prodName = new Map<string, string>();
+      if (pids.length) {
+        const { data: prods } = await db.from('products').select('id, name').in('id', pids);
+        for (const p of (prods ?? []) as any[]) prodName.set(p.id, p.name);
+      }
+      for (const it of items) {
+        const arr = productsByPurchase.get(it.purchase_id) ?? [];
+        arr.push({ name: prodName.get(it.product_id) ?? 'Producto', quantity: Number(it.quantity ?? 0), unit_price: Number(it.unit_price ?? 0) });
+        productsByPurchase.set(it.purchase_id, arr);
+      }
+    }
+
     // KPIs por estado (independientes del filtro de la lista) — conteos exactos.
     const countBy = async (states: string[]) => {
       const { count } = await applyFilters(
@@ -1781,7 +1806,12 @@ admin.get('/reception-log', async (c) => {
     ]);
     return ok(c, {
       count: accepted + rejected + pending, accepted, rejected, pending,
-      rows: rows.map(r => ({ ...r, business_name: nameById.get(r.tenant_id) ?? '—' })),
+      rows: rows.map(r => ({
+        ...r,
+        business_name: nameById.get(r.tenant_id) ?? '—',
+        purchase_number: r.purchase_id ? (poNumber.get(r.purchase_id) ?? null) : null,
+        products: r.purchase_id ? (productsByPurchase.get(r.purchase_id) ?? []) : [],
+      })),
     });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
