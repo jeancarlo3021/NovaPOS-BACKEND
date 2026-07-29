@@ -914,10 +914,35 @@ admin.get('/tenants/:id/alanube/verify', async (c) => {
     const isSandbox = String(cfg.environment ?? 'production') === 'sandbox';
     const companyId = (isSandbox ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id;
     const client = alanube.forEnv(cfg.environment);
+    let effectiveId = companyId;
     const out: any = { environment: client.env, base_url: client.baseUrl(), company_id: companyId ?? null };
-    if (!companyId) return ok(c, { ...out, exists: false, note: 'No hay company_id guardado para este ambiente.' });
+
+    // Sin id guardado: intentamos recuperar la empresa 'main' del token (GET /company).
+    // Si aparece, la GUARDAMOS para futuras emisiones/actualizaciones.
+    if (!effectiveId) {
+      try {
+        const main: any = await client.getMainCompany();
+        const mainId = findCompanyId(main?.company ?? main?.data ?? main);
+        const apiStatus = main?.company?.apiStatus ?? main?.apiStatus ?? null;
+        const cedula = main?.company?.identificationNumber ?? main?.identificationNumber
+          ?? main?.company?.identification?.identificationNumber ?? null;
+        if (mainId) {
+          cfg.alanube_env = client.env;
+          if (client.env === 'sandbox') cfg.alanube_company_id_sandbox = mainId;
+          else cfg.alanube_company_id_production = mainId;
+          cfg.alanube_company_id = mainId;
+          await db.from('settings').upsert({
+            tenant_id: id, type: 'electronic-invoice', config: cfg, updated_at: new Date().toISOString(),
+          }, { onConflict: 'tenant_id,type' });
+          return ok(c, { ...out, company_id: mainId, exists: true, api_status: apiStatus,
+            identification: cedula,
+            note: `Empresa principal recuperada del token y guardada (id ${mainId}${cedula ? `, cédula ${cedula}` : ''}). Ya podés «Actualizar empresa».` });
+        }
+      } catch { /* la cuenta no expone /company → mensaje normal */ }
+      return ok(c, { ...out, exists: false, note: 'No hay company_id guardado y el token no devolvió una empresa principal.' });
+    }
     try {
-      const company = await client.getCompany(String(companyId));
+      const company = await client.getCompany(String(effectiveId));
       return ok(c, { ...out, exists: true, api_status: company?.company?.apiStatus ?? company?.apiStatus ?? null });
     } catch (e: any) {
       const status = e instanceof AlanubeError ? e.status : 500;
@@ -1097,6 +1122,14 @@ function findCompanyId(result: any): string | null {
 async function findExistingCompanyId(client: any, cfg: Record<string, any>): Promise<string | null> {
   const cedula = String(cfg.emisor_identification ?? '').replace(/\D/g, '');
 
+  // 0) Empresa 'main' del token (GET /company, sin id). Es la vía más directa:
+  //    devuelve la principal registrada en la cuenta sin necesitar el id.
+  try {
+    const main: any = await client.getMainCompany?.();
+    const found = findCompanyId(main?.company ?? main?.data ?? main);
+    if (found) return found;
+  } catch { /* la cuenta no expone /company o no hay main → seguir */ }
+
   // 1) Ids candidatos ya conocidos → verificar que existan en este ambiente.
   const candidates = [
     cfg.alanube_company_id_sandbox, cfg.alanube_company_id_production,
@@ -1124,6 +1157,52 @@ async function findExistingCompanyId(client: any, cfg: Record<string, any>): Pro
   return null;
 }
 
+// Valida los datos del emisor ANTES de llamar a Alanube y devuelve una lista de
+// problemas legibles (para saber qué campo corregir en Datos de FE).
+function validateEmisorForAlanube(cfg: Record<string, any>, env: 'sandbox' | 'production'): string[] {
+  const p: string[] = [];
+  const prod = env === 'production';
+
+  if (!String(cfg.emisor_name ?? '').trim()) p.push('Nombre del emisor: vacío.');
+
+  const idType = String(cfg.emisor_identification_type ?? '').trim();
+  if (!['01', '02', '03', '04'].includes(idType))
+    p.push(`Tipo de identificación inválido ("${idType || 'vacío'}"): debe ser 01 (física), 02 (jurídica), 03 (DIMEX) o 04 (NITE).`);
+  const ced = String(cfg.emisor_identification ?? '').replace(/\D/g, '');
+  if (!ced) p.push('Número de identificación (cédula) del emisor: vacío.');
+  else {
+    const len: Record<string, number[]> = { '01': [9], '02': [10], '03': [11, 12], '04': [10] };
+    if (idType && len[idType] && !len[idType].includes(ced.length))
+      p.push(`Cédula "${ced}" tiene ${ced.length} dígitos, no coincide con el tipo ${idType} (física=9, jurídica=10, DIMEX=11-12, NITE=10).`);
+  }
+
+  const prov = provDigit(cfg.emisor_province_code);
+  if (!prov || !/^[1-7]$/.test(String(prov))) p.push('Provincia: falta o inválida (1 a 7). Completá la dirección en Datos de FE.');
+  const canton = pad2Code(cfg.emisor_canton_code);
+  if (!canton || !/^\d{2}$/.test(String(canton))) p.push('Cantón: falta o inválido (2 dígitos).');
+  const distr = pad2Code(cfg.emisor_district_code);
+  if (!distr || !/^\d{2}$/.test(String(distr))) p.push('Distrito: falta o inválido (2 dígitos).');
+  if (!String(cfg.emisor_address ?? '').trim()) p.push('Otras señas (dirección exacta): vacío.');
+
+  if (!String(cfg.economic_activity_code ?? '').trim()) p.push('Actividad económica: vacía (código de Hacienda requerido).');
+
+  const email = String(cfg.emisor_email ?? '').trim();
+  if (!email) p.push('Correo del emisor: vacío.');
+  else if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) p.push(`Correo del emisor inválido: "${email}".`);
+
+  const atvUser = String((prod ? cfg.atv_username_production : cfg.atv_username_sandbox) || cfg.atv_username || '').trim();
+  const atvPass = String((prod ? cfg.atv_password_production : cfg.atv_password_sandbox) || cfg.atv_password || '');
+  if (!atvUser) p.push(`Usuario de API de ATV (${prod ? 'Producción' : 'Sandbox'}): vacío.`);
+  if (!atvPass) p.push(`Contraseña de API de ATV (${prod ? 'Producción' : 'Sandbox'}): vacía.`);
+
+  const p12Pass = String((prod ? cfg.p12_password_production : cfg.p12_password_sandbox)
+    || (prod ? cfg.hacienda_pin_production : cfg.hacienda_pin_sandbox)
+    || cfg.p12_password || cfg.hacienda_pin || '');
+  if (!p12Pass) p.push(`PIN/contraseña del certificado .p12 (${prod ? 'Producción' : 'Sandbox'}): vacío.`);
+
+  return p;
+}
+
 // POST /tenants/:id/alanube/company — crea/da de alta la empresa en Alanube.
 admin.post('/tenants/:id/alanube/company', async (c) => {
   const { id } = c.req.param();
@@ -1132,17 +1211,20 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
       .eq('tenant_id', id).eq('type', 'electronic-invoice').maybeSingle();
     const cfg: Record<string, any> = { ...((row as any)?.config ?? {}) };
 
-    // Validaciones mínimas antes de llamar a Alanube.
-    if (!cfg.emisor_name) return fail(c, 'Falta el nombre del emisor (Datos de FE).', 422);
-    if (!cfg.emisor_identification) return fail(c, 'Falta la identificación del emisor.', 422);
-    // Usuario ATV: acepta el del ambiente elegido o el legacy.
+    // Validación completa de los datos del emisor ANTES de llamar a Alanube.
+    // Devuelve TODOS los problemas de una vez para que el usuario sepa exactamente
+    // qué campo corregir en Datos de FE (esto es lo que causa el rechazo silencioso).
     const prodEnv = String(cfg.environment ?? 'production') !== 'sandbox';
+    const problems = validateEmisorForAlanube(cfg, prodEnv ? 'production' : 'sandbox');
+    // El certificado se valida aparte (es un archivo en Storage, no un campo del config).
     const cert = resolveCert(cfg);
-    if (!cert) return fail(c, `Falta subir el certificado .p12 de ${prodEnv ? 'Producción' : 'QA/Sandbox'} (Datos de FE).`, 422);
-    const atvUserSet = (prodEnv ? cfg.atv_username_production : cfg.atv_username_sandbox) ?? cfg.atv_username;
-    if (!atvUserSet) return fail(c, `Falta el usuario de API de ATV para ${prodEnv ? 'Producción' : 'QA/Sandbox'} (Datos de FE).`, 422);
+    if (!cert) problems.unshift(`Certificado .p12 de ${prodEnv ? 'Producción' : 'QA/Sandbox'}: falta subirlo (Datos de FE).`);
+    if (problems.length) {
+      return fail(c, 'No se puede crear la empresa en Alanube — revisá estos datos en «Datos de FE»:\n• ' + problems.join('\n• '), 422);
+    }
 
     // Bajar el .p12 de Storage y pasarlo a base64 (sin prefijo data:).
+    if (!cert) return fail(c, 'Falta el certificado .p12 (Datos de FE).', 422); // ya cubierto arriba; guarda para el tipo
     const { data: file, error: dlErr } = await db.storage.from(FE_CERT_BUCKET).download(cert.path);
     if (dlErr || !file) return fail(c, `No se pudo leer el certificado del Storage: ${dlErr?.message ?? 'vacío'}`, 500);
     const p12Base64 = Buffer.from(await file.arrayBuffer()).toString('base64');
@@ -1182,12 +1264,28 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
       if (!existingId) existingId = await findExistingCompanyId(client, cfg);
       if (!existingId) {
         // La cuenta ya tiene su empresa principal pero no logramos ubicar su id por
-        // API (CRI no lista la 'main'). No hace falta para EMITIR —la emisión usa la
-        // main de la cuenta automáticamente—; solo para actualizar sus datos.
-        return fail(c, 'Esta cuenta de Alanube ya tiene su empresa principal registrada. '
-          + 'No necesitás crearla de nuevo: podés emitir directamente. Para corregir la '
-          + 'dirección del emisor, pegá el ID de la empresa (lo ves en el panel de Alanube) '
-          + 'en Datos de FE y usá «Actualizar empresa».', 409);
+        // API (CRI no lista la 'main'). NO es un error que bloquee: la emisión usa la
+        // 'main' de la cuenta automáticamente. Marcamos el tenant como registrado y
+        // listo para emitir, y guardamos el cuerpo crudo del error de Alanube para
+        // depurar dónde viene el id (el usuario puede pegarlo luego en Datos de FE).
+        cfg.alanube_env = client.env;
+        cfg.alanube_registered_at = new Date().toISOString();
+        cfg.alanube_main_exists = true;
+        cfg.alanube_create_error_body = (e as any)?.body ?? null;
+        await db.from('settings').upsert({
+          tenant_id: id, type: 'electronic-invoice', config: cfg, updated_at: new Date().toISOString(),
+        }, { onConflict: 'tenant_id,type' });
+        return ok(c, {
+          ok: true,
+          already_main: true,
+          env: client.env,
+          company_id: null,
+          message: 'La empresa principal YA existe en esta cuenta de Alanube. Ya podés emitir '
+            + 'comprobantes (la emisión usa esa empresa automáticamente). Si querés actualizar '
+            + 'sus datos o activar el webhook de recepción, pegá el ID de la empresa (del panel '
+            + 'de Alanube) en Datos de FE y usá «Actualizar empresa».',
+          alanube_error_body: (e as any)?.body ?? null,   // diagnóstico: dónde viene el id
+        });
       }
 
       const updPayload: Record<string, any> = { ...payload };

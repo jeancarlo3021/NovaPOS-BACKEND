@@ -132,6 +132,10 @@ function clientFor(env: AlanubeEnv) {
     // y GET /companies/{id}.
     getAssociated: (limit = 100) => f(`/companies/associated?limit=${limit}`, { method: 'GET' }),
     getCompany: (id: string) => f(`/companies/${id}`, { method: 'GET' }),
+    // Empresa 'main' asociada al TOKEN (sin necesitar el id). Es la única forma de
+    // recuperar el id de la empresa principal cuando no lo tenemos guardado.
+    //   GET /cri/v1/company   (singular; la base ya incluye /cri/v1)
+    getMainCompany: () => f('/company', { method: 'GET' }),
     // PDF del comprobante en BASE64 (endpoint dedicado). documentType:
     // invoice|ticket|credit-note|debit-note|purchase-invoice|export-invoice.
     getDocumentPdf: (idDocument: string, documentType: string, idCompany: string) => {
