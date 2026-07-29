@@ -54,7 +54,8 @@ function tokenFor(env: AlanubeEnv): string {
 
 export class AlanubeError extends Error {
   status: number;
-  constructor(message: string, status = 502) { super(message); this.status = status; }
+  body?: any;   // cuerpo crudo de la respuesta de error (suele traer el id de la empresa existente)
+  constructor(message: string, status = 502, body?: any) { super(message); this.status = status; this.body = body; }
 }
 
 const fetchWithTimeout: typeof fetch = (input, init) => {
@@ -104,7 +105,7 @@ async function alanubeFetch<T = any>(base: string, tok: string, path: string, in
     }
     const base = body?.message || body?.error || `Alanube respondió ${res.status}`;
     const msg = parts.length ? `${base} — ${parts.join(' · ')}` : base;
-    throw new AlanubeError(msg, res.status === 401 || res.status === 403 ? 401 : res.status);
+    throw new AlanubeError(msg, res.status === 401 || res.status === 403 ? 401 : res.status, body);
   }
   return body as T;
 }

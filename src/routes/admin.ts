@@ -1167,8 +1167,19 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
         && /already has (a )?main company|ya tiene.*empresa|main company/i.test(msg);
       if (!alreadyMain) throw e;
 
-      // Ya existe la 'main' en la cuenta: la ubicamos y la actualizamos.
-      const existingId = await findExistingCompanyId(client, cfg);
+      // Ya existe la 'main' en la cuenta: ubicamos su id y la actualizamos.
+      //   1) Del CUERPO del error (Alanube suele devolver el id de la empresa
+      //      existente en la respuesta 400/409) — verificado contra GET /companies/{id}.
+      //   2) Respaldo: por ids guardados / cédula en asociadas.
+      let existingId: string | null = null;
+      const fromErr = findCompanyId((e as any)?.body);
+      if (fromErr) {
+        try {
+          const co: any = await client.getCompany(String(fromErr));
+          if (findCompanyId(co?.company ?? co)) existingId = String(fromErr);
+        } catch { /* el id del error no es válido en este ambiente */ }
+      }
+      if (!existingId) existingId = await findExistingCompanyId(client, cfg);
       if (!existingId) {
         // La cuenta ya tiene su empresa principal pero no logramos ubicar su id por
         // API (CRI no lista la 'main'). No hace falta para EMITIR —la emisión usa la
