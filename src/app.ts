@@ -6,6 +6,7 @@ import { enforceActiveTenant } from './middleware/tenantStatus.js';
 import authRoutes      from './routes/auth.js';
 import webhooks        from './routes/webhooks.js';
 import cron            from './routes/cron.js';
+import feExternal      from './routes/feExternal.js';
 import products        from './routes/products.js';
 import categories      from './routes/categories.js';
 import unitTypes       from './routes/unitTypes.js';
@@ -71,6 +72,8 @@ app.get('/health', (c) => c.json({
     // Tokens de Alanube por ambiente (para diagnosticar "Company not found").
     alanube_token_production: !!process.env.ALANUBE_API_TOKEN_PRODUCTION,
     alanube_token_sandbox:    !!process.env.ALANUBE_API_TOKEN_SANDBOX,
+    // Pasarela de FE externa (/fe-external, ej. JKM) — ¿está configurada?
+    fe_external_supabase: !!process.env.FE_EXTERNAL_SUPABASE_URL && !!process.env.FE_EXTERNAL_SUPABASE_ANON_KEY,
     // Correo (Resend) — para diagnosticar "no llega el correo".
     resend_api_key: !!process.env.RESEND_API_KEY,
     email_from:     process.env.EMAIL_FROM ?? '(default onboarding@resend.dev)',
@@ -85,6 +88,12 @@ app.route('/webhooks', webhooks);
 
 // Cron externo (cron-job.org) — público, protegido por CRON_SECRET
 app.route('/cron', cron);
+
+// Pasarela de FE para apps EXTERNAS (ej. JKM, que corre sobre su propio proyecto
+// de Supabase). NO usa el auth de NovaPOS: valida el JWT del proyecto Supabase de
+// la app externa y es completamente SIN ESTADO (no toca la base de NovaPOS).
+// Ver routes/feExternal.ts.
+app.route('/fe-external', feExternal);
 
 const api = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 api.use('*', auth);

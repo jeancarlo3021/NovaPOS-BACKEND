@@ -324,8 +324,9 @@ function friendlyFEError(raw: string): string {
   return m;
 }
 
-/** Traduce los errores de validación de Alanube (400) a mensajes claros. */
-function friendlyAlanubeError(raw: string): string {
+/** Traduce los errores de validación de Alanube (400) a mensajes claros.
+ *  Exportada para reusarla desde la pasarela de FE externa (feExternal.ts). */
+export function friendlyAlanubeError(raw: string): string {
   const s = String(raw || '');
   // Detalle después de "Alanube respondió 400 — ..." (o el mensaje entero).
   const detail = s.replace(/^alanube respondi[oó]\s*\d+\s*[—:-]\s*/i, '').trim();
@@ -409,8 +410,9 @@ function mapAlanubeStatus(s: any): string {
 }
 
 /** Consulta el estado de un documento en Alanube por su id (ULID). Devuelve
- *  también la clave real de Hacienda (50 díg) y el estado CRUDO (para depurar). */
-async function alanubeDocStatus(client: ReturnType<typeof alanube.forEnv>, docId: string, opts?: { kind?: 'invoice' | 'ticket' | 'credit-note' | 'debit-note'; companyId?: string }): Promise<{ status: string; rawStatus: any; clave: string | null; error: string | null; raw: any }> {
+ *  también la clave real de Hacienda (50 díg) y el estado CRUDO (para depurar).
+ *  Exportada para reusarla desde la pasarela de FE externa (feExternal.ts). */
+export async function alanubeDocStatus(client: ReturnType<typeof alanube.forEnv>, docId: string, opts?: { kind?: 'invoice' | 'ticket' | 'credit-note' | 'debit-note'; companyId?: string }): Promise<{ status: string; rawStatus: any; clave: string | null; error: string | null; raw: any }> {
   const doc: any = await client.getDocument(docId, opts);
   const d = doc?.document ?? doc?.invoice ?? doc?.ticket ?? doc?.creditNote ?? doc?.debitNote ?? doc?.data ?? doc;
   // En CRI el estado de HACIENDA viene en `legalStatus` (ACCEPTED/REJECTED); el
