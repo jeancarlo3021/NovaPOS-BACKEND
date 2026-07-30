@@ -5,7 +5,7 @@ import { sendEmail, paymentReceiptEmailHtml, customInvoiceEmailHtml, planFeature
 import { alanube, AlanubeError } from '../services/alanube.js';
 import { endOfDay } from '../utils/dateRange.js';
 import { whatsappEnabled, sendTemplate, normalizePhone } from '../services/whatsapp.js';
-import { refreshInvoiceStatus } from './hacienda.js';
+import { refreshInvoiceStatus, emitInvoiceCore } from './hacienda.js';
 import { notifyPaymentDue, businessContact } from '../services/whatsappNotify.js';
 
 const admin = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
@@ -1765,6 +1765,19 @@ admin.post('/fe-refresh/:id', async (c) => {
     if (!inv) return fail(c, 'Factura no encontrada', 404);
     const r = await refreshInvoiceStatus((inv as any).tenant_id, id);
     return ok(c, r);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// POST /fe-reemit/:id — RE-EMITE (solo admin) la misma factura corrigiendo el
+// consecutivo: reasigna el número respetando el consecutivo configurado en Datos de
+// FE y limpia el estado FE previo, luego la vuelve a enviar a Hacienda/Alanube.
+admin.post('/fe-reemit/:id', async (c) => {
+  if (!isAdminRole(c)) return fail(c, 'forbidden', 403);
+  try {
+    const { id } = c.req.param();
+    const { data: inv } = await db.from('invoices').select('tenant_id').eq('id', id).maybeSingle();
+    if (!inv) return fail(c, 'Factura no encontrada', 404);
+    return await emitInvoiceCore(c, (inv as any).tenant_id, id, { renumber: true });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

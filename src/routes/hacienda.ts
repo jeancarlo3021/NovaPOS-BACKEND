@@ -532,12 +532,18 @@ hacienda.post('/refresh-pending', async (c) => {
 
 // POST /emit — emite un documento electrónico (tiquete/factura) a Hacienda vía
 // Facturemos a partir de una factura existente. body: { invoice_id }.
-hacienda.post('/emit', async (c) => {
-  const tenantId = c.get('tenantId');
-  let invoice_id: string | undefined;
-  let debug = false;
+// Núcleo de emisión de UNA factura ya creada. Reutilizado por el POS (/emit) y por
+// la re-emisión desde el panel admin. `opts.renumber` reasigna el consecutivo
+// respetando el piso configurado en Datos de FE y limpia el estado FE previo (para
+// re-enviar una factura que salió con el consecutivo equivocado).
+export async function emitInvoiceCore(
+  c: any,
+  tenantId: string,
+  invoice_id: string | undefined,
+  opts: { debug?: boolean; renumber?: boolean } = {},
+): Promise<Response> {
+  const debug = opts.debug === true;
   try {
-    ({ invoice_id, debug } = await c.req.json().catch(() => ({})));
     if (!invoice_id) return fail(c, 'Falta invoice_id', 422);
 
     const cfg = await loadFEConfig(tenantId);
@@ -551,7 +557,32 @@ hacienda.post('/emit', async (c) => {
     const { data: inv } = await db.from('invoices')
       .select('*, invoice_items(*)').eq('id', invoice_id).eq('tenant_id', tenantId).maybeSingle();
     if (!inv) return fail(c, 'Factura no encontrada', 404);
-    if ((inv as any).fe_clave) return fail(c, 'La factura ya fue emitida', 409);
+    if ((inv as any).fe_clave && !opts.renumber) return fail(c, 'La factura ya fue emitida', 409);
+
+    // Re-emisión (admin): asigna el SIGUIENTE consecutivo disponible (respetando el
+    // piso configurado en Datos de FE) y limpia el estado FE previo, para volver a
+    // enviar la MISMA factura. Se toma un número nuevo SIEMPRE que la factura ya
+    // haya sido transmitida (tiene clave, aunque haya sido rechazada): en Hacienda
+    // un consecutivo ya enviado queda "quemado" y no se puede reutilizar.
+    if (opts.renumber) {
+      const floor = configuredNextConsecutivo(cfg, (inv as any).document_type);
+      const clearFE = {
+        fe_clave: null, fe_consecutivo: null, fe_status: null, fe_situacion: null,
+        fe_error: null, fe_request: null, fe_response: null, fe_environment: null,
+      };
+      // nextInvoiceNumber incluye la factura actual en el máximo, así que devuelve
+      // el siguiente número: si salió con 1 → sube al piso (643); si salió con 670
+      // (rechazada) → 671.
+      let newNum = await nextInvoiceNumber(tenantId, 0, floor);
+      for (let attempt = 0; attempt < 8; attempt++) {
+        const { error } = await db.from('invoices').update({ ...clearFE, invoice_number: newNum })
+          .eq('id', invoice_id).eq('tenant_id', tenantId);
+        if (!error) { (inv as any).invoice_number = newNum; break; }
+        if (!(String((error as any)?.code) === '23505' || /duplicate/i.test((error as any)?.message ?? ''))) break;
+        newNum = await nextInvoiceNumber(tenantId, attempt + 1, floor);
+      }
+      (inv as any).fe_clave = null;
+    }
 
     const allItems: any[] = (inv as any).invoice_items ?? [];
     const pids = [...new Set(allItems.map(it => it.product_id).filter(Boolean))];
@@ -737,6 +768,12 @@ hacienda.post('/emit', async (c) => {
     }
     return fail(c, friendly, status);
   }
+}
+
+hacienda.post('/emit', async (c) => {
+  const tenantId = c.get('tenantId');
+  const body = await c.req.json().catch(() => ({} as any));
+  return emitInvoiceCore(c, tenantId, body?.invoice_id, { debug: body?.debug === true });
 });
 
 // POST /credit-note — emite una Nota de Crédito (03) que ANULA una factura ya
@@ -1770,8 +1807,21 @@ hacienda.get('/fe-pdf/:id', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
-/** Próximo consecutivo simple (000001…). */
-async function nextInvoiceNumber(tenantId: string, offset = 0): Promise<string> {
+/** Consecutivo configurado en Datos de FE ("Próx. …") según el tipo de documento.
+ *  Es el SIGUIENTE número a emitir (0 si no está configurado). */
+function configuredNextConsecutivo(cfg: any, docType: string): number {
+  const raw = docType === 'factura_electronica' ? cfg?.consecutivo_factura
+    : docType === 'tiquete_electronico' ? cfg?.consecutivo_tiquete
+    : (docType === 'nota_credito' || docType === 'nota_debito') ? cfg?.consecutivo_nc
+    : null;
+  const n = parseInt(String(raw ?? '').replace(/\D/g, ''), 10);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/** Próximo consecutivo (000001…). Respeta `floor` = consecutivo inicial
+ *  configurado en Datos de FE (migración desde otro sistema): el resultado nunca
+ *  es menor que ese número. */
+async function nextInvoiceNumber(tenantId: string, offset = 0, floor = 0): Promise<string> {
   // Paginado: sin esto, con >1000 facturas el máximo salía bajo → número duplicado.
   const PAGE = 1000;
   let maxSeq = 0;
@@ -1782,11 +1832,13 @@ async function nextInvoiceNumber(tenantId: string, offset = 0): Promise<string> 
     const chunk = (data ?? []) as any[];
     for (const r of chunk) {
       const s = String(r.invoice_number ?? '').trim();
-      if (/^\d{1,6}$/.test(s)) maxSeq = Math.max(maxSeq, parseInt(s, 10));
+      if (/^\d{1,10}$/.test(s)) maxSeq = Math.max(maxSeq, parseInt(s, 10));
     }
     if (chunk.length < PAGE) break;
   }
-  return String(maxSeq + 1 + offset).padStart(6, '0');
+  // El próximo número es el mayor entre (máximo existente + 1) y el piso configurado.
+  const next = Math.max(maxSeq + 1, floor) + offset;
+  return String(next).padStart(6, '0');
 }
 
 // POST /emit-direct — crea la factura desde el carrito (con precio e IVA por
@@ -1867,8 +1919,10 @@ hacienda.post('/emit-direct', async (c) => {
     const docType = tipoDoc === '01' ? 'factura_electronica' : 'tiquete_electronico';
     const payment: string = ['cash', 'card', 'sinpe', 'credit'].includes(b.payment_method) ? b.payment_method : 'cash';
 
-    // Crear factura (consecutivo único).
-    let inv: any = null, invErr: any = null, finalNumber = await nextInvoiceNumber(tenantId);
+    // Crear factura (consecutivo único). El piso = consecutivo inicial configurado
+    // en Datos de FE (para continuar la numeración migrada de otro sistema).
+    const consecFloor = configuredNextConsecutivo(cfg, docType);
+    let inv: any = null, invErr: any = null, finalNumber = await nextInvoiceNumber(tenantId, 0, consecFloor);
     for (let attempt = 0; attempt < 8; attempt++) {
       const res = await db.from('invoices').insert({
         tenant_id: tenantId,
@@ -1887,7 +1941,7 @@ hacienda.post('/emit-direct', async (c) => {
       if (!res.error) { inv = res.data; break; }
       invErr = res.error;
       if (!(String(invErr?.code) === '23505' || /duplicate/i.test(invErr?.message ?? ''))) break;
-      finalNumber = await nextInvoiceNumber(tenantId, attempt + 1);
+      finalNumber = await nextInvoiceNumber(tenantId, attempt + 1, consecFloor);
     }
     if (!inv) throw new Error(invErr?.message ?? 'No se pudo crear la factura');
 

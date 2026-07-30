@@ -66,7 +66,7 @@ const InvoiceSchema = z.object({
 // 000001, 000002, ... — el mismo para ventas online y offline. Toma el MAYOR
 // número de secuencia ya usado por el tenant (los dígitos finales de cualquier
 // formato) y le suma 1. `attemptOffset` permite reintentar ante colisión.
-async function nextInvoiceNumber(tenantId: string, attemptOffset = 0): Promise<string> {
+async function nextInvoiceNumber(tenantId: string, attemptOffset = 0, floor = 0): Promise<string> {
   // ⚠️ Paginado: Supabase trae máx 1000 filas por query. Con miles de facturas,
   // sin paginar/ordenar el máximo salía MÁS BAJO que el real → número DUPLICADO.
   // Solo consecutivos SIMPLES (1-6 dígitos puros); se ignoran fechas/claves de FE.
@@ -80,11 +80,27 @@ async function nextInvoiceNumber(tenantId: string, attemptOffset = 0): Promise<s
     const chunk = (data ?? []) as any[];
     for (const r of chunk) {
       const s = String(r.invoice_number ?? '').trim();
-      if (/^\d{1,6}$/.test(s)) maxSeq = Math.max(maxSeq, parseInt(s, 10));
+      if (/^\d{1,10}$/.test(s)) maxSeq = Math.max(maxSeq, parseInt(s, 10));
     }
     if (chunk.length < PAGE) break;
   }
-  return String(maxSeq + 1 + attemptOffset).padStart(6, '0');
+  // `floor` = consecutivo inicial configurado en Datos de FE (numeración migrada):
+  // el próximo número nunca es menor que ese piso.
+  return String(Math.max(maxSeq + 1, floor) + attemptOffset).padStart(6, '0');
+}
+
+/** Piso de consecutivo migrado: el MAYOR de los "Próx. …" configurados en
+ *  Datos de FE (se comparte un solo contador entre corriente y electrónico). */
+async function consecutivoFloor(tenantId: string): Promise<number> {
+  try {
+    const { data } = await db.from('settings').select('config')
+      .eq('tenant_id', tenantId).eq('type', 'electronic-invoice').maybeSingle();
+    const cfg: any = (data as any)?.config ?? {};
+    const nums = [cfg.consecutivo_factura, cfg.consecutivo_tiquete, cfg.consecutivo_nc]
+      .map(v => parseInt(String(v ?? '').replace(/\D/g, ''), 10))
+      .filter(n => Number.isFinite(n) && n > 0);
+    return nums.length ? Math.max(...nums) : 0;
+  } catch { return 0; }
 }
 
 invoices.get('/', async (c) => {
@@ -118,7 +134,8 @@ invoices.get('/', async (c) => {
 
 invoices.get('/next-number', async (c) => {
   try {
-    const num = await nextInvoiceNumber(c.get('tenantId'));
+    const tid = c.get('tenantId');
+    const num = await nextInvoiceNumber(tid, 0, await consecutivoFloor(tid));
     return ok(c, { invoice_number: num });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
@@ -175,7 +192,8 @@ invoices.post('/', async (c) => {
     // Consecutivo unificado: el backend SIEMPRE asigna el número (ignora el que
     // venga del cliente) para que online y offline compartan una sola secuencia.
     void invoice_number;
-    let finalNumber = await nextInvoiceNumber(tenantId);
+    const floor = await consecutivoFloor(tenantId);
+    let finalNumber = await nextInvoiceNumber(tenantId, 0, floor);
 
     for (let attempt = 0; attempt < 8; attempt++) {
       const res = await db.from('invoices').insert({
@@ -195,7 +213,7 @@ invoices.post('/', async (c) => {
       if (!isDup) break;  // otro error → no reintentar
 
       // Colisión: regenerar tomando el siguiente consecutivo (offset crece por intento).
-      finalNumber = await nextInvoiceNumber(tenantId, attempt + 1);
+      finalNumber = await nextInvoiceNumber(tenantId, attempt + 1, floor);
     }
     if (invErr) throw new Error(invErr.message);
     if (!inv) throw new Error('No se pudo generar la factura (número duplicado)');

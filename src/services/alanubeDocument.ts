@@ -150,8 +150,11 @@ export function buildAlanubeDocument(
       taxableBase: money(montoTotal),
       taxNet: money(impuesto),
       amountTotalLine: money(lineTotal),
-      // taxes: code=01 (IVA), feeCode=código de tarifa (08=13%), fee=porcentaje "13.00".
-      taxes: [{ code: '01', feeCode: rateCode(tarifa), fee: Number(tarifa).toFixed(2), amount: money(impuesto) }],
+      // taxes: code=01 (IVA), feeCode=código de tarifa Hacienda (08=13%, 10=Exenta).
+      // Para líneas con IVA 0% usamos el código EXENTA (10), NO "Tarifa 0%" (01):
+      // con "01" Hacienda las clasifica como "No Sujetas" y el resumen (que las
+      // suma como Exentas) no cuadra → rechazo -481/-485/-107.
+      taxes: [{ code: '01', feeCode: tarifa > 0 ? rateCode(tarifa) : '10', fee: Number(tarifa).toFixed(2), amount: money(impuesto) }],
     };
     if (l.sku) item.commercialCode = [{ typeCode: '04', code: String(l.sku) }];
     return item;
