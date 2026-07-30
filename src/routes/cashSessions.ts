@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
+import { endOfDay } from '../utils/dateRange.js';
 
 const cashSessions = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
@@ -95,6 +96,53 @@ cashSessions.post('/:id/close', async (c) => {
     }).eq('id', id).eq('tenant_id', tenantId).select().single();
     if (error) throw new Error(error.message);
     return ok(c, data);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// GET /movements-report?from=&to= — Entradas y salidas del FONDO de caja del tenant
+// (movimientos manuales + apertura/cierre; EXCLUYE las ventas). Para el reporte
+// descargable. Se filtra por tenant vía las sesiones (cash_movements no tiene tenant).
+cashSessions.get('/movements-report', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const from = c.req.query('from');
+    const to   = c.req.query('to');
+
+    // Sesiones del tenant → sus ids + datos (para atribuir cajero y fecha de apertura).
+    const { data: sessions, error: sErr } = await db.from('cash_sessions')
+      .select('id, opening_date, user_id, status').eq('tenant_id', tenantId);
+    if (sErr) throw new Error(sErr.message);
+    const sessList = (sessions ?? []) as any[];
+    const sessionIds = sessList.map(s => s.id);
+    if (sessionIds.length === 0) return ok(c, { movements: [] });
+    const sessById = new Map(sessList.map(s => [s.id, s]));
+
+    // Nombre del cajero por sesión (users.full_name).
+    const userIds = [...new Set(sessList.map(s => s.user_id).filter(Boolean))];
+    const nameByUser = new Map<string, string>();
+    if (userIds.length) {
+      const { data: users } = await db.from('users').select('id, full_name').in('id', userIds as string[]);
+      for (const u of (users ?? []) as any[]) nameByUser.set(u.id, u.full_name ?? '');
+    }
+
+    let q = db.from('cash_movements').select('*')
+      .in('cash_session_id', sessionIds)
+      .neq('type', 'sale')                         // el fondo de caja NO incluye ventas
+      .order('created_at', { ascending: false });
+    if (from) q = q.gte('created_at', from);
+    if (to)   q = q.lte('created_at', endOfDay(to));
+    const { data, error } = await q;
+    if (error) throw new Error(error.message);
+
+    const movements = (data ?? []).map((m: any) => {
+      const s = sessById.get(m.cash_session_id);
+      return {
+        ...m,
+        cashier_name: s ? (nameByUser.get(s.user_id) ?? '') : '',
+        session_opened_at: s?.opening_date ?? null,
+      };
+    });
+    return ok(c, { movements });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
