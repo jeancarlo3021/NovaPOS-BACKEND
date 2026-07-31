@@ -66,7 +66,8 @@ const COMPROBANTE: Record<string, string> = {
 // 04 transferencia/depósito, 05 canje, 06 SINPE Móvil, 07 plataforma digital, 99 otros.
 const MEDIO_PAGO: Record<string, string> = {
   cash: '01', card: '02', check: '03', transfer: '04', deposit: '04',
-  sinpe: '06', sinpe_movil: '06', credit: '02', mixed: '01',
+  third_party: '05', sinpe: '06', sinpe_movil: '06', digital: '07',
+  other: '99', credit: '02', mixed: '01',
 };
 
 const pad = (s: string | number, n: number) => String(s).replace(/\D/g, '').padStart(n, '0').slice(-n);

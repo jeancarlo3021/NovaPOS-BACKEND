@@ -543,13 +543,35 @@ reports.get('/products/sales', async (c) => {
       .eq('tenant_id', tenantId)
       .neq('status', 'cancelled')
       .gte('issued_at', from || '1900-01-01')
-      .lte('issued_at', to || '2099-12-31');
+      .lte('issued_at', to || '2099-12-31')
+      .order('issued_at', { ascending: false })
+      .limit(5000);
 
     const invoiceIds = (invoices ?? []).map((i: any) => i.id);
 
-    const { data: items } = await db.from('invoice_items')
-      .select('invoice_id, product_id, product_name, quantity, unit_price, subtotal')
-      .in('invoice_id', invoiceIds.length > 0 ? invoiceIds : ['null']);
+    // Traer los ítems EN LOTES: un solo `.in()` con cientos/miles de ids genera una
+    // URL gigante que falla en silencio (items vacío → reporte vacío aunque haya
+    // ventas). Paginamos de a 200 para que siempre traiga todo.
+    const items: any[] = [];
+    const CHUNK = 200;
+    let withName = true;   // si la columna product_name no existe aún (migración 70), reintentamos sin ella
+    for (let i = 0; i < invoiceIds.length; i += CHUNK) {
+      const chunk = invoiceIds.slice(i, i + CHUNK);
+      const cols = withName
+        ? 'invoice_id, product_id, product_name, quantity, unit_price, subtotal'
+        : 'invoice_id, product_id, quantity, unit_price, subtotal';
+      let part: any = null;
+      let itErr: any = null;
+      { const r = await db.from('invoice_items').select(cols).in('invoice_id', chunk); part = r.data; itErr = r.error; }
+      if (itErr && withName && /product_name/i.test(String(itErr.message))) {
+        withName = false;
+        const r = await db.from('invoice_items')
+          .select('invoice_id, product_id, quantity, unit_price, subtotal').in('invoice_id', chunk);
+        part = r.data; itErr = r.error;
+      }
+      if (itErr) throw new Error(itErr.message);
+      if (part) items.push(...part);
+    }
 
     const { data: products } = await db.from('products').select('id, name');
 

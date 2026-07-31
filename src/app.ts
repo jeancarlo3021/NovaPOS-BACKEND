@@ -49,8 +49,20 @@ import exchangeRate     from './routes/exchangeRate.js';
 const app = new Hono().basePath('/api');
 
 app.use('*', logger());
+// Orígenes permitidos: los de FRONTEND_URL (normalizados sin '/' final) + cualquier
+// localhost/127.0.0.1 (desarrollo). Sin esto, un frontend local recibía "NetworkError"
+// porque el navegador aprueba el OPTIONS pero bloquea el request real por CORS.
+const ALLOWED_ORIGINS = (process.env.FRONTEND_URL?.split(',') ?? [])
+  .map(s => s.trim().replace(/\/+$/, ''))
+  .filter(Boolean);
 app.use('*', cors({
-  origin: process.env.FRONTEND_URL?.split(',') ?? '*',
+  origin: (origin) => {
+    if (!origin) return origin;                      // curl / server-to-server: sin restricción
+    const clean = origin.replace(/\/+$/, '');
+    if (ALLOWED_ORIGINS.includes(clean)) return origin;
+    if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(clean)) return origin;  // dev local
+    return ALLOWED_ORIGINS[0] ?? '';                 // no permitido
+  },
   allowHeaders: ['Content-Type', 'Authorization', 'x-branch-id'],
   allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
 }));

@@ -602,7 +602,8 @@ export async function emitInvoiceCore(
     const lines: FELine[] = items.map((it: any) => {
       const p = prodMap.get(it.product_id) ?? {};
       return {
-        product_name: p.name ?? 'Producto',
+        // Ad-hoc (sin producto en catálogo): usa el nombre guardado en el ítem.
+        product_name: p.name ?? it.product_name ?? 'Producto',
         sku: p.sku ?? null,
         quantity: Number(it.quantity),
         unit_price: Number(it.unit_price),
@@ -1919,7 +1920,7 @@ hacienda.post('/emit-direct', async (c) => {
       return fail(c, 'Para Factura Electrónica el cliente debe tener cédula. Seleccioná un cliente con identificación o emití como tiquete.', 422);
     }
     const docType = tipoDoc === '01' ? 'factura_electronica' : 'tiquete_electronico';
-    const payment: string = ['cash', 'card', 'sinpe', 'credit'].includes(b.payment_method) ? b.payment_method : 'cash';
+    const payment: string = ['cash', 'card', 'sinpe', 'credit', 'check', 'transfer', 'third_party', 'digital', 'other'].includes(b.payment_method) ? b.payment_method : 'cash';
 
     // Crear factura (consecutivo único). El piso = consecutivo inicial configurado
     // en Datos de FE (para continuar la numeración migrada de otro sistema).
@@ -1947,13 +1948,21 @@ hacienda.post('/emit-direct', async (c) => {
     }
     if (!inv) throw new Error(invErr?.message ?? 'No se pudo crear la factura');
 
-    await db.from('invoice_items').insert(rawLines
-      .filter((l: any) => l.product_id && Number(l.quantity) > 0)
+    const itemRowsFe = rawLines
+      .filter((l: any) => Number(l.quantity) > 0 && Number(l.unit_price) >= 0)
       .map((l: any) => ({
-        invoice_id: inv.id, product_id: l.product_id, quantity: Number(l.quantity),
+        invoice_id: inv.id, product_id: l.product_id ?? null,
+        product_name: l.name ?? 'Producto',   // snapshot: sobrevive si se borra el producto
+        quantity: Number(l.quantity),
         unit_price: Number(l.unit_price) || 0, discount_percent: 0, discount_amount: 0,
         subtotal: Math.round((Number(l.quantity) || 0) * (Number(l.unit_price) || 0) * 100) / 100,
-      })));
+      }));
+    let { error: feItemErr } = await db.from('invoice_items').insert(itemRowsFe);
+    if (feItemErr && /product_name/i.test(feItemErr.message)) {
+      const stripped = itemRowsFe.map(({ product_name, ...r }: any) => r);
+      ({ error: feItemErr } = await db.from('invoice_items').insert(stripped));
+    }
+    if (feItemErr) console.warn('[emit-direct] no se pudieron guardar los invoice_items:', feItemErr.message);
 
     // Emitir a Hacienda.
     const emisor = {

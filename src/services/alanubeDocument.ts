@@ -36,7 +36,8 @@ export interface AlanubeInvoiceMeta {
 // Hacienda MedioPago: 01 efectivo, 02 tarjeta, 03 cheque, 04 transf, 06 SINPE.
 const MEDIO_PAGO: Record<string, string> = {
   cash: '01', card: '02', check: '03', transfer: '04', deposit: '04',
-  sinpe: '06', sinpe_movil: '06', credit: '02', mixed: '01',
+  third_party: '05', sinpe: '06', sinpe_movil: '06', digital: '07',
+  other: '99', credit: '02', mixed: '01',
 };
 
 // Tarifa IVA → CodigoTarifa Hacienda (08 = 13%, 01 = 0%/exento, 04 = 1%…).

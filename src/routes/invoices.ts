@@ -9,7 +9,10 @@ const invoices = new Hono<{ Variables: { userId: string; tenantId: string; role:
 
 // CartItem from frontend has extra fields (product, promo) — accept any object with product_id
 const ItemSchema = z.object({
-  product_id:       z.string().uuid(),
+  // product_id NULL = producto rápido/ad-hoc (no está en el catálogo). En ese caso
+  // el nombre viaja en product_name.
+  product_id:       z.string().uuid().nullable().optional(),
+  product_name:     z.string().optional().nullable(),
   quantity:         z.number().positive(),
   unit_price:       z.number().nonnegative(),
   discount_percent: z.number().nonnegative().optional().default(0),
@@ -30,7 +33,7 @@ const InvoiceSchema = z.object({
   tax_percent:      z.number().nonnegative().optional().default(13),
   tax_amount:       z.number().nonnegative().default(0),
   total:            z.number().nonnegative(),
-  payment_method:   z.enum(['cash', 'card', 'sinpe', 'check', 'transfer', 'credit']).default('cash'),
+  payment_method:   z.enum(['cash', 'card', 'sinpe', 'check', 'transfer', 'third_party', 'digital', 'other', 'credit']).default('cash'),
   /** Tipo de documento fiscal. */
   document_type:    z.enum(['ticket', 'tiquete_electronico', 'factura_electronica']).optional().default('ticket'),
   // Multimoneda: moneda del pago en efectivo y tipo de cambio (₡ por $1).
@@ -218,22 +221,45 @@ invoices.post('/', async (c) => {
     if (invErr) throw new Error(invErr.message);
     if (!inv) throw new Error('No se pudo generar la factura (número duplicado)');
 
+    // Cliente excluido del cierre (ej. compras de empleados): marcamos la factura para
+    // que el cierre de caja NO la contabilice. Best-effort (update aparte) para no
+    // romper la creación si la columna/ migración 71 aún no está.
+    if (invoiceData.customer_id) {
+      try {
+        const { data: cust } = await db.from('customers')
+          .select('exclude_from_cash_close').eq('id', invoiceData.customer_id).eq('tenant_id', tenantId).maybeSingle();
+        if ((cust as any)?.exclude_from_cash_close) {
+          await db.from('invoices').update({ exclude_from_close: true }).eq('id', inv.id).eq('tenant_id', tenantId);
+          (inv as any).exclude_from_close = true;
+        }
+      } catch { /* columna sin migrar → se ignora */ }
+    }
+
     // Insert items (strip extra CartItem fields)
     const itemRows = items.map((item: any) => ({
       invoice_id:       inv.id,
-      product_id:       item.product_id,
+      product_id:       item.product_id ?? null,
+      // Nombre del producto (snapshot). Imprescindible para los ad-hoc que no tienen
+      // product_id con qué resolver el nombre después.
+      product_name:     item.product_name ?? item.product?.name ?? null,
       quantity:         item.quantity,
       unit_price:       item.unit_price,
       discount_percent: item.discount_percent ?? 0,
       discount_amount:  item.discount_amount ?? 0,
       subtotal:         item.subtotal,
     }));
-    const { error: itemErr } = await db.from('invoice_items').insert(itemRows);
+    let { error: itemErr } = await db.from('invoice_items').insert(itemRows);
+    // Si la columna product_name aún no existe (migración 70 sin correr), reintentar sin ella.
+    if (itemErr && /product_name/i.test(itemErr.message)) {
+      const stripped = itemRows.map(({ product_name, ...r }: any) => r);
+      ({ error: itemErr } = await db.from('invoice_items').insert(stripped));
+    }
     if (itemErr) throw new Error(itemErr.message);
 
     // Decrement stock — SOLO productos que manejan inventario.
     // Los de stock infinito (tracks_stock === false) NO se descuentan.
     for (const item of items as any[]) {
+      if (!item.product_id) continue;   // ad-hoc: sin producto que descontar
       const { data: p } = await db.from('products')
         .select('stock_quantity, tracks_stock').eq('id', item.product_id).maybeSingle();
       if (p && (p as any).tracks_stock !== false) {

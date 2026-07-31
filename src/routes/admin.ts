@@ -1743,12 +1743,46 @@ admin.get('/alanube/reports/emissions', async (c) => {
     };
     const perC = unwrap(perCompany);
     const byU = unwrap(byUser);
+
+    // El reporte de Alanube SOLO trae empresas con emisiones en el rango. Para que
+    // aparezcan TODAS las empresas registradas (aunque no hayan emitido), fusionamos
+    // con las empresas Alanube guardadas por los tenants (en 0 las que no emitieron).
+    if (Array.isArray(perC)) {
+      try {
+        const { data: feRows } = await db.from('settings').select('config').eq('type', 'electronic-invoice');
+        const present = new Set(perC.map((r: any) => String(r.idCompany ?? r.id ?? '')));
+        const zeros: any[] = [];
+        for (const row of (feRows ?? []) as any[]) {
+          const cfg = row.config ?? {};
+          const id = String((env === 'sandbox' ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id ?? '');
+          if (!id || present.has(id)) continue;
+          present.add(id);
+          zeros.push({
+            idCompany: id,
+            companyName: cfg.emisor_commercial_name || cfg.emisor_name || '(sin nombre)',
+            companyEmail: cfg.emisor_email ?? '',
+            invoices: 0, exportInvoices: 0, purchaseInvoices: 0, creditNotes: 0,
+            debitNotes: 0, receiverMessages: 0, tickets: 0, paymentReceipts: 0, total: 0,
+            _noEmissions: true,   // marca para el frontend (opcional)
+          });
+        }
+        // Empresas con emisiones primero (ordenadas por total), luego las inactivas.
+        perC.sort((a: any, b: any) => Number(b.total || 0) - Number(a.total || 0));
+        perC.push(...zeros);
+      } catch { /* si falla la fusión, devolvemos solo las que trajo Alanube */ }
+    }
+    // Modo diagnóstico: devuelve la respuesta CRUDA de Alanube (tal cual, sin
+    // desenvolver) para ver los nombres reales de los campos y corregir el mapeo.
+    const debug = c.req.query('debug') === '1';
+    const rawOf = (r: PromiseSettledResult<any>) =>
+      r.status === 'fulfilled' ? r.value : { error: r.reason instanceof Error ? r.reason.message : String(r.reason) };
     return ok(c, {
       env, from, until,
       per_company: perC, by_user: byU,
       // Bandera para que el frontend sepa que el token trae datos aunque un reporte
       // esté vacío/forbidden.
       has_data: (Array.isArray(perC) && perC.length > 0) || (Array.isArray(byU) && byU.length > 0),
+      ...(debug ? { raw: { per_company: rawOf(perCompany), by_user: rawOf(byUser) } } : {}),
     });
   } catch (err: any) {
     const st = err instanceof AlanubeError ? err.status : 500;
@@ -1791,7 +1825,7 @@ admin.get('/fe-log', async (c) => {
     const limit = Math.min(Number(c.req.query('limit') || 500), 2000);
 
     let q = db.from('invoices')
-      .select('id, tenant_id, invoice_number, customer_name, total, issued_at, created_at, document_type, fe_clave, fe_consecutivo, fe_status, fe_error, fe_emailed, fe_request, fe_response')
+      .select('id, tenant_id, invoice_number, customer_name, total, issued_at, created_at, document_type, fe_clave, fe_consecutivo, fe_status, fe_error, fe_emailed, fe_request, fe_response, fe_nc_clave, fe_nc_status, fe_nd_clave, fe_nd_status')
       .not('fe_status', 'is', null)                 // solo comprobantes electrónicos
       .order('created_at', { ascending: false })
       .limit(limit);
@@ -1810,7 +1844,7 @@ admin.get('/fe-log', async (c) => {
     // reintenta sin ellas.
     if (error && /fe_request|fe_response|fe_emailed/.test(error.message)) {
       let q2 = db.from('invoices')
-        .select('id, tenant_id, invoice_number, customer_name, total, issued_at, created_at, document_type, fe_clave, fe_consecutivo, fe_status, fe_error')
+        .select('id, tenant_id, invoice_number, customer_name, total, issued_at, created_at, document_type, fe_clave, fe_consecutivo, fe_status, fe_error, fe_nc_clave, fe_nc_status, fe_nd_clave, fe_nd_status')
         .not('fe_status', 'is', null)
         .order('created_at', { ascending: false }).limit(limit);
       if (tenantId) q2 = q2.eq('tenant_id', tenantId);
@@ -1831,12 +1865,44 @@ admin.get('/fe-log', async (c) => {
       const { data: ts } = await db.from('tenants').select('id, name').in('id', tenantIds);
       for (const t of (ts ?? []) as any[]) nameById.set(t.id, t.name);
     }
+    // Expandir: cada factura + (si tiene) su NOTA DE CRÉDITO y su NOTA DE DÉBITO
+    // como filas propias en la bitácora (las notas se guardan en la misma factura).
+    const out: any[] = [];
+    for (const r of rows) {
+      const business_name = nameById.get(r.tenant_id) ?? '—';
+      out.push({ ...r, business_name });
+      if (r.fe_nc_clave) {
+        out.push({
+          id: `${r.id}-nc`, tenant_id: r.tenant_id, business_name,
+          invoice_number: r.invoice_number, parent_invoice_number: r.invoice_number,
+          customer_name: r.customer_name, total: r.total,
+          issued_at: r.issued_at, created_at: r.created_at,
+          document_type: 'nota_credito', is_note: true,
+          fe_clave: r.fe_nc_clave, fe_consecutivo: null,
+          fe_status: r.fe_nc_status ?? 'sent', fe_error: null,
+        });
+      }
+      if (r.fe_nd_clave) {
+        out.push({
+          id: `${r.id}-nd`, tenant_id: r.tenant_id, business_name,
+          invoice_number: r.invoice_number, parent_invoice_number: r.invoice_number,
+          customer_name: r.customer_name, total: r.total,
+          issued_at: r.issued_at, created_at: r.created_at,
+          document_type: 'nota_debito', is_note: true,
+          fe_clave: r.fe_nd_clave, fe_consecutivo: null,
+          fe_status: r.fe_nd_status ?? 'sent', fe_error: null,
+        });
+      }
+    }
+    // Si hay filtro de estado, aplicarlo también a las notas (por su propio estado).
+    const finalRows = status
+      ? out.filter(r => String(r.fe_status ?? '').toLowerCase() === status.toLowerCase())
+      : out;
+    finalRows.sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')));
+
     // Contadores rápidos.
-    const errors = rows.filter(r => String(r.fe_status).toLowerCase() === 'error').length;
-    return ok(c, {
-      count: rows.length, errors,
-      rows: rows.map(r => ({ ...r, business_name: nameById.get(r.tenant_id) ?? '—' })),
-    });
+    const errors = finalRows.filter(r => String(r.fe_status).toLowerCase() === 'error').length;
+    return ok(c, { count: finalRows.length, errors, rows: finalRows });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

@@ -25,6 +25,7 @@ const CustomerSchema = z.object({
   is_active:           z.boolean().optional(),
   credit_enabled:      z.boolean().optional(),
   credit_limit:        z.number().nonnegative().optional(),
+  exclude_from_cash_close: z.boolean().optional(),
 });
 
 // ── Zonas (lista administrable) ──────────────────────────────────────────────

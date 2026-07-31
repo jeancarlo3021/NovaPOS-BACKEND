@@ -94,7 +94,12 @@ const str = (v: any): string => (v == null ? '' : String(v)).trim();
 // Devuelve null si el XML no es un comprobante electrónico (ej. es la respuesta
 // "MensajeHacienda" de aceptación, que no nos interesa recepcionar).
 export function parseHaciendaXml(xml: string): ParsedDoc | null {
-  const parser = new XMLParser({ ignoreAttributes: true, removeNSPrefix: true, parseTagValue: true });
+  // parseTagValue:false → NO convertir valores a número. La Clave (50 dígitos) y el
+  // consecutivo (20) son números enteros gigantes: con parseTagValue:true JS los
+  // convertía a float (5.06e+49), perdiendo precisión, y TODAS las claves del mismo
+  // emisor/fecha colapsaban al mismo valor → chocaban como duplicado y no se
+  // guardaban. Los montos igual se leen con num() sobre el string.
+  const parser = new XMLParser({ ignoreAttributes: true, removeNSPrefix: true, parseTagValue: false });
   let obj: any;
   try { obj = parser.parse(xml); } catch { return null; }
   if (!obj || typeof obj !== 'object') return null;
@@ -255,8 +260,15 @@ export async function fetchAndProcessReceivedEmails(opts?: { debug?: boolean }):
   try {
     const lock = await client.getMailboxLock(mailbox);
     try {
-      // Solo los NO leídos, para no reprocesar todo el buzón cada vez.
-      const uids = await client.search({ seen: false }, { uid: true });
+      // Procesamos los correos RECIENTES (leídos o no), no solo los no leídos: si
+      // alguien abre el correo (ej. para verificar que llegó, o porque el proveedor
+      // lo manda dos veces), quedaba marcado como leído y el cron lo saltaba PARA
+      // SIEMPRE → la compra nunca cargaba. La deduplicación por clave (tenant_id +
+      // clave en received_documents) evita insertar dos veces. Ventana configurable
+      // con RECEPTION_DAYS (por defecto 15 días).
+      const days = Math.max(1, Number(process.env.RECEPTION_DAYS || 15));
+      const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+      const uids = await client.search({ since }, { uid: true });
       for (const uid of (uids || [])) {
         summary.scanned++;
         try {
