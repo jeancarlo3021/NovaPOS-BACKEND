@@ -209,6 +209,11 @@ async function processXml(
     raw: { lines: doc.lines, receiver: doc.receiver },
   });
   if (error) {
+    // Violación de índice único (tenant_id + clave): la factura ya está en la bandeja
+    // (dos correos iguales o corridas del cron solapadas) → es un DUPLICADO, no un error.
+    if ((error as any).code === '23505' || /duplicate key|unique/i.test(error.message)) {
+      return 'dup';
+    }
     // La columna extra puede no existir si no se corrió la migración 53: reintenta mínimo.
     if (/column .* does not exist/i.test(error.message)) {
       await db.from('received_documents').insert({

@@ -85,7 +85,8 @@ app.get('/health', (c) => c.json({
     alanube_token_production: !!process.env.ALANUBE_API_TOKEN_PRODUCTION,
     alanube_token_sandbox:    !!process.env.ALANUBE_API_TOKEN_SANDBOX,
     // Pasarela de FE externa (/fe-external, ej. JKM) — ¿está configurada?
-    fe_external_supabase: !!process.env.FE_EXTERNAL_SUPABASE_URL && !!process.env.FE_EXTERNAL_SUPABASE_ANON_KEY,
+    fe_external_supabase: !!process.env.FE_EXTERNAL_SUPABASE_URL
+      && (!!process.env.FE_EXTERNAL_SUPABASE_SERVICE_KEY || !!process.env.FE_EXTERNAL_SUPABASE_ANON_KEY),
     // Correo (Resend) — para diagnosticar "no llega el correo".
     resend_api_key: !!process.env.RESEND_API_KEY,
     email_from:     process.env.EMAIL_FROM ?? '(default onboarding@resend.dev)',

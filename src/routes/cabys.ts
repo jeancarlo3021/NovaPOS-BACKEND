@@ -16,19 +16,27 @@ cabys.get('/search', async (c) => {
     const q = (c.req.query('q') ?? '').trim();
     if (q.length < 2) return ok(c, []);
 
-    let query = db.from('cabys_catalog').select('code, description, iva_rate').limit(60);
-    if (/^\d+$/.test(q)) {
-      // Búsqueda por código: por prefijo.
-      query = query.ilike('code', `${q}%`);
-    } else {
-      // Búsqueda por texto: cada palabra (≥2 letras) debe estar en la descripción.
-      const words = norm(q).split(/\s+/).filter(w => w.length >= 2);
-      for (const w of (words.length ? words : [norm(q)])) {
-        // unaccent no está garantizado en la columna; usamos ilike sobre el texto original.
-        query = query.ilike('description', `%${w}%`);
+    // Busca contra `col` (description_norm sin tildes, o description como respaldo).
+    const runSearch = async (col: 'description_norm' | 'description') => {
+      let query = db.from('cabys_catalog').select('code, description, iva_rate').limit(60);
+      if (/^\d+$/.test(q)) {
+        query = query.ilike('code', `${q}%`);            // código: por prefijo
+      } else {
+        // Cada palabra (≥2 letras) debe estar en la descripción (sin importar tildes).
+        const words = norm(q).split(/\s+/).filter(w => w.length >= 2);
+        for (const w of (words.length ? words : [norm(q)])) {
+          query = query.ilike(col, `%${w}%`);
+        }
       }
+      return query;
+    };
+
+    // Preferimos la columna normalizada (sin tildes). Si aún no existe (migración 72
+    // sin correr), caemos a la descripción original.
+    let { data, error } = await (await runSearch('description_norm'));
+    if (error && /description_norm/i.test(error.message)) {
+      ({ data, error } = await (await runSearch('description')));
     }
-    const { data, error } = await query;
     if (error) throw new Error(error.message);
 
     // Ranking: coincidencia exacta > empieza con > palabra al inicio > contiene.
@@ -65,15 +73,24 @@ cabys.post('/bulk', async (c) => {
     const rows: any[] = Array.isArray(b.rows) ? b.rows : [];
     const clean = rows
       .filter(r => r?.code && r?.description)
-      .map(r => ({
-        code: String(r.code).trim(),
-        description: String(r.description).trim().slice(0, 500),
-        iva_rate: Number.isFinite(Number(r.iva_rate)) ? Number(r.iva_rate) : 13,
-        sheet: r.sheet ?? 'catalogo',
-        updated_at: new Date().toISOString(),
-      }));
+      .map(r => {
+        const description = String(r.description).trim().slice(0, 500);
+        return {
+          code: String(r.code).trim(),
+          description,
+          description_norm: norm(description),   // sin tildes, para buscar (migración 72)
+          iva_rate: Number.isFinite(Number(r.iva_rate)) ? Number(r.iva_rate) : 13,
+          sheet: r.sheet ?? 'catalogo',
+          updated_at: new Date().toISOString(),
+        };
+      });
     if (clean.length === 0) return ok(c, { inserted: 0 });
-    const { error } = await db.from('cabys_catalog').upsert(clean, { onConflict: 'code' });
+    let { error } = await db.from('cabys_catalog').upsert(clean, { onConflict: 'code' });
+    // Si la columna description_norm aún no existe (migración 72 sin correr), reintentar sin ella.
+    if (error && /description_norm/i.test(error.message)) {
+      const stripped = clean.map(({ description_norm, ...r }: any) => r);
+      ({ error } = await db.from('cabys_catalog').upsert(stripped, { onConflict: 'code' }));
+    }
     if (error) throw new Error(error.message);
     return ok(c, { inserted: clean.length });
   } catch (err: any) { return fail(c, err.message, 500); }

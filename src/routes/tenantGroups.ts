@@ -604,13 +604,15 @@ groups.get('/my/branches-stats', async (c) => {
       usersCount.set(u.tenant_id, (usersCount.get(u.tenant_id) ?? 0) + 1);
     }
 
-    // 4. Facturas del mes en curso por tenant + desglose por tipo de documento
-    const now = new Date();
-    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+    // 4. Facturas del mes en curso por tenant + desglose por tipo de documento.
+    // Inicio de mes en hora CR (UTC-6) y filtrado por `issued_at` (fecha de la venta,
+    // como el resto de reportes), no por created_at (inserción en BD).
+    const crNow = new Date(Date.now() - 6 * 60 * 60 * 1000);
+    const monthStart = `${crNow.getUTCFullYear()}-${String(crNow.getUTCMonth() + 1).padStart(2, '0')}-01`;
     const { data: invoices } = await db.from('invoices')
-      .select('tenant_id, total, status, document_type, created_at')
+      .select('tenant_id, total, status, document_type, issued_at')
       .in('tenant_id', tenantIds)
-      .gte('created_at', monthStart);
+      .gte('issued_at', monthStart);
     type DocC = { ticket: number; tiquete_electronico: number; factura_electronica: number };
     const invoicesMonth = new Map<string, { count: number; total: number; docs: DocC }>();
     for (const inv of (invoices ?? []) as any[]) {
@@ -675,12 +677,15 @@ groups.get('/my/branches-report', async (c) => {
     const { data: tenants } = await db.from('tenants')
       .select('id, name, is_demo, status').in('id', tenantIds);
 
-    // Facturas en rango (solo completadas) por tenant
+    // Facturas en rango (solo completadas) por tenant. Filtramos por `issued_at`
+    // (fecha de la VENTA), igual que el resto de los reportes — NO por created_at
+    // (fecha de inserción en BD), que difiere en ventas offline sincronizadas después
+    // y por el desfase de hora CR, y hacía que los números no cuadraran.
     let invQ = db.from('invoices')
-      .select('tenant_id, total, tax_amount, status, document_type, created_at')
+      .select('tenant_id, total, tax_amount, status, document_type, issued_at')
       .in('tenant_id', tenantIds);
-    if (from) invQ = invQ.gte('created_at', from);
-    if (to)   invQ = invQ.lte('created_at', to);
+    if (from) invQ = invQ.gte('issued_at', from);
+    if (to)   invQ = invQ.lte('issued_at', to);
     const { data: invoices } = await invQ;
 
     type DocCounts = { ticket: number; tiquete_electronico: number; factura_electronica: number };

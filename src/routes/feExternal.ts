@@ -15,17 +15,25 @@
  *  · /hacienda autentica con el JWT de Supabase de NovaPOS y resuelve `tenantId`;
  *    acá se valida el JWT del proyecto Supabase de la app externa.
  *
- * Autenticación: `Authorization: Bearer <access_token de la app externa>`. Se
- * verifica contra `FE_EXTERNAL_SUPABASE_URL/auth/v1/user`, así NO hace falta
- * ningún secreto compartido en el bundle del frontend. Opcionalmente se limita
- * por correo con `FE_EXTERNAL_ALLOWED_EMAILS`.
+ * Autenticación: `Authorization: Bearer <token de sesión de la app externa>`.
+ * Se aceptan dos formatos, según cómo autentique la app:
+ *
+ *  1. Token de sesión propio (JKM): un token opaco que Postgres emite al validar
+ *     las credenciales, guardado en la tabla `sesiones_admin`. Se verifica con la
+ *     SERVICE KEY del proyecto externo, que se salta RLS. La app no puede
+ *     fabricar sesiones porque la tabla no es escribible con la anon key.
+ *  2. JWT de Supabase Auth: se verifica contra `/auth/v1/user`. Sirve si la app
+ *     externa llegara a migrar a Supabase Auth.
+ *
+ * En ninguno de los dos casos hace falta un secreto en el bundle del frontend.
  *
  * Variables de entorno:
- *  · FE_EXTERNAL_SUPABASE_URL       URL del proyecto Supabase de la app externa
- *  · FE_EXTERNAL_SUPABASE_ANON_KEY  anon key de ese proyecto (para /auth/v1/user)
- *  · FE_EXTERNAL_ALLOWED_EMAILS     (opcional) lista de correos autorizados
+ *  · FE_EXTERNAL_SUPABASE_URL          URL del proyecto Supabase de la app externa
+ *  · FE_EXTERNAL_SUPABASE_SERVICE_KEY  service key (valida `sesiones_admin`)
+ *  · FE_EXTERNAL_SUPABASE_ANON_KEY     anon key (solo para el modo Supabase Auth)
+ *  · FE_EXTERNAL_ALLOWED_EMAILS        (opcional) lista de correos/usuarios permitidos
  *  · ALANUBE_API_TOKEN_SANDBOX / ALANUBE_API_TOKEN_PRODUCTION (ya existentes)
- *  · FRONTEND_URL                   debe incluir el origen de la app externa (CORS)
+ *  · FRONTEND_URL                      debe incluir el origen de la app externa (CORS)
  */
 import { Hono } from 'hono';
 import { createMiddleware } from 'hono/factory';
@@ -40,39 +48,78 @@ type Variables = { feUserEmail: string };
 
 const feExternal = new Hono<{ Variables: Variables }>();
 
-/** Valida el JWT del proyecto Supabase de la app externa. */
-const requireExternalUser = createMiddleware<{ Variables: Variables }>(async (c, next) => {
-  const url  = (process.env.FE_EXTERNAL_SUPABASE_URL ?? '').trim().replace(/\/+$/, '');
+/** Valida un token de sesión propio contra la tabla `sesiones_admin` del proyecto
+ *  externo, usando la SERVICE KEY (se salta RLS). Devuelve el usuario o null. */
+async function validarSesionPropia(url: string, token: string): Promise<string | null> {
+  const service = (process.env.FE_EXTERNAL_SUPABASE_SERVICE_KEY ?? '').trim();
+  if (!service) return null;
+
+  const qs = new URLSearchParams({
+    select: 'usuario,expira_at',
+    token: `eq.${token}`,
+    // La sesión tiene que seguir vigente; PostgREST compara contra la hora del server.
+    expira_at: `gt.${new Date().toISOString()}`,
+    limit: '1',
+  });
+
+  const res = await fetch(`${url}/rest/v1/sesiones_admin?${qs.toString()}`, {
+    headers: { apikey: service, Authorization: `Bearer ${service}` },
+  });
+  if (!res.ok) return null;
+
+  const filas: any[] = await res.json().catch(() => []);
+  const usuario = filas?.[0]?.usuario;
+  return usuario ? String(usuario) : null;
+}
+
+/** Valida un JWT de Supabase Auth. Devuelve el correo o null. */
+async function validarJwtSupabase(url: string, token: string): Promise<string | null> {
   const anon = (process.env.FE_EXTERNAL_SUPABASE_ANON_KEY ?? '').trim();
-  if (!url || !anon) {
-    return fail(c, 'La pasarela de FE externa no está configurada en el servidor (FE_EXTERNAL_SUPABASE_URL / FE_EXTERNAL_SUPABASE_ANON_KEY).', 500);
+  if (!anon) return null;
+
+  const res = await fetch(`${url}/auth/v1/user`, {
+    headers: { apikey: anon, Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) return null;
+
+  const user: any = await res.json().catch(() => null);
+  return user?.id ? String(user?.email ?? user.id) : null;
+}
+
+/** Autentica al usuario de la app externa (sesión propia o Supabase Auth). */
+const requireExternalUser = createMiddleware<{ Variables: Variables }>(async (c, next) => {
+  const url = (process.env.FE_EXTERNAL_SUPABASE_URL ?? '').trim().replace(/\/+$/, '');
+  if (!url) {
+    return fail(c, 'La pasarela de FE externa no está configurada en el servidor (falta FE_EXTERNAL_SUPABASE_URL).', 500);
+  }
+  if (!process.env.FE_EXTERNAL_SUPABASE_SERVICE_KEY && !process.env.FE_EXTERNAL_SUPABASE_ANON_KEY) {
+    return fail(c, 'La pasarela de FE externa no está configurada en el servidor (falta FE_EXTERNAL_SUPABASE_SERVICE_KEY).', 500);
   }
 
   const token = c.req.header('Authorization')?.replace(/^Bearer\s+/i, '').trim();
   if (!token) return fail(c, 'No autorizado: falta el token de sesión.', 401);
 
-  let user: any;
+  let identidad: string | null = null;
   try {
-    const res = await fetch(`${url}/auth/v1/user`, {
-      headers: { apikey: anon, Authorization: `Bearer ${token}` },
-    });
-    if (!res.ok) return fail(c, 'Token inválido o expirado. Volvé a iniciar sesión.', 401);
-    user = await res.json();
+    // Un JWT trae dos puntos; el token propio es hexadecimal opaco. Se prueba
+    // primero el formato que corresponde y se cae al otro por compatibilidad.
+    identidad = token.split('.').length === 3
+      ? (await validarJwtSupabase(url, token)) ?? (await validarSesionPropia(url, token))
+      : (await validarSesionPropia(url, token)) ?? (await validarJwtSupabase(url, token));
   } catch (err: any) {
     return fail(c, `No se pudo validar la sesión: ${err?.message ?? 'error de red'}`, 502);
   }
 
-  const email = String(user?.email ?? '').trim().toLowerCase();
-  if (!user?.id) return fail(c, 'Token inválido: sin usuario.', 401);
+  if (!identidad) return fail(c, 'Sesión inválida o expirada. Volvé a iniciar sesión.', 401);
 
-  // Lista blanca opcional de correos con permiso para emitir.
+  // Lista blanca opcional de usuarios/correos con permiso para emitir.
   const allowed = (process.env.FE_EXTERNAL_ALLOWED_EMAILS ?? '')
     .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
-  if (allowed.length > 0 && !allowed.includes(email)) {
+  if (allowed.length > 0 && !allowed.includes(identidad.toLowerCase())) {
     return fail(c, 'Tu usuario no tiene permiso para emitir comprobantes electrónicos.', 403);
   }
 
-  c.set('feUserEmail', email);
+  c.set('feUserEmail', identidad);
   await next();
 });
 

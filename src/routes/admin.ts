@@ -1506,6 +1506,56 @@ admin.post('/tenants/:id/products-import', async (c) => {
 // POST /tenants/:id/fe-renew — renovar la bolsa de comprobantes FE (cuando el
 // cliente paga). Reinicia fe_quota_start a HOY → el contador vuelve a 0 y el
 // tenant recupera la cantidad incluida completa.
+// POST /tenants/:id/reset-business — DESTRUCTIVO: deja el negocio "como nuevo"
+// borrando TODOS los datos operativos (ventas, caja, CxC, compras, gastos, recibidos,
+// clientes…) pero CONSERVANDO los PRODUCTOS y la configuración. Exige confirmar con
+// el nombre exacto del negocio.
+admin.post('/tenants/:id/reset-business', async (c) => {
+  if (!isAdminRole(c)) return fail(c, 'forbidden', 403);
+  try {
+    const { id } = c.req.param();
+    const body = await c.req.json().catch(() => ({} as any));
+    const { data: t } = await db.from('tenants').select('name').eq('id', id).maybeSingle();
+    if (!t) return fail(c, 'Negocio no encontrado', 404);
+    if (String(body?.confirm ?? '').trim().toLowerCase() !== String((t as any).name ?? '').trim().toLowerCase()) {
+      return fail(c, 'Confirmación incorrecta: escribí el nombre exacto del negocio.', 422);
+    }
+
+    const CHUNK = 200;
+    // Borra los hijos por FK (sin ON DELETE CASCADE garantizado) primero, por id del padre.
+    const delChildren = async (parent: string, child: string, fk: string) => {
+      try {
+        const { data: parents } = await db.from(parent).select('id').eq('tenant_id', id);
+        const ids = (parents ?? []).map((p: any) => p.id);
+        for (let i = 0; i < ids.length; i += CHUNK) {
+          await db.from(child).delete().in(fk, ids.slice(i, i + CHUNK));
+        }
+      } catch (e: any) { console.warn(`[reset-business] ${child}:`, e?.message); }
+    };
+
+    await delChildren('invoices', 'invoice_items', 'invoice_id');
+    await delChildren('purchases', 'purchase_items', 'purchase_id');
+    await delChildren('cash_sessions', 'cash_movements', 'cash_session_id');
+
+    // Tablas con tenant_id directo. Se CONSERVAN: products, categories, unit_types,
+    // suppliers, settings, users (catálogo + configuración). Cada borrado es tolerante
+    // a que la tabla no exista.
+    const tables = [
+      'accounts_receivable_payments', 'accounts_receivable',
+      'invoices', 'cash_sessions',
+      'purchases', 'stock_adjustments', 'expenses',
+      'received_documents', 'proformas', 'customer_prices', 'customers',
+    ];
+    const deleted: Record<string, boolean> = {};
+    for (const tbl of tables) {
+      try { await db.from(tbl).delete().eq('tenant_id', id); deleted[tbl] = true; }
+      catch (e: any) { deleted[tbl] = false; console.warn(`[reset-business] ${tbl}:`, e?.message); }
+    }
+
+    return ok(c, { ok: true, tenant: (t as any).name, deleted, kept: ['products', 'categories', 'unit_types', 'suppliers', 'settings', 'users'] });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 admin.post('/tenants/:id/fe-renew', async (c) => {
   try {
     const { id } = c.req.param();

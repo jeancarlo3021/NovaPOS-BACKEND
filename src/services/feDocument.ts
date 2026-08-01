@@ -179,20 +179,24 @@ export function buildDocumentoJson(
   const condicionVenta = inv.payment_method === 'credit' ? '02' : '01';
   const medioPago = MEDIO_PAGO[inv.payment_method] ?? '01';
 
-  let totalLineas = 0;   // suma de MontoTotalLinea (subtotal + impuesto) de todas las líneas
+  // Acumuladores del ResumenFactura (Hacienda EXIGE los totales explícitos; ya no
+  // alcanza con RecalcularResumen). Clasificamos cada línea por CABYS: primer dígito
+  // 0-4 = MERCANCÍA, 5-9 = SERVICIO; y por tarifa: >0 gravado, =0 exento.
+  let totalServGrav = 0, totalServEx = 0, totalMercGrav = 0, totalMercEx = 0;
+  let totalImpuesto = 0, totalVenta = 0, totalDescuentos = 0;
+  const taxByRate: Record<string, number> = {};   // CodigoTarifaIVA → monto acumulado
+
   const lineaDetalle = lines.map((l, i) => {
     const tarifa = Number(l.iva_rate ?? 0);
     const cantidad = Number(l.quantity) || 0;
     // Subtotal = lo realmente cobrado por la línea (con precio especial/promo ya aplicado).
     const subtotal = Math.round(Number(l.subtotal ?? l.unit_price * cantidad) * 100) / 100;
-    // PRECIO EFECTIVO: usamos el precio realmente cobrado por unidad como
-    // PrecioUnitario, de modo que MontoTotal = SubTotal y NO haya que declarar un
-    // nodo Descuento (evita las validaciones de CodigoDescuento /
-    // ImpuestoAsumidoEmisorFabrica). El precio especial/promo queda reflejado en
-    // el precio unitario, que es una forma válida ante Hacienda.
+    // PRECIO EFECTIVO: el precio realmente cobrado por unidad → MontoTotal = SubTotal,
+    // sin nodo Descuento (evita validaciones de CodigoDescuento).
     const precioUnitario = cantidad > 0 ? subtotal / cantidad : subtotal;
     const montoTotal = Math.round(precioUnitario * cantidad * 100) / 100;  // == subtotal
     const impuestoMonto = Math.round(subtotal * (tarifa / 100) * 100) / 100;
+
     const linea: any = {
       NumeroLinea: String(i + 1),
       CodigoCABYS: l.cabys_code ?? '',
@@ -203,28 +207,43 @@ export function buildDocumentoJson(
       MontoTotal: money(montoTotal),
       SubTotal: money(subtotal),
       BaseImponible: money(subtotal),
-      MontoTotalLinea: money(subtotal + impuestoMonto),
     };
     if (l.sku) linea.CodigoComercial = [{ Tipo: '04', Codigo: l.sku }];
-    if (tarifa > 0) {
-      linea.Impuesto = [{
-        Codigo: '01',
-        CodigoTarifaIVA: codigoTarifaIVA(tarifa),
-        Tarifa: String(tarifa),
-        Monto: money(impuestoMonto),
-      }];
-      linea.ImpuestoNeto = money(impuestoMonto);
-    }
+    // El nodo Impuesto va SIEMPRE (Hacienda lo exige aunque la tarifa sea 0%/exenta).
+    const codTarifa = codigoTarifaIVA(tarifa);
+    linea.Impuesto = [{
+      Codigo: '01',
+      CodigoTarifaIVA: codTarifa,
+      Tarifa: Number(tarifa).toFixed(2),
+      Monto: money(impuestoMonto),
+    }];
+    linea.ImpuestoNeto = money(impuestoMonto);
     // Requerido por Hacienda: impuesto asumido por el emisor de fábrica (0 si no aplica).
     linea.ImpuestoAsumidoEmisorFabrica = '0';
-    totalLineas += subtotal + impuestoMonto;
+    linea.MontoTotalLinea = money(subtotal + impuestoMonto);
+
+    // Acumular para el resumen.
+    const cabys = String(l.cabys_code ?? '').replace(/\D/g, '');
+    const esServicio = cabys.length > 0 && cabys[0] >= '5';   // CABYS 5-9 = servicio
+    if (tarifa > 0) {
+      if (esServicio) totalServGrav += subtotal; else totalMercGrav += subtotal;
+      taxByRate[codTarifa] = (taxByRate[codTarifa] ?? 0) + impuestoMonto;
+    } else {
+      if (esServicio) totalServEx += subtotal; else totalMercEx += subtotal;
+    }
+    totalImpuesto += impuestoMonto;
+    totalVenta += montoTotal;
     return linea;
   });
 
-  // El total del comprobante DEBE ser la suma de las líneas (lo que Facturemos
-  // recalcula con RecalcularResumen=1). Usar inv.total podía diferir por el
-  // redondeo a ₡10 del POS → los medios de pago no cuadraban con el total.
-  const totalComprobante = Math.round(totalLineas * 100) / 100;
+  const round2 = (n: number) => Math.round(n * 100) / 100;
+  totalServGrav = round2(totalServGrav); totalServEx = round2(totalServEx);
+  totalMercGrav = round2(totalMercGrav); totalMercEx = round2(totalMercEx);
+  totalImpuesto = round2(totalImpuesto); totalVenta = round2(totalVenta);
+  const totalGravado = round2(totalServGrav + totalMercGrav);
+  const totalExento = round2(totalServEx + totalMercEx);
+  const totalVentaNeta = round2(totalVenta - totalDescuentos);
+  const totalComprobante = round2(totalVentaNeta + totalImpuesto);
 
   // Facturemos indica: NO enviar Clave ni NumeroConsecutivo (los asigna su API;
   // si mandamos "0" los toma como valor 0). Y el contenido de `Factura` va SIN el
@@ -261,6 +280,24 @@ export function buildDocumentoJson(
       LineaDetalle: lineaDetalle,
     },
     ResumenFactura: {
+      CodigoTipoMoneda: { CodigoMoneda: 'CRC', TipoCambio: '1.00000' },
+      TotalServGravados: money(totalServGrav),
+      TotalServExentos: money(totalServEx),
+      TotalMercanciasGravadas: money(totalMercGrav),
+      TotalMercanciasExentas: money(totalMercEx),
+      TotalGravado: money(totalGravado),
+      TotalExento: money(totalExento),
+      TotalVenta: money(totalVenta),
+      TotalDescuentos: money(totalDescuentos),
+      TotalVentaNeta: money(totalVentaNeta),
+      // Desglose del impuesto por tarifa cobrada (solo las que tienen monto).
+      ...(Object.keys(taxByRate).length > 0 ? {
+        TotalDesgloseImpuesto: Object.entries(taxByRate).map(([cod, monto]) => ({
+          Codigo: '01', CodigoTarifaIVA: cod, TotalMontoImpuesto: money(round2(monto)),
+        })),
+      } : {}),
+      TotalImpuesto: money(totalImpuesto),
+      TotalComprobante: money(totalComprobante),
       MedioPago: [{ TipoMedioPago: medioPago, TotalMedioPago: money(totalComprobante) }],
     },
     Otros: {
