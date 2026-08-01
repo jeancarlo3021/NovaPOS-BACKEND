@@ -84,9 +84,12 @@ app.get('/health', (c) => c.json({
     // Tokens de Alanube por ambiente (para diagnosticar "Company not found").
     alanube_token_production: !!process.env.ALANUBE_API_TOKEN_PRODUCTION,
     alanube_token_sandbox:    !!process.env.ALANUBE_API_TOKEN_SANDBOX,
-    // Pasarela de FE externa (/fe-external, ej. JKM) — ¿está configurada?
-    fe_external_supabase: !!process.env.FE_EXTERNAL_SUPABASE_URL
-      && (!!process.env.FE_EXTERNAL_SUPABASE_SERVICE_KEY || !!process.env.FE_EXTERNAL_SUPABASE_ANON_KEY),
+    // Pasarela de FE externa (/fe-external, ej. JKM). Se reportan por separado:
+    // la SERVICE key es la que valida los tokens de sesión propios, la anon solo
+    // sirve para el modo Supabase Auth. Juntarlas escondía cuál faltaba.
+    fe_external_url:         !!process.env.FE_EXTERNAL_SUPABASE_URL,
+    fe_external_service_key: !!process.env.FE_EXTERNAL_SUPABASE_SERVICE_KEY,
+    fe_external_anon_key:    !!process.env.FE_EXTERNAL_SUPABASE_ANON_KEY,
     // Correo (Resend) — para diagnosticar "no llega el correo".
     resend_api_key: !!process.env.RESEND_API_KEY,
     email_from:     process.env.EMAIL_FROM ?? '(default onboarding@resend.dev)',

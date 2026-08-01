@@ -31,7 +31,10 @@
  *  · FE_EXTERNAL_SUPABASE_URL          URL del proyecto Supabase de la app externa
  *  · FE_EXTERNAL_SUPABASE_SERVICE_KEY  service key (valida `sesiones_admin`)
  *  · FE_EXTERNAL_SUPABASE_ANON_KEY     anon key (solo para el modo Supabase Auth)
- *  · FE_EXTERNAL_ALLOWED_EMAILS        (opcional) lista de correos/usuarios permitidos
+ *  · FE_EXTERNAL_ALLOWED_USERS         (opcional) usuarios permitidos, separados por
+ *                                      coma. Con sesión propia son NOMBRES DE
+ *                                      USUARIO (ej. 'jkm'), no correos. Vacía =
+ *                                      sin filtro. Alias viejo: FE_EXTERNAL_ALLOWED_EMAILS.
  *  · ALANUBE_API_TOKEN_SANDBOX / ALANUBE_API_TOKEN_PRODUCTION (ya existentes)
  *  · FRONTEND_URL                      debe incluir el origen de la app externa (CORS)
  */
@@ -52,7 +55,10 @@ const feExternal = new Hono<{ Variables: Variables }>();
  *  externo, usando la SERVICE KEY (se salta RLS). Devuelve el usuario o null. */
 async function validarSesionPropia(url: string, token: string): Promise<string | null> {
   const service = (process.env.FE_EXTERNAL_SUPABASE_SERVICE_KEY ?? '').trim();
-  if (!service) return null;
+  if (!service) {
+    console.warn('[fe-external] Falta FE_EXTERNAL_SUPABASE_SERVICE_KEY: no se pueden validar sesiones propias.');
+    return null;
+  }
 
   const qs = new URLSearchParams({
     select: 'usuario,expira_at',
@@ -65,10 +71,22 @@ async function validarSesionPropia(url: string, token: string): Promise<string |
   const res = await fetch(`${url}/rest/v1/sesiones_admin?${qs.toString()}`, {
     headers: { apikey: service, Authorization: `Bearer ${service}` },
   });
-  if (!res.ok) return null;
+
+  if (!res.ok) {
+    // Sin este log el motivo real (tabla inexistente, service key equivocada,
+    // proyecto equivocado) quedaba escondido detrás de un 401 genérico.
+    const detalle = await res.text().catch(() => '');
+    console.warn(`[fe-external] Consulta a sesiones_admin falló (${res.status}): ${detalle.slice(0, 300)}`);
+    return null;
+  }
 
   const filas: any[] = await res.json().catch(() => []);
-  const usuario = filas?.[0]?.usuario;
+  if (!filas?.length) {
+    console.warn('[fe-external] Token de sesión no encontrado o vencido en sesiones_admin.');
+    return null;
+  }
+
+  const usuario = filas[0]?.usuario;
   return usuario ? String(usuario) : null;
 }
 
@@ -112,11 +130,15 @@ const requireExternalUser = createMiddleware<{ Variables: Variables }>(async (c,
 
   if (!identidad) return fail(c, 'Sesión inválida o expirada. Volvé a iniciar sesión.', 401);
 
-  // Lista blanca opcional de usuarios/correos con permiso para emitir.
-  const allowed = (process.env.FE_EXTERNAL_ALLOWED_EMAILS ?? '')
+  // Lista blanca OPCIONAL. Con el token de sesión propio la identidad es el
+  // NOMBRE DE USUARIO (ej. 'jkm'); con Supabase Auth es el correo. Por eso se
+  // acepta `FE_EXTERNAL_ALLOWED_USERS` además del nombre viejo, que quedó
+  // engañoso. Vacía = sin filtro (la autenticación por token igual se exige).
+  const allowed = (process.env.FE_EXTERNAL_ALLOWED_USERS ?? process.env.FE_EXTERNAL_ALLOWED_EMAILS ?? '')
     .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
   if (allowed.length > 0 && !allowed.includes(identidad.toLowerCase())) {
-    return fail(c, 'Tu usuario no tiene permiso para emitir comprobantes electrónicos.', 403);
+    console.warn(`[fe-external] Usuario "${identidad}" no está en la lista blanca (${allowed.join(', ')}).`);
+    return fail(c, `El usuario "${identidad}" no está autorizado para emitir comprobantes. Agregalo a FE_EXTERNAL_ALLOWED_USERS en el servidor, o borrá esa variable para permitir a todos.`, 403);
   }
 
   c.set('feUserEmail', identidad);
