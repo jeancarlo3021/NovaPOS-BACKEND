@@ -30,6 +30,19 @@ export async function businessContact(tenantId: string): Promise<BizContact> {
     name = String(cfg.emisor_commercial_name || cfg.emisor_name || '').trim();
   } catch { /* ignore */ }
 
+  // Los datos del EMISOR viven en la config de facturación electrónica, no en la
+  // general. Sin este respaldo, los avisos quedaban sin teléfono (y no se enviaban)
+  // en todos los negocios que solo llenaron «Datos de FE».
+  if (!phone || !name) {
+    try {
+      const { data: fe } = await db.from('settings').select('config')
+        .eq('tenant_id', tenantId).eq('type', 'electronic-invoice').maybeSingle();
+      const f: any = (fe as any)?.config ?? {};
+      if (!phone) phone = normalizePhone(f.notify_phone || f.emisor_phone);
+      if (!name)  name  = String(f.emisor_commercial_name || f.emisor_name || '').trim();
+    } catch { /* ignore */ }
+  }
+
   const { data: t } = await db.from('tenants').select('name, owner_id').eq('id', tenantId).maybeSingle();
   if (!name) name = String((t as any)?.name ?? 'su negocio').trim();
 

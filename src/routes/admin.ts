@@ -1128,15 +1128,47 @@ function findCompanyId(result: any): string | null {
 //   1) verificamos los ids que YA tengamos guardados (sandbox/producción/legacy/
 //      respuesta cruda) contra GET /companies/{id} en el ambiente actual, y
 //   2) como respaldo, buscamos por cédula en GET /companies/associated.
+/** Cédula (solo dígitos) de una empresa devuelta por Alanube, mire donde mire. */
+function companyCedula(co: any): string {
+  if (!co || typeof co !== 'object') return '';
+  const direct = co.identificationNumber ?? co.identification?.identificationNumber
+    ?? co.company?.identificationNumber ?? co.data?.identificationNumber;
+  if (direct) return String(direct).replace(/\D/g, '');
+  const seen = new Set<any>();
+  const walk = (o: any): string => {
+    if (!o || typeof o !== 'object' || seen.has(o)) return '';
+    seen.add(o);
+    for (const [k, v] of Object.entries(o)) {
+      if (/identificationNumber/i.test(k) && (typeof v === 'string' || typeof v === 'number')) {
+        return String(v).replace(/\D/g, '');
+      }
+    }
+    for (const v of Object.values(o)) { const r = walk(v); if (r) return r; }
+    return '';
+  };
+  return walk(co);
+}
+
+/** Empresa 'main' de la cuenta/token, con su cédula (para saber DE QUIÉN es). */
+async function getMainCompanyInfo(client: any): Promise<{ id: string | null; cedula: string; raw: any }> {
+  try {
+    const main: any = await client.getMainCompany?.();
+    const body = main?.company ?? main?.data ?? main;
+    return { id: findCompanyId(body), cedula: companyCedula(body), raw: body };
+  } catch { return { id: null, cedula: '', raw: null }; }
+}
+
 async function findExistingCompanyId(client: any, cfg: Record<string, any>): Promise<string | null> {
   const cedula = String(cfg.emisor_identification ?? '').replace(/\D/g, '');
 
-  // 0) Empresa 'main' del token (GET /company, sin id). Es la vía más directa:
-  //    devuelve la principal registrada en la cuenta sin necesitar el id.
+  // 0) Empresa 'main' del token (GET /company, sin id). SOLO se adopta si su cédula
+  //    es la MISMA que la de este tenant. En CRI cada cuenta/token tiene una sola
+  //    empresa main: si es de OTRO emisor y la adoptáramos, la actualizaríamos con
+  //    los datos de este negocio y los dos tenants quedarían apuntando al mismo id
+  //    (uno de los dos emitiendo con la cédula del otro).
   try {
-    const main: any = await client.getMainCompany?.();
-    const found = findCompanyId(main?.company ?? main?.data ?? main);
-    if (found) return found;
+    const main = await getMainCompanyInfo(client);
+    if (main.id && (!main.cedula || !cedula || main.cedula === cedula)) return main.id;
   } catch { /* la cuenta no expone /company o no hay main → seguir */ }
 
   // 1) Ids candidatos ya conocidos → verificar que existan en este ambiente.
@@ -1147,8 +1179,11 @@ async function findExistingCompanyId(client: any, cfg: Record<string, any>): Pro
   for (const cid of candidates) {
     try {
       const co: any = await client.getCompany(String(cid));
-      const found = findCompanyId(co?.company ?? co);
-      if (found) return found;
+      const body = co?.company ?? co;
+      const found = findCompanyId(body);
+      const ced = companyCedula(body);
+      // Mismo control que arriba: no adoptar la empresa de otro emisor.
+      if (found && (!ced || !cedula || ced === cedula)) return found;
     } catch { /* no existe en este ambiente → seguir */ }
   }
 
@@ -1262,15 +1297,37 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
       //   1) Del CUERPO del error (Alanube suele devolver el id de la empresa
       //      existente en la respuesta 400/409) — verificado contra GET /companies/{id}.
       //   2) Respaldo: por ids guardados / cédula en asociadas.
+      const myCedula = String(cfg.emisor_identification ?? '').replace(/\D/g, '');
       let existingId: string | null = null;
       const fromErr = findCompanyId((e as any)?.body);
       if (fromErr) {
         try {
           const co: any = await client.getCompany(String(fromErr));
-          if (findCompanyId(co?.company ?? co)) existingId = String(fromErr);
+          const body = co?.company ?? co;
+          const ced = companyCedula(body);
+          // Solo adoptamos la empresa si es de ESTA cédula (ver findExistingCompanyId).
+          if (findCompanyId(body) && (!ced || !myCedula || ced === myCedula)) existingId = String(fromErr);
         } catch { /* el id del error no es válido en este ambiente */ }
       }
       if (!existingId) existingId = await findExistingCompanyId(client, cfg);
+
+      // La cuenta YA tiene una empresa main y NO es la de este negocio: no se puede
+      // seguir. Actualizarla pisaría el certificado y la cédula del otro emisor, y
+      // los dos tenants quedarían con el mismo company_id.
+      if (!existingId) {
+        const main = await getMainCompanyInfo(client);
+        if (main.id && main.cedula && myCedula && main.cedula !== myCedula) {
+          return fail(c,
+            `Esta cuenta de Alanube (${client.env}) YA tiene su empresa principal registrada con la cédula `
+            + `${main.cedula}, que NO es la de este negocio (${myCedula}).\n\n`
+            + `En Costa Rica cada cuenta/token de Alanube admite UNA sola empresa emisora. `
+            + `Continuar sobrescribiría los datos y el certificado del otro emisor, y ambos negocios `
+            + `quedarían apuntando a la misma empresa (id ${main.id}).\n\n`
+            + `Solución: creá una cuenta de Alanube aparte para este negocio y cargá su token `
+            + `(ALANUBE_API_TOKEN_${client.env === 'sandbox' ? 'SANDBOX' : 'PRODUCTION'}) para este tenant.`,
+            409);
+        }
+      }
       if (!existingId) {
         // La cuenta ya tiene su empresa principal pero no logramos ubicar su id por
         // API (CRI no lista la 'main'). NO es un error que bloquee: la emisión usa la
@@ -1323,7 +1380,28 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
     return ok(c, { ok: true, company_id: companyId, env: client.env, updated_existing: updatedExisting, result });
   } catch (err: any) {
     const status = err instanceof AlanubeError ? err.status : 500;
-    return fail(c, err.message, status);
+    // El CUERPO del error de Alanube trae el detalle real (qué campo rechazó y por
+    // qué). Sin esto solo se veía un mensaje genérico y no había cómo diagnosticar.
+    let detail = '';
+    const body = (err as any)?.body;
+    if (body) {
+      const parts: string[] = [];
+      const walk = (v: any, depth = 0) => {
+        if (depth > 4 || v == null) return;
+        if (typeof v === 'string') { if (v.trim() && v.length < 300) parts.push(v.trim()); return; }
+        if (Array.isArray(v)) { v.forEach(x => walk(x, depth + 1)); return; }
+        if (typeof v === 'object') {
+          for (const k of ['message', 'error', 'detail', 'details', 'errors', 'msg', 'description']) {
+            if (k in v) walk((v as any)[k], depth + 1);
+          }
+        }
+      };
+      walk(body);
+      const uniq = [...new Set(parts)].filter(x => x !== err.message);
+      if (uniq.length) detail = '\n\nDetalle de Alanube:\n• ' + uniq.join('\n• ');
+      else detail = '\n\nRespuesta cruda de Alanube:\n' + JSON.stringify(body).slice(0, 1200);
+    }
+    return fail(c, err.message + detail, status);
   }
 });
 
@@ -1701,6 +1779,62 @@ admin.get('/tenants/:id/hacienda-activities', async (c) => {
       // que valida Hacienda al emitir (-407).
       configured_valid: configured ? activeCodes.includes(configured) : null,
       suggestion: configured && !activeCodes.includes(configured) ? (activeCodes[0] ?? null) : null,
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// GET /alanube/duplicate-companies — negocios que comparten el MISMO company_id de
+// Alanube. Eso NO debería pasar (una empresa por cuenta/token) y significa que un
+// alta pisó la de otro emisor: el que quedó sin su empresa emite con la cédula ajena.
+admin.get('/alanube/duplicate-companies', async (c) => {
+  if (!isAdminRole(c)) return fail(c, 'forbidden', 403);
+  try {
+    const { data: rows } = await db.from('settings')
+      .select('tenant_id, config').eq('type', 'electronic-invoice');
+    const { data: tenants } = await db.from('tenants').select('id, name');
+    const nameById = new Map<string, string>();
+    for (const t of (tenants ?? []) as any[]) nameById.set(t.id, t.name);
+
+    // Un registro por (ambiente, company_id).
+    const byCompany = new Map<string, any[]>();
+    for (const r of (rows ?? []) as any[]) {
+      const cfg = r.config ?? {};
+      for (const [env, cid] of [
+        ['production', cfg.alanube_company_id_production],
+        ['sandbox', cfg.alanube_company_id_sandbox],
+        ['legacy', cfg.alanube_company_id],
+      ] as const) {
+        if (!cid) continue;
+        const key = `${env}:${cid}`;
+        const entry = {
+          tenant_id: r.tenant_id,
+          business: nameById.get(r.tenant_id) ?? '—',
+          env,
+          company_id: String(cid),
+          cedula: String(cfg.emisor_identification ?? '').replace(/\D/g, '') || null,
+          emisor: cfg.emisor_name ?? null,
+        };
+        byCompany.set(key, [...(byCompany.get(key) ?? []), entry]);
+      }
+    }
+
+    const duplicates = [...byCompany.entries()]
+      .filter(([, list]) => list.length > 1)
+      .map(([key, list]) => ({
+        company_id: key.split(':').slice(1).join(':'),
+        env: key.split(':')[0],
+        count: list.length,
+        // Cédulas DISTINTAS bajo el mismo id = el caso grave.
+        distinct_cedulas: [...new Set(list.map(x => x.cedula).filter(Boolean))],
+        tenants: list,
+      }));
+
+    return ok(c, {
+      duplicates,
+      total_conflicts: duplicates.length,
+      note: duplicates.length
+        ? 'Cada company_id repetido con cédulas distintas es un conflicto: uno de los negocios está emitiendo con la empresa del otro. Cada uno necesita su propia cuenta/token de Alanube.'
+        : 'Sin company_id repetidos.',
     });
   } catch (err: any) { return fail(c, err.message, 500); }
 });

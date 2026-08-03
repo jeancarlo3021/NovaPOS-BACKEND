@@ -1,10 +1,26 @@
 import { Hono } from 'hono';
 import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
-import { autoSendComprobanteToCustomer } from './hacienda.js';
+import { autoSendComprobanteToCustomer, bumpConsecutivoOnDuplicate, loadFEConfig } from './hacienda.js';
+import { notifyFeError } from '../services/whatsappNotify.js';
 
 // Rutas PÚBLICAS para webhooks entrantes (Alanube nos llama; no hay sesión).
 // Se monta FUERA del middleware de auth. Se valida por un secreto compartido.
+/** El governmentResponse de Hacienda viene crudo ("-99, \"\"mensaje\"\", 0, 0").
+ *  Devolvemos solo los mensajes, legibles, para el aviso de WhatsApp. */
+function cleanGovError(raw: any): string {
+  const s = String(raw ?? '').trim();
+  if (!s || !/[a-zA-ZáéíóúñÁÉÍÓÚÑ]/.test(s)) return '';
+  const msgs: string[] = [];
+  const re = /(-?\d+)\s*,\s*""([\s\S]*?)""\s*,/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(s)) !== null) {
+    const msg = m[2].replace(/\s+/g, ' ').trim();
+    if (msg) msgs.push(msg);
+  }
+  return (msgs.length ? msgs.join(' | ') : s.replace(/\s+/g, ' ')).slice(0, 400);
+}
+
 const webhooks = new Hono();
 
 /** Busca recursivamente el primer valor cuya clave matchee `re` (string/número). */
@@ -78,6 +94,27 @@ webhooks.post('/alanube', async (c) => {
           // Al ACEPTARSE, enviar automáticamente el comprobante completo al cliente.
           if (feStatus === 'accepted') {
             for (const row of res.data as any[]) autoSendComprobanteToCustomer(row.tenant_id, row.id);
+          }
+          // RECHAZO por consecutivo ya usado (-99): subir el piso configurado para
+          // que la próxima emisión no vuelva a chocar. El estado suele llegar por
+          // acá (async), no solo al consultar a mano.
+          if (feStatus === 'rejected' || feStatus === 'error') {
+            const govErr = d?.governmentResponse ?? d?.errorMessage
+              ?? deepFind(body, /(governmentResponse|errorMessage)/i, 5000);
+            for (const row of res.data as any[]) {
+              try {
+                const { data: inv } = await db.from('invoices')
+                  .select('document_type, invoice_number').eq('id', row.id).maybeSingle();
+                const cfg = await loadFEConfig(row.tenant_id);
+                await bumpConsecutivoOnDuplicate(row.tenant_id, cfg, (inv as any)?.document_type, govErr);
+                // AVISO por WhatsApp al negocio. El rechazo casi siempre llega por
+                // acá (asíncrono desde Alanube), no al consultar el estado a mano:
+                // sin esto el negocio nunca se enteraba de que la factura se cayó.
+                const docLabel = `#${(inv as any)?.invoice_number ?? row.id}`;
+                void notifyFeError(row.tenant_id, docLabel,
+                  cleanGovError(govErr) || 'Comprobante rechazado por Hacienda').catch(() => {});
+              } catch (e: any) { console.warn('[webhook] rechazo:', e?.message); }
+            }
           }
           return ok(c, { ok: true, kind: 'emission', fe_status: feStatus });
         }

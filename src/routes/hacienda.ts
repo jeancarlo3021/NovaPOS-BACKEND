@@ -45,9 +45,9 @@ function cleanReceptionDetail(s: any): string {
 
 async function matchLines(tenantId: string, lines: any[]): Promise<any[]> {
   let sel: any = await db.from('products')
-    .select('id, name, cabys_code, sku').eq('tenant_id', tenantId).is('deleted_at', null).limit(5000);
+    .select('id, name, cabys_code, sku, tracks_stock').eq('tenant_id', tenantId).is('deleted_at', null).limit(5000);
   if (sel.error && /deleted_at/.test(sel.error.message ?? '')) {   // migración 58 sin correr
-    sel = await db.from('products').select('id, name, cabys_code, sku').eq('tenant_id', tenantId).limit(5000);
+    sel = await db.from('products').select('id, name, cabys_code, sku, tracks_stock').eq('tenant_id', tenantId).limit(5000);
   }
   const products = sel.data ?? [];
   const byCabys = new Map<string, any>(), bySku = new Map<string, any>(), byName = new Map<string, any>();
@@ -78,6 +78,9 @@ async function matchLines(tenantId: string, lines: any[]): Promise<any[]> {
       product_name: match?.name ?? null,
       exists: !!match,
       matched_by: mCabys ? 'cabys' : mSku ? 'sku' : mName ? 'name' : null,   // cómo coincidió
+      // El producto que coincidió NO lleva control de stock (infinito). Se informa
+      // para que el modal lo muestre y quede claro que la compra no lo cambia.
+      infinite: match ? (match as any).tracks_stock === false : false,
     };
   });
 }
@@ -386,7 +389,7 @@ function cleanHaciendaError(raw: any): string | null {
  *  Acá lo leemos, sacamos el número (últimos 10 díg) y SUBIMOS el piso configurado en
  *  Datos de FE a ese+1, para que la próxima emisión no vuelva a chocar. Devuelve el
  *  nuevo piso, o null si el rechazo no fue por consecutivo duplicado. */
-async function bumpConsecutivoOnDuplicate(
+export async function bumpConsecutivoOnDuplicate(
   tenantId: string, cfg: any, docType: string | null | undefined, errText: any,
 ): Promise<number | null> {
   const s = String(errText ?? '');
@@ -510,7 +513,9 @@ export async function refreshInvoiceStatus(tenantId: string, invoiceId: string):
   let consecutivo_bumped: number | null = null;
   if (fe_status === 'rejected' || fe_status === 'error') {
     const docLabel = `#${(inv as any)?.invoice_number ?? invoiceId}`;
-    void notifyFeError(tenantId, docLabel, String(errDetail || 'Comprobante rechazado por Hacienda')).catch(() => {});
+    // Mensaje LEGIBLE (no el texto crudo con códigos y comillas dobles de Hacienda).
+    void notifyFeError(tenantId, docLabel,
+      cleanHaciendaError(errDetail) || 'Comprobante rechazado por Hacienda').catch(() => {});
     // Rechazo por consecutivo ya usado (-99): subir el piso para que el próximo no choque.
     consecutivo_bumped = await bumpConsecutivoOnDuplicate(
       tenantId, cfg, (inv as any)?.document_type, errDetail ?? patch.fe_error);
@@ -1469,9 +1474,12 @@ hacienda.post('/received/reconcile', async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const body = await c.req.json().catch(() => ({}));
-    const { id, purchase_id, items, no_inventory } = body as {
+    const { id, purchase_id, items, no_inventory, no_products } = body as {
       id: string; purchase_id?: string; no_inventory?: boolean;
-      items?: Array<{ detail: string; quantity: number; unit_price: number; total?: number; subtotal?: number; cabys?: string | null; product_id?: string | null; action: 'update' | 'create' | 'skip' }>;
+      items?: Array<{ detail: string; quantity: number; unit_price: number; total?: number; subtotal?: number; cabys?: string | null; product_id?: string | null; action: 'update' | 'create' | 'skip'; no_stock?: boolean }>;
+      /** true = la compra NO genera productos de catálogo (insumos de proceso), pero
+       *  su MONTO sí se registra en la orden. Sin esto el total quedaba en ₡0. */
+      no_products?: boolean;
     };
     if (!id) return fail(c, 'Falta el id', 422);
 
@@ -1523,8 +1531,17 @@ hacienda.post('/received/reconcile', async (c) => {
     const noInventory = !!no_inventory;
     const purchaseItems: any[] = [];
 
+    // Monto de las líneas que NO generan producto (modo "no crear productos" o
+    // líneas marcadas "No agregar"). Se registra igual en la orden: la plata se
+    // gastó aunque el artículo no entre al catálogo.
+    let skippedTotal = 0;
+
     for (const it of workItems) {
-      if (it.action === 'skip') continue;
+      if (it.action === 'skip') {
+        const q = Number(it.quantity) || 1;
+        skippedTotal += Number(it.total ?? it.subtotal) || q * (Number(it.unit_price) || 0);
+        continue;
+      }
       let productId = it.product_id ?? null;
       const qty = Number(it.quantity) || 1;
       // Costo por unidad CONFIABLE: el XML a veces trae un PrecioUnitario que NO
@@ -1559,7 +1576,9 @@ hacienda.post('/received/reconcile', async (c) => {
           name: cleanReceptionDetail(it.detail) || 'Producto',
           cabys_code: it.cabys || null,
           cost_price: price, unit_price: price,
-          stock_quantity: 0, tracks_stock: !noInventory,
+          // tracks_stock por LÍNEA: `no_stock` gana sobre el interruptor global, así
+          // se puede crear un insumo infinito y otro con inventario en la misma compra.
+          stock_quantity: 0, tracks_stock: !(it.no_stock ?? noInventory),
           supplier_id: supplierId,   // proveedor del comprobante
         };
         let ins = await db.from('products').insert({ ...baseProd, sku: xmlCode || genReceptionSku(it.detail) }).select('id').single();
@@ -1596,7 +1615,7 @@ hacienda.post('/received/reconcile', async (c) => {
       }
       const { data: existing } = await db.from('purchases').select('total_amount, purchase_number').eq('id', purchaseId).eq('tenant_id', tenantId).maybeSingle();
       purchaseNumber = String((existing as any)?.purchase_number ?? '');
-      const addTotal = purchaseItems.reduce((s, pi) => s + pi.subtotal, 0);
+      const addTotal = purchaseItems.reduce((s, pi) => s + pi.subtotal, 0) + skippedTotal;
       await db.from('purchases').update({
         total_amount: isReload ? addTotal : Number((existing as any)?.total_amount ?? 0) + addTotal,
         updated_at: new Date().toISOString(),
@@ -1605,7 +1624,7 @@ hacienda.post('/received/reconcile', async (c) => {
         ? `🔄 Orden ${purchaseNumber} recargada con ${purchaseItems.length} artículo(s).`
         : `🔗 ${purchaseItems.length} artículo(s) agregado(s) a la orden ${purchaseNumber}.`);
     } else {
-      const total = purchaseItems.reduce((s, pi) => s + pi.subtotal, 0) || Number(d.total ?? 0);
+      const total = (purchaseItems.reduce((s, pi) => s + pi.subtotal, 0) + skippedTotal) || Number(d.total ?? 0);
       purchaseNumber = await nextPurchaseNumber(tenantId);
       const { data: np, error: pErr } = await db.from('purchases').insert({
         tenant_id: tenantId,
@@ -1626,8 +1645,13 @@ hacienda.post('/received/reconcile', async (c) => {
     }
 
     // Resumen para el total a registrar.
-    const totalReg = purchaseItems.reduce((s, pi) => s + pi.subtotal, 0);
+    const totalReg = purchaseItems.reduce((s, pi) => s + pi.subtotal, 0) + skippedTotal;
     messages.unshift(`💰 Total registrado ₡${totalReg.toLocaleString('es-CR')} · ${updated} coincidencia(s) con CABYS/precio actualizado · ${created} producto(s) nuevo(s) creado(s).`);
+    if (skippedTotal > 0) {
+      messages.push(no_products
+        ? `📦 ₡${skippedTotal.toLocaleString('es-CR')} registrado SIN crear productos (insumos de proceso): el monto entra en la orden pero no se detalla por artículo.`
+        : `📦 ₡${skippedTotal.toLocaleString('es-CR')} de líneas marcadas "No agregar": el monto se registró, sin crear el producto.`);
+    }
 
     // Ya no se difieren productos: se crean/actualizan al conciliar (arriba). Se
     // deja pending_products vacío. Resiliente si la columna purchase_id no existe.
