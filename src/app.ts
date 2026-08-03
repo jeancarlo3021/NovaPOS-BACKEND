@@ -44,6 +44,7 @@ import cabys            from './routes/cabys.js';
 import taxWithholdings  from './routes/taxWithholdings.js';
 import recipesRoute     from './routes/recipes.js';
 import exchangeRate     from './routes/exchangeRate.js';
+import tableOrders      from './routes/tableOrders.js';
 
 // basePath('/api') matches Vercel's catch-all at api/[[...route]].ts
 const app = new Hono().basePath('/api');
@@ -151,6 +152,7 @@ api.route('/cabys',             cabys);
 api.route('/exchange-rate',     exchangeRate);
 api.route('/tax-withholdings',  taxWithholdings);
 api.route('/recipes',           recipesRoute);
+api.route('/table-orders',       tableOrders);
 
 app.route('/', api);
 

@@ -2787,6 +2787,110 @@ admin.post('/fe-reemit/:id', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+// GET /fe-log/export — bitácora para EXCEL: una fila por comprobante, con el
+// desglose de IVA POR TARIFA (0 %, 1 %, 2 %, 4 %, 13 %). El IVA no se guarda en la
+// factura sino que sale de la tarifa de cada producto, así que se reconstruye
+// leyendo los ítems. Va aparte de /fe-log para no frenar la bitácora en pantalla.
+// Filtros: tenant_id, from, to, status, search (los mismos que /fe-log).
+admin.get('/fe-log/export', async (c) => {
+  if (!isAdminRole(c)) return fail(c, 'forbidden', 403);
+  try {
+    const tenantId = c.req.query('tenant_id');
+    const from = c.req.query('from');
+    const to = c.req.query('to');
+    const status = c.req.query('status');
+    const search = (c.req.query('search') || '').trim();
+    const limit = Math.min(Number(c.req.query('limit') || 5000), 20000);
+
+    let q = db.from('invoices')
+      .select('id, tenant_id, invoice_number, customer_name, customer_id, subtotal, tax_amount, total, '
+        + 'issued_at, created_at, document_type, payment_method, status, fe_clave, fe_consecutivo, fe_status, fe_error')
+      .order('issued_at', { ascending: false }).limit(limit);
+    if (tenantId) q = q.eq('tenant_id', tenantId);
+    if (status)   q = q.eq('fe_status', status);
+    if (from)     q = q.gte('issued_at', from);
+    if (to)       q = q.lte('issued_at', endOfDay(to));
+    if (search) {
+      const t = search.replace(/[%,]/g, ' ');
+      q = q.or(`customer_name.ilike.%${t}%,fe_consecutivo.ilike.%${t}%,fe_clave.ilike.%${t}%,invoice_number.ilike.%${t}%`);
+    }
+    const { data: invs, error } = await q;
+    if (error) throw new Error(error.message);
+    const rows = (invs ?? []) as any[];
+    if (rows.length === 0) return ok(c, { rows: [], rates: [] });
+
+    // Ítems de esas facturas (en tandas: PostgREST corta el `in` muy largo).
+    const ids = rows.map(r => r.id);
+    const items: any[] = [];
+    for (let i = 0; i < ids.length; i += 200) {
+      const { data } = await db.from('invoice_items')
+        .select('invoice_id, product_id, quantity, unit_price, subtotal')
+        .in('invoice_id', ids.slice(i, i + 200));
+      items.push(...(data ?? []));
+    }
+
+    // Tarifa de IVA por producto.
+    const pids = [...new Set(items.map(it => it.product_id).filter(Boolean))];
+    const rateByProduct = new Map<string, number>();
+    for (let i = 0; i < pids.length; i += 200) {
+      const { data } = await db.from('products').select('id, iva_rate').in('id', pids.slice(i, i + 200) as string[]);
+      for (const p of (data ?? []) as any[]) rateByProduct.set(p.id, Number(p.iva_rate ?? 13));
+    }
+
+    // Base e IVA por tarifa, factura por factura.
+    const byInvoice = new Map<string, { base: Record<string, number>; iva: Record<string, number> }>();
+    const ratesSeen = new Set<number>();
+    for (const it of items) {
+      const rate = it.product_id ? (rateByProduct.get(it.product_id) ?? 13) : 13;
+      ratesSeen.add(rate);
+      const acc = byInvoice.get(it.invoice_id) ?? { base: {}, iva: {} };
+      const base = Number(it.subtotal ?? 0);
+      acc.base[rate] = (acc.base[rate] ?? 0) + base;
+      acc.iva[rate]  = (acc.iva[rate] ?? 0) + Math.round(base * (rate / 100) * 100) / 100;
+      byInvoice.set(it.invoice_id, acc);
+    }
+
+    const nameById = new Map<string, string>();
+    const tids = [...new Set(rows.map(r => r.tenant_id))];
+    if (tids.length) {
+      const { data: ts } = await db.from('tenants').select('id, name').in('id', tids);
+      for (const t of (ts ?? []) as any[]) nameById.set(t.id, t.name);
+    }
+
+    // Tarifas presentes + las estándar de Costa Rica, para columnas estables.
+    const rates = [...new Set([0, 1, 2, 4, 13, ...ratesSeen])].sort((a, b) => a - b);
+
+    const out = rows.map(r => {
+      const acc = byInvoice.get(r.id) ?? { base: {}, iva: {} };
+      const clave = String(r.fe_clave ?? '').replace(/\D/g, '');
+      const row: Record<string, any> = {
+        negocio: nameById.get(r.tenant_id) ?? '—',
+        numero: r.invoice_number ?? '',
+        tipo: r.document_type ?? '',
+        fecha: r.issued_at ?? r.created_at ?? '',
+        cliente: r.customer_name ?? '',
+        estado_fe: r.fe_status ?? '',
+        clave: clave || '',
+        emisor_cedula: clave.length === 50 ? clave.slice(9, 21).replace(/^0+/, '') : '',
+        consecutivo_fe: r.fe_consecutivo ?? '',
+        metodo_pago: r.payment_method ?? '',
+        anulada: r.status === 'cancelled' ? 'Sí' : 'No',
+        error: r.fe_error ?? '',
+      };
+      for (const rate of rates) {
+        row[`base_${rate}`] = Math.round((acc.base[rate] ?? 0) * 100) / 100;
+        row[`iva_${rate}`]  = Math.round((acc.iva[rate] ?? 0) * 100) / 100;
+      }
+      row.subtotal = Number(r.subtotal ?? 0);
+      row.iva_total = Number(r.tax_amount ?? 0);
+      row.total = Number(r.total ?? 0);
+      return row;
+    });
+
+    return ok(c, { rows: out, rates });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 admin.get('/fe-log', async (c) => {
   try {
     const tenantId = c.req.query('tenant_id');

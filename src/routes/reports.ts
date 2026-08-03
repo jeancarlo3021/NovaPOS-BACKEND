@@ -187,6 +187,99 @@ reports.get('/vouchers', async (c) => {
 // GET /taxes — reporte de impuestos (IVA débito fiscal) con CIERRE MENSUAL.
 // Agrupa las ventas por mes: base (subtotal), IVA (tax_amount) y total. Sirve
 // para la declaración de IVA y para "cerrar" cada mes.
+// GET /taxes/breakdown — desglose de IVA POR TARIFA de cada comprobante (una fila
+// por factura, columnas por tarifa). El IVA no se guarda en la factura: sale de la
+// tarifa de cada producto, así que se reconstruye leyendo los ítems.
+// Mismos filtros que /taxes: from, to, environment.
+reports.get('/taxes/breakdown', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const from = c.req.query('from');
+    const to   = endOfDay(c.req.query('to'));
+    const environment = String(c.req.query('environment') || 'production');
+
+    // `customer_identification` puede no existir como columna: se pide y, si falla,
+    // se reintenta sin ella (la cedula se resuelve desde el cliente).
+    const build = (withIdent: boolean) => {
+      let q = db.from('invoices')
+        .select('id, invoice_number, customer_name, customer_id, subtotal, tax_amount, total, '
+          + 'issued_at, status, document_type, fe_clave, fe_nc_clave, fe_nd_clave, fe_environment'
+          + (withIdent ? ', customer_identification' : ''))
+        .eq('tenant_id', tenantId).limit(20000);
+      if (from) q = q.gte('issued_at', from);
+      if (to)   q = q.lte('issued_at', to);
+      if (environment === 'sandbox') q = q.eq('fe_environment', 'sandbox');
+      else if (environment !== 'all') q = q.or('fe_environment.is.null,fe_environment.neq.sandbox');
+      return q;
+    };
+    let { data: invs, error } = await build(true);
+    if (error && /customer_identification/i.test(error.message)) ({ data: invs, error } = await build(false));
+    if (error) throw new Error(error.message);
+    const rows = (invs ?? []) as any[];
+    if (rows.length === 0) return ok(c, { rows: [], rates: [0, 1, 2, 4, 13] });
+
+    // Cedula del cliente (cuando la factura no la guarda).
+    const custIds = [...new Set(rows.map(r => r.customer_id).filter(Boolean))];
+    const cedByCustomer = new Map<string, string>();
+    for (let i = 0; i < custIds.length; i += 200) {
+      const { data } = await db.from('customers').select('id, identification').in('id', custIds.slice(i, i + 200) as string[]);
+      for (const cu of (data ?? []) as any[]) if (cu.identification) cedByCustomer.set(cu.id, String(cu.identification));
+    }
+
+    const ids = rows.map(r => r.id);
+    const items: any[] = [];
+    for (let i = 0; i < ids.length; i += 200) {
+      const { data } = await db.from('invoice_items')
+        .select('invoice_id, product_id, subtotal').in('invoice_id', ids.slice(i, i + 200));
+      items.push(...(data ?? []));
+    }
+    const pids = [...new Set(items.map(it => it.product_id).filter(Boolean))];
+    const rateByProduct = new Map<string, number>();
+    for (let i = 0; i < pids.length; i += 200) {
+      const { data } = await db.from('products').select('id, iva_rate').in('id', pids.slice(i, i + 200) as string[]);
+      for (const p of (data ?? []) as any[]) rateByProduct.set(p.id, Number(p.iva_rate ?? 13));
+    }
+
+    const acc = new Map<string, { base: Record<string, number>; iva: Record<string, number> }>();
+    const seen = new Set<number>();
+    for (const it of items) {
+      const rate = it.product_id ? (rateByProduct.get(it.product_id) ?? 13) : 13;
+      seen.add(rate);
+      const a = acc.get(it.invoice_id) ?? { base: {}, iva: {} };
+      const base = Number(it.subtotal ?? 0);
+      a.base[rate] = (a.base[rate] ?? 0) + base;
+      a.iva[rate]  = (a.iva[rate] ?? 0) + Math.round(base * (rate / 100) * 100) / 100;
+      acc.set(it.invoice_id, a);
+    }
+    const rates = [...new Set([0, 1, 2, 4, 13, ...seen])].sort((a, b) => a - b);
+
+    const out = rows.map(r => {
+      const a = acc.get(r.id) ?? { base: {}, iva: {} };
+      const row: Record<string, any> = {
+        invoice_id: r.id,
+        fecha: r.issued_at ?? '',
+        tipo: r.document_type ?? '',
+        numero: r.invoice_number ?? '',
+        cliente: r.customer_name ?? '',
+        cedula: r.customer_identification ?? (r.customer_id ? (cedByCustomer.get(r.customer_id) ?? '') : ''),
+        clave: String(r.fe_clave ?? ''),
+        anulada: r.status === 'cancelled' ? 'Sí' : 'No',
+        tiene_nc: r.fe_nc_clave ? 'Sí' : 'No',
+        tiene_nd: r.fe_nd_clave ? 'Sí' : 'No',
+      };
+      for (const rate of rates) {
+        row[`base_${rate}`] = Math.round((a.base[rate] ?? 0) * 100) / 100;
+        row[`iva_${rate}`]  = Math.round((a.iva[rate] ?? 0) * 100) / 100;
+      }
+      row.subtotal  = Number(r.subtotal ?? 0);
+      row.iva_total = Number(r.tax_amount ?? 0);
+      row.total     = Number(r.total ?? 0);
+      return row;
+    });
+    return ok(c, { rows: out, rates });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 reports.get('/taxes', async (c) => {
   try {
     const tenantId = c.get('tenantId');
