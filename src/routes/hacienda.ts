@@ -111,7 +111,7 @@ function deepFind(obj: any, re: RegExp, minLen = 1): string | null {
 }
 
 /** Carga la config de FE del tenant (settings type='electronic-invoice'). */
-async function loadFEConfig(tenantId: string): Promise<any> {
+export async function loadFEConfig(tenantId: string): Promise<any> {
   const { data } = await db.from('settings').select('config')
     .eq('tenant_id', tenantId).eq('type', 'electronic-invoice').maybeSingle();
   const cfg = (data as any)?.config ?? {};
@@ -379,6 +379,48 @@ function cleanHaciendaError(raw: any): string | null {
   return s.replace(/\s+/g, ' ').trim();
 }
 
+/** Hacienda rechaza con código -99 cuando el CONSECUTIVO ya se usó antes (típico al
+ *  migrar desde otro sistema: el emisor ya quemó números con el proveedor anterior).
+ *  El mensaje trae el consecutivo de 20 díg: "La numeración consecutiva
+ *  00100001010000000085 del comprobante … ya existe … desde el día 16-08-2023".
+ *  Acá lo leemos, sacamos el número (últimos 10 díg) y SUBIMOS el piso configurado en
+ *  Datos de FE a ese+1, para que la próxima emisión no vuelva a chocar. Devuelve el
+ *  nuevo piso, o null si el rechazo no fue por consecutivo duplicado. */
+async function bumpConsecutivoOnDuplicate(
+  tenantId: string, cfg: any, docType: string | null | undefined, errText: any,
+): Promise<number | null> {
+  const s = String(errText ?? '');
+  if (!/-99/.test(s) || !/numeraci[oó]n consecutiva/i.test(s)) return null;
+  // Todos los consecutivos de 20 díg del mensaje (puede citar más de uno): usamos el mayor.
+  const found = [...s.matchAll(/\b(\d{20})\b/g)].map(m => parseInt(m[1].slice(-10), 10))
+    .filter(n => Number.isFinite(n) && n > 0);
+  if (found.length === 0) return null;
+  const nextFloor = Math.max(...found) + 1;
+
+  const key = docType === 'factura_electronica' ? 'consecutivo_factura'
+    : docType === 'tiquete_electronico' ? 'consecutivo_tiquete'
+    : (docType === 'nota_credito' || docType === 'nota_debito') ? 'consecutivo_nc'
+    : null;
+  if (!key) return null;
+  const current = configuredNextConsecutivo(cfg, String(docType));
+  if (current >= nextFloor) return null;   // el piso configurado ya es suficiente
+
+  try {
+    const { data: prev } = await db.from('settings').select('config')
+      .eq('tenant_id', tenantId).eq('type', 'electronic-invoice').maybeSingle();
+    const merged = { ...((prev?.config as any) ?? {}), [key]: String(nextFloor) };
+    await db.from('settings').upsert({
+      tenant_id: tenantId, type: 'electronic-invoice', config: merged,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'tenant_id,type' });
+    console.warn(`[fe] consecutivo duplicado (-99) en ${tenantId}: ${key} → ${nextFloor}`);
+    return nextFloor;
+  } catch (e: any) {
+    console.warn('[fe] no se pudo subir el consecutivo:', e?.message);
+    return null;
+  }
+}
+
 /** company_id de Alanube del tenant según el ambiente. Necesario para consultar
  *  documentos de empresas 'associated' (?idCompany=). */
 function feCompanyId(cfg: any): string | undefined {
@@ -465,11 +507,15 @@ export async function refreshInvoiceStatus(tenantId: string, invoiceId: string):
     upd = await db.from('invoices').update(rest).eq('id', invoiceId).eq('tenant_id', tenantId);
   }
   if (fe_status === 'accepted') autoSendComprobanteToCustomer(tenantId, invoiceId);
+  let consecutivo_bumped: number | null = null;
   if (fe_status === 'rejected' || fe_status === 'error') {
     const docLabel = `#${(inv as any)?.invoice_number ?? invoiceId}`;
     void notifyFeError(tenantId, docLabel, String(errDetail || 'Comprobante rechazado por Hacienda')).catch(() => {});
+    // Rechazo por consecutivo ya usado (-99): subir el piso para que el próximo no choque.
+    consecutivo_bumped = await bumpConsecutivoOnDuplicate(
+      tenantId, cfg, (inv as any)?.document_type, errDetail ?? patch.fe_error);
   }
-  return { fe_status, ind_estado: indEstado, error: errDetail };
+  return { fe_status, ind_estado: indEstado, error: errDetail, consecutivo_bumped } as any;
 }
 
 // POST /refresh-status — consulta el estatus de una factura por su Clave y lo GUARDA.
@@ -1812,7 +1858,7 @@ hacienda.get('/fe-pdf/:id', async (c) => {
 
 /** Consecutivo configurado en Datos de FE ("Próx. …") según el tipo de documento.
  *  Es el SIGUIENTE número a emitir (0 si no está configurado). */
-function configuredNextConsecutivo(cfg: any, docType: string): number {
+export function configuredNextConsecutivo(cfg: any, docType: string): number {
   const raw = docType === 'factura_electronica' ? cfg?.consecutivo_factura
     : docType === 'tiquete_electronico' ? cfg?.consecutivo_tiquete
     : (docType === 'nota_credito' || docType === 'nota_debito') ? cfg?.consecutivo_nc
@@ -1824,7 +1870,7 @@ function configuredNextConsecutivo(cfg: any, docType: string): number {
 /** Próximo consecutivo (000001…). Respeta `floor` = consecutivo inicial
  *  configurado en Datos de FE (migración desde otro sistema): el resultado nunca
  *  es menor que ese número. */
-async function nextInvoiceNumber(tenantId: string, offset = 0, floor = 0): Promise<string> {
+export async function nextInvoiceNumber(tenantId: string, offset = 0, floor = 0): Promise<string> {
   // Paginado: sin esto, con >1000 facturas el máximo salía bajo → número duplicado.
   const PAGE = 1000;
   let maxSeq = 0;

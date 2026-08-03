@@ -372,6 +372,11 @@ feExternal.post('/company', async (c) => {
       && /already has (a )?main company|ya tiene.*empresa|main company/i.test(String(err?.message ?? ''));
 
     if (!yaExiste) {
+      // El cuerpo crudo suele traer el detalle real cuando Alanube responde el
+      // genérico "Something went wrong" (p. ej. PIN del .p12 incorrecto o
+      // credenciales de ATV inválidas).
+      console.error('[fe-external] Error creando empresa en Alanube:', err?.message,
+        JSON.stringify((err as any)?.body ?? null).slice(0, 2000));
       const status = err instanceof AlanubeError ? (err.status === 401 ? 401 : 422) : 502;
       return fail(c, err instanceof AlanubeError ? friendlyAlanubeError(err.message) : (err?.message ?? 'Error registrando la empresa en Alanube'), status);
     }
@@ -547,6 +552,10 @@ feExternal.post('/emit', async (c) => {
   try {
     resp = await alanube.forEnv(environment).emitDocument(kindOfTipoDoc(tipoDoc) as any, doc, companyId);
   } catch (err: any) {
+    // Igual que en el alta de empresa: el cuerpo crudo trae el detalle que el
+    // mensaje genérico de Alanube esconde.
+    console.error('[fe-external] Error emitiendo en Alanube:', err?.message,
+      JSON.stringify((err as any)?.body ?? null).slice(0, 2000));
     const status = err instanceof AlanubeError ? (err.status === 401 ? 401 : 422) : 502;
     // Se devuelve el JSON enviado para que la app externa lo guarde en su bitácora.
     return c.json({

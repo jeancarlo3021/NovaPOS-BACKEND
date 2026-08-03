@@ -247,11 +247,18 @@ invoices.post('/', async (c) => {
       discount_percent: item.discount_percent ?? 0,
       discount_amount:  item.discount_amount ?? 0,
       subtotal:         item.subtotal,
+      // Nota de la línea (comidas: "sin cebolla", "para llevar"…).
+      notes:            item.notes?.trim() ? String(item.notes).trim() : null,
     }));
     let { error: itemErr } = await db.from('invoice_items').insert(itemRows);
     // Si la columna product_name aún no existe (migración 70 sin correr), reintentar sin ella.
     if (itemErr && /product_name/i.test(itemErr.message)) {
       const stripped = itemRows.map(({ product_name, ...r }: any) => r);
+      ({ error: itemErr } = await db.from('invoice_items').insert(stripped));
+    }
+    // Idem con `notes` (migración 74 sin correr).
+    if (itemErr && /notes/i.test(itemErr.message)) {
+      const stripped = itemRows.map(({ notes, ...r }: any) => r);
       ({ error: itemErr } = await db.from('invoice_items').insert(stripped));
     }
     if (itemErr) throw new Error(itemErr.message);

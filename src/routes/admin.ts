@@ -772,7 +772,16 @@ admin.put('/tenants/:id/fe-config', async (c) => {
         updated_at: new Date().toISOString(),
       }, { onConflict: 'tenant_id,type' });
     }
-    return ok(c, { ok: true });
+
+    // Al guardar los datos de Hacienda del negocio, refrescar su ficha de CLIENTE en
+    // el POS del admin (cédula, nombre, correo, teléfono, ubicación, actividad) para
+    // poder facturarle la suscripción con los datos correctos. No bloquea el guardado.
+    let customer_synced = false;
+    if (fe) {
+      try { await syncTenantsToCustomers(c.get('tenantId'), id); customer_synced = true; }
+      catch (e: any) { console.warn('[fe-config] sync customer:', e?.message); }
+    }
+    return ok(c, { ok: true, customer_synced });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
@@ -1553,6 +1562,155 @@ admin.post('/tenants/:id/reset-business', async (c) => {
     }
 
     return ok(c, { ok: true, tenant: (t as any).name, deleted, kept: ['products', 'categories', 'unit_types', 'suppliers', 'settings', 'users'] });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// POST /sync-customers — MIGRA los negocios del panel admin a la lista de CLIENTES
+// del POS del propio admin (ColónClick), para poder facturarles la suscripción.
+// Cada tenant (menos el propio) se vuelve un customer con los datos del emisor FE
+// (cédula, nombre, correo, teléfono, dirección). Es IDEMPOTENTE: si el cliente ya
+// existe (misma cédula, o mismo nombre cuando no hay cédula) se ACTUALIZA en vez de
+// duplicarse. body opcional: { tenant_id } para migrar uno solo.
+async function syncTenantsToCustomers(myTenant: string, onlyTenant: string | null) {
+  {
+    let q = db.from('tenants').select('id, name, owner_id');
+    if (onlyTenant) q = q.eq('id', onlyTenant);
+    const { data: tenants, error: tErr } = await q;
+    if (tErr) throw new Error(tErr.message);
+    const targets = (tenants ?? []).filter((t: any) => t.id !== myTenant);
+    if (targets.length === 0) return { created: 0, updated: 0, total: 0, errors: [] as string[] };
+
+    // Config FE de cada negocio (datos del emisor) — de ahí salen cédula/correo/dirección.
+    const feByTenant: Record<string, any> = {};
+    try {
+      const { data: rows } = await db.from('settings')
+        .select('tenant_id, config').eq('type', 'electronic-invoice')
+        .in('tenant_id', targets.map((t: any) => t.id));
+      for (const r of (rows ?? []) as any[]) feByTenant[r.tenant_id] = r.config ?? {};
+    } catch (e: any) { console.warn('[sync-customers] fe config:', e?.message); }
+
+    // Correo del dueño como respaldo cuando la config FE no trae correo.
+    const emailByOwner: Record<string, string> = {};
+    try {
+      const ownerIds = targets.map((t: any) => t.owner_id).filter(Boolean);
+      if (ownerIds.length > 0) {
+        const { data: us } = await db.from('users').select('id, email').in('id', ownerIds);
+        for (const u of (us ?? []) as any[]) if (u.email) emailByOwner[u.id] = u.email;
+      }
+    } catch (e: any) { console.warn('[sync-customers] owner emails:', e?.message); }
+
+    // Clientes que ya tengo, indexados por cédula y por nombre (para no duplicar).
+    const { data: existing } = await db.from('customers')
+      .select('id, name, identification').eq('tenant_id', myTenant);
+    const byIdent: Record<string, string> = {};
+    const byName:  Record<string, string> = {};
+    for (const cu of (existing ?? []) as any[]) {
+      const ident = String(cu.identification ?? '').replace(/\D/g, '');
+      if (ident) byIdent[ident] = cu.id;
+      const n = String(cu.name ?? '').trim().toLowerCase();
+      if (n) byName[n] = cu.id;
+    }
+
+    let created = 0, updated = 0;
+    const errors: string[] = [];
+    for (const t of targets as any[]) {
+      const fe = feByTenant[t.id] ?? {};
+      const ident = String(fe.emisor_identification ?? '').replace(/\D/g, '');
+      const name  = String(fe.emisor_name || t.name || '').trim();
+      if (!name) continue;
+      const payload: Record<string, any> = {
+        tenant_id:           myTenant,
+        name,
+        commercial_name:     fe.emisor_commercial_name || t.name || null,
+        identification:      ident || null,
+        identification_type: fe.emisor_identification_type || (ident ? (ident.length === 9 ? '01' : '02') : null),
+        email:               fe.emisor_email || emailByOwner[t.owner_id] || null,
+        phone:               fe.emisor_phone || null,
+        address:             fe.emisor_address || null,
+        province_code:       fe.emisor_province_code || null,
+        canton_code:         fe.emisor_canton_code || null,
+        district_code:       fe.emisor_district_code || null,
+        economic_activity_code: fe.economic_activity_code || null,
+        is_active:           true,
+      };
+      const existingId = (ident && byIdent[ident]) || byName[name.toLowerCase()] || null;
+      try {
+        if (existingId) {
+          // No pisar con nulos lo que ya esté lleno.
+          const patch = Object.fromEntries(Object.entries(payload).filter(([k, v]) => k !== 'tenant_id' && v != null));
+          const { error } = await db.from('customers').update(patch).eq('id', existingId).eq('tenant_id', myTenant);
+          if (error) throw new Error(error.message);
+          updated++;
+        } else {
+          const { error } = await db.from('customers').insert(payload);
+          if (error) throw new Error(error.message);
+          created++;
+          if (ident) byIdent[ident] = 'new';
+          byName[name.toLowerCase()] = 'new';
+        }
+      } catch (e: any) { errors.push(`${name}: ${e?.message}`); }
+    }
+
+    return { created, updated, total: targets.length, errors };
+  }
+}
+
+// GET /tenants/:id/hacienda-activities — consulta el PADRÓN público de Hacienda las
+// actividades económicas REGISTRADAS para la cédula del emisor. Sirve para evitar el
+// rechazo -407 ("El Código de la Actividad Económica del emisor … no se encuentra
+// Registrado ante el Ministerio de Hacienda para este contribuyente").
+// ?identificacion=<cédula> para consultar una distinta a la configurada.
+admin.get('/tenants/:id/hacienda-activities', async (c) => {
+  if (!isAdminRole(c)) return fail(c, 'forbidden', 403);
+  try {
+    const { id } = c.req.param();
+    let ident = String(c.req.query('identificacion') ?? '').replace(/\D/g, '');
+    let configured: string | null = null;
+    if (!ident) {
+      const { data: row } = await db.from('settings').select('config')
+        .eq('tenant_id', id).eq('type', 'electronic-invoice').maybeSingle();
+      const cfg = (row?.config as any) ?? {};
+      ident = String(cfg.emisor_identification ?? '').replace(/\D/g, '');
+      configured = String(cfg.economic_activity_code ?? '').replace(/\D/g, '') || null;
+    }
+    if (!ident) return fail(c, 'El negocio no tiene cédula del emisor configurada', 422);
+
+    const url = `https://api.hacienda.go.cr/fe/ae?identificacion=${ident}`;
+    const res = await fetch(url, { headers: { Accept: 'application/json' } });
+    if (res.status === 404) return fail(c, `Hacienda no tiene registrada la cédula ${ident}`, 404);
+    if (!res.ok) return fail(c, `Hacienda respondió ${res.status} al consultar la cédula ${ident}`, 502);
+    const body: any = await res.json().catch(() => ({}));
+
+    // Solo las ACTIVAS sirven para facturar; el resto se devuelven marcadas.
+    const activities = (Array.isArray(body?.actividades) ? body.actividades : []).map((a: any) => ({
+      codigo:      String(a?.codigo ?? '').trim(),
+      descripcion: String(a?.descripcion ?? '').trim(),
+      estado:      String(a?.estado ?? '').trim(),
+      tipo:        String(a?.tipo ?? '').trim(),
+      activa:      /^a/i.test(String(a?.estado ?? '')),   // "A" / "Activo"
+    })).filter((a: any) => a.codigo);
+    const activeCodes = activities.filter((a: any) => a.activa).map((a: any) => a.codigo);
+
+    return ok(c, {
+      identificacion: ident,
+      nombre:      body?.nombre ?? null,
+      situacion:   body?.situacion ?? null,
+      activities,
+      configured,
+      // ¿La actividad configurada está registrada Y activa? Esto es exactamente lo
+      // que valida Hacienda al emitir (-407).
+      configured_valid: configured ? activeCodes.includes(configured) : null,
+      suggestion: configured && !activeCodes.includes(configured) ? (activeCodes[0] ?? null) : null,
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+admin.post('/sync-customers', async (c) => {
+  if (!isAdminRole(c)) return fail(c, 'forbidden', 403);
+  try {
+    const body = await c.req.json().catch(() => ({} as any));
+    const r = await syncTenantsToCustomers(c.get('tenantId'), body?.tenant_id ? String(body.tenant_id) : null);
+    return ok(c, r);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

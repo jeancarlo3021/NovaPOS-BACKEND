@@ -128,13 +128,19 @@ export function buildAlanubeDocument(
 
     const cabys = String(l.cabys_code ?? '').replace(/\D/g, '');
     const esServicio = cabys.length > 0 && cabys[0] >= '5';   // CABYS 5-9 = servicio
+    // Código de tarifa de la línea. Para 0% es '10' (Exenta) — el MISMO que va en
+    // `taxes` del ítem; tienen que coincidir o Alanube rechaza (ver abajo).
+    const feeCode = tarifa > 0 ? rateCode(tarifa) : '10';
     if (tarifa > 0) {
       if (esServicio) totalServicesTaxable += montoTotal; else totalTaxedGoods += montoTotal;
-      const fc = rateCode(tarifa);
-      taxByRate[fc] = (taxByRate[fc] ?? 0) + impuesto;
     } else {
       if (esServicio) totalExemptServices += montoTotal; else totalExemptGoods += montoTotal;
     }
+    // El desglose acumula TODOS los códigos de tarifa presentes en las líneas,
+    // INCLUIDO el exento (10) con monto 0. Alanube valida que cada par
+    // (code, feeCode) que aparece en las líneas exista en totalTaxBreakdown:
+    // omitir el 10 daba "The total tax breakdown missing code: 01 with fee code 10".
+    taxByRate[feeCode] = (taxByRate[feeCode] ?? 0) + impuesto;
     totalTax += impuesto;
     totalSale += montoTotal;
 
@@ -155,7 +161,7 @@ export function buildAlanubeDocument(
       // Para líneas con IVA 0% usamos el código EXENTA (10), NO "Tarifa 0%" (01):
       // con "01" Hacienda las clasifica como "No Sujetas" y el resumen (que las
       // suma como Exentas) no cuadra → rechazo -481/-485/-107.
-      taxes: [{ code: '01', feeCode: tarifa > 0 ? rateCode(tarifa) : '10', fee: Number(tarifa).toFixed(2), amount: money(impuesto) }],
+      taxes: [{ code: '01', feeCode, fee: Number(tarifa).toFixed(2), amount: money(impuesto) }],
     };
     if (l.sku) item.commercialCode = [{ typeCode: '04', code: String(l.sku) }];
     return item;
@@ -200,9 +206,11 @@ export function buildAlanubeDocument(
     if (totalExempt > 0) t.totalExempt = money(totalExempt);
     t.totalSale = money(totalSale);                 // suma de líneas sin IVA
     t.totalNetSale = money(totalSale);              // venta neta (sin descuentos)
-    if (totalTax > 0) {
-      t.totalTax = money(totalTax);                 // total impuesto
-      // TotalDesgloseImpuesto: un renglón por código de tarifa cobrado.
+    if (totalTax > 0) t.totalTax = money(totalTax);   // total impuesto
+    // TotalDesgloseImpuesto: un renglón por CADA código de tarifa presente en las
+    // líneas — incluido el exento (10) en 0. Va aunque totalTax sea 0 (comprobante
+    // 100% exento): Alanube exige que todo (code, feeCode) de las líneas esté acá.
+    if (Object.keys(taxByRate).length > 0) {
       t.totalTaxBreakdown = Object.entries(taxByRate).map(([feeCode, amt]) => ({
         code: '01', feeCode, totalTaxAmount: money(amt),
       }));
