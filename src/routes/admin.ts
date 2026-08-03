@@ -1053,7 +1053,9 @@ function buildAlanubeCompanyPayload(cfg: Record<string, any>, p12Base64: string,
 
   const payload: Record<string, any> = {
     name: String(cfg.emisor_name ?? '').trim(),
-    identificationType: String(cfg.emisor_identification_type ?? '02'),
+    // Mismo criterio que la validación: si no se guardó, se deduce de la cédula.
+    identificationType: String(cfg.emisor_identification_type ?? '').trim()
+      || inferIdType(cfg.emisor_identification) || '02',
     identificationNumber: String(cfg.emisor_identification ?? '').replace(/\D/g, ''),
     // CRI EMITE SIEMPRE con la empresa 'main' (no hay parámetro idCompany en la
     // emisión), así que la empresa emisora del tenant DEBE crearse como 'main'.
@@ -1203,13 +1205,25 @@ async function findExistingCompanyId(client: any, cfg: Record<string, any>): Pro
 
 // Valida los datos del emisor ANTES de llamar a Alanube y devuelve una lista de
 // problemas legibles (para saber qué campo corregir en Datos de FE).
+/** Tipo de identificación deducido de la longitud de la cédula (CR). */
+function inferIdType(identification: any): string {
+  const d = String(identification ?? '').replace(/\D/g, '');
+  if (d.length === 9) return '01';    // física
+  if (d.length === 10) return '02';   // jurídica
+  if (d.length === 11 || d.length === 12) return '03';   // DIMEX
+  return '';
+}
+
 function validateEmisorForAlanube(cfg: Record<string, any>, env: 'sandbox' | 'production'): string[] {
   const p: string[] = [];
   const prod = env === 'production';
 
   if (!String(cfg.emisor_name ?? '').trim()) p.push('Nombre del emisor: vacío.');
 
-  const idType = String(cfg.emisor_identification_type ?? '').trim();
+  // Tipo de identificación. Si nunca se guardó (el <select> lo mostraba por defecto
+  // pero no lo persistía), se DEDUCE de la longitud de la cédula en vez de bloquear:
+  // 9 = física, 10 = jurídica, 11-12 = DIMEX.
+  const idType = String(cfg.emisor_identification_type ?? '').trim() || inferIdType(cfg.emisor_identification);
   if (!['01', '02', '03', '04'].includes(idType))
     p.push(`Tipo de identificación inválido ("${idType || 'vacío'}"): debe ser 01 (física), 02 (jurídica), 03 (DIMEX) o 04 (NITE).`);
   const ced = String(cfg.emisor_identification ?? '').replace(/\D/g, '');
