@@ -43,13 +43,27 @@ function baseUrlFor(env: AlanubeEnv): string {
 /** Token del ambiente. Producción usa SOLO `ALANUBE_API_TOKEN_PRODUCTION` (el
  *  legacy `ALANUBE_API_TOKEN` era el de sandbox y no debe usarse en prod).
  *  Sandbox/QA usa el suyo, con fallback al legacy. */
-function tokenFor(env: AlanubeEnv): string {
+function tokenFor(env: AlanubeEnv, override?: string | null): string {
+  // Token PROPIO del tenant (Datos de FE). En Costa Rica cada cuenta de Alanube
+  // admite UNA sola empresa emisora, así que un negocio que no comparte cédula con
+  // el de la cuenta global necesita su propia cuenta/token.
+  const own = (override || '').trim();
+  if (own) return own;
   const specific = env === 'production'
     ? process.env.ALANUBE_API_TOKEN_PRODUCTION
     : (process.env.ALANUBE_API_TOKEN_SANDBOX || process.env.ALANUBE_API_TOKEN_QA || process.env.ALANUBE_API_TOKEN);
   const t = (specific || '').trim();
-  if (!t) throw new AlanubeError(`Falta el token de Alanube para el ambiente ${env}. Configurá ALANUBE_API_TOKEN_${env === 'production' ? 'PRODUCTION' : 'SANDBOX'} en el servidor.`, 500);
+  if (!t) throw new AlanubeError(`Falta el token de Alanube para el ambiente ${env}. Configurá ALANUBE_API_TOKEN_${env === 'production' ? 'PRODUCTION' : 'SANDBOX'} en el servidor, o cargá el token propio del negocio en Datos de FE.`, 500);
   return t;
+}
+
+/** Token propio del tenant guardado en su config de FE, según el ambiente. */
+export function tenantAlanubeToken(cfg: any, env: AlanubeEnv): string {
+  if (!cfg) return '';
+  const v = env === 'production'
+    ? (cfg.alanube_token_production ?? cfg.alanube_api_token_production)
+    : (cfg.alanube_token_sandbox ?? cfg.alanube_api_token_sandbox);
+  return String(v ?? cfg.alanube_token ?? '').trim();
 }
 
 export class AlanubeError extends Error {
@@ -119,9 +133,9 @@ const EMIT_PATH: Record<string, string> = {
 };
 
 /** Cliente Alanube atado a UN ambiente (sandbox/QA o producción). */
-function clientFor(env: AlanubeEnv) {
+function clientFor(env: AlanubeEnv, tokenOverride?: string | null) {
   const base = baseUrlFor(env);
-  const tok = tokenFor(env);
+  const tok = tokenFor(env, tokenOverride);
   const f = <T = any>(path: string, init: RequestInit = {}) => alanubeFetch<T>(base, tok, path, init);
 
   return {
@@ -144,6 +158,18 @@ function clientFor(env: AlanubeEnv) {
     },
     createCompany: (payload: Record<string, any>) =>
       f('/companies', { method: 'POST', body: JSON.stringify(payload) }),
+    // Baja de una empresa. Se prueban las rutas conocidas porque CRI no documenta
+    // el DELETE de forma estable: /companies/{id} y, si no, /company/{id}.
+    deleteCompany: async (id: string) => {
+      try {
+        return await f(`/companies/${id}`, { method: 'DELETE' });
+      } catch (e: any) {
+        if (e instanceof AlanubeError && (e.status === 404 || e.status === 405)) {
+          return await f(`/company/${id}`, { method: 'DELETE' });
+        }
+        throw e;
+      }
+    },
     updateCompany: async (id: string, payload: Record<string, any>) => {
       try {
         return await f(`/companies/${id}`, { method: 'PUT', body: JSON.stringify(payload) });
@@ -154,10 +180,26 @@ function clientFor(env: AlanubeEnv) {
         throw e;
       }
     },
-    emitDocument: (kind: 'invoice' | 'ticket' | 'credit-note' | 'debit-note', _payload: Record<string, any>, _companyId?: string) => {
-      // CRI emite SIEMPRE con la empresa 'main' de la cuenta: NO hay parámetro
-      // idCompany (ni body, ni header, ni query). El companyId se ignora acá.
-      return f(EMIT_PATH[kind], { method: 'POST', body: JSON.stringify(_payload) });
+    // Emisión. Por defecto CRI usa la empresa 'main' de la cuenta y NO hace falta
+    // idCompany. Pero una cuenta puede tener además empresas ASOCIADAS (varios
+    // emisores bajo el mismo token): para emitir con una de ellas hay que indicar
+    // `idCompany`, igual que ya se hace al consultar el documento. Solo se manda
+    // cuando `asCompany` viene en true, para no alterar el flujo de la principal.
+    emitDocument: (
+      kind: 'invoice' | 'ticket' | 'credit-note' | 'debit-note',
+      _payload: Record<string, any>,
+      _companyId?: string,
+      opts?: { asCompany?: boolean },
+    ) => {
+      const useCompany = opts?.asCompany && _companyId;
+      const path = useCompany
+        ? `${EMIT_PATH[kind]}?idCompany=${encodeURIComponent(String(_companyId))}`
+        : EMIT_PATH[kind];
+      // Se manda también por header: Alanube acepta ambas formas según el recurso.
+      const headers = useCompany
+        ? { idCompany: String(_companyId), 'X-Company-Id': String(_companyId) }
+        : undefined;
+      return f(path, { method: 'POST', body: JSON.stringify(_payload), headers });
     },
     // Consulta el ESTATUS de un documento en CRI:
     //   GET /cri/v1/{recurso}/{id}   (recurso = invoices|tickets|credit-notes|
@@ -223,6 +265,12 @@ export const alanube = {
   normalizeEnv,
   /** Ambiente global por defecto (si un tenant no define el suyo). */
   defaultEnv,
-  /** Cliente para el ambiente de un tenant: alanube.forEnv(cfg.environment). */
-  forEnv: (env?: string | null): AlanubeClient => clientFor(resolveEnv(env)),
+  /** Cliente para el ambiente de un tenant: alanube.forEnv(cfg.environment).
+   *  El 2º parámetro permite usar el token PROPIO del negocio (cuenta aparte). */
+  forEnv: (env?: string | null, token?: string | null): AlanubeClient => clientFor(resolveEnv(env), token),
+  /** Cliente a partir de la config FE del tenant: usa su token propio si lo tiene. */
+  forTenant: (cfg: any): AlanubeClient => {
+    const env = resolveEnv(cfg?.environment);
+    return clientFor(env, tenantAlanubeToken(cfg, env));
+  },
 };

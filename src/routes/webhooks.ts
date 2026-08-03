@@ -80,6 +80,34 @@ webhooks.post('/alanube', async (c) => {
     };
     if (!event.includes('recep')) {
       const feStatus = mapStatus(rawStatus);
+
+      // ── NOTAS de crédito/débito ────────────────────────────────────────────
+      // Su clave NO vive en `fe_clave` sino en `fe_nc_clave` / `fe_nd_clave`, así
+      // que el filtro de abajo NUNCA las encontraba y quedaban clavadas en "sent".
+      // Se resuelven primero, por su propia clave, y actualizan su propio estado.
+      if (claveDigits) {
+        for (const [claveCol, statusCol, etiqueta] of [
+          ['fe_nc_clave', 'fe_nc_status', 'nota de crédito'],
+          ['fe_nd_clave', 'fe_nd_status', 'nota de débito'],
+        ] as const) {
+          const { data: notes } = await db.from('invoices')
+            .select('id, tenant_id, invoice_number').eq(claveCol, claveDigits);
+          if (!notes || notes.length === 0) continue;
+          await db.from('invoices')
+            .update({ [statusCol]: feStatus, updated_at: new Date().toISOString() })
+            .eq(claveCol, claveDigits);
+          if (feStatus === 'rejected' || feStatus === 'error') {
+            const govErr = d?.governmentResponse ?? d?.errorMessage
+              ?? deepFind(body, /(governmentResponse|errorMessage)/i, 5000);
+            for (const n of notes as any[]) {
+              void notifyFeError(n.tenant_id, `${etiqueta} de #${n.invoice_number}`,
+                cleanGovError(govErr) || `${etiqueta} rechazada por Hacienda`).catch(() => {});
+            }
+          }
+          return ok(c, { ok: true, kind: 'note', note: statusCol, fe_status: feStatus, matched: notes.length });
+        }
+      }
+
       const filters = [claveDigits ? `fe_clave.eq.${claveDigits}` : null, docId ? `fe_consecutivo.eq.${docId}` : null].filter(Boolean).join(',');
       if (filters) {
         let res = await db.from('invoices')

@@ -337,6 +337,11 @@ export function friendlyAlanubeError(raw: string): string {
   const map: Array<[RegExp, string]> = [
     [/otrassenas.*at least 5|otrassenas.*5 characters/i, 'La dirección del cliente (otras señas) debe tener al menos 5 caracteres. Completá la dirección del cliente.'],
     [/receiver\.address|address\.(province|canton|district)/i, 'La dirección del cliente es inválida (provincia/cantón/distrito/señas). Revisá los datos del cliente.'],
+    // Los errores del SENDER van ANTES que los del receptor: sin esto un problema
+    // del emisor se reportaba como "identificación del cliente" y despistaba.
+    [/sender:.*additional properties|sender\.(identification|name|tradename|economicactivity)/i,
+      'Alanube no acepta datos del emisor dentro del comprobante: la cédula y el certificado con que sale '
+      + 'son los de la empresa registrada en Alanube. Para cambiarlos hay que corregir esa empresa.'],
     [/receiver\.identification|identificationnumber|identificationtype/i, 'La identificación del cliente (cédula) no corresponde al tipo seleccionado (física/jurídica/DIMEX).'],
     [/receiver\.email|receiver\.name/i, 'Faltan o son inválidos los datos del cliente (nombre o correo).'],
     [/sendereconomicactivity|economicactivity/i, 'La actividad económica del emisor es inválida o falta en los Datos de FE.'],
@@ -347,6 +352,12 @@ export function friendlyAlanubeError(raw: string): string {
     [/amount.*not equal|taxablebase.*fee|amounttotalline/i, 'Los montos de una línea no cuadran (base × IVA). Revisá el precio o la tarifa del producto.'],
     [/consecutiv|numberofdocument/i, 'Problema con la numeración consecutiva del comprobante.'],
     [/at least (\d+) characters/i, 'Un dato del comprobante es más corto de lo permitido.'],
+    // "Invalid credentials … hacienda system" NO es el token de Alanube: son el
+    // usuario y la contraseña de API que se generan en ATV, propios de CADA cédula.
+    [/invalid credentials.*hacienda|data supplied to connect to the hacienda/i,
+      'Las credenciales de ATV (Hacienda) del emisor son inválidas. En «Datos de FE» revisá '
+      + '«Usuario de API de ATV» y «Contraseña de API de ATV» del ambiente activo: se generan en ATV '
+      + 'para ESA cédula y no son el PIN del certificado .p12.'],
     [/invalid credentials|unauthorized|token/i, 'Error de autenticación con Alanube. Revisá el token del ambiente.'],
   ];
   for (const [re, friendly] of map) if (re.test(l)) return `${friendly}\n(Detalle técnico: ${detail})`;
@@ -488,7 +499,7 @@ export async function refreshInvoiceStatus(tenantId: string, invoiceId: string):
   if (provider === 'alanube') {
     const docId = (inv as any).fe_consecutivo;
     if (!docId) throw new Error('No hay id de documento de Alanube para consultar. Volvé a emitir.');
-    const r = await alanubeDocStatus(alanube.forEnv(cfg.environment), docId, { kind: feKindOf((inv as any).document_type), companyId: feCompanyId(cfg) });
+    const r = await alanubeDocStatus(alanube.forTenant(cfg), docId, { kind: feKindOf((inv as any).document_type), companyId: feCompanyId(cfg) });
     fe_status = r.status; indEstado = r.rawStatus; errDetail = r.error;
     patch.fe_status = fe_status;
     patch.fe_error = r.error;
@@ -521,6 +532,74 @@ export async function refreshInvoiceStatus(tenantId: string, invoiceId: string):
       tenantId, cfg, (inv as any)?.document_type, errDetail ?? patch.fe_error);
   }
   return { fe_status, ind_estado: indEstado, error: errDetail, consecutivo_bumped } as any;
+}
+
+/** Estado de una NOTA de crédito/débito. Es un documento PROPIO ante Hacienda:
+ *  se consulta por SU clave (Facturemos) y se guarda en fe_nc_status/fe_nd_status.
+ *  Con Alanube el estado llega por webhook: no guardamos el id del documento de la
+ *  nota, así que se informa en vez de fallar. */
+export async function refreshNoteStatus(
+  tenantId: string, invoiceId: string, kind: 'nc' | 'nd',
+): Promise<{ fe_status: string; ind_estado: any; error: any; note: string | null }> {
+  const cfg = await loadFEConfig(tenantId);
+  const provider = cfg.fe_provider === 'alanube' ? 'alanube' : 'facturemos';
+  const claveCol  = kind === 'nc' ? 'fe_nc_clave'  : 'fe_nd_clave';
+  const statusCol = kind === 'nc' ? 'fe_nc_status' : 'fe_nd_status';
+
+  const { data: inv } = await db.from('invoices')
+    .select(`id, ${claveCol}, ${statusCol}`).eq('id', invoiceId).eq('tenant_id', tenantId).maybeSingle();
+  const clave = String((inv as any)?.[claveCol] ?? '').replace(/\D/g, '');
+  const label = kind === 'nc' ? 'nota de crédito' : 'nota de débito';
+  if (!clave) throw new Error(`Esta factura no tiene ${label} emitida.`);
+
+  if (provider !== 'facturemos') {
+    // Alanube: se consulta con el id del documento (ULID). Se prueban, en orden:
+    // el id guardado al emitir, y si no hay, lo que esté en la columna de clave
+    // (cuando Alanube no devolvió la clave, ahí quedó el propio id).
+    const docCol = kind === 'nc' ? 'fe_nc_doc_id' : 'fe_nd_doc_id';
+    let storedId: string | null = null;
+    try {
+      const { data: r2 } = await db.from('invoices').select(docCol).eq('id', invoiceId).maybeSingle();
+      storedId = (r2 as any)?.[docCol] ?? null;
+    } catch { /* migración 75 sin correr */ }
+    const rawClave = String((inv as any)?.[claveCol] ?? '');
+    const candidates = [storedId, /^\d{50}$/.test(rawClave) ? null : rawClave].filter(Boolean) as string[];
+
+    if (candidates.length === 0) {
+      return {
+        fe_status: String((inv as any)?.[statusCol] ?? 'sent'),
+        ind_estado: null, error: null,
+        note: `No se guardó el id de documento de esta ${label} (se emitió antes de la migración 75), `
+          + `así que no se puede reconsultar en Alanube. Su estado se actualiza cuando llega el webhook. `
+          + `Si quedó trabada, verificá la clave ${rawClave} directamente en Hacienda (ATV).`,
+      };
+    }
+
+    const client = alanube.forTenant(cfg);
+    let last: any = null;
+    for (const docId of candidates) {
+      try {
+        const r = await alanubeDocStatus(client, docId, { kind: 'credit-note', companyId: feCompanyId(cfg) });
+        await db.from('invoices').update({ [statusCol]: r.status, updated_at: new Date().toISOString() })
+          .eq('id', invoiceId).eq('tenant_id', tenantId);
+        return { fe_status: r.status, ind_estado: r.rawStatus, error: r.error, note: null };
+      } catch (e: any) { last = e; }
+    }
+    return {
+      fe_status: String((inv as any)?.[statusCol] ?? 'sent'),
+      ind_estado: null, error: last?.message ?? null,
+      note: `Alanube no devolvió el estado de esta ${label}: ${last?.message ?? 'documento no encontrado'}. `
+        + 'Se actualizará cuando llegue el webhook.',
+    };
+  }
+
+  if (!cfg.api_key_emisor) throw new Error('Falta configurar la ApiKey del emisor');
+  const env = cfg.environment === 'sandbox' ? 'sandbox' : 'production';
+  const data = await consultaEstatus(env, cfg.api_key_emisor, clave);
+  const fe_status = mapEstado(data?.Ind_estado);
+  await db.from('invoices').update({ [statusCol]: fe_status, updated_at: new Date().toISOString() })
+    .eq('id', invoiceId).eq('tenant_id', tenantId);
+  return { fe_status, ind_estado: data?.Ind_estado ?? null, error: data?.Error ?? null, note: null };
 }
 
 // POST /refresh-status — consulta el estatus de una factura por su Clave y lo GUARDA.
@@ -559,7 +638,7 @@ hacienda.post('/refresh-pending', async (c) => {
         if (provider === 'alanube') {
           if (!inv.fe_consecutivo) continue;   // sin id de Alanube no podemos consultar
           const kind = feKindOf(inv.document_type);
-          const r = await alanubeDocStatus(alanube.forEnv(cfg.environment), inv.fe_consecutivo, { kind, companyId: feCompanyId(cfg) });
+          const r = await alanubeDocStatus(alanube.forTenant(cfg), inv.fe_consecutivo, { kind, companyId: feCompanyId(cfg) });
           fe_status = r.status;
           patch.fe_error = r.error;    // motivo del rechazo (si lo hay)
           patch.fe_response = r.raw;   // respuesta cruda para depurar el estado
@@ -603,7 +682,9 @@ export async function emitInvoiceCore(
     if (!cfg.enabled) return fail(c, 'La facturación electrónica no está activada', 409);
     const provider = cfg.fe_provider === 'alanube' ? 'alanube' : 'facturemos';
     if (provider === 'facturemos' && !cfg.api_key_emisor) return fail(c, 'Falta configurar la ApiKey del emisor', 422);
-    if (provider === 'alanube' && !cfg.alanube_company_id) return fail(c, 'La empresa no está dada de alta en Alanube. Usá «Crear empresa en Alanube».', 422);
+    // Se acepta el id del AMBIENTE activo (o el legacy). Con empresas asociadas el
+    // id es obligatorio: es lo que le dice a Alanube con cuál emisor firmar.
+    if (provider === 'alanube' && !feCompanyId(cfg)) return fail(c, 'La empresa no está dada de alta en Alanube. Usá «Crear empresa en Alanube».', 422);
     const env = cfg.environment === 'sandbox' ? 'sandbox' : 'production'; // default producción
 
     // Factura + ítems.
@@ -738,7 +819,7 @@ export async function emitInvoiceCore(
       }
       let resp: any;
       try {
-        resp = await alanube.forEnv(cfg.environment).emitDocument(kind as any, doc, cfg.alanube_company_id);
+        resp = await alanube.forTenant(cfg).emitDocument(kind as any, doc, feCompanyId(cfg), { asCompany: cfg.alanube_company_type === 'associated' });
       } catch (e: any) {
         // Guardar el JSON enviado para poder verlo en la bitácora aunque falle.
         await db.from('invoices').update({ fe_request: doc }).eq('id', invoice_id).eq('tenant_id', tenantId).then(() => {}, () => {});
@@ -833,17 +914,28 @@ hacienda.post('/emit', async (c) => {
 // POST /credit-note — emite una Nota de Crédito (03) que ANULA una factura ya
 // emitida. body: { invoice_id, reason? }.
 hacienda.post('/credit-note', async (c) => {
-  const tenantId = c.get('tenantId');
-  let invoice_id: string | undefined;
+  const body = await c.req.json().catch(() => ({} as any));
+  return emitCreditNoteCore(c, c.get('tenantId'), body?.invoice_id, body?.reason);
+});
+
+/** Emite la Nota de Crédito de anulación de una factura. Extraída de la ruta para
+ *  poder reusarla desde el panel admin (anulación en lote). */
+export async function emitCreditNoteCore(
+  c: any, tenantId: string, invoiceId: string | undefined, reason?: string,
+  opts?: { companyIdOverride?: string | null },
+): Promise<Response> {
+  const invoice_id = invoiceId;
+  // Id de empresa de Alanube a usar para ESTA nota. Sirve cuando la empresa se
+  // volvió a crear (id nuevo) y la config todavía tiene el anterior.
+  const companyOverride = String(opts?.companyIdOverride ?? '').trim() || null;
+  {
   try {
-    let reason: string | undefined;
-    ({ invoice_id, reason } = await c.req.json().catch(() => ({})));
     if (!invoice_id) return fail(c, 'Falta invoice_id', 422);
 
     const cfg = await loadFEConfig(tenantId);
     const provider = cfg.fe_provider === 'alanube' ? 'alanube' : 'facturemos';
     if (provider === 'facturemos' && !cfg.api_key_emisor) return fail(c, 'Falta configurar la ApiKey del emisor', 422);
-    const alanubeCompanyId = (String(cfg.environment ?? 'production') === 'sandbox'
+    const alanubeCompanyId = companyOverride ?? (String(cfg.environment ?? 'production') === 'sandbox'
       ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id;
     if (provider === 'alanube' && !alanubeCompanyId) return fail(c, 'La empresa no está dada de alta en Alanube.', 422);
     const env = cfg.environment === 'sandbox' ? 'sandbox' : 'production'; // default producción
@@ -903,7 +995,7 @@ hacienda.post('/credit-note', async (c) => {
         numberOfDocument: (inv as any).invoice_number,
         // Empresa emisora en Alanube según el ambiente (para que emita el tenant y
         // no la 'main' de la cuenta). Sin id, Alanube usa la main por defecto.
-        senderId: (String(cfg.environment ?? 'production') === 'sandbox'
+        senderId: companyOverride ?? (String(cfg.environment ?? 'production') === 'sandbox'
           ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id,
         reference: {
           documentType: tipoOriginal,
@@ -915,17 +1007,25 @@ hacienda.post('/credit-note', async (c) => {
       });
       let resp: any;
       try {
-        resp = await alanube.forEnv(cfg.environment).emitDocument('credit-note', doc, cfg.alanube_company_id);
+        resp = await alanube.forTenant(cfg).emitDocument('credit-note', doc, companyOverride ?? feCompanyId(cfg), { asCompany: cfg.alanube_company_type === 'associated' });
       } catch (e: any) {
         return fail(c, e instanceof AlanubeError ? friendlyAlanubeError(e.message) : (e?.message ?? 'Error emitiendo NC con Alanube'), 422);
       }
       const docObj = resp?.creditNote ?? resp?.document ?? resp?.data ?? resp;
       const ncId = docObj?.id ?? deepFind(resp, /(^id$|_id$|documentId$)/i, 10) ?? null;
       const ncClave = docObj?.key ?? docObj?.clave ?? deepFind(resp, /(clave|^key$)/i, 40) ?? null;
-      await db.from('invoices').update({
-        fe_nc_clave: ncClave ?? ncId, fe_nc_status: 'sent',
+      // Se guarda TAMBIÉN el id de Alanube: es lo único con lo que se puede
+      // reconsultar el estado si el webhook se pierde.
+      let updNc = await db.from('invoices').update({
+        fe_nc_clave: ncClave ?? ncId, fe_nc_doc_id: ncId, fe_nc_status: 'sent',
         updated_at: new Date().toISOString(),
       }).eq('id', invoice_id).eq('tenant_id', tenantId);
+      if (updNc.error && /fe_nc_doc_id/.test(updNc.error.message)) {   // migración 75 sin correr
+        await db.from('invoices').update({
+          fe_nc_clave: ncClave ?? ncId, fe_nc_status: 'sent',
+          updated_at: new Date().toISOString(),
+        }).eq('id', invoice_id).eq('tenant_id', tenantId);
+      }
       return ok(c, { ok: true, provider: 'alanube', nc_clave: ncClave, alanube_doc_id: ncId, response: resp });
     }
 
@@ -966,7 +1066,8 @@ hacienda.post('/credit-note', async (c) => {
     }
     return fail(c, friendlyFEError(err.message), status);
   }
-});
+  }
+}
 
 // POST /debit-note — emite una Nota de Débito (02) que INCREMENTA/corrige el
 // monto de un comprobante ya emitido. body: { invoice_id, reason? }.
@@ -1052,7 +1153,7 @@ hacienda.post('/debit-note', async (c) => {
       });
       let resp: any;
       try {
-        resp = await alanube.forEnv(cfg.environment).emitDocument('debit-note', doc, cfg.alanube_company_id);
+        resp = await alanube.forTenant(cfg).emitDocument('debit-note', doc, feCompanyId(cfg), { asCompany: cfg.alanube_company_type === 'associated' });
       } catch (e: any) {
         return fail(c, e instanceof AlanubeError ? friendlyAlanubeError(e.message) : (e?.message ?? 'Error emitiendo ND con Alanube'), 422);
       }
@@ -1299,7 +1400,7 @@ hacienda.post('/received/confirm', async (c) => {
         },
       };
       try {
-        const resp = await alanube.forEnv(cfg.environment).sendReceiverMessage(payload, String(senderCompanyId));
+        const resp = await alanube.forTenant(cfg).sendReceiverMessage(payload, String(senderCompanyId));
         mrId = resp?.id ?? deepFind(resp, /(^id$|_id$)/i, 40) ?? null;
       } catch (e: any) {
         messages.push(`⚠️ No se pudo enviar el mensaje a Hacienda (Alanube): ${e?.message ?? 'error'}. Se marcó localmente.`);
@@ -1756,7 +1857,7 @@ async function toB64(v: any): Promise<string | null> {
 async function alanubeAttachments(cfg: any, docId: string | null | undefined, kind: any, clave: string, companyId?: string | null): Promise<Array<{ filename: string; content: string }>> {
   const out: Array<{ filename: string; content: string }> = [];
   if (!docId) return out;
-  const client = alanube.forEnv(cfg.environment);
+  const client = alanube.forTenant(cfg);
   const base = String(clave || docId);
 
   // 1) XML original + XML de respuesta de Hacienda. CRI los devuelve como URL en
@@ -1872,7 +1973,7 @@ hacienda.get('/fe-pdf/:id', async (c) => {
     const companyId = (String(cfg.environment ?? 'production') === 'sandbox'
       ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id;
     if (!companyId) return fail(c, 'La empresa no está registrada en Alanube', 422);
-    const resp: any = await alanube.forEnv(cfg.environment)
+    const resp: any = await alanube.forTenant(cfg)
       .getDocumentPdf(String(docId), feKindOf((inv as any).document_type), String(companyId));
     const pdf = await toB64(resp?.pdf ?? deepFind(resp, /^pdf$/i, 12_000_000));
     if (!pdf) return fail(c, 'PDF no disponible en Alanube todavía', 404);
@@ -2058,7 +2159,7 @@ hacienda.post('/emit-direct', async (c) => {
           ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id,
       });
       try {
-        const resp: any = await alanube.forEnv(cfg.environment).emitDocument(kind as any, doc, cfg.alanube_company_id);
+        const resp: any = await alanube.forTenant(cfg).emitDocument(kind as any, doc, feCompanyId(cfg), { asCompany: cfg.alanube_company_type === 'associated' });
         const docObj = resp?.ticket ?? resp?.invoice ?? resp?.document ?? resp?.data ?? resp;
         const docId = docObj?.id ?? deepFind(resp, /(^id$|_id$|documentId$)/i, 10) ?? null;
         const clave = docObj?.key ?? docObj?.clave ?? deepFind(resp, /(clave|^key$)/i, 40) ?? null;

@@ -189,6 +189,10 @@ export function buildAlanubeDocument(
   // sender.id → indica EXPLÍCITAMENTE con qué empresa emitir (confirmado en el
   // ejemplo oficial de createInvoice). Sin esto, Alanube usa la empresa 'main' de
   // la cuenta, que puede NO ser la del tenant.
+  // sender: SOLO el id de la empresa en Alanube. Su esquema NO admite más campos
+  // (probado: "Additional properties not allowed: identificationNumber, name…").
+  // La cédula, el nombre y el certificado con que sale el comprobante son los que
+  // tenga cargada ESA empresa en Alanube — no se pueden mandar por documento.
   if (opts.senderId) payload.sender = { id: String(opts.senderId) };
 
   // Resumen de la factura. Hacienda EXIGE el desglose completo (servicios/mercancías

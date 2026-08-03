@@ -2,10 +2,10 @@ import { Hono } from 'hono';
 import { db, anonClient } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
 import { sendEmail, paymentReceiptEmailHtml, customInvoiceEmailHtml, planFeatureLabels } from '../services/emailService.js';
-import { alanube, AlanubeError } from '../services/alanube.js';
+import { alanube, AlanubeError, tenantAlanubeToken } from '../services/alanube.js';
 import { endOfDay } from '../utils/dateRange.js';
 import { whatsappEnabled, sendTemplate, normalizePhone } from '../services/whatsapp.js';
-import { refreshInvoiceStatus, emitInvoiceCore } from './hacienda.js';
+import { refreshInvoiceStatus, refreshNoteStatus, emitInvoiceCore, emitCreditNoteCore } from './hacienda.js';
 import { notifyPaymentDue, businessContact } from '../services/whatsappNotify.js';
 
 const admin = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
@@ -181,7 +181,13 @@ admin.get('/invoices-monthly', async (c) => {
     };
     let sel = await fetchAll('tenant_id, status, issued_at, route_id, document_type, fe_clave, fe_status');
     // Si las columnas fe_clave/document_type no existen aún, reintenta sin ellas.
+    // OJO: en ese caso NINGÚN comprobante puede contarse como electrónico (no hay
+    // con qué distinguirlo) → todos los negocios saldrían con 0. Se reporta en
+    // `?debug=1` para no quedarse adivinando.
+    let feColumnsMissing = false;
+    const firstError = sel.error?.message ?? null;
     if (sel.error && /fe_clave|document_type|fe_status/.test(sel.error.message ?? '')) {
+      feColumnsMissing = true;
       sel = await fetchAll('tenant_id, status, issued_at, route_id');
     }
     if (sel.error) throw new Error(sel.error.message);
@@ -223,6 +229,36 @@ admin.get('/invoices-monthly', async (c) => {
         period_start: periodStart, period_end: periodEnd,
       };
     });
+    // ?debug=1 — por qué el conteo de ELECTRÓNICOS sale en 0. Muestra si faltan las
+    // columnas FE, cuántas filas traen clave y cómo se reparten los fe_status.
+    if (c.req.query('debug') === '1') {
+      const rows = (sel.data ?? []) as any[];
+      const statusCount: Record<string, number> = {};
+      let withClave = 0, withIssuedAt = 0;
+      for (const r of rows) {
+        const st = r.fe_status == null ? '(null)' : String(r.fe_status);
+        statusCount[st] = (statusCount[st] ?? 0) + 1;
+        if (r.fe_clave) withClave++;
+        if (r.issued_at) withIssuedAt++;
+      }
+      return ok(c, {
+        counts: out,
+        debug: {
+          period: { start: periodStart, end: periodEnd },
+          rows_in_period: rows.length,
+          fe_columns_missing: feColumnsMissing,
+          first_query_error: firstError,
+          rows_with_fe_clave: withClave,
+          rows_with_issued_at: withIssuedAt,
+          fe_status_breakdown: statusCount,
+          hint: feColumnsMissing
+            ? 'Las columnas fe_clave/fe_status/document_type no se pudieron leer: sin ellas TODO se cuenta como corriente.'
+            : withClave === 0
+              ? 'Ninguna factura del mes tiene fe_clave: o no se emitió a Hacienda, o la clave no se está guardando.'
+              : 'Hay comprobantes con clave; revisá fe_status_breakdown (rejected/error NO cuentan como electrónicos).',
+        },
+      });
+    }
     return ok(c, out);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
@@ -922,7 +958,7 @@ admin.get('/tenants/:id/alanube/verify', async (c) => {
     const cfg: Record<string, any> = { ...((row as any)?.config ?? {}) };
     const isSandbox = String(cfg.environment ?? 'production') === 'sandbox';
     const companyId = (isSandbox ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id;
-    const client = alanube.forEnv(cfg.environment);
+    const client = alanube.forTenant(cfg);
     let effectiveId = companyId;
     const out: any = { environment: client.env, base_url: client.baseUrl(), company_id: companyId ?? null };
 
@@ -981,7 +1017,7 @@ admin.get('/tenants/:id/fe-test', async (c) => {
     if (provider === 'alanube') {
       const isSandbox = String(cfg.environment ?? 'production') === 'sandbox';
       const companyId = (isSandbox ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id;
-      const client = alanube.forEnv(cfg.environment);
+      const client = alanube.forTenant(cfg);
 
       // 1) Token del ambiente válido.
       let tokenOk = false;
@@ -1288,8 +1324,42 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
     const p12Base64 = Buffer.from(await file.arrayBuffer()).toString('base64');
 
     // Ambiente del TENANT (producción o QA/sandbox según su config FE).
-    const client = alanube.forEnv(cfg.environment);
+    const client = alanube.forTenant(cfg);
     const payload = buildAlanubeCompanyPayload(cfg, p12Base64, client.env);
+
+    // ?debug=1 — devuelve el payload que se le manda a Alanube, SIN secretos, para
+    // poder diagnosticar cuando responden "Something went wrong" sin detalle.
+    if (c.req.query('debug') === '1') {
+      const mask = (v: any) => (v ? `«${String(v).length} caracteres»` : '(vacío)');
+      return ok(c, {
+        env: client.env,
+        usa_token_propio: !!tenantAlanubeToken(cfg, client.env as any),
+        payload: {
+          ...payload,
+          certificate: payload.certificate
+            ? { extension: payload.certificate.extension, content: mask(payload.certificate.content), password: mask(payload.certificate.password) }
+            : null,
+          token: payload.token
+            ? { username: payload.token.username || '(vacío)', password: mask(payload.token.password) }
+            : null,
+        },
+        checklist: {
+          cedula: payload.identificationNumber,
+          tipo_identificacion: payload.identificationType,
+          tipo_empresa: payload.type,
+          actividades: payload.economicActivities ?? null,
+          provincia_canton_distrito: `${payload.address?.province}-${payload.address?.canton}-${payload.address?.district}`,
+          otras_senas_len: String(payload.address?.otrasSenas ?? '').length,
+          certificado_bytes: Buffer.from(p12Base64, 'base64').length,
+          webhook: payload.webhooks ? 'configurado' : 'sin webhook (falta PUBLIC_API_URL o ALANUBE_WEBHOOK_SECRET)',
+        },
+      });
+    }
+
+    // Empresa ASOCIADA: la cuenta ya tiene su 'main' (otro emisor) y este negocio se
+    // registra como una empresa adicional bajo el MISMO token. Es la forma de tener
+    // varios emisores sin una cuenta por cada uno. La emisión le pasa `idCompany`.
+    const asAssociated = cfg.alanube_company_type === 'associated';
 
     // En CRI cada cuenta/token solo admite UNA empresa 'main'. Si ya existe (por un
     // alta previa), Alanube responde "already has main company". En ese caso NO
@@ -1301,6 +1371,9 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
     try {
       result = await client.createCompany(payload);
     } catch (e: any) {
+      // Como asociada no hay conflicto con la principal: si Alanube igual se queja,
+      // se reporta tal cual en vez de adoptar/pisar la empresa de otro emisor.
+      if (asAssociated) throw e;
       const msg = String(e?.message ?? '');
       const alreadyMain = e instanceof AlanubeError
         && (e.status === 400 || e.status === 409)
@@ -1331,14 +1404,24 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
       if (!existingId) {
         const main = await getMainCompanyInfo(client);
         if (main.id && main.cedula && myCedula && main.cedula !== myCedula) {
+          const usandoPropio = !!tenantAlanubeToken(cfg, client.env as any);
           return fail(c,
             `Esta cuenta de Alanube (${client.env}) YA tiene su empresa principal registrada con la cédula `
             + `${main.cedula}, que NO es la de este negocio (${myCedula}).\n\n`
-            + `En Costa Rica cada cuenta/token de Alanube admite UNA sola empresa emisora. `
-            + `Continuar sobrescribiría los datos y el certificado del otro emisor, y ambos negocios `
-            + `quedarían apuntando a la misma empresa (id ${main.id}).\n\n`
-            + `Solución: creá una cuenta de Alanube aparte para este negocio y cargá su token `
-            + `(ALANUBE_API_TOKEN_${client.env === 'sandbox' ? 'SANDBOX' : 'PRODUCTION'}) para este tenant.`,
+            + `En Costa Rica cada cuenta/token de Alanube admite UNA sola empresa emisora, y la emisión `
+            + `usa siempre esa empresa principal. Continuar sobrescribiría los datos y el certificado del `
+            + `otro emisor, y ambos negocios quedarían apuntando a la misma empresa (id ${main.id}).\n\n`
+            + (usandoPropio
+              ? `Este negocio YA tiene un token propio cargado en «Datos de FE», pero ese token apunta a una `
+                + `cuenta que ya está ocupada por la cédula ${main.cedula}. Revisá que sea el token de la `
+                + `cuenta NUEVA (la creada para este emisor), no el de la cuenta compartida.`
+              : `CÓMO ARREGLARLO:\n`
+                + `1) Creá una cuenta nueva en Alanube para este emisor (${myCedula}).\n`
+                + `2) Copiá su token de ${client.env === 'sandbox' ? 'QA/Sandbox' : 'producción'}.\n`
+                + `3) Pegalo acá mismo, en «Datos de FE» → «Token de la cuenta de Alanube» → `
+                + `${client.env === 'sandbox' ? 'QA / Sandbox' : 'Producción'}, y guardá.\n`
+                + `4) Volvé a darle a «Crear empresa en Alanube».\n\n`
+                + `Mientras el token esté vacío se usa el del servidor, que es el de la cédula ${main.cedula}.`),
             409);
         }
       }
@@ -1414,8 +1497,113 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
       const uniq = [...new Set(parts)].filter(x => x !== err.message);
       if (uniq.length) detail = '\n\nDetalle de Alanube:\n• ' + uniq.join('\n• ');
       else detail = '\n\nRespuesta cruda de Alanube:\n' + JSON.stringify(body).slice(0, 1200);
+      // Pista concreta para el error más común al dar de alta una empresa: las
+      // credenciales de ATV son POR CÉDULA y no son el PIN del .p12.
+      if (/invalid credentials|hacienda system/i.test(JSON.stringify(body))) {
+        detail += '\n\n👉 Esto NO es el token de Alanube: son las credenciales de ATV (Hacienda) del emisor.\n'
+          + 'En «Datos de FE», para el ambiente activo, revisá:\n'
+          + '  · Usuario de API de ATV — se genera en ATV para ESA cédula (suele terminar en @stag.comprobanteselectronicos.go.cr o .go.cr)\n'
+          + '  · Contraseña de API de ATV — es la que da ATV al generar el usuario, NO el PIN del certificado .p12\n'
+          + '  · Que sean las del MISMO contribuyente cuyo certificado subiste.';
+      }
     }
     return fail(c, err.message + detail, status);
+  }
+});
+
+// DELETE /tenants/:id/alanube/company — DA DE BAJA la empresa en Alanube.
+// Sirve para liberar la cuenta cuando la empresa principal quedó registrada con la
+// cédula equivocada (o con datos de otro emisor) y no hay portal de Alanube a mano.
+// Después de borrarla, «Crear empresa» la crea limpia con los datos de este negocio.
+// body: { confirm: "<cédula del emisor a borrar>", company_id?: "<id>" }
+admin.delete('/tenants/:id/alanube/company', async (c) => {
+  if (!isAdminRole(c)) return fail(c, 'forbidden', 403);
+  try {
+    const { id } = c.req.param();
+    const body = await c.req.json().catch(() => ({} as any));
+
+    const { data: row } = await db.from('settings').select('config')
+      .eq('tenant_id', id).eq('type', 'electronic-invoice').maybeSingle();
+    const cfg: Record<string, any> = { ...((row as any)?.config ?? {}) };
+    const client = alanube.forTenant(cfg);
+
+    // Qué empresa se va a borrar: la indicada, o la 'main' de la cuenta/token.
+    let targetId = String(body?.company_id ?? '').trim();
+    let targetCed = '';
+    if (targetId) {
+      try {
+        const co: any = await client.getCompany(targetId);
+        targetCed = companyCedula(co?.company ?? co);
+      } catch { /* seguimos: puede existir igual */ }
+    } else {
+      const main = await getMainCompanyInfo(client);
+      if (!main.id) {
+        return fail(c, `No se encontró ninguna empresa registrada en esta cuenta de Alanube (${client.env}). `
+          + 'Si conocés el id, mandalo en company_id.', 404);
+      }
+      targetId = main.id;
+      targetCed = main.cedula;
+    }
+
+    // Confirmación EXPLÍCITA con la cédula de la empresa que se va a borrar, para
+    // no eliminar por error la empresa de otro emisor.
+    const confirm = String(body?.confirm ?? '').replace(/\D/g, '');
+    if (!confirm || (targetCed && confirm !== targetCed.replace(/^0+/, '') && confirm !== targetCed)) {
+      return fail(c,
+        `Confirmación requerida. Se va a dar de baja la empresa ${targetId}`
+        + (targetCed ? ` (cédula ${targetCed})` : '')
+        + ` en la cuenta de Alanube de ${client.env}.\n\n`
+        + `Escribí la cédula ${targetCed || 'de la empresa'} para confirmar.`,
+        422);
+    }
+
+    let deleted = false;
+    let alanubeError: string | null = null;
+    try {
+      await client.deleteCompany(targetId);
+      deleted = true;
+    } catch (e: any) {
+      alanubeError = e?.message ?? 'Error desconocido';
+      // Si Alanube no permite borrar por API, se avisa claro en vez de mentir.
+      const st = e instanceof AlanubeError ? e.status : 0;
+      if (st === 404) { deleted = true; alanubeError = null; }   // ya no existía
+    }
+
+    // Limpiar SIEMPRE las referencias locales al id borrado: aunque Alanube haya
+    // fallado, dejar el id apuntando a una empresa ajena es peor.
+    let cleaned = false;
+    for (const k of ['alanube_company_id', 'alanube_company_id_production', 'alanube_company_id_sandbox']) {
+      if (cfg[k] && String(cfg[k]) === targetId) { delete cfg[k]; cleaned = true; }
+    }
+    if (cleaned || deleted) {
+      delete cfg.alanube_main_exists;
+      delete cfg.alanube_company_raw;
+      await db.from('settings').upsert({
+        tenant_id: id, type: 'electronic-invoice', config: cfg, updated_at: new Date().toISOString(),
+      }, { onConflict: 'tenant_id,type' });
+    }
+
+    if (!deleted) {
+      return fail(c,
+        `Alanube no permitió dar de baja la empresa ${targetId}: ${alanubeError}\n\n`
+        + `Es probable que su API no exponga el borrado de empresas o que la empresa ya tenga `
+        + `comprobantes emitidos. Pedile la baja al soporte de Alanube indicando el id ${targetId}.`
+        + (cleaned ? '\n\n(La referencia local a esa empresa SÍ se limpió en este negocio.)' : ''),
+        502);
+    }
+
+    return ok(c, {
+      ok: true,
+      deleted_company_id: targetId,
+      cedula: targetCed || null,
+      env: client.env,
+      local_refs_cleared: cleaned,
+      message: `Empresa ${targetId} dada de baja en Alanube (${client.env}). `
+        + 'Ya podés usar «Crear empresa en Alanube» para registrarla con los datos de este negocio.',
+    });
+  } catch (err: any) {
+    const status = err instanceof AlanubeError ? err.status : 500;
+    return fail(c, err.message, status);
   }
 });
 
@@ -1436,7 +1624,7 @@ admin.put('/tenants/:id/alanube/company', async (c) => {
     if (dlErr || !file) return fail(c, `No se pudo leer el certificado del Storage: ${dlErr?.message ?? 'vacío'}`, 500);
     const p12Base64 = Buffer.from(await file.arrayBuffer()).toString('base64');
 
-    const client = alanube.forEnv(cfg.environment);
+    const client = alanube.forTenant(cfg);
     // Si el id no quedó guardado en la config, lo recuperamos de la cuenta de Alanube.
     let companyId = (isSandbox ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id;
     if (!companyId) {
@@ -1800,6 +1988,285 @@ admin.get('/tenants/:id/hacienda-activities', async (c) => {
 // GET /alanube/duplicate-companies — negocios que comparten el MISMO company_id de
 // Alanube. Eso NO debería pasar (una empresa por cuenta/token) y significa que un
 // alta pisó la de otro emisor: el que quedó sin su empresa emite con la cédula ajena.
+// GET /fe-wrong-emisor?tenant_id= — comprobantes cuya CLAVE de Hacienda NO
+// corresponde a la cédula configurada del negocio. Pasa cuando dos tenants
+// compartieron la misma empresa de Alanube: se emitió con la cédula del otro.
+// La clave (50 díg) lleva la cédula del emisor rellenada a 12 dígitos en las
+// posiciones 9..20 (506 + DDMMAA + cedula12 + consecutivo20 + situacion + seguridad8).
+admin.get('/fe-wrong-emisor', async (c) => {
+  if (!isAdminRole(c)) return fail(c, 'forbidden', 403);
+  try {
+    const tenantFilter = c.req.query('tenant_id') || null;
+
+    // Cédula configurada por tenant.
+    const { data: cfgRows } = await db.from('settings')
+      .select('tenant_id, config').eq('type', 'electronic-invoice');
+    const cedByTenant = new Map<string, string>();
+    for (const r of (cfgRows ?? []) as any[]) {
+      const ced = String(r.config?.emisor_identification ?? '').replace(/\D/g, '');
+      if (ced) cedByTenant.set(r.tenant_id, ced);
+    }
+    const { data: tenants } = await db.from('tenants').select('id, name');
+    const nameById = new Map<string, string>();
+    for (const t of (tenants ?? []) as any[]) nameById.set(t.id, t.name);
+
+    let q = db.from('invoices')
+      .select('id, tenant_id, invoice_number, fe_clave, fe_status, document_type, total, issued_at, customer_name')
+      .not('fe_clave', 'is', null)
+      .order('issued_at', { ascending: false })
+      .limit(2000);
+    if (tenantFilter) q = q.eq('tenant_id', tenantFilter);
+    const { data: invs, error } = await q;
+    if (error) throw new Error(error.message);
+
+    const wrong: any[] = [];
+    for (const inv of (invs ?? []) as any[]) {
+      const clave = String(inv.fe_clave ?? '').replace(/\D/g, '');
+      if (clave.length !== 50) continue;              // ids de Alanube (aún sin clave real)
+      const myCed = cedByTenant.get(inv.tenant_id);
+      if (!myCed) continue;                            // sin cédula configurada: nada que comparar
+      const claveCed = clave.slice(9, 21).replace(/^0+/, '');   // cédula del emisor en la clave
+      if (claveCed === myCed.replace(/^0+/, '')) continue;      // coincide → está bien
+      wrong.push({
+        invoice_id: inv.id,
+        tenant_id: inv.tenant_id,
+        business: nameById.get(inv.tenant_id) ?? '—',
+        invoice_number: inv.invoice_number,
+        document_type: inv.document_type,
+        fe_status: inv.fe_status,
+        total: inv.total,
+        issued_at: inv.issued_at,
+        customer_name: inv.customer_name,
+        clave: clave,
+        cedula_en_clave: claveCed,
+        cedula_configurada: myCed,
+        // Qué hacer con cada una.
+        accion: (inv.fe_status === 'rejected' || inv.fe_status === 'error')
+          ? 'RE-EMITIR: Hacienda la rechazó, no existe legalmente. Corregí los datos y usá «Re-emitir».'
+          : inv.fe_status === 'accepted'
+            ? 'ANULAR CON NOTA DE CRÉDITO desde el emisor de la clave y volver a emitirla desde este negocio.'
+            : 'EN PROCESO: esperá el estado final antes de tocarla.',
+      });
+    }
+
+    const byStatus: Record<string, number> = {};
+    for (const w of wrong) byStatus[String(w.fe_status ?? 'sent')] = (byStatus[String(w.fe_status ?? 'sent')] ?? 0) + 1;
+
+    return ok(c, {
+      total: wrong.length,
+      por_estado: byStatus,
+      invoices: wrong,
+      note: wrong.length === 0
+        ? 'Ninguna factura salió con una cédula distinta a la configurada.'
+        : 'Las RECHAZADAS se re-emiten sin más. Las ACEPTADAS ya existen en Hacienda a nombre de la cédula de la clave: hay que anularlas con nota de crédito DESDE ESE emisor y volver a emitirlas desde este.',
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// POST /fe-bulk-credit-notes — anula EN LOTE las facturas aceptadas que salieron
+// con la cédula equivocada (empresa de Alanube compartida). Emite una nota de
+// crédito por cada una.
+//
+// GUARD CLAVE: Hacienda exige que quien anula sea el MISMO emisor del documento
+// referenciado. Por eso solo se procesan facturas cuya clave lleve la cédula que el
+// tenant tiene configurada AHORA. Si ya reconfiguraste el negocio con otra cédula,
+// hay que volver a poner la anterior (con su certificado) para poder anular.
+//
+// body: { tenant_id, invoice_ids?: string[], confirm: "ANULAR", reason?, dry_run? }
+admin.post('/fe-bulk-credit-notes', async (c) => {
+  if (!isAdminRole(c)) return fail(c, 'forbidden', 403);
+  try {
+    const body = await c.req.json().catch(() => ({} as any));
+    const tenantId = String(body?.tenant_id ?? '').trim();
+    if (!tenantId) return fail(c, 'Falta tenant_id', 422);
+    const dryRun = body?.dry_run === true;
+    const reason = String(body?.reason ?? 'Anulación: comprobante emitido con datos de emisor incorrectos').slice(0, 180);
+
+    // La NC se emite con la configuración de FE de ESTE negocio, salvo que se
+    // indique `emisor_tenant_id`: el negocio que HOY tiene configurada la cédula
+    // con la que salieron esas facturas. Sirve cuando el negocio original ya se
+    // reconfiguró con otra cédula y la anterior vive en otro tenant.
+    const emisorTenantId = String(body?.emisor_tenant_id ?? '').trim() || tenantId;
+    const { data: cfgRow } = await db.from('settings').select('config')
+      .eq('tenant_id', emisorTenantId).eq('type', 'electronic-invoice').maybeSingle();
+    const myCed = String((cfgRow as any)?.config?.emisor_identification ?? '').replace(/\D/g, '').replace(/^0+/, '');
+    if (!myCed) return fail(c, `El negocio emisor (${emisorTenantId}) no tiene cédula del emisor configurada.`, 422);
+
+    // Candidatas: aceptadas, con clave real, sin nota de crédito previa.
+    let q = db.from('invoices')
+      .select('id, invoice_number, fe_clave, fe_status, fe_nc_clave, total, issued_at, customer_name')
+      .eq('tenant_id', tenantId).eq('fe_status', 'accepted')
+      .not('fe_clave', 'is', null).limit(2000);
+    if (Array.isArray(body?.invoice_ids) && body.invoice_ids.length) q = q.in('id', body.invoice_ids);
+    const { data: invs, error } = await q;
+    if (error) throw new Error(error.message);
+
+    const eligible: any[] = [];
+    const skipped: any[] = [];
+    for (const inv of (invs ?? []) as any[]) {
+      const clave = String(inv.fe_clave ?? '').replace(/\D/g, '');
+      const base = { invoice_id: inv.id, invoice_number: inv.invoice_number, total: inv.total, customer_name: inv.customer_name };
+      if (clave.length !== 50) { skipped.push({ ...base, motivo: 'Sin clave de Hacienda válida (50 díg).' }); continue; }
+      if (inv.fe_nc_clave)     { skipped.push({ ...base, motivo: 'Ya tiene nota de crédito.' }); continue; }
+      const claveCed = clave.slice(9, 21).replace(/^0+/, '');
+      if (claveCed !== myCed) {
+        skipped.push({ ...base, motivo: `La clave es del emisor ${claveCed}, pero el emisor usado para anular está configurado como ${myCed}. `
+          + 'Hacienda solo acepta la anulación desde el emisor original: pasá en emisor_tenant_id el negocio que hoy tiene la cédula '
+          + `${claveCed} (con su certificado y su cuenta de Alanube), o reconfigurala temporalmente acá.` });
+        continue;
+      }
+      eligible.push({ ...base, clave });
+    }
+
+    // dry_run o sin confirmar: se devuelve la previsualización SIN emitir nada.
+    if (dryRun || String(body?.confirm ?? '') !== 'ANULAR') {
+      return ok(c, {
+        dry_run: true,
+        emisor_tenant_id: emisorTenantId,
+        cedula_configurada: myCed,
+        elegibles: eligible.length, omitidas: skipped.length,
+        total_a_anular: eligible.reduce((s, e) => s + Number(e.total ?? 0), 0),
+        eligible, skipped,
+        note: 'Nada se emitió. Para ejecutar, repetí el llamado con confirm: "ANULAR". '
+          + 'Si las facturas salieron con una cédula que hoy está configurada en OTRO negocio, '
+          + 'pasá su id en emisor_tenant_id para emitir las NC desde ahí.',
+      });
+    }
+
+    const results: any[] = [];
+    for (const e of eligible) {
+      try {
+        // OJO: la NC se emite con la config del emisor, pero la factura vive en el
+        // tenant original. Si son distintos, se emite temporalmente "como" el emisor.
+        const res: any = await emitCreditNoteCore(c, emisorTenantId, e.invoice_id, reason);
+        // emitCreditNoteCore devuelve una Response de Hono: leemos su cuerpo.
+        const parsed = await res.clone().json().catch(() => null);
+        const okRes = !!parsed?.data && !parsed?.error;
+        results.push({ ...e, ok: okRes, nc_clave: parsed?.data?.nc_clave ?? null, error: parsed?.error ?? null });
+      } catch (err: any) {
+        results.push({ ...e, ok: false, error: err?.message ?? 'Error desconocido' });
+      }
+    }
+
+    const okCount = results.filter(r => r.ok).length;
+    return ok(c, {
+      dry_run: false,
+      anuladas: okCount,
+      fallidas: results.length - okCount,
+      omitidas: skipped.length,
+      results, skipped,
+      note: 'Las notas de crédito quedan en estado "sent" hasta que Hacienda las resuelva. '
+        + 'Revisá la bitácora FE en unos minutos y volvé a emitir esas ventas desde el emisor correcto.',
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// POST /fe-bulk-reemit — vuelve a emitir EN LOTE, ya con la configuración correcta
+// del negocio (cédula, certificado, cuenta de Alanube, actividad económica).
+// Toma consecutivo NUEVO: en Hacienda un número ya transmitido queda quemado.
+//
+// Solo son elegibles las que NO están vivas en Hacienda:
+//   · rechazadas / con error  → nunca existieron legalmente
+//   · anuladas con nota de crédito → ya se dieron de baja
+// Una factura ACEPTADA y SIN nota de crédito se OMITE: re-emitirla duplicaría la
+// venta ante Hacienda (quedarían dos comprobantes válidos por la misma operación).
+//
+// body: { tenant_id, invoice_ids?: string[], confirm: "EMITIR", dry_run? }
+admin.post('/fe-bulk-reemit', async (c) => {
+  if (!isAdminRole(c)) return fail(c, 'forbidden', 403);
+  try {
+    const body = await c.req.json().catch(() => ({} as any));
+    const tenantId = String(body?.tenant_id ?? '').trim();
+    if (!tenantId) return fail(c, 'Falta tenant_id', 422);
+    const dryRun = body?.dry_run === true;
+
+    const { data: cfgRow } = await db.from('settings').select('config')
+      .eq('tenant_id', tenantId).eq('type', 'electronic-invoice').maybeSingle();
+    const cfg: any = (cfgRow as any)?.config ?? {};
+    const myCed = String(cfg.emisor_identification ?? '').replace(/\D/g, '').replace(/^0+/, '');
+    if (!myCed) return fail(c, 'El negocio no tiene cédula del emisor configurada.', 422);
+    if (!cfg.enabled) return fail(c, 'La facturación electrónica no está activada para este negocio.', 409);
+
+    let q = db.from('invoices')
+      .select('id, invoice_number, fe_clave, fe_status, fe_nc_clave, fe_nc_status, total, issued_at, customer_name, document_type, notes, status')
+      .eq('tenant_id', tenantId).limit(2000);
+    if (Array.isArray(body?.invoice_ids) && body.invoice_ids.length) q = q.in('id', body.invoice_ids);
+    else q = q.not('fe_status', 'is', null);
+    const { data: invs, error } = await q;
+    if (error) throw new Error(error.message);
+
+    const eligible: any[] = [];
+    const skipped: any[] = [];
+    for (const inv of (invs ?? []) as any[]) {
+      const base = {
+        invoice_id: inv.id, invoice_number: inv.invoice_number,
+        total: inv.total, customer_name: inv.customer_name, fe_status: inv.fe_status,
+      };
+      if (inv.status === 'cancelled') { skipped.push({ ...base, motivo: 'La venta está anulada en el sistema.' }); continue; }
+      const rechazada = inv.fe_status === 'rejected' || inv.fe_status === 'error';
+      const anulada = !!inv.fe_nc_clave;
+      if (!rechazada && !anulada) {
+        skipped.push({ ...base, motivo: inv.fe_status === 'accepted'
+          ? 'ACEPTADA y sin nota de crédito: primero anulala (fe-bulk-credit-notes). Re-emitirla ahora duplicaría la venta ante Hacienda.'
+          : 'En proceso: esperá el estado final de Hacienda.' });
+        continue;
+      }
+      eligible.push({ ...base, clave_anterior: inv.fe_clave ?? null, nc_clave: inv.fe_nc_clave ?? null, notes: inv.notes ?? null });
+    }
+
+    if (dryRun || String(body?.confirm ?? '') !== 'EMITIR') {
+      return ok(c, {
+        dry_run: true,
+        cedula_configurada: myCed,
+        elegibles: eligible.length, omitidas: skipped.length,
+        total_a_emitir: eligible.reduce((s, e) => s + Number(e.total ?? 0), 0),
+        eligible, skipped,
+        note: 'Nada se emitió. Para ejecutar, repetí el llamado con confirm: "EMITIR". '
+          + 'Cada factura toma un consecutivo NUEVO y sale con la configuración actual del negocio.',
+      });
+    }
+
+    const results: any[] = [];
+    for (const e of eligible) {
+      try {
+        // Antes de limpiar el estado FE, dejamos RASTRO de lo anterior en las notas:
+        // sin esto se perdería a qué clave/NC correspondía esta venta.
+        const trail = `[Re-emitida ${new Date().toISOString().slice(0, 10)}]`
+          + (e.clave_anterior ? ` Clave anterior: ${e.clave_anterior}.` : '')
+          + (e.nc_clave ? ` Anulada con NC: ${e.nc_clave}.` : ' (rechazada, sin efecto fiscal).');
+        const notes = [e.notes, trail].filter(Boolean).join(' ').slice(0, 1000);
+        // La nota de crédito anterior pertenece a la clave vieja: el comprobante
+        // nuevo nace sin NC.
+        await db.from('invoices').update({ notes, fe_nc_clave: null, fe_nc_status: null })
+          .eq('id', e.invoice_id).eq('tenant_id', tenantId);
+
+        const res: any = await emitInvoiceCore(c, tenantId, e.invoice_id, { renumber: true });
+        const parsed = await res.clone().json().catch(() => null);
+        const okRes = !!parsed?.data && !parsed?.error;
+        results.push({
+          ...e, ok: okRes,
+          nueva_clave: parsed?.data?.clave ?? parsed?.data?.fe_clave ?? null,
+          nuevo_numero: parsed?.data?.invoice_number ?? null,
+          error: parsed?.error ?? null,
+        });
+      } catch (err: any) {
+        results.push({ ...e, ok: false, error: err?.message ?? 'Error desconocido' });
+      }
+    }
+
+    const okCount = results.filter(r => r.ok).length;
+    return ok(c, {
+      dry_run: false,
+      emitidas: okCount,
+      fallidas: results.length - okCount,
+      omitidas: skipped.length,
+      results, skipped,
+      note: 'Quedan en estado "sent" hasta que Hacienda las resuelva; revisá la bitácora FE en unos minutos. '
+        + 'La clave anterior y la nota de crédito quedaron registradas en las notas de cada factura.',
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 admin.get('/alanube/duplicate-companies', async (c) => {
   if (!isAdminRole(c)) return fail(c, 'forbidden', 403);
   try {
@@ -2083,6 +2550,22 @@ admin.get('/alanube/reports/emissions', async (c) => {
     const legalStatus = c.req.query('legalStatus') || undefined;   // ACCEPTED/REJECTED
     const status = c.req.query('status') || undefined;
     const client = alanube.forEnv(env);
+    // Los reportes son POR CUENTA (token). Desde que un negocio puede tener su
+    // propia cuenta de Alanube, consultar solo el token global dejaba fuera a esos
+    // emisores y el reporte salía "sin emisiones".
+    const extraTokens: Array<{ token: string; tenants: string[] }> = [];
+    try {
+      const { data: feRows } = await db.from('settings')
+        .select('tenant_id, config').eq('type', 'electronic-invoice');
+      const byToken = new Map<string, string[]>();
+      for (const row of (feRows ?? []) as any[]) {
+        const tok = tenantAlanubeToken(row.config ?? {}, env as any);
+        if (!tok) continue;
+        byToken.set(tok, [...(byToken.get(tok) ?? []), row.tenant_id]);
+      }
+      for (const [token, tenants] of byToken) extraTokens.push({ token, tenants });
+    } catch (e: any) { console.warn('[alanube reports] tokens propios:', e?.message); }
+
     const [perCompany, byUser] = await Promise.allSettled([
       client.reportEmissionsPerCompany(from, until, { legalStatus, status }),
       client.reportEmissionsByUser(from, until, legalStatus || 'ACCEPTED'),
@@ -2127,6 +2610,27 @@ admin.get('/alanube/reports/emissions', async (c) => {
         perC.push(...zeros);
       } catch { /* si falla la fusión, devolvemos solo las que trajo Alanube */ }
     }
+    // Agregar lo que reporten las cuentas PROPIAS de cada negocio.
+    const extraDiag: any[] = [];
+    for (const { token, tenants } of extraTokens) {
+      try {
+        const own = alanube.forEnv(env, token);
+        const r: any = await own.reportEmissionsPerCompany(from, until, { legalStatus, status });
+        const rows = r?.data ?? r ?? [];
+        if (Array.isArray(rows) && Array.isArray(perC)) {
+          const present = new Set(perC.map((x: any) => String(x.idCompany ?? x.id ?? '')));
+          for (const row of rows) {
+            const id = String(row.idCompany ?? row.id ?? '');
+            if (id && present.has(id)) continue;
+            perC.push({ ...row, _ownAccount: true });
+          }
+        }
+        extraDiag.push({ tenants, ok: true, rows: Array.isArray(rows) ? rows.length : 0 });
+      } catch (e: any) {
+        extraDiag.push({ tenants, ok: false, error: e?.message ?? 'error' });
+      }
+    }
+
     // Modo diagnóstico: devuelve la respuesta CRUDA de Alanube (tal cual, sin
     // desenvolver) para ver los nombres reales de los campos y corregir el mapeo.
     const debug = c.req.query('debug') === '1';
@@ -2138,6 +2642,25 @@ admin.get('/alanube/reports/emissions', async (c) => {
       // Bandera para que el frontend sepa que el token trae datos aunque un reporte
       // esté vacío/forbidden.
       has_data: (Array.isArray(perC) && perC.length > 0) || (Array.isArray(byU) && byU.length > 0),
+      // Motivo REAL cuando no hay filas: sin esto un 403 (el plan de Alanube no
+      // habilita el reporte) o un token inválido se veían igual que "no hubo ventas".
+      diagnostico: (() => {
+        const why = (r: PromiseSettledResult<any>) => {
+          if (r.status === 'fulfilled') return null;
+          const msg = r.reason instanceof Error ? r.reason.message : String(r.reason);
+          const st = r.reason instanceof AlanubeError ? r.reason.status : 0;
+          if (st === 403 || /forbidden/i.test(msg)) return `Alanube respondió 403: la cuenta/plan no habilita este reporte (${msg})`;
+          if (st === 404 || /no data|not found|rpt\d+/i.test(msg)) return 'Alanube respondió "sin datos" para el rango consultado';
+          if (/invalid credentials|unauthorized|token/i.test(msg)) return `Token de Alanube inválido para ${env}: ${msg}`;
+          return msg;
+        };
+        return {
+          per_company: why(perCompany),
+          by_user: why(byUser),
+          cuentas_propias: extraDiag,
+          token_global: !!(env === 'production' ? process.env.ALANUBE_API_TOKEN_PRODUCTION : process.env.ALANUBE_API_TOKEN_SANDBOX),
+        };
+      })(),
       ...(debug ? { raw: { per_company: rawOf(perCompany), by_user: rawOf(byUser) } } : {}),
     });
   } catch (err: any) {
@@ -2150,9 +2673,24 @@ admin.get('/alanube/reports/emissions', async (c) => {
 // (para el botón de reintento en la bitácora). Resuelve el tenant de la factura.
 admin.post('/fe-refresh/:id', async (c) => {
   try {
-    const { id } = c.req.param();
-    const { data: inv } = await db.from('invoices').select('tenant_id').eq('id', id).maybeSingle();
+    const raw = c.req.param('id');
+    // Las notas de crédito/débito se muestran en la bitácora como filas SINTÉTICAS
+    // con id "<uuid-de-la-factura>-nc" (o "-nd"): no existen como fila propia en
+    // `invoices`. Sin esto el reintento respondía "Factura no encontrada".
+    const noteKind = /-nc$/.test(raw) ? 'nc' : /-nd$/.test(raw) ? 'nd' : null;
+    const id = noteKind ? raw.replace(/-(nc|nd)$/, '') : raw;
+
+    const { data: inv } = await db.from('invoices')
+      .select('tenant_id, fe_nc_clave, fe_nc_status, fe_nd_clave, fe_nd_status').eq('id', id).maybeSingle();
     if (!inv) return fail(c, 'Factura no encontrada', 404);
+
+    // Al refrescar una NOTA se consulta el estado de la NOTA (por su propia clave),
+    // no el de la factura: son documentos distintos ante Hacienda.
+    if (noteKind) {
+      const r = await refreshNoteStatus((inv as any).tenant_id, id, noteKind);
+      return ok(c, r);
+    }
+
     const r = await refreshInvoiceStatus((inv as any).tenant_id, id);
     return ok(c, r);
   } catch (err: any) { return fail(c, err.message, 500); }
@@ -2161,6 +2699,84 @@ admin.post('/fe-refresh/:id', async (c) => {
 // POST /fe-reemit/:id — RE-EMITE (solo admin) la misma factura corrigiendo el
 // consecutivo: reasigna el número respetando el consecutivo configurado en Datos de
 // FE y limpia el estado FE previo, luego la vuelve a enviar a Hacienda/Alanube.
+// POST /fe-credit-note/:id — emite la NOTA DE CRÉDITO de anulación de una factura
+// desde la bitácora (solo admin). Resuelve el tenant por la factura.
+// body: { reason?, emisor_tenant_id? }  — emisor_tenant_id: el negocio que HOY tiene
+// configurada la cédula con la que salió la factura (cuando no es el mismo).
+admin.post('/fe-credit-note/:id', async (c) => {
+  if (!isAdminRole(c)) return fail(c, 'forbidden', 403);
+  try {
+    const id = c.req.param('id').replace(/-(nc|nd)$/, '');
+    const body = await c.req.json().catch(() => ({} as any));
+    const { data: inv } = await db.from('invoices')
+      .select('tenant_id, fe_clave, fe_status, fe_nc_clave').eq('id', id).maybeSingle();
+    if (!inv) return fail(c, 'Factura no encontrada', 404);
+    if ((inv as any).fe_nc_clave) return fail(c, 'Esta factura ya tiene una nota de crédito.', 409);
+    if (!(inv as any).fe_clave) return fail(c, 'La factura no fue emitida electrónicamente.', 422);
+
+    const emisorTenantId = String(body?.emisor_tenant_id ?? '').trim() || (inv as any).tenant_id;
+
+    // Hacienda solo acepta la anulación desde el MISMO emisor del documento: se
+    // valida la cédula de la clave contra la configurada antes de emitir.
+    const { data: cfgRow } = await db.from('settings').select('config')
+      .eq('tenant_id', emisorTenantId).eq('type', 'electronic-invoice').maybeSingle();
+    const cfgNc: any = (cfgRow as any)?.config ?? {};
+    const companyIdOverride = String(body?.company_id ?? '').trim() || null;
+
+    // Con qué cédula va a salir REALMENTE la nota. Manda la de la EMPRESA de
+    // Alanube que se va a usar (es la que aporta el certificado y la identidad),
+    // no el campo de Datos de FE: al recrear una empresa esos dos quedan
+    // desincronizados y el guard bloqueaba de más.
+    let emisorCed = String(cfgNc.emisor_identification ?? '').replace(/\D/g, '').replace(/^0+/, '');
+    let cedFuente = 'la configuración de Datos de FE';
+    const companyToCheck = companyIdOverride
+      ?? (String(cfgNc.environment ?? 'production') === 'sandbox'
+        ? cfgNc.alanube_company_id_sandbox : cfgNc.alanube_company_id_production)
+      ?? cfgNc.alanube_company_id;
+    if (companyToCheck && cfgNc.fe_provider === 'alanube') {
+      try {
+        const co: any = await alanube.forTenant(cfgNc).getCompany(String(companyToCheck));
+        const ced = companyCedula(co?.company ?? co).replace(/^0+/, '');
+        if (ced) { emisorCed = ced; cedFuente = `la empresa ${companyToCheck} en Alanube`; }
+      } catch (e: any) { console.warn('[fe-credit-note] no se pudo leer la empresa:', e?.message); }
+    }
+
+    const clave = String((inv as any).fe_clave ?? '').replace(/\D/g, '');
+    if (clave.length === 50 && emisorCed) {
+      const claveCed = clave.slice(9, 21).replace(/^0+/, '');
+      if (claveCed !== emisorCed) {
+        return fail(c,
+          `Esta factura salió con la cédula ${claveCed}, pero la nota saldría con ${emisorCed} `
+          + `(según ${cedFuente}).\n\n`
+          + 'Hacienda solo acepta la nota de crédito desde el emisor que emitió el documento.\n\n'
+          + `Necesitás una empresa en Alanube registrada con la cédula ${claveCed} y su certificado, `
+          + 'y usar su ID acá. Si la recreaste con otro contribuyente, esa empresa ya no sirve para anular '
+          + 'este comprobante.', 422);
+      }
+    }
+
+    // Si vino un `company_id`, SE GUARDA en la config del ambiente para no tener
+    // que repetirlo en las próximas notas.
+    if (companyIdOverride) {
+      try {
+        const cfg: any = { ...((cfgRow as any)?.config ?? {}) };
+        const key = String(cfg.environment ?? 'production') === 'sandbox'
+          ? 'alanube_company_id_sandbox' : 'alanube_company_id_production';
+        if (cfg[key] !== companyIdOverride) {
+          cfg[key] = companyIdOverride;
+          cfg.alanube_company_id = companyIdOverride;
+          await db.from('settings').upsert({
+            tenant_id: emisorTenantId, type: 'electronic-invoice', config: cfg,
+            updated_at: new Date().toISOString(),
+          }, { onConflict: 'tenant_id,type' });
+        }
+      } catch (e: any) { console.warn('[fe-credit-note] guardar company_id:', e?.message); }
+    }
+
+    return await emitCreditNoteCore(c, emisorTenantId, id, body?.reason, { companyIdOverride });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 admin.post('/fe-reemit/:id', async (c) => {
   if (!isAdminRole(c)) return fail(c, 'forbidden', 403);
   try {
@@ -2221,14 +2837,44 @@ admin.get('/fe-log', async (c) => {
       const { data: ts } = await db.from('tenants').select('id, name').in('id', tenantIds);
       for (const t of (ts ?? []) as any[]) nameById.set(t.id, t.name);
     }
+    // Cédula del emisor CONFIGURADA hoy en cada negocio (para comparar contra la
+    // que quedó grabada en la clave de cada comprobante).
+    const cedByTenant = new Map<string, string>();
+    if (tenantIds.length) {
+      const { data: cfgs } = await db.from('settings')
+        .select('tenant_id, config').eq('type', 'electronic-invoice').in('tenant_id', tenantIds);
+      for (const cr of (cfgs ?? []) as any[]) {
+        const ced = String(cr.config?.emisor_identification ?? '').replace(/\D/g, '').replace(/^0+/, '');
+        if (ced) cedByTenant.set(cr.tenant_id, ced);
+      }
+    }
+    /** Cédula del emisor grabada en la clave de Hacienda (posiciones 9..20). */
+    const emisorDeClave = (clave: any): string | null => {
+      const d = String(clave ?? '').replace(/\D/g, '');
+      if (d.length !== 50) return null;
+      return d.slice(9, 21).replace(/^0+/, '') || null;
+    };
+
     // Expandir: cada factura + (si tiene) su NOTA DE CRÉDITO y su NOTA DE DÉBITO
     // como filas propias en la bitácora (las notas se guardan en la misma factura).
     const out: any[] = [];
     for (const r of rows) {
       const business_name = nameById.get(r.tenant_id) ?? '—';
-      out.push({ ...r, business_name });
+      const cedConfig = cedByTenant.get(r.tenant_id) ?? null;
+      const cedClave = emisorDeClave(r.fe_clave);
+      out.push({
+        ...r, business_name,
+        // Con qué cédula salió REALMENTE el comprobante, y si difiere de la que el
+        // negocio tiene configurada hoy (empresa de Alanube compartida/recreada).
+        emisor_cedula: cedClave,
+        emisor_config: cedConfig,
+        emisor_mismatch: !!(cedClave && cedConfig && cedClave !== cedConfig),
+      });
       if (r.fe_nc_clave) {
         out.push({
+          emisor_cedula: emisorDeClave(r.fe_nc_clave),
+          emisor_config: cedConfig,
+          emisor_mismatch: !!(emisorDeClave(r.fe_nc_clave) && cedConfig && emisorDeClave(r.fe_nc_clave) !== cedConfig),
           id: `${r.id}-nc`, tenant_id: r.tenant_id, business_name,
           invoice_number: r.invoice_number, parent_invoice_number: r.invoice_number,
           customer_name: r.customer_name, total: r.total,
@@ -2240,6 +2886,9 @@ admin.get('/fe-log', async (c) => {
       }
       if (r.fe_nd_clave) {
         out.push({
+          emisor_cedula: emisorDeClave(r.fe_nd_clave),
+          emisor_config: cedConfig,
+          emisor_mismatch: !!(emisorDeClave(r.fe_nd_clave) && cedConfig && emisorDeClave(r.fe_nd_clave) !== cedConfig),
           id: `${r.id}-nd`, tenant_id: r.tenant_id, business_name,
           invoice_number: r.invoice_number, parent_invoice_number: r.invoice_number,
           customer_name: r.customer_name, total: r.total,
