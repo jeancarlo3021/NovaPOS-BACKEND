@@ -58,7 +58,22 @@ products.get('/', async (c) => {
     if (res.error && /deleted_at/.test(res.error.message ?? '')) res = await fetchAll(false);
     if (res.error) throw new Error(res.error.message);
 
-    return ok(c, res.data);
+    // Unidad de medida de cada producto. Se resuelve con UNA consulta a una tabla
+    // chica en vez de un embed de PostgREST: así el listado no depende del nombre
+    // de la FK, y si algo falla el catálogo igual se muestra (sin la unidad).
+    const rows = res.data ?? [];
+    try {
+      const unitIds = Array.from(new Set(rows.map(r => r.unit_type_id).filter(Boolean)));
+      if (unitIds.length) {
+        const { data: units } = await db.from('unit_types')
+          .select('id, name, abbreviation, requires_weight')
+          .eq('tenant_id', tenantId).in('id', unitIds);
+        const byId = new Map((units ?? []).map((u: any) => [u.id, u]));
+        for (const r of rows) r.unit_type = r.unit_type_id ? byId.get(r.unit_type_id) ?? null : null;
+      }
+    } catch (e: any) { console.warn('[products] unit_types lookup:', e?.message); }
+
+    return ok(c, rows);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
@@ -69,6 +84,12 @@ products.get('/:id', async (c) => {
     const { data, error } = await db.from('products').select('*').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
     if (error) throw new Error(error.message);
     if (!data) return fail(c, 'Producto no encontrado', 404);
+    if ((data as any).unit_type_id) {
+      const { data: u } = await db.from('unit_types')
+        .select('id, name, abbreviation, requires_weight')
+        .eq('id', (data as any).unit_type_id).maybeSingle();
+      (data as any).unit_type = u ?? null;
+    }
     return ok(c, data);
   } catch (err: any) { return fail(c, err.message, 500); }
 });

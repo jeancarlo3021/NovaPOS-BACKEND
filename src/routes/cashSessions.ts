@@ -176,4 +176,42 @@ cashSessions.post('/:id/movements', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+/**
+ * PUT /movements/:id — completar los datos de una entrada o salida.
+ *
+ * En la caja la gente registra el movimiento a la carrera y el motivo, el
+ * proveedor o el número de factura quedan en blanco; después, al cuadrar el mes,
+ * no hay forma de saber qué fue. Esto deja arreglarlo desde el reporte.
+ *
+ * El MONTO y el TIPO no se tocan: cambiarlos descuadraría un arqueo ya cerrado.
+ * Acá solo se completa la descripción y la referencia.
+ */
+cashSessions.put('/movements/:id', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { id } = c.req.param();
+    const body = await c.req.json().catch(() => ({} as any));
+
+    // El movimiento no guarda tenant_id: se valida a través de su sesión.
+    const { data: mov } = await db.from('cash_movements')
+      .select('id, cash_session_id, type').eq('id', id).maybeSingle();
+    if (!mov) return fail(c, 'Movimiento no encontrado', 404);
+    const { data: sess } = await db.from('cash_sessions')
+      .select('id, tenant_id').eq('id', (mov as any).cash_session_id).maybeSingle();
+    if (!sess || (sess as any).tenant_id !== tenantId) {
+      return fail(c, 'Movimiento no encontrado', 404);
+    }
+
+    const patch: Record<string, any> = {};
+    if (body.description !== undefined) patch.description = String(body.description ?? '');
+    if (body.reference_id !== undefined) patch.reference_id = body.reference_id || null;
+    if (Object.keys(patch).length === 0) return fail(c, 'Nada que actualizar', 422);
+
+    const { data, error } = await db.from('cash_movements')
+      .update(patch).eq('id', id).select().single();
+    if (error) throw new Error(error.message);
+    return ok(c, data);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 export default cashSessions;

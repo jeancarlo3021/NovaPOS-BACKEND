@@ -72,6 +72,16 @@ export const AddClientSchema = z.object({
     atv_password:           z.string().optional().nullable(),
     environment:            z.enum(['sandbox', 'production']).optional(),
   }).optional(),
+  /**
+   * Último consecutivo YA emitido por el cliente en su sistema anterior.
+   * Se guarda como "próximo = último + 1" para que la numeración siga donde
+   * quedó: empezar de 1 con Hacienda ya devuelve -99 (consecutivo duplicado).
+   */
+  consecutivos: z.object({
+    factura: z.number().int().nonnegative().optional().nullable(),
+    tiquete: z.number().int().nonnegative().optional().nullable(),
+    nota_credito: z.number().int().nonnegative().optional().nullable(),
+  }).optional(),
   // ── Acceso del cliente a su portal ──
   access: z.object({
     username:  z.string().min(3),
@@ -480,7 +490,7 @@ export async function createGroupClient(
   let createdAuthId: string | null = null;
   let createdTenantId: string | null = null;
   try {
-    const { name, plan_id, fe_plan_id, hacienda, access } = input;
+    const { name, plan_id, fe_plan_id, hacienda, consecutivos, access } = input;
 
     // El usuario del cliente se valida ANTES de crear el negocio: si el nombre
     // ya está tomado, es mejor no dejar un tenant a medio hacer.
@@ -583,7 +593,26 @@ export async function createGroupClient(
       if (sErr) console.warn('[clients] settings FE:', sErr.message);
     }
 
-    // 5) El usuario del cliente
+    // 5) Consecutivos de arranque. Van en el mismo settings de FE, sin depender
+    //    de que se hayan cargado los datos del emisor.
+    if (consecutivos && Object.values(consecutivos).some(v => Number(v) > 0)) {
+      const { data: prev } = await db.from('settings').select('config')
+        .eq('tenant_id', tenantId).eq('type', 'electronic-invoice').maybeSingle();
+      const cfg: Record<string, any> = { ...((prev as any)?.config ?? {}) };
+      const setNext = (key: string, last: any) => {
+        const n = Number(last);
+        if (Number.isFinite(n) && n > 0) cfg[key] = String(n + 1);
+      };
+      setNext('consecutivo_factura', consecutivos.factura);
+      setNext('consecutivo_tiquete', consecutivos.tiquete);
+      setNext('consecutivo_nc', consecutivos.nota_credito);
+      await db.from('settings').upsert({
+        tenant_id: tenantId, type: 'electronic-invoice', config: cfg,
+        updated_at: new Date().toISOString(),
+      }, { onConflict: 'tenant_id,type' });
+    }
+
+    // 6) El usuario del cliente
     if (access && email) {
       const { data: authData, error: authError } = await db.auth.admin.createUser({
         email, password: access.password, email_confirm: true,

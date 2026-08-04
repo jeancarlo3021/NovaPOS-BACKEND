@@ -437,8 +437,15 @@ accountant.put('/clients/:id/fe-config', async (c) => {
     const body = await c.req.json().catch(() => ({} as any));
     const fe = body?.fe ?? body;
 
-    // Campos que el contador NO puede tocar: son comerciales, no fiscales.
-    const BLOCKED = ['fe_included_docs', 'fe_extra_fee', 'fe_quota_start', 'fe_plan_id'];
+    // Campos que el contador NO puede tocar. Los primeros son comerciales (los
+    // define quien vende el plan). Los del certificado son de TRIBU: la llave
+    // criptográfica y su PIN los carga el administrador, no el contador.
+    const BLOCKED = [
+      'fe_included_docs', 'fe_extra_fee', 'fe_quota_start', 'fe_plan_id',
+      'certificate', 'certificate_production', 'certificate_sandbox',
+      'p12_password', 'p12_password_production', 'p12_password_sandbox',
+      'hacienda_pin', 'hacienda_pin_production', 'hacienda_pin_sandbox',
+    ];
     const clean: Record<string, any> = {};
     for (const [k, v] of Object.entries(fe ?? {})) {
       if (!BLOCKED.includes(k)) clean[k] = v;
@@ -470,6 +477,15 @@ accountant.post('/clients/:id/certificate', async (c) => {
     const userId = c.get('userId');
     const id = c.req.param('id');
     if (!(await assertClient(userId, id))) return fail(c, 'Ese negocio no está en tu cartera', 403);
+
+    // La llave criptográfica de TRIBU la carga el ADMINISTRADOR, no el contador:
+    // es el archivo con el que se firma a nombre del contribuyente y no debe
+    // pasar por más manos de las necesarias. Se bloquea acá y no solo en la
+    // pantalla, para que ocultar el botón no sea toda la protección.
+    const { data: me } = await db.from('users').select('role').eq('id', userId).maybeSingle();
+    if ((me as any)?.role === 'contador') {
+      return fail(c, 'La llave criptográfica (.p12) la carga el administrador.', 403);
+    }
     const body = await c.req.json().catch(() => ({} as any));
     const { file_base64, filename, p12_password } = body ?? {};
     if (!file_base64) return fail(c, 'Falta el archivo del certificado (.p12)', 422);
