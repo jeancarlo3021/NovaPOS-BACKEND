@@ -435,6 +435,17 @@ export async function bumpConsecutivoOnDuplicate(
   }
 }
 
+/** Terminal (caja) del EQUIPO que está facturando.
+ *  Viene en el header `x-terminal`; si no, la configurada del tenant. Es lo que
+ *  permite que dos computadoras facturen a la vez sin repetir consecutivo: el
+ *  consecutivo de Hacienda lleva la terminal adentro. */
+function terminalOf(c: any, cfg: any): string {
+  const raw = String(c?.req?.header?.('x-terminal') ?? '').replace(/\D/g, '');
+  const n = parseInt(raw, 10);
+  if (Number.isFinite(n) && n >= 1 && n <= 99999) return String(n);
+  return String(cfg?.terminal ?? '1');
+}
+
 /** company_id de Alanube del tenant según el ambiente. Necesario para consultar
  *  documentos de empresas 'associated' (?idCompany=). */
 function feCompanyId(cfg: any): string | undefined {
@@ -807,7 +818,7 @@ export async function emitInvoiceCore(
       const kind = tipoDoc === '01' ? 'invoice' : 'ticket';
       const doc = buildAlanubeDocument(emisor, inv as any, lines, receptor, {
         tipoDoc,
-        headquarters: cfg.sucursal, terminal: cfg.terminal,
+        headquarters: cfg.sucursal, terminal: terminalOf(c, cfg),
         numberOfDocument: (inv as any).invoice_number,
         // Empresa emisora en Alanube según el ambiente (para que emita el tenant y
         // no la 'main' de la cuenta). Sin id, Alanube usa la main por defecto.
@@ -854,7 +865,7 @@ export async function emitInvoiceCore(
 
     // ── Proveedor FACTUREMOS (flujo existente) ────────────────────────────────
     const consecutivo = buildConsecutivo(inv as any, {
-      sucursal: cfg.sucursal, terminal: cfg.terminal, situacion: '1', tipoComprobante: tipoDoc,
+      sucursal: cfg.sucursal, terminal: terminalOf(c, cfg), situacion: '1', tipoComprobante: tipoDoc,
     });
     const facturaJson = buildDocumentoJson(emisor, inv as any, lines, receptor, { tipoComprobante: tipoDoc });
 
@@ -991,7 +1002,7 @@ export async function emitCreditNoteCore(
     if (provider === 'alanube') {
       const doc = buildAlanubeDocument(emisor, inv as any, lines, receptor, {
         tipoDoc: '03',
-        headquarters: cfg.sucursal, terminal: cfg.terminal,
+        headquarters: cfg.sucursal, terminal: terminalOf(c, cfg),
         numberOfDocument: (inv as any).invoice_number,
         // Empresa emisora en Alanube según el ambiente (para que emita el tenant y
         // no la 'main' de la cuenta). Sin id, Alanube usa la main por defecto.
@@ -1031,7 +1042,7 @@ export async function emitCreditNoteCore(
 
     // Consecutivo de NC (TipoComprobante 03) y referencia al documento original.
     const consecutivo = buildConsecutivo(inv as any, {
-      sucursal: cfg.sucursal, terminal: cfg.terminal, situacion: '1', tipoComprobante: '03',
+      sucursal: cfg.sucursal, terminal: terminalOf(c, cfg), situacion: '1', tipoComprobante: '03',
     });
     // La NC se emite HOY (no con la fecha del original).
     const nowMs = Date.now();
@@ -1137,7 +1148,7 @@ hacienda.post('/debit-note', async (c) => {
     if (provider === 'alanube') {
       const doc = buildAlanubeDocument(emisor, inv as any, lines, receptor, {
         tipoDoc: '02',
-        headquarters: cfg.sucursal, terminal: cfg.terminal,
+        headquarters: cfg.sucursal, terminal: terminalOf(c, cfg),
         numberOfDocument: (inv as any).invoice_number,
         // Empresa emisora en Alanube según el ambiente (para que emita el tenant y
         // no la 'main' de la cuenta). Sin id, Alanube usa la main por defecto.
@@ -1168,7 +1179,7 @@ hacienda.post('/debit-note', async (c) => {
 
     // ── Proveedor FACTUREMOS ──────────────────────────────────────────────────
     const consecutivo = buildConsecutivo(inv as any, {
-      sucursal: cfg.sucursal, terminal: cfg.terminal, situacion: '1', tipoComprobante: '02',
+      sucursal: cfg.sucursal, terminal: terminalOf(c, cfg), situacion: '1', tipoComprobante: '02',
     });
     const nowMs = Date.now();
     const ndInv = { ...(inv as any), issued_at: new Date(nowMs).toISOString() };
@@ -1854,22 +1865,47 @@ async function toB64(v: any): Promise<string | null> {
   return s.startsWith('<') ? Buffer.from(s, 'utf8').toString('base64') : s;
 }
 
+/**
+ * Baja de Alanube el XML firmado y el XML de respuesta de Hacienda.
+ *
+ * Dos detalles que hacían que llegara solo el PDF:
+ *  · `idCompany` es OBLIGATORIO para las empresas 'associated'. Sin él, Alanube
+ *    contesta "document not found" y el XML se perdía en silencio — el PDF sí
+ *    llegaba porque su endpoint siempre lo mandaba.
+ *  · el separador de `documents` no es el mismo en todas las cuentas, así que se
+ *    prueban las dos formas antes de darse por vencido.
+ */
+export async function alanubeXmlFiles(
+  cfg: any, docId: string, kind: any, companyId?: string | null,
+): Promise<{ xml: string | null; xmlHacienda: string | null }> {
+  const client = alanube.forTenant(cfg);
+  for (const documents of ['xml,xmlHacienda', 'xml-xmlHacienda']) {
+    try {
+      const resp: any = await client.getDocument(String(docId), {
+        kind, documents, companyId: companyId ? String(companyId) : undefined,
+      });
+      const d = resp?.invoice ?? resp?.ticket ?? resp?.creditNote ?? resp?.debitNote
+        ?? resp?.document ?? resp?.data ?? resp;
+      const xml = await toB64(d?.xml ?? deepFind(resp, /^xml$/i, 8_000_000));
+      const xmlHacienda = await toB64(
+        d?.xmlHacienda ?? d?.xmlResponse ?? deepFind(resp, /xml_?hacienda|xmlresponse/i, 8_000_000));
+      if (xml || xmlHacienda) return { xml, xmlHacienda };
+    } catch (e: any) { console.warn(`[FE xml] ${documents}:`, e?.message); }
+  }
+  return { xml: null, xmlHacienda: null };
+}
+
 async function alanubeAttachments(cfg: any, docId: string | null | undefined, kind: any, clave: string, companyId?: string | null): Promise<Array<{ filename: string; content: string }>> {
   const out: Array<{ filename: string; content: string }> = [];
   if (!docId) return out;
   const client = alanube.forTenant(cfg);
   const base = String(clave || docId);
 
-  // 1) XML original + XML de respuesta de Hacienda. CRI los devuelve como URL en
-  //    los campos xml / xmlHacienda (separador de guiones). Hay que descargarlos.
-  try {
-    const resp: any = await client.getDocument(String(docId), { kind, documents: 'xml-xmlHacienda' });
-    const d = resp?.invoice ?? resp?.ticket ?? resp?.creditNote ?? resp?.debitNote ?? resp?.document ?? resp?.data ?? resp;
-    const xml = await toB64(d?.xml ?? deepFind(resp, /^xml$/i, 8_000_000));
-    const xmlHac = await toB64(d?.xmlHacienda ?? deepFind(resp, /xmlhacienda/i, 8_000_000));
-    if (xml) out.push({ filename: `${base}.xml`, content: xml });
-    if (xmlHac) out.push({ filename: `${base}-respuesta-hacienda.xml`, content: xmlHac });
-  } catch (e: any) { console.warn('[FE email] XML no disponible:', e?.message); }
+  // 1) XML firmado + XML de respuesta de Hacienda. Son los que valen ante
+  //    Hacienda: el PDF es solo la representación gráfica.
+  const { xml, xmlHacienda } = await alanubeXmlFiles(cfg, String(docId), kind, companyId);
+  if (xml) out.push({ filename: `${base}.xml`, content: xml });
+  if (xmlHacienda) out.push({ filename: `${base}-respuesta-hacienda.xml`, content: xmlHacienda });
 
   // 2) PDF por el endpoint dedicado (base64). Requiere idCompany.
   try {
@@ -1898,12 +1934,18 @@ async function sendComprobanteEmail(to: string, i: {
       <p><b>Clave:</b> ${i.fe_clave}</p>
       <p><b>Total:</b> ₡${Number(i.total ?? 0).toLocaleString('es-CR')}</p>
     </div>`;
-  // Adjuntos: los pasados (Alanube) o, si no hay, el fe_xml guardado.
-  let atts = attachments && attachments.length ? attachments : undefined;
-  if (!atts && i.fe_xml) {
-    atts = [{ filename: `${i.fe_clave}.xml`, content: Buffer.from(String(i.fe_xml), 'utf8').toString('base64') }];
+  // Adjuntos de Alanube. Si el XML no vino (o el proveedor no es Alanube), se
+  // adjunta el `fe_xml` guardado: al cliente le sirve igual y es el que Hacienda
+  // reconoce. Un correo con solo el PDF no es un comprobante entregado.
+  const atts = [...(attachments ?? [])];
+  const hasXml = atts.some(a => a.filename.toLowerCase().endsWith('.xml'));
+  if (!hasXml && i.fe_xml) {
+    atts.push({
+      filename: `${i.fe_clave}.xml`,
+      content: Buffer.from(String(i.fe_xml), 'utf8').toString('base64'),
+    });
   }
-  await sendEmail({ to, subject: `Comprobante electrónico ${i.invoice_number}`, html, attachments: atts });
+  await sendEmail({ to, subject: `Comprobante electrónico ${i.invoice_number}`, html, attachments: atts.length ? atts : undefined });
 }
 
 // Envía AUTOMÁTICAMENTE el comprobante COMPLETO (XML + respuesta de Hacienda +
@@ -1953,6 +1995,51 @@ hacienda.post('/resend-email', async (c) => {
     // Marca que el comprobante ya se envió por correo (para el check en la bitácora).
     await db.from('invoices').update({ fe_emailed: true }).eq('id', invoice_id).eq('tenant_id', tenantId).then(() => {}, () => {});
     return ok(c, { ok: true, attachments: attachments?.length ?? 0 });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// GET /fe-xml/:id — XML firmado y respuesta de Hacienda, en base64, para
+// descargarlos desde la bitácora. El XML es el comprobante de verdad: el
+// contribuyente tiene que poder guardarlo, no solo ver el PDF.
+hacienda.get('/fe-xml/:id', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { id } = c.req.param();
+    const { data: inv } = await db.from('invoices')
+      .select('fe_consecutivo, fe_clave, fe_xml, document_type')
+      .eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+    if (!inv) return fail(c, 'Factura no encontrada', 404);
+    const i = inv as any;
+    const base = String(i.fe_clave || id);
+
+    const cfg = await loadFEConfig(tenantId);
+    let xml: string | null = null;
+    let xmlHacienda: string | null = null;
+
+    if (cfg.fe_provider === 'alanube' && i.fe_consecutivo) {
+      const companyId = (String(cfg.environment ?? 'production') === 'sandbox'
+        ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id;
+      ({ xml, xmlHacienda } = await alanubeXmlFiles(
+        cfg, String(i.fe_consecutivo), feKindOf(i.document_type), companyId));
+    }
+    // Con Facturemos —o si Alanube todavía no lo publica— sirve el guardado.
+    if (!xml && i.fe_xml) xml = Buffer.from(String(i.fe_xml), 'utf8').toString('base64');
+    else if (xml && !i.fe_xml) {
+      // Se guarda la primera vez que se baja: así el comprobante sigue
+      // descargable aunque después Alanube no responda.
+      const plain = Buffer.from(xml, 'base64').toString('utf8');
+      if (plain.trimStart().startsWith('<')) {
+        await db.from('invoices').update({ fe_xml: plain })
+          .eq('id', id).eq('tenant_id', tenantId).then(() => {}, () => {});
+      }
+    }
+
+    if (!xml && !xmlHacienda) return fail(c, 'XML no disponible todavía', 404);
+    return ok(c, {
+      xml, xmlHacienda,
+      filename: `${base}.xml`,
+      filename_hacienda: `${base}-respuesta-hacienda.xml`,
+    });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
@@ -2152,7 +2239,7 @@ hacienda.post('/emit-direct', async (c) => {
       const kind = tipoDoc === '01' ? 'invoice' : 'ticket';
       const doc = buildAlanubeDocument(emisor, invForDoc as any, lines, receptor as any, {
         tipoDoc,
-        headquarters: cfg.sucursal, terminal: cfg.terminal,
+        headquarters: cfg.sucursal, terminal: terminalOf(c, cfg),
         numberOfDocument: inv.invoice_number,
         // Empresa emisora del tenant (si no, Alanube usa la 'main' de la cuenta).
         senderId: (String(cfg.environment ?? 'production') === 'sandbox'
@@ -2182,7 +2269,7 @@ hacienda.post('/emit-direct', async (c) => {
     }
 
     // ── Proveedor FACTUREMOS ──────────────────────────────────────────────────
-    const consecutivo = buildConsecutivo(invForDoc as any, { sucursal: cfg.sucursal, terminal: cfg.terminal, situacion: '1', tipoComprobante: tipoDoc });
+    const consecutivo = buildConsecutivo(invForDoc as any, { sucursal: cfg.sucursal, terminal: terminalOf(c, cfg), situacion: '1', tipoComprobante: tipoDoc });
     const facturaJson = buildDocumentoJson(emisor, invForDoc as any, lines, receptor as any, { tipoComprobante: tipoDoc });
 
     try {

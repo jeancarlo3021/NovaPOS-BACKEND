@@ -17,6 +17,9 @@ const CreateUserSchema = z.object({
   role: z.enum([
     'owner', 'admin', 'gerente', 'asistente_1', 'asistente_2', 'asistente_3',
     'cocinero', 'mesero', 'cajero', 'almacenero', 'contador', 'repartidor',
+    // 'agente': arma pedidos y los envía a caja (no cobra). Sin esto, un agente
+    // creado desde su módulo no se podía editar desde Usuarios.
+    'agente',
   ]).optional().default('asistente_1'),
   phone: z.string().optional().nullable(),
   /** Zona asignada: si se setea, el usuario solo ve clientes/CxC de esa zona. */
@@ -30,6 +33,9 @@ const UpdateUserSchema = z.object({
   role: z.enum([
     'owner', 'admin', 'gerente', 'asistente_1', 'asistente_2', 'asistente_3',
     'cocinero', 'mesero', 'cajero', 'almacenero', 'contador', 'repartidor',
+    // 'agente': arma pedidos y los envía a caja (no cobra). Sin esto, un agente
+    // creado desde su módulo no se podía editar desde Usuarios.
+    'agente',
   ]).optional(),
   phone: z.string().optional().nullable(),
   zone: z.string().optional().nullable(),

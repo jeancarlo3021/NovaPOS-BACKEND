@@ -44,7 +44,7 @@ admin.get('/owners', async (c) => {
     // ── Membresía: 2 queries simples + merge en JS para evitar problemas
     //    con la sintaxis de joins anidados de PostgREST. ──
     const tenantIds = owners.map((o: any) => o.id);
-    const membership: Record<string, { group_id: string; group_name: string; role: string }> = {};
+    const membership: Record<string, { group_id: string; group_name: string; group_kind?: string; role: string }> = {};
     try {
       // a) Filas de tenant_group_members para nuestros tenants
       const { data: members, error: mErr } = await db.from('tenant_group_members')
@@ -54,12 +54,12 @@ admin.get('/owners', async (c) => {
 
       // b) Datos de los grupos involucrados
       const groupIds = Array.from(new Set((members ?? []).map((r: any) => r.group_id))).filter(Boolean);
-      const groupsById: Record<string, { id: string; name: string }> = {};
+      const groupsById: Record<string, { id: string; name: string; kind?: string }> = {};
       if (groupIds.length > 0) {
         const { data: groups, error: gErr } = await db.from('tenant_groups')
-          .select('id, name').in('id', groupIds);
+          .select('id, name, kind').in('id', groupIds);
         if (gErr) console.warn('[owners] groups lookup error:', gErr.message);
-        for (const g of (groups ?? []) as Array<{ id: string; name: string }>) {
+        for (const g of (groups ?? []) as Array<{ id: string; name: string; kind?: string }>) {
           groupsById[g.id] = g;
         }
       }
@@ -70,6 +70,7 @@ admin.get('/owners', async (c) => {
         membership[m.tenant_id] = {
           group_id:   m.group_id,
           group_name: g?.name ?? '(grupo sin nombre)',
+          group_kind: g?.kind ?? 'branches',
           role:       m.role,
         };
       }
@@ -116,13 +117,18 @@ admin.get('/owners', async (c) => {
     const enriched = await Promise.all(
       owners.map(async (o: any) => {
         const g = membership[o.id] ?? null;
-        const groupBilling = g?.group_id ? await getGroupBilling(g.group_id) : null;
+        // La cuota del grupo solo tiene sentido en SUCURSALES. En una cartera de
+        // contador cada empresa es de un cliente distinto y paga lo suyo: sumarlas
+        // daría una cifra que no le corresponde cobrar a nadie.
+        const groupBilling = (g?.group_id && g?.group_kind !== 'accounting')
+          ? await getGroupBilling(g.group_id) : null;
         const customPrice = customPriceByTenant[o.id];
         return {
           ...o,
           group_id:      g?.group_id ?? null,
           group_name:    g?.group_name ?? null,
           group_role:    g?.role ?? null,        // 'main' | 'branch' | null
+          group_kind:    g?.group_kind ?? null,  // 'branches' | 'accounting'
           group_billing: groupBilling,            // total mensual del grupo (saas + FE)
           custom_price:  customPrice ?? null,     // precio personalizado (si hay)
           fe_provider:   feProviderByTenant[o.id] ?? 'facturemos',
@@ -822,10 +828,10 @@ admin.put('/tenants/:id/fe-config', async (c) => {
 });
 
 // ── Certificado criptográfico (.p12) por empresa — Supabase Storage PRIVADO ─────
-const FE_CERT_BUCKET = 'fe-certificates';
+export const FE_CERT_BUCKET = 'fe-certificates';
 
 // Certificado .p12 del ambiente activo del tenant (con fallback al legacy).
-function resolveCert(cfg: Record<string, any>): { path: string; filename?: string } | null {
+export function resolveCert(cfg: Record<string, any>): { path: string; filename?: string } | null {
   const isSandbox = String(cfg.environment ?? 'production') === 'sandbox';
   const cert = (isSandbox ? cfg.certificate_sandbox : cfg.certificate_production) ?? cfg.certificate;
   return cert?.path ? cert : null;
@@ -1069,7 +1075,7 @@ admin.get('/tenants/:id/fe-test', async (c) => {
 const provDigit = (s: any) => (String(s ?? '').replace(/\D/g, '').replace(/^0+/, '') || '').slice(0, 1);
 const pad2Code = (s: any) => { const d = String(s ?? '').replace(/\D/g, ''); return d ? d.padStart(2, '0').slice(-2) : ''; };
 
-function buildAlanubeCompanyPayload(cfg: Record<string, any>, p12Base64: string, env: 'sandbox' | 'production' = 'production') {
+export function buildAlanubeCompanyPayload(cfg: Record<string, any>, p12Base64: string, env: 'sandbox' | 'production' = 'production') {
   const others = String(cfg.emisor_address ?? '').trim();
   const activity = String(cfg.economic_activity_code ?? '').trim();
   const email = String(cfg.emisor_email ?? '').trim();
@@ -1167,7 +1173,7 @@ function findCompanyId(result: any): string | null {
 //      respuesta cruda) contra GET /companies/{id} en el ambiente actual, y
 //   2) como respaldo, buscamos por cédula en GET /companies/associated.
 /** Cédula (solo dígitos) de una empresa devuelta por Alanube, mire donde mire. */
-function companyCedula(co: any): string {
+export function companyCedula(co: any): string {
   if (!co || typeof co !== 'object') return '';
   const direct = co.identificationNumber ?? co.identification?.identificationNumber
     ?? co.company?.identificationNumber ?? co.data?.identificationNumber;
@@ -1188,7 +1194,7 @@ function companyCedula(co: any): string {
 }
 
 /** Empresa 'main' de la cuenta/token, con su cédula (para saber DE QUIÉN es). */
-async function getMainCompanyInfo(client: any): Promise<{ id: string | null; cedula: string; raw: any }> {
+export async function getMainCompanyInfo(client: any): Promise<{ id: string | null; cedula: string; raw: any }> {
   try {
     const main: any = await client.getMainCompany?.();
     const body = main?.company ?? main?.data ?? main;
@@ -1196,7 +1202,7 @@ async function getMainCompanyInfo(client: any): Promise<{ id: string | null; ced
   } catch { return { id: null, cedula: '', raw: null }; }
 }
 
-async function findExistingCompanyId(client: any, cfg: Record<string, any>): Promise<string | null> {
+export async function findExistingCompanyId(client: any, cfg: Record<string, any>): Promise<string | null> {
   const cedula = String(cfg.emisor_identification ?? '').replace(/\D/g, '');
 
   // 0) Empresa 'main' del token (GET /company, sin id). SOLO se adopta si su cédula
@@ -1242,7 +1248,7 @@ async function findExistingCompanyId(client: any, cfg: Record<string, any>): Pro
 // Valida los datos del emisor ANTES de llamar a Alanube y devuelve una lista de
 // problemas legibles (para saber qué campo corregir en Datos de FE).
 /** Tipo de identificación deducido de la longitud de la cédula (CR). */
-function inferIdType(identification: any): string {
+export function inferIdType(identification: any): string {
   const d = String(identification ?? '').replace(/\D/g, '');
   if (d.length === 9) return '01';    // física
   if (d.length === 10) return '02';   // jurídica
@@ -1250,7 +1256,7 @@ function inferIdType(identification: any): string {
   return '';
 }
 
-function validateEmisorForAlanube(cfg: Record<string, any>, env: 'sandbox' | 'production'): string[] {
+export function validateEmisorForAlanube(cfg: Record<string, any>, env: 'sandbox' | 'production'): string[] {
   const p: string[] = [];
   const prod = env === 'production';
 
@@ -2317,6 +2323,83 @@ admin.get('/alanube/duplicate-companies', async (c) => {
         ? 'Cada company_id repetido con cédulas distintas es un conflicto: uno de los negocios está emitiendo con la empresa del otro. Cada uno necesita su propia cuenta/token de Alanube.'
         : 'Sin company_id repetidos.',
     });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// GET /accountants?tenant_id= — contadores del sistema y si llevan ESE negocio.
+// Sirve para el modal «Contadores» del panel: una sola llamada trae la lista y el
+// estado de cada uno, sin tener que cruzar nada del lado del cliente.
+admin.get('/accountants', async (c) => {
+  if (!isAdminRole(c)) return fail(c, 'forbidden', 403);
+  try {
+    const tenantId = c.req.query('tenant_id') || null;
+    // Se listan los usuarios con rol contador; si no hay ninguno todavía, se
+    // devuelven todos los del negocio para poder elegir a quién ascender.
+    let { data: users } = await db.from('users')
+      .select('id, email, full_name, role, tenant_id').eq('role', 'contador').limit(500);
+    if (!users || users.length === 0) {
+      const r = await db.from('users').select('id, email, full_name, role, tenant_id').limit(500);
+      users = r.data ?? [];
+    }
+    const ids = (users ?? []).map((u: any) => u.id);
+
+    // Cuántos negocios lleva cada uno + si lleva el que se está viendo.
+    const byUser: Record<string, string[]> = {};
+    if (ids.length > 0) {
+      const { data: links } = await db.from('user_tenants')
+        .select('user_id, tenant_id').in('user_id', ids);
+      for (const l of (links ?? []) as any[]) {
+        byUser[l.user_id] = [...(byUser[l.user_id] ?? []), l.tenant_id];
+      }
+    }
+
+    const out = (users ?? []).map((u: any) => ({
+      id: u.id,
+      email: u.email,
+      full_name: u.full_name,
+      role: u.role,
+      clients: (byUser[u.id] ?? []).length,
+      assigned: tenantId ? (byUser[u.id] ?? []).includes(tenantId) : false,
+    })).sort((a: any, b: any) =>
+      Number(b.assigned) - Number(a.assigned)
+      || (b.role === 'contador' ? 1 : 0) - (a.role === 'contador' ? 1 : 0)
+      || String(a.full_name ?? a.email).localeCompare(String(b.full_name ?? b.email)));
+    return ok(c, out);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// POST /tenants/:id/accountants — da o quita acceso de un contador a ESTE negocio.
+// Escribe en `user_tenants`, igual que el acceso a una sucursal.
+// body: { accountant_id, assigned: boolean, make_role?: boolean }
+admin.post('/tenants/:id/accountants', async (c) => {
+  if (!isAdminRole(c)) return fail(c, 'forbidden', 403);
+  try {
+    const tenantId = c.req.param('id');
+    const body = await c.req.json().catch(() => ({} as any));
+    const userId = String(body?.accountant_id ?? '').trim();
+    if (!userId) return fail(c, 'Falta accountant_id', 422);
+
+    if (body?.assigned) {
+      const { error } = await db.from('user_tenants').upsert({
+        user_id: userId, tenant_id: tenantId, role: 'staff', is_default: false,
+      }, { onConflict: 'user_id,tenant_id' });
+      if (error) throw new Error(error.message);
+      // Si se pidió, se le pone el rol contador para que vea el portal.
+      if (body?.make_role) {
+        try { await db.from('users').update({ role: 'contador' }).eq('id', userId); }
+        catch (e: any) { console.warn('[accountants] rol:', e?.message); }
+      }
+    } else {
+      // No se quita el acceso a su PROPIO negocio: lo dejaría fuera de su cuenta.
+      const { data: u } = await db.from('users').select('tenant_id').eq('id', userId).maybeSingle();
+      if ((u as any)?.tenant_id === tenantId) {
+        return fail(c, 'Ese es el negocio principal del usuario: no se le puede quitar el acceso.', 409);
+      }
+      const { error } = await db.from('user_tenants').delete()
+        .eq('user_id', userId).eq('tenant_id', tenantId);
+      if (error) throw new Error(error.message);
+    }
+    return ok(c, { ok: true });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

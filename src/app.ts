@@ -45,6 +45,10 @@ import taxWithholdings  from './routes/taxWithholdings.js';
 import recipesRoute     from './routes/recipes.js';
 import exchangeRate     from './routes/exchangeRate.js';
 import tableOrders      from './routes/tableOrders.js';
+import salesAgents      from './routes/salesAgents.js';
+import agentOrders      from './routes/agentOrders.js';
+import returnsRoute     from './routes/returns.js';
+import accountant       from './routes/accountant.js';
 
 // basePath('/api') matches Vercel's catch-all at api/[[...route]].ts
 const app = new Hono().basePath('/api');
@@ -64,7 +68,7 @@ app.use('*', cors({
     if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(clean)) return origin;  // dev local
     return ALLOWED_ORIGINS[0] ?? '';                 // no permitido
   },
-  allowHeaders: ['Content-Type', 'Authorization', 'x-branch-id'],
+  allowHeaders: ['Content-Type', 'Authorization', 'x-branch-id', 'x-terminal'],
   allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
 }));
 
@@ -153,6 +157,10 @@ api.route('/exchange-rate',     exchangeRate);
 api.route('/tax-withholdings',  taxWithholdings);
 api.route('/recipes',           recipesRoute);
 api.route('/table-orders',       tableOrders);
+api.route('/sales-agents',       salesAgents);
+api.route('/agent-orders',       agentOrders);
+api.route('/returns',            returnsRoute);
+api.route('/accountant',         accountant);
 
 app.route('/', api);
 

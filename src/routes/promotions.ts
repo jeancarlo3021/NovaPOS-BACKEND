@@ -8,8 +8,11 @@ const promotions = new Hono<{ Variables: { userId: string; tenantId: string; rol
 const PromotionSchema = z.object({
   name: z.string().min(1),
   description: z.string().optional().nullable(),
-  type: z.enum(['percentage', 'fixed', 'bogo', 'bundle', '2x1', 'combo']).optional().default('percentage'),
+  type: z.enum(['percentage', 'fixed', 'bogo', 'bundle', '2x1', 'combo', 'qty_bundle'])
+    .optional().default('percentage'),
   value: z.number().nonnegative(),
+  /** Promo por cantidad: cuántas unidades/kg forman el paquete (`value` = su precio). */
+  bundle_qty: z.number().positive().optional().nullable(),
   // Combo/bundle: 'price' = precio fijo del combo · 'percent' = % de descuento sobre el combo.
   combo_mode: z.enum(['price', 'percent']).optional().nullable(),
   min_purchase: z.number().nonnegative().optional().nullable(),
@@ -73,6 +76,9 @@ promotions.post('/', async (c) => {
     const body = await c.req.json();
     const parsed = PromotionSchema.safeParse(body);
     if (!parsed.success) return fail(c, parsed.error.message, 422);
+    if (parsed.data.type === 'qty_bundle' && !(Number(parsed.data.bundle_qty) > 0)) {
+      return fail(c, 'La promoción por cantidad necesita cuántas unidades forman el paquete.', 422);
+    }
 
     const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Costa_Rica' });
     const payload = {
@@ -81,12 +87,15 @@ promotions.post('/', async (c) => {
       description: parsed.data.description || null,
       type: parsed.data.type || 'percentage',
       value: parsed.data.value,
+      bundle_qty: parsed.data.bundle_qty ?? null,
       combo_mode: parsed.data.combo_mode ?? null,
       min_purchase: parsed.data.min_purchase || null,
       applies_to: parsed.data.applies_to || 'all',
       category_id: parsed.data.category_id || null,
       product_ids: parsed.data.product_ids || null,
       starts_at: parsed.data.starts_at || today,
+      // Sin fecha de fin = promoción PERMANENTE. La columna acepta NULL desde la
+      // migración 82; antes esto reventaba con un not-null violation.
       ends_at: parsed.data.ends_at || null,
       is_active: parsed.data.is_active !== undefined ? parsed.data.is_active : true,
     };
@@ -118,10 +127,19 @@ promotions.put('/:id', async (c) => {
     const body = await c.req.json();
     const parsed = PromotionSchema.partial().safeParse(body);
     if (!parsed.success) return fail(c, parsed.error.message, 422);
+    if (parsed.data.type === 'qty_bundle' && parsed.data.bundle_qty !== undefined
+        && !(Number(parsed.data.bundle_qty) > 0)) {
+      return fail(c, 'La promoción por cantidad necesita cuántas unidades forman el paquete.', 422);
+    }
+
+    // Una fecha de fin vacía significa "permanente", no "sin cambios": hay que
+    // mandar NULL o la promo se quedaría con el vencimiento anterior.
+    const patch: Record<string, any> = { ...parsed.data };
+    if ('ends_at' in patch && !patch.ends_at) patch.ends_at = null;
 
     const { data, error } = await db
       .from('promotions')
-      .update(parsed.data)
+      .update(patch)
       .eq('id', id)
       .eq('tenant_id', tenantId)
       .select()

@@ -21,6 +21,9 @@ const CreateGroupSchema = z.object({
   main_tenant_id: z.string().uuid().optional().nullable(),
   // Si no se pasa, el dueño es el usuario que crea el grupo (el JWT actual).
   owner_id:       z.string().uuid().optional().nullable(),
+  /** 'branches' = sucursales del mismo negocio · 'accounting' = cartera de un
+   *  contador (empresas de clientes distintos, que NO se suman entre sí). */
+  kind:           z.enum(['branches', 'accounting']).optional(),
 });
 
 const TransferOwnerSchema = z.object({
@@ -39,6 +42,42 @@ const AddBranchSchema = z.object({
   }).optional(),
   // Plan FE opcional (si no se asigna, queda sin FE)
   fe_plan_id:   z.string().uuid().optional().nullable(),
+});
+
+/**
+ * Alta de un CLIENTE en la cartera de un contador.
+ *
+ * Es "agregar sucursal" con dos cosas más que en una cartera contable siempre
+ * hacen falta y hoy obligaban a ir al Panel Admin: los datos de Hacienda del
+ * emisor (PIN del .p12 y usuario/clave de ATV) y las credenciales con las que el
+ * cliente entra a su propio portal.
+ */
+export const AddClientSchema = z.object({
+  name:        z.string().min(2),
+  plan_id:     z.string().uuid().optional().nullable(),
+  fe_plan_id:  z.string().uuid().optional().nullable(),
+  // ── Datos de Hacienda del emisor ──
+  hacienda: z.object({
+    identification:         z.string().optional().nullable(),
+    identification_type:    z.string().optional().nullable(),
+    name:                   z.string().optional().nullable(),
+    commercial_name:        z.string().optional().nullable(),
+    email:                  z.string().optional().nullable(),
+    phone:                  z.string().optional().nullable(),
+    address:                z.string().optional().nullable(),
+    economic_activity_code: z.string().optional().nullable(),
+    /** PIN del certificado .p12 */
+    p12_password:           z.string().optional().nullable(),
+    atv_username:           z.string().optional().nullable(),
+    atv_password:           z.string().optional().nullable(),
+    environment:            z.enum(['sandbox', 'production']).optional(),
+  }).optional(),
+  // ── Acceso del cliente a su portal ──
+  access: z.object({
+    username:  z.string().min(3),
+    password:  z.string().min(6),
+    full_name: z.string().optional().nullable(),
+  }).optional(),
 });
 
 const AssignFePlanSchema = z.object({
@@ -209,8 +248,18 @@ groups.post('/', async (c) => {
         owner_id:      finalOwnerId,
         billing_email: parsed.data.billing_email ?? null,
         notes:         parsed.data.notes ?? null,
+        kind:          parsed.data.kind ?? 'branches',
       })
       .select().single();
+    // Resiliente: si la migración 81 no corrió, se crea sin `kind`.
+    if (error && /kind/i.test(error.message)) {
+      const retry = await db.from('tenant_groups').insert({
+        name: parsed.data.name, owner_id: finalOwnerId,
+        billing_email: parsed.data.billing_email ?? null, notes: parsed.data.notes ?? null,
+      }).select().single();
+      if (retry.error) throw new Error(retry.error.message);
+      return ok(c, retry.data, 201);
+    }
     if (error) throw new Error(error.message);
 
     // Si nos pasan el tenant matriz, lo enlazamos como 'main'.
@@ -401,6 +450,180 @@ groups.post('/:id/branches', async (c) => {
     return ok(c, { tenant_id: tenantId, linked: true }, 201);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
+
+// ── POST /:id/clients — agregar un CLIENTE a la cartera del contador ──────
+// Crea el negocio, lo enlaza al grupo, guarda los datos de Hacienda y (opcional)
+// le crea al cliente el usuario con el que entra a su portal.
+groups.post('/:id/clients', async (c) => {
+  try {
+    const userId = c.get('userId');
+    const { id: groupId } = c.req.param();
+    if (!(await isGroupOwner(userId, groupId))) return fail(c, 'No autorizado', 403);
+
+    const parsed = AddClientSchema.safeParse(await c.req.json());
+    if (!parsed.success) return fail(c, parsed.error.message, 422);
+    const r = await createGroupClient(userId, groupId, parsed.data);
+    return r.ok ? ok(c, r, 201) : fail(c, r.message ?? 'No se pudo crear el cliente', r.status ?? 500);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/**
+ * Alta completa de un cliente dentro de un grupo. Vive aparte de la ruta porque
+ * el portal del contador la usa igual, y duplicarla sería garantizar que las dos
+ * copias se separen.
+ */
+export async function createGroupClient(
+  userId: string,
+  groupId: string,
+  input: z.infer<typeof AddClientSchema>,
+): Promise<{ ok: boolean; tenant_id?: string; user_email?: string | null; message?: string; status?: number }> {
+  let createdAuthId: string | null = null;
+  let createdTenantId: string | null = null;
+  try {
+    const { name, plan_id, fe_plan_id, hacienda, access } = input;
+
+    // El usuario del cliente se valida ANTES de crear el negocio: si el nombre
+    // ya está tomado, es mejor no dejar un tenant a medio hacer.
+    let email: string | null = null;
+    if (access) {
+      email = access.username.includes('@')
+        ? access.username.toLowerCase()
+        : `${access.username.toLowerCase()}@nexoerp.local`;
+      const { data: dup } = await db.from('users').select('id').eq('email', email).maybeSingle();
+      if (dup) return { ok: false, status: 409, message: `Ya existe un usuario "${access.username}". Elegí otro.` };
+    }
+
+    // 1) El negocio
+    const tenantUuid = (globalThis.crypto as any)?.randomUUID?.()
+      ?? `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
+    const { data: created, error: tErr } = await db.from('tenants')
+      .insert({
+        name,
+        owner_id:    userId,
+        plan_id:     plan_id ?? null,
+        status:      'active',
+        is_demo:     false,
+        schema_name: `tenant_${String(tenantUuid).replace(/-/g, '_')}`,
+      })
+      .select('id').single();
+    if (tErr) throw new Error(tErr.message);
+    const tenantId = created.id as string;
+    createdTenantId = tenantId;
+
+    if (plan_id) {
+      try {
+        const { data: planRow } = await db.from('subscription_plans')
+          .select('billing_cycle').eq('id', plan_id).maybeSingle();
+        const cycleDays = (planRow?.billing_cycle ?? 'monthly').toLowerCase() === 'yearly' ? 365 : 30;
+        const { data: sub } = await db.from('subscriptions').insert({
+          tenant_id: tenantId, plan_id, status: 'active', auto_renew: true,
+          ends_at: new Date(Date.now() + cycleDays * 86400000).toISOString(),
+        }).select('id').single();
+        if (sub?.id) await db.from('tenants').update({ subscription_id: sub.id }).eq('id', tenantId);
+      } catch (e: any) { console.warn('[clients] suscripción:', e?.message); }
+    }
+
+    // 2) Enlazarlo al grupo como cliente (no como sucursal: no se suma con las demás)
+    const { error: linkErr } = await db.from('tenant_group_members')
+      .insert({ group_id: groupId, tenant_id: tenantId, role: 'client' });
+    if (linkErr) throw new Error(linkErr.message);
+
+    // 3) Acceso del contador (y del dueño del grupo si es otra persona)
+    const { data: ownerRow } = await db.from('tenant_groups')
+      .select('owner_id').eq('id', groupId).maybeSingle();
+    const accessUsers = new Set<string>([userId]);
+    if (ownerRow?.owner_id) accessUsers.add(ownerRow.owner_id);
+    await db.from('user_tenants').upsert(
+      Array.from(accessUsers).map(uid => ({
+        user_id: uid, tenant_id: tenantId, role: 'owner', is_default: false,
+      })), { onConflict: 'user_id,tenant_id' });
+
+    if (fe_plan_id) {
+      await db.from('tenant_fe_plans').upsert({ tenant_id: tenantId, fe_plan_id, active: true });
+    }
+
+    // 4) Datos de Hacienda. El .p12 se sube aparte (es un archivo); lo demás queda
+    //    listo para que el alta en Alanube se dispare sola al subirlo.
+    if (hacienda) {
+      const env = hacienda.environment ?? 'production';
+      const prod = env === 'production';
+      const ident = String(hacienda.identification ?? '').replace(/\D/g, '');
+      const cfg: Record<string, any> = {
+        enabled: true,
+        fe_provider: 'alanube',
+        environment: env,
+        emisor_identification: ident || null,
+        emisor_identification_type: hacienda.identification_type
+          ?? (ident.length === 9 ? '01' : ident.length === 10 ? '02' : ident.length ? '03' : null),
+        emisor_name: hacienda.name ?? name,
+        emisor_commercial_name: hacienda.commercial_name ?? null,
+        emisor_email: hacienda.email ?? null,
+        emisor_phone: hacienda.phone ?? null,
+        emisor_address: hacienda.address ?? null,
+        economic_activity_code: hacienda.economic_activity_code ?? null,
+      };
+      // Las credenciales se guardan por ambiente: las de pruebas no sirven en
+      // producción y mezclarlas es una fuente clásica de rechazos.
+      if (hacienda.p12_password) {
+        cfg[prod ? 'p12_password_production' : 'p12_password_sandbox'] = hacienda.p12_password;
+        cfg.p12_password = hacienda.p12_password;
+      }
+      if (hacienda.atv_username) {
+        cfg[prod ? 'atv_username_production' : 'atv_username_sandbox'] = hacienda.atv_username;
+        cfg.atv_username = hacienda.atv_username;
+      }
+      if (hacienda.atv_password) {
+        cfg[prod ? 'atv_password_production' : 'atv_password_sandbox'] = hacienda.atv_password;
+        cfg.atv_password = hacienda.atv_password;
+      }
+      const { error: sErr } = await db.from('settings').upsert({
+        tenant_id: tenantId, type: 'electronic-invoice', config: cfg,
+        updated_at: new Date().toISOString(),
+      }, { onConflict: 'tenant_id,type' });
+      if (sErr) console.warn('[clients] settings FE:', sErr.message);
+    }
+
+    // 5) El usuario del cliente
+    if (access && email) {
+      const { data: authData, error: authError } = await db.auth.admin.createUser({
+        email, password: access.password, email_confirm: true,
+      });
+      if (authError) {
+        if (/already (registered|exists)/i.test(authError.message)) {
+          throw new Error(`Ya existe un usuario "${access.username}". Elegí otro.`);
+        }
+        throw new Error(authError.message);
+      }
+      if (!authData.user) throw new Error('No se pudo crear el usuario del cliente');
+      createdAuthId = authData.user.id;
+
+      const { error: uErr } = await db.from('users').insert({
+        id: authData.user.id, email,
+        full_name: access.full_name || name,
+        role: 'owner', tenant_id: tenantId,
+      });
+      if (uErr) throw new Error(uErr.message);
+
+      await db.from('user_tenants').upsert({
+        user_id: authData.user.id, tenant_id: tenantId, role: 'owner', is_default: true,
+      }, { onConflict: 'user_id,tenant_id' });
+    }
+
+    return { ok: true, tenant_id: tenantId, user_email: email };
+  } catch (err: any) {
+    // Sin rollback quedaría un negocio fantasma en la cartera y un usuario que no
+    // entra a ninguna parte.
+    if (createdAuthId) {
+      try { await db.auth.admin.deleteUser(createdAuthId); } catch { /* ignore */ }
+      try { await db.from('users').delete().eq('id', createdAuthId); } catch { /* ignore */ }
+    }
+    if (createdTenantId) {
+      try { await db.from('tenant_group_members').delete().eq('tenant_id', createdTenantId); } catch { /* ignore */ }
+      try { await db.from('tenants').delete().eq('id', createdTenantId); } catch { /* ignore */ }
+    }
+    return { ok: false, message: err.message };
+  }
+}
 
 // ── DELETE /:id/branches/:tenantId — desvincular sucursal ─────────────────
 groups.delete('/:id/branches/:tenantId', async (c) => {
