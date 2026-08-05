@@ -247,6 +247,7 @@ export function planFeatureLabels(features: Record<string, unknown> | null | und
   if (on('settings')) a.push('Configuración del negocio');
   if (on('electronic_invoicing')) a.push('Facturación electrónica');
   if (on('kiosk')) a.push('Modo kiosko');
+  if (on('android_app')) a.push('App de Android');
   return a;
 }
 
