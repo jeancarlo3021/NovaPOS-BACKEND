@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
+import { requirePermission } from '../middleware/permissions.js';
 
 const products = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
@@ -94,7 +95,7 @@ products.get('/:id', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
-products.post('/', async (c) => {
+products.post('/', requirePermission('inventory', 'create'), async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const parsed = ProductSchema.safeParse(await c.req.json());
@@ -113,7 +114,7 @@ products.post('/', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
-products.put('/:id', async (c) => {
+products.put('/:id', requirePermission('inventory', 'edit'), async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const { id } = c.req.param();
@@ -130,7 +131,7 @@ products.put('/:id', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
-products.delete('/:id', async (c) => {
+products.delete('/:id', requirePermission('inventory', 'delete'), async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const { id } = c.req.param();

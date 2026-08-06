@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
+import { requirePermission } from '../middleware/permissions.js';
 
 const stockAdjustments = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
@@ -43,7 +44,7 @@ stockAdjustments.get('/', async (c) => {
 });
 
 // POST / — registrar ajuste de stock
-stockAdjustments.post('/', async (c) => {
+stockAdjustments.post('/', requirePermission('inventory', 'edit'), async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const userId = c.get('userId');
@@ -127,7 +128,7 @@ const PhysicalCountSchema = z.object({
   user_email: z.string().optional().nullable(),
 });
 
-stockAdjustments.post('/physical-count', async (c) => {
+stockAdjustments.post('/physical-count', requirePermission('inventory', 'edit'), async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const userId = c.get('userId');

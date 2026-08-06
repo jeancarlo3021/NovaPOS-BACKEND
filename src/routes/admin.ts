@@ -7,6 +7,7 @@ import { endOfDay } from '../utils/dateRange.js';
 import { whatsappEnabled, sendTemplate, normalizePhone } from '../services/whatsapp.js';
 import { refreshInvoiceStatus, refreshNoteStatus, emitInvoiceCore, emitCreditNoteCore } from './hacienda.js';
 import { notifyPaymentDue, businessContact } from '../services/whatsappNotify.js';
+import { clearPermissionCache } from '../middleware/permissions.js';
 
 const admin = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
@@ -2614,6 +2615,65 @@ admin.put('/tenants/:id/feature-overrides', async (c) => {
     }, { onConflict: 'tenant_id,type' });
     if (error) throw new Error(error.message);
     return ok(c, { ok: true, overrides });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// ── Permisos por rol de UNA empresa (desde el Panel Admin) ─────────────────
+//
+// Los mismos datos que el negocio edita en Usuarios → Roles, pero alcanzables
+// sin tener que entrar a la empresa. Cuando el super-admin crea los usuarios de
+// un cliente, lo natural es dejarle los permisos listos ahí mismo; obligarlo a
+// cambiar de empresa para eso era la vuelta larga.
+
+// GET /tenants/:id/role-permissions/:role
+admin.get('/tenants/:id/role-permissions/:role', async (c) => {
+  try {
+    const { id, role } = c.req.param();
+    const { data, error } = await db.from('role_permissions')
+      .select('module, can_access, can_create, can_edit, can_delete')
+      .eq('tenant_id', id).eq('role', role);
+    if (error) throw new Error(error.message);
+
+    const out: Record<string, any> = {};
+    for (const r of (data ?? []) as any[]) {
+      out[r.module] = {
+        can_access: r.can_access, can_create: r.can_create,
+        can_edit: r.can_edit, can_delete: r.can_delete,
+      };
+    }
+    return ok(c, out);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// PUT /tenants/:id/role-permissions/:role
+admin.put('/tenants/:id/role-permissions/:role', async (c) => {
+  try {
+    const { id, role } = c.req.param();
+    if (role === 'owner') return fail(c, 'El dueño siempre tiene acceso total.', 422);
+
+    const body = await c.req.json().catch(() => ({} as any));
+    const matrix = (body?.permissions ?? body) as Record<string, any>;
+    if (!matrix || typeof matrix !== 'object') return fail(c, 'Matriz inválida', 422);
+
+    // Se reemplaza la matriz completa: así un módulo que se quita desaparece de
+    // verdad. Dejar filas viejas sueltas era lo que hacía que revocar no revocara.
+    const { error: delErr } = await db.from('role_permissions')
+      .delete().eq('tenant_id', id).eq('role', role);
+    if (delErr) throw new Error(delErr.message);
+
+    const rows = Object.entries(matrix).map(([module, p]: [string, any]) => ({
+      tenant_id: id, role, module,
+      can_access: p?.can_access === true,
+      can_create: p?.can_create === true,
+      can_edit:   p?.can_edit   === true,
+      can_delete: p?.can_delete === true,
+    }));
+    if (rows.length) {
+      const { error } = await db.from('role_permissions').insert(rows);
+      if (error) throw new Error(error.message);
+    }
+    clearPermissionCache();   // el middleware cachea un minuto
+    return ok(c, { ok: true, modules: rows.length });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

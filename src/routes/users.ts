@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
+import { clearPermissionCache } from '../middleware/permissions.js';
 
 const users = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
@@ -604,6 +605,10 @@ users.put('/roles/:role/permissions', async (c) => {
       }
       console.log('[role-perms] inserted', data?.length, 'rows');
     }
+
+    // El middleware cachea la matriz un minuto: sin esto, quitarle un permiso a
+    // alguien seguiría dejándolo pasar hasta que venza el cache.
+    clearPermissionCache();
 
     return ok(c, {
       message: 'Permisos del rol actualizados',
