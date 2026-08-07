@@ -124,13 +124,24 @@ export function haciendaUnit(unit?: string | null): string {
 
 export function buildConsecutivo(
   inv: FEInvoice,
-  opts: { sucursal?: string; terminal?: string; situacion?: string; tipoComprobante?: string } = {},
+  opts: {
+    sucursal?: string; terminal?: string; situacion?: string; tipoComprobante?: string;
+    /**
+     * Número de 10 dígitos YA ASIGNADO para este tipo de comprobante.
+     *
+     * Sin esto se usaba `inv.invoice_number`, o sea el número de la FACTURA, para
+     * todo: las notas de crédito y de débito salían con el consecutivo del
+     * documento que corrigen. Dos notas sobre la misma factura llevaban el mismo
+     * número y Hacienda las rechazaba con -99 («numeración consecutiva repetida»).
+     */
+    consecutivoInterno?: string | number;
+  } = {},
 ): ConsecutivoModel {
   return {
     Sucursal: pad(opts.sucursal ?? '1', 3),
     Terminal: pad(opts.terminal ?? '1', 5),
     TipoComprobante: opts.tipoComprobante ?? tipoComprobante(inv.document_type),
-    ConsecutivoInterno: pad(inv.invoice_number, 10),
+    ConsecutivoInterno: pad(opts.consecutivoInterno ?? inv.invoice_number, 10),
     SituacionDelComprobante: opts.situacion ?? '1',
   };
 }

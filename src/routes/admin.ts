@@ -2618,6 +2618,48 @@ admin.put('/tenants/:id/feature-overrides', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+// GET /tenants/:id/fe-consecutivos — en qué número va cada serie AHORA.
+//
+// Es la verdad del sistema, no lo configurado: sirve para comprobar que el
+// «próximo» que se puso en Datos de FE es el que realmente se va a usar.
+admin.get('/tenants/:id/fe-consecutivos', async (c) => {
+  try {
+    const { id } = c.req.param();
+    const { data, error } = await db.from('fe_consecutivos')
+      .select('sucursal, terminal, tipo, last_number, updated_at')
+      .eq('tenant_id', id).order('tipo');
+    // Si la migración 83 no corrió todavía, la tabla no existe: no es un error
+    // del usuario, simplemente no hay contadores que mostrar.
+    if (error) return ok(c, { rows: [], available: false, message: error.message });
+    return ok(c, { rows: data ?? [], available: true });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// PUT /tenants/:id/fe-consecutivos — fija el ÚLTIMO consecutivo emitido de una
+// serie. El siguiente comprobante sale con ese número + 1.
+// body: { tipo: '01'|'02'|'03'|'04', last_number: number, sucursal?, terminal? }
+admin.put('/tenants/:id/fe-consecutivos', async (c) => {
+  try {
+    const { id } = c.req.param();
+    const b = await c.req.json().catch(() => ({} as any));
+    const tipo = String(b?.tipo ?? '');
+    if (!['01', '02', '03', '04'].includes(tipo)) return fail(c, 'Tipo inválido (01/02/03/04)', 422);
+    const last = Number(b?.last_number);
+    if (!Number.isFinite(last) || last < 0) return fail(c, 'Número inválido', 422);
+
+    const sucursal = String(b?.sucursal ?? '001').replace(/\D/g, '').padStart(3, '0').slice(-3);
+    const terminal = String(b?.terminal ?? '00001').replace(/\D/g, '').padStart(5, '0').slice(-5);
+
+    const { error } = await db.from('fe_consecutivos').upsert({
+      tenant_id: id, sucursal, terminal, tipo,
+      last_number: Math.floor(last), updated_at: new Date().toISOString(),
+    }, { onConflict: 'tenant_id,sucursal,terminal,tipo' });
+    if (error) throw new Error(error.message);
+
+    return ok(c, { ok: true, tipo, last_number: Math.floor(last), next: Math.floor(last) + 1 });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // ── Permisos por rol de UNA empresa (desde el Panel Admin) ─────────────────
 //
 // Los mismos datos que el negocio edita en Usuarios → Roles, pero alcanzables

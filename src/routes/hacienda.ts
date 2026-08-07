@@ -816,10 +816,15 @@ export async function emitInvoiceCore(
     // ── Proveedor ALANUBE ─────────────────────────────────────────────────────
     if (provider === 'alanube') {
       const kind = tipoDoc === '01' ? 'invoice' : 'ticket';
+      // Consecutivo PROPIO del tipo. Antes iba el número interno de la factura,
+      // así que factura y tiquete compartían secuencia y las notas heredaban el
+      // número del documento que corrigen.
       const doc = buildAlanubeDocument(emisor, inv as any, lines, receptor, {
         tipoDoc,
         headquarters: cfg.sucursal, terminal: terminalOf(c, cfg),
-        numberOfDocument: (inv as any).invoice_number,
+        numberOfDocument: await reserveConsecutivo(
+          tenantId, tipoDoc, configuredNextConsecutivo(cfg, (inv as any).document_type),
+          String(cfg.sucursal ?? '1'), terminalOf(c, cfg)),
         // Empresa emisora en Alanube según el ambiente (para que emita el tenant y
         // no la 'main' de la cuenta). Sin id, Alanube usa la main por defecto.
         senderId: (String(cfg.environment ?? 'production') === 'sandbox'
@@ -864,8 +869,15 @@ export async function emitInvoiceCore(
     }
 
     // ── Proveedor FACTUREMOS (flujo existente) ────────────────────────────────
+    // Cada tipo lleva su propia numeración: se reserva acá, no se hereda del
+    // número interno de la factura.
+    const sucursalFe = String(cfg.sucursal ?? '1');
+    const terminalFe = terminalOf(c, cfg);
     const consecutivo = buildConsecutivo(inv as any, {
-      sucursal: cfg.sucursal, terminal: terminalOf(c, cfg), situacion: '1', tipoComprobante: tipoDoc,
+      sucursal: sucursalFe, terminal: terminalFe, situacion: '1', tipoComprobante: tipoDoc,
+      consecutivoInterno: await reserveConsecutivo(
+        tenantId, tipoDoc, configuredNextConsecutivo(cfg, (inv as any).document_type),
+        sucursalFe, terminalFe),
     });
     const facturaJson = buildDocumentoJson(emisor, inv as any, lines, receptor, { tipoComprobante: tipoDoc });
 
@@ -1003,7 +1015,11 @@ export async function emitCreditNoteCore(
       const doc = buildAlanubeDocument(emisor, inv as any, lines, receptor, {
         tipoDoc: '03',
         headquarters: cfg.sucursal, terminal: terminalOf(c, cfg),
-        numberOfDocument: (inv as any).invoice_number,
+        // Serie propia de notas de crédito: dos notas sobre la misma factura ya
+        // no salen con el mismo consecutivo (rechazo -99).
+        numberOfDocument: await reserveConsecutivo(
+          tenantId, '03', configuredNextConsecutivo(cfg, 'nota_credito'),
+          String(cfg.sucursal ?? '1'), terminalOf(c, cfg)),
         // Empresa emisora en Alanube según el ambiente (para que emita el tenant y
         // no la 'main' de la cuenta). Sin id, Alanube usa la main por defecto.
         senderId: companyOverride ?? (String(cfg.environment ?? 'production') === 'sandbox'
@@ -1041,8 +1057,15 @@ export async function emitCreditNoteCore(
     }
 
     // Consecutivo de NC (TipoComprobante 03) y referencia al documento original.
+    // El número es PROPIO de la serie de notas de crédito. Antes se usaba el de
+    // la factura original: dos notas sobre la misma factura salían con el mismo
+    // consecutivo y Hacienda las rechazaba con -99.
+    const sucursalNc = String(cfg.sucursal ?? '1');
+    const terminalNc = terminalOf(c, cfg);
     const consecutivo = buildConsecutivo(inv as any, {
-      sucursal: cfg.sucursal, terminal: terminalOf(c, cfg), situacion: '1', tipoComprobante: '03',
+      sucursal: sucursalNc, terminal: terminalNc, situacion: '1', tipoComprobante: '03',
+      consecutivoInterno: await reserveConsecutivo(
+        tenantId, '03', configuredNextConsecutivo(cfg, 'nota_credito'), sucursalNc, terminalNc),
     });
     // La NC se emite HOY (no con la fecha del original).
     const nowMs = Date.now();
@@ -1149,7 +1172,10 @@ hacienda.post('/debit-note', async (c) => {
       const doc = buildAlanubeDocument(emisor, inv as any, lines, receptor, {
         tipoDoc: '02',
         headquarters: cfg.sucursal, terminal: terminalOf(c, cfg),
-        numberOfDocument: (inv as any).invoice_number,
+        // Serie propia de notas de débito (ver el comentario de la NC).
+        numberOfDocument: await reserveConsecutivo(
+          tenantId, '02', configuredNextConsecutivo(cfg, 'nota_debito'),
+          String(cfg.sucursal ?? '1'), terminalOf(c, cfg)),
         // Empresa emisora en Alanube según el ambiente (para que emita el tenant y
         // no la 'main' de la cuenta). Sin id, Alanube usa la main por defecto.
         senderId: (String(cfg.environment ?? 'production') === 'sandbox'
@@ -1178,8 +1204,13 @@ hacienda.post('/debit-note', async (c) => {
     }
 
     // ── Proveedor FACTUREMOS ──────────────────────────────────────────────────
+    // Serie propia de notas de débito (ver el comentario de la NC).
+    const sucursalNd = String(cfg.sucursal ?? '1');
+    const terminalNd = terminalOf(c, cfg);
     const consecutivo = buildConsecutivo(inv as any, {
-      sucursal: cfg.sucursal, terminal: terminalOf(c, cfg), situacion: '1', tipoComprobante: '02',
+      sucursal: sucursalNd, terminal: terminalNd, situacion: '1', tipoComprobante: '02',
+      consecutivoInterno: await reserveConsecutivo(
+        tenantId, '02', configuredNextConsecutivo(cfg, 'nota_debito'), sucursalNd, terminalNd),
     });
     const nowMs = Date.now();
     const ndInv = { ...(inv as any), issued_at: new Date(nowMs).toISOString() };
@@ -1472,6 +1503,37 @@ hacienda.post('/received/classify', async (c) => {
       .eq('id', id).eq('tenant_id', tenantId);
     if (error) throw new Error(error.message);
     return ok(c, { ok: true, kind: k });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// POST /received/classify-all — marca de una vez TODOS los comprobantes que
+// quedaron sin categorizar.
+//
+// La mayoría de los negocios no lleva órdenes de compra: para ellos cada factura
+// de proveedor es simplemente «una compra», y clasificarlas de a una era trabajo
+// puro sin ningún beneficio. Esto solo escribe la etiqueta: NO crea órdenes de
+// compra, NO toca inventario y NO confirma nada ante Hacienda —esa aceptación es
+// un acto legal y se sigue haciendo comprobante por comprobante, a propósito.
+// body: { kind?: 'compra' | 'gasto' }
+hacienda.post('/received/classify-all', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const body = await c.req.json().catch(() => ({} as any));
+    const kind = body?.kind === 'gasto' ? 'gasto' : 'compra';
+
+    const { data: pending, error: selErr } = await db.from('received_documents')
+      .select('id').eq('tenant_id', tenantId).is('kind', null);
+    if (selErr) throw new Error(selErr.message);
+
+    const ids = (pending ?? []).map((r: any) => r.id);
+    if (ids.length === 0) return ok(c, { updated: 0, kind });
+
+    const { error } = await db.from('received_documents')
+      .update({ kind, updated_at: new Date().toISOString() })
+      .in('id', ids).eq('tenant_id', tenantId);
+    if (error) throw new Error(error.message);
+
+    return ok(c, { updated: ids.length, kind });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
@@ -2068,12 +2130,203 @@ hacienda.get('/fe-pdf/:id', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+// GET /consecutivo-audit?from=&to= — TRAZABILIDAD de la numeración.
+//
+// Para qué existe: al compartir un solo contador, cada serie quedó con huecos.
+// Los huecos no provocan rechazo, pero en una fiscalización aparece la pregunta
+// «¿dónde están los comprobantes faltantes?». Este reporte la contesta número por
+// número: por cada hueco dice qué comprobante —de otra serie— consumió ese
+// número, con su clave y su fecha. Deja de ser una laguna y pasa a ser un
+// desglose verificable contra el ATV.
+hacienda.get('/consecutivo-audit', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const from = c.req.query('from');
+    const to = c.req.query('to');
+
+    let q = db.from('invoices')
+      .select('id, invoice_number, issued_at, created_at, total, document_type, '
+        + 'fe_clave, fe_status, fe_nc_clave, fe_nc_status, fe_nd_clave, fe_nd_status')
+      .eq('tenant_id', tenantId);
+    if (from) q = q.gte('created_at', from);
+    if (to) q = q.lte('created_at', endOfDay(to));
+    const { data, error } = await q;
+    if (error) throw new Error(error.message);
+
+    const TIPO_LABEL: Record<string, string> = {
+      '01': 'Factura', '02': 'Nota de débito', '03': 'Nota de crédito', '04': 'Tiquete',
+    };
+
+    /** El consecutivo de 20 díg va EMBEBIDO en la clave de 50: posiciones 21–40. */
+    const parseClave = (clave: any) => {
+      const k = String(clave ?? '').replace(/\D/g, '');
+      if (k.length < 41) return null;
+      const cons = k.slice(21, 41);
+      return {
+        consecutivo: cons,
+        sucursal: cons.slice(0, 3),
+        terminal: cons.slice(3, 8),
+        tipo: cons.slice(8, 10),
+        numero: parseInt(cons.slice(10), 10),
+      };
+    };
+
+    interface Doc {
+      serie: string; tipo: string; tipo_label: string; numero: number;
+      consecutivo: string; clave: string; fecha: string; total: number;
+      estado: string; factura: string;
+    }
+    const docs: Doc[] = [];
+    const push = (clave: any, estado: any, r: any) => {
+      const p = parseClave(clave);
+      if (!p || !Number.isFinite(p.numero)) return;
+      docs.push({
+        serie: `${p.sucursal}-${p.terminal}`,
+        tipo: p.tipo, tipo_label: TIPO_LABEL[p.tipo] ?? p.tipo,
+        numero: p.numero, consecutivo: p.consecutivo,
+        clave: String(clave), fecha: r.issued_at ?? r.created_at ?? '',
+        total: Number(r.total ?? 0), estado: String(estado ?? ''),
+        factura: String(r.invoice_number ?? ''),
+      });
+    };
+    for (const r of (data ?? []) as any[]) {
+      push(r.fe_clave, r.fe_status, r);
+      push(r.fe_nc_clave, r.fe_nc_status, r);
+      push(r.fe_nd_clave, r.fe_nd_status, r);
+    }
+
+    // Índice número → documentos que lo usaron (en cualquier serie/tipo).
+    const byNumber = new Map<number, Doc[]>();
+    for (const d of docs) {
+      const arr = byNumber.get(d.numero) ?? [];
+      arr.push(d);
+      byNumber.set(d.numero, arr);
+    }
+
+    // Agrupar por serie+tipo y detectar huecos y repetidos.
+    const groups = new Map<string, Doc[]>();
+    for (const d of docs) {
+      const k = `${d.serie}|${d.tipo}`;
+      groups.set(k, [...(groups.get(k) ?? []), d]);
+    }
+
+    const series = [...groups.entries()].map(([key, list]) => {
+      const [serie, tipo] = key.split('|');
+      list.sort((a, b) => a.numero - b.numero);
+      const nums = list.map(d => d.numero);
+      const min = nums[0], max = nums[nums.length - 1];
+
+      // Repetidos: ESTO sí es un problema real y hay que verlo de primero.
+      const seen = new Map<number, number>();
+      for (const n of nums) seen.set(n, (seen.get(n) ?? 0) + 1);
+      const repetidos = [...seen.entries()].filter(([, n]) => n > 1).map(([num]) => num);
+
+      // Huecos, cada uno con su explicación.
+      const present = new Set(nums);
+      const huecos: any[] = [];
+      for (let n = min; n <= max; n++) {
+        if (present.has(n)) continue;
+        const usadoPor = (byNumber.get(n) ?? []).filter(d => d.tipo !== tipo);
+        huecos.push({
+          numero: n,
+          explicado: usadoPor.length > 0,
+          usado_por: usadoPor.map(d => ({
+            tipo: d.tipo_label, consecutivo: d.consecutivo, clave: d.clave,
+            fecha: d.fecha, total: d.total,
+          })),
+        });
+      }
+
+      return {
+        serie, tipo, tipo_label: TIPO_LABEL[tipo] ?? tipo,
+        emitidos: list.length, desde: min, hasta: max,
+        huecos_total: huecos.length,
+        huecos_explicados: huecos.filter(h => h.explicado).length,
+        huecos_sin_explicar: huecos.filter(h => !h.explicado).length,
+        repetidos,
+        huecos,
+        documentos: list,
+      };
+    }).sort((a, b) => a.serie.localeCompare(b.serie) || a.tipo.localeCompare(b.tipo));
+
+    return ok(c, {
+      generado: new Date().toISOString(),
+      desde: from ?? null, hasta: to ?? null,
+      total_documentos: docs.length,
+      series,
+      // Resumen para leer de un vistazo.
+      resumen: {
+        huecos_sin_explicar: series.reduce((s, x) => s + x.huecos_sin_explicar, 0),
+        repetidos: series.reduce((s, x) => s + x.repetidos.length, 0),
+      },
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/**
+ * Reserva el SIGUIENTE consecutivo de Hacienda para un tipo de comprobante.
+ *
+ * Cada tipo lleva su propia numeración (01 factura, 02 ND, 03 NC, 04 tiquete) y
+ * tiene que ser consecutiva y sin repetir. La reserva se hace con una función
+ * atómica en la base: con un SELECT-y-después-UPDATE, dos cajas facturando en el
+ * mismo segundo se llevan el mismo número.
+ *
+ * Si la migración 83 todavía no corrió, cae a calcularlo desde `invoices` para
+ * ese tipo. Ese respaldo NO es seguro entre cajas simultáneas — es solo para que
+ * el negocio no se quede sin poder facturar mientras se corre la migración.
+ */
+export async function reserveConsecutivo(
+  tenantId: string, tipo: string, floor: number,
+  sucursal: string, terminal: string,
+): Promise<string> {
+  try {
+    const { data, error } = await db.rpc('next_fe_consecutivo', {
+      p_tenant: tenantId, p_tipo: tipo, p_floor: floor,
+      p_sucursal: sucursal, p_terminal: terminal,
+    });
+    if (error) throw new Error(error.message);
+    const n = Number(Array.isArray(data) ? data[0] : data);
+    if (Number.isFinite(n) && n > 0) return String(n).padStart(10, '0');
+    throw new Error('respuesta vacía');
+  } catch (e: any) {
+    console.warn('[fe] next_fe_consecutivo no disponible, usando respaldo:', e?.message);
+    const docTypes = tipo === '01' ? ['factura_electronica']
+      : tipo === '04' ? ['tiquete_electronico']
+      : null;
+    let max = 0;
+    try {
+      if (docTypes) {
+        const { data } = await db.from('invoices')
+          .select('invoice_number').eq('tenant_id', tenantId)
+          .in('document_type', docTypes).not('fe_clave', 'is', null);
+        for (const r of (data ?? []) as any[]) {
+          const v = parseInt(String(r.invoice_number ?? '').replace(/\D/g, ''), 10);
+          if (Number.isFinite(v)) max = Math.max(max, v);
+        }
+      } else {
+        // NC/ND: sin columna propia, se parte del mayor número emitido en general
+        // para no repetir ninguno de los que ya salieron con el número heredado.
+        const { data } = await db.from('invoices')
+          .select('invoice_number').eq('tenant_id', tenantId);
+        for (const r of (data ?? []) as any[]) {
+          const v = parseInt(String(r.invoice_number ?? '').replace(/\D/g, ''), 10);
+          if (Number.isFinite(v)) max = Math.max(max, v);
+        }
+      }
+    } catch { /* se usa el piso */ }
+    return String(Math.max(max + 1, floor, 1)).padStart(10, '0');
+  }
+}
+
 /** Consecutivo configurado en Datos de FE ("Próx. …") según el tipo de documento.
  *  Es el SIGUIENTE número a emitir (0 si no está configurado). */
 export function configuredNextConsecutivo(cfg: any, docType: string): number {
+  // La nota de débito tiene su propio campo; si no se configuró, cae al de NC
+  // por compatibilidad con lo que ya estaba guardado.
   const raw = docType === 'factura_electronica' ? cfg?.consecutivo_factura
     : docType === 'tiquete_electronico' ? cfg?.consecutivo_tiquete
-    : (docType === 'nota_credito' || docType === 'nota_debito') ? cfg?.consecutivo_nc
+    : docType === 'nota_debito' ? (cfg?.consecutivo_nd ?? cfg?.consecutivo_nc)
+    : docType === 'nota_credito' ? cfg?.consecutivo_nc
     : null;
   const n = parseInt(String(raw ?? '').replace(/\D/g, ''), 10);
   return Number.isFinite(n) && n > 0 ? n : 0;
@@ -2240,7 +2493,8 @@ hacienda.post('/emit-direct', async (c) => {
       const doc = buildAlanubeDocument(emisor, invForDoc as any, lines, receptor as any, {
         tipoDoc,
         headquarters: cfg.sucursal, terminal: terminalOf(c, cfg),
-        numberOfDocument: inv.invoice_number,
+        numberOfDocument: await reserveConsecutivo(
+          tenantId, tipoDoc, consecFloor, String(cfg.sucursal ?? '1'), terminalOf(c, cfg)),
         // Empresa emisora del tenant (si no, Alanube usa la 'main' de la cuenta).
         senderId: (String(cfg.environment ?? 'production') === 'sandbox'
           ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id,
@@ -2269,7 +2523,13 @@ hacienda.post('/emit-direct', async (c) => {
     }
 
     // ── Proveedor FACTUREMOS ──────────────────────────────────────────────────
-    const consecutivo = buildConsecutivo(invForDoc as any, { sucursal: cfg.sucursal, terminal: terminalOf(c, cfg), situacion: '1', tipoComprobante: tipoDoc });
+    const sucursalDir = String(cfg.sucursal ?? '1');
+    const terminalDir = terminalOf(c, cfg);
+    const consecutivo = buildConsecutivo(invForDoc as any, {
+      sucursal: sucursalDir, terminal: terminalDir, situacion: '1', tipoComprobante: tipoDoc,
+      consecutivoInterno: await reserveConsecutivo(
+        tenantId, tipoDoc, consecFloor, sucursalDir, terminalDir),
+    });
     const facturaJson = buildDocumentoJson(emisor, invForDoc as any, lines, receptor as any, { tipoComprobante: tipoDoc });
 
     try {
