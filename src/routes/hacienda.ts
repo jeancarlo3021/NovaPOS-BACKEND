@@ -335,6 +335,15 @@ export function friendlyAlanubeError(raw: string): string {
   const detail = s.replace(/^alanube respondi[oó]\s*\d+\s*[—:-]\s*/i, '').trim();
   const l = detail.toLowerCase();
   const map: Array<[RegExp, string]> = [
+    // Control de numeración de Alanube (changelog CRI): valida la combinación
+    // «cédula de la empresa + consecutivo». Confirma que el consecutivo lo manda
+    // el emisor, no Alanube — si lo generara ella, no tendría nada que validar.
+    [/ap3018|numeration was already used/i,
+      'Ese consecutivo YA se usó para esta empresa. La numeración la manda el sistema, no Alanube: '
+      + 'corregí el "Próximo consecutivo" del tipo de comprobante en Datos de FE y volvé a emitir.'],
+    [/ap3017|numeration is already in process/i,
+      'Ese consecutivo está siendo procesado en este momento (otro envío con el mismo número). '
+      + 'Esperá unos segundos y consultá el estado antes de reintentar: puede que ya haya salido.'],
     [/otrassenas.*at least 5|otrassenas.*5 characters/i, 'La dirección del cliente (otras señas) debe tener al menos 5 caracteres. Completá la dirección del cliente.'],
     [/receiver\.address|address\.(province|canton|district)/i, 'La dirección del cliente es inválida (provincia/cantón/distrito/señas). Revisá los datos del cliente.'],
     // Los errores del SENDER van ANTES que los del receptor: sin esto un problema
@@ -2264,6 +2273,57 @@ hacienda.get('/consecutivo-audit', async (c) => {
 });
 
 /**
+ * Mira en qué número va la serie SIN consumirlo.
+ *
+ * Es lo contrario de `reserveConsecutivo`: acá no se incrementa nada. Se usa en
+ * la prueba en seco, donde reservar un número dejaría un hueco por haber
+ * ensayado.
+ */
+async function peekConsecutivo(
+  tenantId: string, tipo: string, floor: number, sucursal: string, terminal: string,
+): Promise<string> {
+  try {
+    const suc = String(sucursal).replace(/\D/g, '').padStart(3, '0').slice(-3);
+    const ter = String(terminal).replace(/\D/g, '').padStart(5, '0').slice(-5);
+    const { data } = await db.from('fe_consecutivos')
+      .select('last_number').eq('tenant_id', tenantId)
+      .eq('sucursal', suc).eq('terminal', ter).eq('tipo', tipo).maybeSingle();
+    const last = Number((data as any)?.last_number ?? 0);
+    return String(Math.max(last + 1, floor, 1)).padStart(10, '0');
+  } catch { return String(Math.max(floor, 1)).padStart(10, '0'); }
+}
+
+/**
+ * Qué le falta al comprobante para poder salir.
+ *
+ * La prueba tiene que decir QUÉ está mal, no solo que algo lo está: Hacienda
+ * responde con códigos que no le sirven a nadie en la caja.
+ */
+function previewChecks(
+  cfg: any, emisor: any, receptor: any, lines: any[], tipoDoc: string,
+): string[] {
+  const f: string[] = [];
+  if (!String(emisor?.identification ?? '').trim()) f.push('Falta la cédula del emisor.');
+  if (!String(emisor?.name ?? '').trim()) f.push('Falta el nombre / razón social del emisor.');
+  if (!String(emisor?.economic_activity_code ?? '').trim()) f.push('Falta la actividad económica del emisor.');
+  if (!String(emisor?.email ?? '').trim()) f.push('Falta el correo del emisor.');
+  if (tipoDoc === '01') {
+    if (!receptor?.identification) f.push('Factura electrónica sin cédula del cliente.');
+    if (!receptor?.email) f.push('El cliente no tiene correo: no se le podrá enviar el comprobante.');
+  }
+  lines.forEach((l: any, i: number) => {
+    const cabys = String(l.cabys_code ?? l.cabys ?? '').replace(/\D/g, '');
+    if (!cabys) f.push(`Línea ${i + 1} (${l.name ?? l.detail ?? '—'}): sin código CABYS.`);
+    else if (cabys.length !== 13) f.push(`Línea ${i + 1}: CABYS de ${cabys.length} dígitos (deben ser 13).`);
+    if (!(Number(l.quantity) > 0)) f.push(`Línea ${i + 1}: cantidad en cero.`);
+  });
+  if (String(cfg?.environment ?? 'production') === 'sandbox') {
+    f.push('Ambiente de PRUEBAS (sandbox): lo que se emita acá no tiene validez fiscal.');
+  }
+  return f;
+}
+
+/**
  * Reserva el SIGUIENTE consecutivo de Hacienda para un tipo de comprobante.
  *
  * Cada tipo lleva su propia numeración (01 factura, 02 ND, 03 NC, 04 tiquete) y
@@ -2366,6 +2426,22 @@ hacienda.post('/emit-direct', async (c) => {
     const rawLines: any[] = Array.isArray(b.lines) ? b.lines : [];
     if (rawLines.length === 0) return fail(c, 'No hay líneas para facturar', 422);
 
+    /**
+     * PRUEBA EN SECO (`preview`).
+     *
+     * Arma el comprobante exactamente igual que una emisión real —mismos datos
+     * del emisor, del cliente, los mismos productos y los mismos cálculos— pero:
+     *   · NO crea la factura en la base,
+     *   · NO consume un consecutivo (usa uno imaginario),
+     *   · NO envía nada a Hacienda ni a Alanube.
+     *
+     * Sirve para ver qué saldría antes de quemar un consecutivo. Pasa por el
+     * MISMO camino de código a propósito: una prueba que corre por otro lado no
+     * prueba nada.
+     */
+    const preview = b.preview === true;
+    const FAKE_CONSECUTIVO = '9999999999';
+
     const cfg = await loadFEConfig(tenantId);
     if (!cfg.enabled) return fail(c, 'La facturación electrónica no está activada', 409);
     const provider = cfg.fe_provider === 'alanube' ? 'alanube' : 'facturemos';
@@ -2437,7 +2513,14 @@ hacienda.post('/emit-direct', async (c) => {
     // en Datos de FE (para continuar la numeración migrada de otro sistema).
     const consecFloor = configuredNextConsecutivo(cfg, docType);
     let inv: any = null, invErr: any = null, finalNumber = await nextInvoiceNumber(tenantId, 0, consecFloor);
-    for (let attempt = 0; attempt < 8; attempt++) {
+    if (preview) {
+      // Factura de mentira, solo para armar el documento. Nada se guarda.
+      inv = {
+        id: null, invoice_number: FAKE_CONSECUTIVO,
+        issued_at: b.issued_at ?? new Date(Date.now() - 6 * 3600 * 1000).toISOString().replace('Z', ''),
+      };
+    }
+    for (let attempt = 0; !preview && attempt < 8; attempt++) {
       const res = await db.from('invoices').insert({
         tenant_id: tenantId,
         cash_session_id: b.session_id ?? null,
@@ -2468,7 +2551,9 @@ hacienda.post('/emit-direct', async (c) => {
         unit_price: Number(l.unit_price) || 0, discount_percent: 0, discount_amount: 0,
         subtotal: Math.round((Number(l.quantity) || 0) * (Number(l.unit_price) || 0) * 100) / 100,
       }));
-    let { error: feItemErr } = await db.from('invoice_items').insert(itemRowsFe);
+    let { error: feItemErr } = preview
+      ? { error: null } as any
+      : await db.from('invoice_items').insert(itemRowsFe);
     if (feItemErr && /product_name/i.test(feItemErr.message)) {
       const stripped = itemRowsFe.map(({ product_name, ...r }: any) => r);
       ({ error: feItemErr } = await db.from('invoice_items').insert(stripped));
@@ -2493,12 +2578,31 @@ hacienda.post('/emit-direct', async (c) => {
       const doc = buildAlanubeDocument(emisor, invForDoc as any, lines, receptor as any, {
         tipoDoc,
         headquarters: cfg.sucursal, terminal: terminalOf(c, cfg),
-        numberOfDocument: await reserveConsecutivo(
+        // En la prueba se usa un consecutivo imaginario: reservar uno de verdad
+        // lo quemaría y dejaría un hueco en la numeración por haber ensayado.
+        numberOfDocument: preview ? FAKE_CONSECUTIVO : await reserveConsecutivo(
           tenantId, tipoDoc, consecFloor, String(cfg.sucursal ?? '1'), terminalOf(c, cfg)),
         // Empresa emisora del tenant (si no, Alanube usa la 'main' de la cuenta).
         senderId: (String(cfg.environment ?? 'production') === 'sandbox'
           ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id,
       });
+
+      if (preview) {
+        return ok(c, {
+          ok: true, preview: true, provider: 'alanube', tipo: tipoDoc,
+          document_type: docType,
+          consecutivo_imaginario: `${String(cfg.sucursal ?? '1').padStart(3, '0')}`
+            + `${terminalOf(c, cfg).padStart(5, '0')}${tipoDoc}${FAKE_CONSECUTIVO}`,
+          proximo_consecutivo_real: await peekConsecutivo(
+            tenantId, tipoDoc, consecFloor, String(cfg.sucursal ?? '1'), terminalOf(c, cfg)),
+          ambiente: env,
+          totales: { subtotal, iva: taxAmount, total },
+          lineas: lines.length,
+          faltantes: previewChecks(cfg, emisor, receptor, lines, tipoDoc),
+          documento: doc,
+        });
+      }
+
       try {
         const resp: any = await alanube.forTenant(cfg).emitDocument(kind as any, doc, feCompanyId(cfg), { asCompany: cfg.alanube_company_type === 'associated' });
         const docObj = resp?.ticket ?? resp?.invoice ?? resp?.document ?? resp?.data ?? resp;
@@ -2527,10 +2631,26 @@ hacienda.post('/emit-direct', async (c) => {
     const terminalDir = terminalOf(c, cfg);
     const consecutivo = buildConsecutivo(invForDoc as any, {
       sucursal: sucursalDir, terminal: terminalDir, situacion: '1', tipoComprobante: tipoDoc,
-      consecutivoInterno: await reserveConsecutivo(
+      consecutivoInterno: preview ? FAKE_CONSECUTIVO : await reserveConsecutivo(
         tenantId, tipoDoc, consecFloor, sucursalDir, terminalDir),
     });
     const facturaJson = buildDocumentoJson(emisor, invForDoc as any, lines, receptor as any, { tipoComprobante: tipoDoc });
+
+    if (preview) {
+      return ok(c, {
+        ok: true, preview: true, provider: 'facturemos', tipo: tipoDoc,
+        document_type: docType,
+        consecutivo_imaginario: `${consecutivo.Sucursal}${consecutivo.Terminal}`
+          + `${consecutivo.TipoComprobante}${consecutivo.ConsecutivoInterno}`,
+        proximo_consecutivo_real: await peekConsecutivo(
+          tenantId, tipoDoc, consecFloor, sucursalDir, terminalDir),
+        ambiente: env,
+        totales: { subtotal, iva: taxAmount, total },
+        lineas: lines.length,
+        faltantes: previewChecks(cfg, emisor, receptor, lines, tipoDoc),
+        documento: { ConsecutivoModel: consecutivo, FacturaJson: facturaJson },
+      });
+    }
 
     try {
       const resp = await enviaDocumentoConsecutivoJson(env, cfg.api_key_emisor, facturaJson, consecutivo);
