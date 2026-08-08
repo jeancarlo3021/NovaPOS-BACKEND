@@ -77,6 +77,21 @@ products.get('/', async (c) => {
       }
     } catch (e: any) { console.warn('[products] unit_types lookup:', e?.message); }
 
+    // Proveedor de cada producto, con el mismo criterio: una consulta aparte a una
+    // tabla chica. Sin esto el listado solo traía `supplier_id` —un UUID—, así que
+    // ni se podía filtrar por proveedor ni la columna «supplier» del Excel salía
+    // con algo adentro.
+    try {
+      const supIds = Array.from(new Set(rows.map(r => r.supplier_id).filter(Boolean)));
+      if (supIds.length) {
+        const { data: sups } = await db.from('suppliers')
+          .select('id, name')
+          .eq('tenant_id', tenantId).in('id', supIds);
+        const byId = new Map((sups ?? []).map((s: any) => [s.id, s]));
+        for (const r of rows) r.supplier = r.supplier_id ? byId.get(r.supplier_id) ?? null : null;
+      }
+    } catch (e: any) { console.warn('[products] suppliers lookup:', e?.message); }
+
     return ok(c, rows);
   } catch (err: any) { return fail(c, err.message, 500); }
 });

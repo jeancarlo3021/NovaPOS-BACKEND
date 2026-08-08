@@ -5,7 +5,7 @@ import { sendEmail, paymentReceiptEmailHtml, customInvoiceEmailHtml, planFeature
 import { alanube, AlanubeError, tenantAlanubeToken } from '../services/alanube.js';
 import { endOfDay } from '../utils/dateRange.js';
 import { whatsappEnabled, sendTemplate, normalizePhone } from '../services/whatsapp.js';
-import { refreshInvoiceStatus, refreshNoteStatus, emitInvoiceCore, emitCreditNoteCore } from './hacienda.js';
+import { refreshInvoiceStatus, refreshNoteStatus, emitInvoiceCore, emitCreditNoteCore, configuredNextConsecutivo } from './hacienda.js';
 import { notifyPaymentDue, businessContact } from '../services/whatsappNotify.js';
 import { clearPermissionCache } from '../middleware/permissions.js';
 
@@ -2962,13 +2962,69 @@ admin.post('/fe-credit-note/:id', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+// body opcional: { consecutivo?: number } — consecutivo de Hacienda EXACTO.
+//
+// Sin él se toma «el siguiente» de la serie, que es justo lo que no sirve cuando
+// el contador quedó atrasado: Hacienda contesta «numeration was already used» y
+// re-emitir vuelve a fallar con el mismo número, una y otra vez. Pasando el
+// número se sale del bucle, y el contador queda adelantado para que las ventas
+// normales sigan desde ahí.
 admin.post('/fe-reemit/:id', async (c) => {
   if (!isAdminRole(c)) return fail(c, 'forbidden', 403);
   try {
     const { id } = c.req.param();
+    const b = await c.req.json().catch(() => ({} as any));
+    const consecutivo = Number(b?.consecutivo);
+    if (b?.consecutivo !== undefined && b?.consecutivo !== null && b?.consecutivo !== ''
+        && (!Number.isFinite(consecutivo) || consecutivo < 1 || consecutivo > 9_999_999_999)) {
+      return fail(c, 'El consecutivo debe ser un número entre 1 y 9999999999.', 422);
+    }
     const { data: inv } = await db.from('invoices').select('tenant_id').eq('id', id).maybeSingle();
     if (!inv) return fail(c, 'Factura no encontrada', 404);
-    return await emitInvoiceCore(c, (inv as any).tenant_id, id, { renumber: true });
+    return await emitInvoiceCore(c, (inv as any).tenant_id, id, {
+      renumber: true,
+      ...(Number.isFinite(consecutivo) && consecutivo >= 1 ? { consecutivo } : {}),
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// GET /fe-next-consecutivo/:id — qué consecutivo le tocaría a ESTA factura.
+//
+// Es lo que se le muestra al admin antes de re-emitir: el número que el sistema
+// usaría por su cuenta, para que pueda ver de un vistazo si el contador está
+// atrasado respecto de lo que Hacienda ya recibió, y corregirlo ahí mismo.
+admin.get('/fe-next-consecutivo/:id', async (c) => {
+  if (!isAdminRole(c)) return fail(c, 'forbidden', 403);
+  try {
+    const { id } = c.req.param();
+    const { data: inv } = await db.from('invoices')
+      .select('tenant_id, document_type').eq('id', id).maybeSingle();
+    if (!inv) return fail(c, 'Factura no encontrada', 404);
+    const tenantId = (inv as any).tenant_id;
+    const docType = String((inv as any).document_type ?? '');
+    const tipo = docType === 'factura_electronica' ? '01' : '04';
+
+    const { data: cfgRow } = await db.from('settings').select('config')
+      .eq('tenant_id', tenantId).eq('type', 'electronic-invoice').maybeSingle();
+    const cfg: any = (cfgRow as any)?.config ?? {};
+    const sucursal = String(cfg.sucursal ?? '1').replace(/\D/g, '').padStart(3, '0').slice(-3);
+    const terminal = String(cfg.terminal ?? '1').replace(/\D/g, '').padStart(5, '0').slice(-5);
+
+    let last = 0;
+    try {
+      const { data } = await db.from('fe_consecutivos').select('last_number')
+        .eq('tenant_id', tenantId).eq('sucursal', sucursal).eq('terminal', terminal).eq('tipo', tipo)
+        .maybeSingle();
+      last = Number((data as any)?.last_number ?? 0);
+    } catch { /* migración 83 sin correr: se cae al configurado */ }
+
+    const floor = configuredNextConsecutivo(cfg, docType);
+    return ok(c, {
+      tipo, sucursal, terminal,
+      last_number: last,
+      suggested: Math.max(last + 1, floor, 1),
+      configured_next: floor || null,
+    });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

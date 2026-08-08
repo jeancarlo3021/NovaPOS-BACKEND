@@ -37,10 +37,26 @@ function linesFromDoc(d: any): any[] {
 // Algunos proveedores meten datos internos en el <Detalle> separados por ';'
 // (ej. "Casco KOV RACING L;32100.98;24;;P001688;24396.74"). Nos quedamos con el
 // NOMBRE real: todo lo anterior al primer ';' seguido de un número.
+//
+// Otros anteponen su código entre corchetes —"[MXP39] PIÑON TRASERO XL125 38T"—,
+// y no lo hacen en todas las líneas, así que en una misma compra unos productos
+// entraban limpios y otros con el código pegado al nombre. Ese código ya se
+// guarda aparte como SKU (viene en <Codigo>), así que en el nombre solo estorba:
+// además rompe el emparejamiento por nombre, y el mismo artículo vuelve a
+// crearse como nuevo en la siguiente compra.
+//
+// El corchete se quita solo si va al PRINCIPIO, si adentro hay algo con pinta de
+// código (sin espacios) y si después queda nombre de verdad. Un "[2 UNIDADES]"
+// o un nombre que sea solo el corchete se dejan como están.
+const SUPPLIER_CODE_PREFIX = /^\[[A-Za-z0-9][A-Za-z0-9._/+-]*\]\s*/;
+
 function cleanReceptionDetail(s: any): string {
   const str = String(s ?? '').trim();
   const m = str.match(/^(.*?);\s*\d/);
-  return (m ? m[1] : str).trim();
+  let out = (m ? m[1] : str).trim();
+  const stripped = out.replace(SUPPLIER_CODE_PREFIX, '').trim();
+  if (stripped) out = stripped;
+  return out;
 }
 
 async function matchLines(tenantId: string, lines: any[]): Promise<any[]> {
@@ -692,7 +708,13 @@ export async function emitInvoiceCore(
   c: any,
   tenantId: string,
   invoice_id: string | undefined,
-  opts: { debug?: boolean; renumber?: boolean } = {},
+  opts: {
+    debug?: boolean; renumber?: boolean;
+    /** Consecutivo de Hacienda EXACTO a usar (re-emisión desde el panel admin).
+     *  Sin esto solo se puede tomar «el siguiente», que es justo el que Hacienda
+     *  ya rechazó cuando el contador quedó atrasado. */
+    consecutivo?: number;
+  } = {},
 ): Promise<Response> {
   const debug = opts.debug === true;
   try {
@@ -822,6 +844,18 @@ export async function emitInvoiceCore(
       return await failFE('Para emitir Factura Electrónica el cliente debe tener cédula (identificación). Seleccioná un cliente registrado con identificación o emití como tiquete.');
     }
 
+    // Consecutivo de Hacienda: el siguiente de la serie, salvo que el admin haya
+    // pedido uno concreto al re-emitir (porque el contador quedó atrasado y
+    // Hacienda rechazó el que tocaba). Se resuelve acá para que los dos
+    // proveedores usen exactamente el mismo criterio.
+    const forcedConsec = Number(opts.consecutivo) > 0 ? Math.floor(Number(opts.consecutivo)) : 0;
+    const takeConsecutivo = (sucursal: string, terminal: string): Promise<string> =>
+      forcedConsec
+        ? forceConsecutivo(tenantId, tipoDoc, forcedConsec, sucursal, terminal)
+        : reserveConsecutivo(
+            tenantId, tipoDoc, configuredNextConsecutivo(cfg, (inv as any).document_type),
+            sucursal, terminal);
+
     // ── Proveedor ALANUBE ─────────────────────────────────────────────────────
     if (provider === 'alanube') {
       const kind = tipoDoc === '01' ? 'invoice' : 'ticket';
@@ -831,9 +865,7 @@ export async function emitInvoiceCore(
       const doc = buildAlanubeDocument(emisor, inv as any, lines, receptor, {
         tipoDoc,
         headquarters: cfg.sucursal, terminal: terminalOf(c, cfg),
-        numberOfDocument: await reserveConsecutivo(
-          tenantId, tipoDoc, configuredNextConsecutivo(cfg, (inv as any).document_type),
-          String(cfg.sucursal ?? '1'), terminalOf(c, cfg)),
+        numberOfDocument: await takeConsecutivo(String(cfg.sucursal ?? '1'), terminalOf(c, cfg)),
         // Empresa emisora en Alanube según el ambiente (para que emita el tenant y
         // no la 'main' de la cuenta). Sin id, Alanube usa la main por defecto.
         senderId: (String(cfg.environment ?? 'production') === 'sandbox'
@@ -884,9 +916,7 @@ export async function emitInvoiceCore(
     const terminalFe = terminalOf(c, cfg);
     const consecutivo = buildConsecutivo(inv as any, {
       sucursal: sucursalFe, terminal: terminalFe, situacion: '1', tipoComprobante: tipoDoc,
-      consecutivoInterno: await reserveConsecutivo(
-        tenantId, tipoDoc, configuredNextConsecutivo(cfg, (inv as any).document_type),
-        sucursalFe, terminalFe),
+      consecutivoInterno: await takeConsecutivo(sucursalFe, terminalFe),
     });
     const facturaJson = buildDocumentoJson(emisor, inv as any, lines, receptor, { tipoComprobante: tipoDoc });
 
@@ -1659,12 +1689,37 @@ hacienda.post('/received/reconcile', async (c) => {
     const body = await c.req.json().catch(() => ({}));
     const { id, purchase_id, items, no_inventory, no_products } = body as {
       id: string; purchase_id?: string; no_inventory?: boolean;
-      items?: Array<{ detail: string; quantity: number; unit_price: number; total?: number; subtotal?: number; cabys?: string | null; product_id?: string | null; action: 'update' | 'create' | 'skip'; no_stock?: boolean }>;
+      items?: Array<{
+        detail: string; quantity: number; unit_price: number; total?: number; subtotal?: number;
+        cabys?: string | null; product_id?: string | null;
+        action: 'update' | 'create' | 'skip'; no_stock?: boolean;
+        /** Precio de VENTA (costo × margen) calculado en la pantalla. */
+        sale_price?: number;
+        /** Segundo código del producto. null/vacío = no tocarlo. */
+        sku2?: string | null;
+        /** Escribir `sale_price` en el producto. */
+        reprice?: boolean;
+      }>;
       /** true = la compra NO genera productos de catálogo (insumos de proceso), pero
        *  su MONTO sí se registra en la orden. Sin esto el total quedaba en ₡0. */
       no_products?: boolean;
     };
     if (!id) return fail(c, 'Falta el id', 422);
+
+    // ── Conciliación POR LOTES ────────────────────────────────────────────
+    // Cada línea del XML es una consulta a la base. Un comprobante de 250
+    // artículos son cientos de idas y vueltas encadenadas: la petición se pasa
+    // del tiempo máximo y el proxy la corta, dejando productos creados pero SIN
+    // orden de compra. Por eso el front puede partir el trabajo:
+    //
+    //   stage:'products' → procesa un lote de líneas y devuelve las resueltas.
+    //                      No toca la orden ni el comprobante.
+    //   stage:'finish'   → recibe TODAS las líneas ya resueltas y arma la orden.
+    //
+    // El estado lo lleva el cliente entre llamada y llamada, así que el servidor
+    // no guarda nada a medias: si un lote falla, no hay orden que limpiar.
+    // Sin `stage` se comporta como siempre (todo en una sola llamada).
+    const stage = (body.stage ?? 'all') as 'all' | 'products' | 'finish';
 
     const { data: doc } = await db.from('received_documents')
       .select('*').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
@@ -1673,8 +1728,10 @@ hacienda.post('/received/reconcile', async (c) => {
 
     // Si el front no mandó items (o vinieron vacíos), los re-derivamos del XML.
     // Esto arregla el "0 artículos" cuando la bandeja no tenía las líneas.
+    // En `finish` no aplica: ahí las líneas ya vienen resueltas de los lotes
+    // anteriores y re-derivarlas duplicaría la orden.
     let workItems = Array.isArray(items) ? items : [];
-    if (workItems.length === 0) {
+    if (workItems.length === 0 && stage !== 'finish') {
       const matched = await matchLines(tenantId, linesFromDoc(d));
       workItems = matched.map((m: any) => ({
         detail: m.detail, quantity: m.quantity, unit_price: m.unit_price,
@@ -1712,12 +1769,14 @@ hacienda.post('/received/reconcile', async (c) => {
     const messages: string[] = [];
     let updated = 0, created = 0;
     const noInventory = !!no_inventory;
-    const purchaseItems: any[] = [];
+    // En `finish` las líneas ya vienen resueltas por los lotes previos; en los
+    // demás modos se llenan abajo, recorriendo el XML.
+    const purchaseItems: any[] = stage === 'finish' ? (body.lines ?? []) : [];
 
     // Monto de las líneas que NO generan producto (modo "no crear productos" o
     // líneas marcadas "No agregar"). Se registra igual en la orden: la plata se
     // gastó aunque el artículo no entre al catálogo.
-    let skippedTotal = 0;
+    let skippedTotal = stage === 'finish' ? Number(body.skipped_total) || 0 : 0;
 
     for (const it of workItems) {
       if (it.action === 'skip') {
@@ -1737,17 +1796,34 @@ hacienda.post('/received/reconcile', async (c) => {
       const consistent = rawUnit > 0 && lineTotal > 0 && Math.abs(rawUnit * qty - lineTotal) <= Math.max(1, lineTotal * 0.02);
       const price = Math.round((consistent ? rawUnit : fromTotal) * 100) / 100;
 
+      // Precio de VENTA. Llega calculado desde la pantalla (costo × margen, ya
+      // redondeado) para que sea exactamente el que el usuario vio en la columna
+      // «P. Venta». Si no viene, se cae al costo: es el comportamiento anterior.
+      const sale = Number(it.sale_price) > 0 ? Number(it.sale_price) : price;
+      const sku2 = String(it.sku2 ?? '').trim();
+
       if (it.action === 'update' && productId) {
         // Producto que COINCIDE (por código/nombre): actualizar CABYS/precio/nombre.
         const upd: any = { updated_at: new Date().toISOString() };
         if (it.cabys) upd.cabys_code = it.cabys;
         if (price > 0) upd.cost_price = price;
         if (supplierId) upd.supplier_id = supplierId;   // proveedor del comprobante
+        // El precio de VENTA solo se toca si se pidió: una compra no debería
+        // reescribir por su cuenta los precios del catálogo.
+        if (it.reprice && sale > 0) upd.unit_price = sale;
+        if (sku2) upd.sku2 = sku2;
         // Sobrescribir el NOMBRE con el del comprobante (limpio) si viene uno nuevo.
         const newName = cleanReceptionDetail(it.detail);
         if (newName) upd.name = newName;
-        const { error: uErr } = await db.from('products').update(upd).eq('id', productId).eq('tenant_id', tenantId);
-        if (uErr) { messages.push(`⚠️ No se pudo actualizar "${it.detail}": ${uErr.message}`); }
+        let uRes = await db.from('products').update(upd).eq('id', productId).eq('tenant_id', tenantId);
+        // Un 2° código repetido no debe costar el resto de la línea: se reintenta
+        // sin él y se avisa, para que el costo y el CABYS sí queden guardados.
+        if (uRes.error && sku2 && /sku2|duplicate|unique/i.test(uRes.error.message)) {
+          const { sku2: _drop, ...rest } = upd;
+          uRes = await db.from('products').update(rest).eq('id', productId).eq('tenant_id', tenantId);
+          if (!uRes.error) messages.push(`⚠️ El 2° código "${sku2}" ya lo tiene otro producto: no se guardó.`);
+        }
+        if (uRes.error) { messages.push(`⚠️ No se pudo actualizar "${it.detail}": ${uRes.error.message}`); }
         else { updated++; messages.push(`✏️ Actualizado (nombre/CABYS/precio): ${newName || it.detail}`); }
       } else {
         // Producto NUEVO (el código NO coincide con ninguno interno): se CREA ahora
@@ -1758,7 +1834,11 @@ hacienda.post('/received/reconcile', async (c) => {
           tenant_id: tenantId,
           name: cleanReceptionDetail(it.detail) || 'Producto',
           cabys_code: it.cabys || null,
-          cost_price: price, unit_price: price,
+          // Costo del comprobante y precio de venta con el margen de la pantalla.
+          // Antes los dos eran el costo: el producto entraba con margen CERO y
+          // había que corregirlo a mano después de cada compra.
+          cost_price: price, unit_price: sale,
+          ...(sku2 ? { sku2 } : {}),
           // tracks_stock por LÍNEA: `no_stock` gana sobre el interruptor global, así
           // se puede crear un insumo infinito y otro con inventario en la misma compra.
           stock_quantity: 0, tracks_stock: !(it.no_stock ?? noInventory),
@@ -1768,6 +1848,13 @@ hacienda.post('/received/reconcile', async (c) => {
         // Si el código del XML choca con un SKU ya existente, reintenta con uno único.
         if (ins.error && xmlCode && /duplicate|unique|sku/i.test(ins.error.message)) {
           ins = await db.from('products').insert({ ...baseProd, sku: genReceptionSku(it.detail) }).select('id').single();
+        }
+        // Último recurso: si lo que choca es el 2° código, se crea sin él. Vale
+        // más el producto en el catálogo que el código de barras.
+        if (ins.error && sku2 && /sku2|duplicate|unique/i.test(ins.error.message)) {
+          const { sku2: _drop, ...rest } = baseProd as any;
+          ins = await db.from('products').insert({ ...rest, sku: genReceptionSku(it.detail) }).select('id').single();
+          if (!ins.error) messages.push(`⚠️ El 2° código "${sku2}" ya lo tiene otro producto: no se guardó.`);
         }
         const np = ins.data; const cErr = ins.error;
         if (cErr) { messages.push(`⚠️ No se pudo crear "${it.detail}": ${cErr.message}`); continue; }
@@ -1779,6 +1866,17 @@ hacienda.post('/received/reconcile', async (c) => {
       if (productId) {
         purchaseItems.push({ product_id: productId, quantity: qty, unit_price: price, subtotal: qty * price });
       }
+    }
+
+    // Fin del lote: se devuelven las líneas resueltas para que el front las
+    // acumule. La orden se arma en la última llamada (`finish`), cuando ya están
+    // TODAS: crearla acá dejaría una orden por lote.
+    if (stage === 'products') {
+      return ok(c, {
+        ok: true, stage: 'products',
+        lines: purchaseItems, skipped_total: skippedTotal,
+        created, updated, messages,
+      });
     }
 
     // Orden de compra: relacionar existente o crear nueva.
@@ -1827,9 +1925,12 @@ hacienda.post('/received/reconcile', async (c) => {
       messages.push(`🧾 Orden de compra ${purchaseNumber} creada con ${purchaseItems.length} artículo(s).`);
     }
 
-    // Resumen para el total a registrar.
+    // Resumen para el total a registrar. En `finish` los conteos los trae el
+    // front sumando los lotes: acá ya no se procesó ningún producto.
     const totalReg = purchaseItems.reduce((s, pi) => s + pi.subtotal, 0) + skippedTotal;
-    messages.unshift(`💰 Total registrado ₡${totalReg.toLocaleString('es-CR')} · ${updated} coincidencia(s) con CABYS/precio actualizado · ${created} producto(s) nuevo(s) creado(s).`);
+    const totCreated = stage === 'finish' ? (Number(body.created) || 0) : created;
+    const totUpdated = stage === 'finish' ? (Number(body.updated) || 0) : updated;
+    messages.unshift(`💰 Total registrado ₡${totalReg.toLocaleString('es-CR')} · ${totUpdated} coincidencia(s) con CABYS/precio actualizado · ${totCreated} producto(s) nuevo(s) creado(s).`);
     if (skippedTotal > 0) {
       messages.push(no_products
         ? `📦 ₡${skippedTotal.toLocaleString('es-CR')} registrado SIN crear productos (insumos de proceso): el monto entra en la orden pero no se detalla por artículo.`
@@ -1848,7 +1949,7 @@ hacienda.post('/received/reconcile', async (c) => {
         .eq('id', id).eq('tenant_id', tenantId);
     }
 
-    return ok(c, { ok: true, purchase_id: purchaseId, purchase_number: purchaseNumber, updated, created, items: purchaseItems.length, total: totalReg, messages }, 201);
+    return ok(c, { ok: true, purchase_id: purchaseId, purchase_number: purchaseNumber, updated: totUpdated, created: totCreated, items: purchaseItems.length, total: totalReg, messages }, 201);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
@@ -2376,6 +2477,42 @@ export async function reserveConsecutivo(
     } catch { /* se usa el piso */ }
     return String(Math.max(max + 1, floor, 1)).padStart(10, '0');
   }
+}
+
+/**
+ * Fuerza UN consecutivo concreto (re-emisión desde el panel admin).
+ *
+ * Existe porque el contador puede quedarse atrás de la realidad de Hacienda: si
+ * el negocio emitió antes con otro sistema, o si un envío llegó a Hacienda pero
+ * la respuesta se perdió, el sistema cree que el número está libre y Hacienda lo
+ * rechaza con «numeration was already used». Ahí no hay nada que calcular: hay
+ * que poder decirle «usá el 000260» y seguir.
+ *
+ * Además de devolver el número, ADELANTA el contador hasta él. Sin eso, la
+ * siguiente venta normal volvería a intentar el número quemado y chocaría otra
+ * vez. Nunca lo retrocede: bajar el contador sería garantizar el choque.
+ */
+export async function forceConsecutivo(
+  tenantId: string, tipo: string, value: number,
+  sucursal: string, terminal: string,
+): Promise<string> {
+  const n = Math.floor(value);
+  try {
+    const { data } = await db.from('fe_consecutivos')
+      .select('last_number')
+      .eq('tenant_id', tenantId).eq('sucursal', sucursal).eq('terminal', terminal).eq('tipo', tipo)
+      .maybeSingle();
+    const current = Number((data as any)?.last_number ?? 0);
+    await db.from('fe_consecutivos').upsert({
+      tenant_id: tenantId, sucursal, terminal, tipo,
+      last_number: Math.max(current, n), updated_at: new Date().toISOString(),
+    }, { onConflict: 'tenant_id,sucursal,terminal,tipo' });
+  } catch (e: any) {
+    // Si la tabla no existe todavía (migración 83 sin correr), igual se emite con
+    // el número pedido: es justo lo que el admin quiso.
+    console.warn('[fe] no se pudo adelantar el contador:', e?.message);
+  }
+  return String(n).padStart(10, '0');
 }
 
 /** Consecutivo configurado en Datos de FE ("Próx. …") según el tipo de documento.
