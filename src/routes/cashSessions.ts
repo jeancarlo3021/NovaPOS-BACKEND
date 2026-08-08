@@ -99,6 +99,99 @@ cashSessions.post('/:id/close', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+// GET /daily-summary?date=YYYY-MM-DD — CONSOLIDADO DEL DÍA.
+//
+// Junta TODOS los cierres del día natural (00:00 a 00:00, hora de Costa Rica) en
+// un solo resumen. Un negocio puede abrir y cerrar caja varias veces —cambio de
+// turno, dos cajeros, una caja que se cerró por error— y hasta ahora la única
+// forma de saber cuánto vendió el día era sumar los tiquetes a mano.
+cashSessions.get('/daily-summary', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    // Día en hora de CR: sin esto, cerrar a las 7pm caía en el día siguiente UTC.
+    const date = c.req.query('date')
+      || new Date().toLocaleDateString('en-CA', { timeZone: 'America/Costa_Rica' });
+    const from = `${date}T00:00:00`;
+    const to = `${date}T23:59:59.999`;
+
+    const { data: sessions, error } = await db.from('cash_sessions')
+      .select('id, opening_amount, closing_amount, opening_date, closing_date, status, user_id, notes')
+      .eq('tenant_id', tenantId)
+      .gte('opening_date', from).lte('opening_date', to)
+      .order('opening_date');
+    if (error) throw new Error(error.message);
+    const list = (sessions ?? []) as any[];
+    if (list.length === 0) return ok(c, { date, sessions: [], totals: null });
+
+    // Nombre del cajero de cada sesión.
+    const userIds = [...new Set(list.map(s2 => s2.user_id).filter(Boolean))];
+    const nameByUser = new Map<string, string>();
+    if (userIds.length) {
+      const { data: users } = await db.from('users').select('id, full_name, email').in('id', userIds as string[]);
+      for (const u of (users ?? []) as any[]) nameByUser.set(u.id, u.full_name || u.email || '');
+    }
+
+    // Ventas por sesión. Se excluye lo que no entra al arqueo, igual que el cierre
+    // individual: anuladas, delivery y clientes excluidos.
+    const ids = list.map(s2 => s2.id);
+    const { data: invs } = await db.from('invoices')
+      .select('cash_session_id, total, payment_method, status, is_delivery, exclude_from_close')
+      .in('cash_session_id', ids);
+
+    const bySession = new Map<string, any>();
+    for (const id of ids) {
+      bySession.set(id, { cash: 0, card: 0, sinpe: 0, credit: 0, transfer: 0, other: 0, count: 0, total: 0 });
+    }
+    let anuladas = 0, anuladasTotal = 0, delivery = 0, deliveryTotal = 0;
+    for (const i of (invs ?? []) as any[]) {
+      const acc = bySession.get(i.cash_session_id);
+      if (!acc) continue;
+      const amount = Number(i.total ?? 0);
+      if (i.status === 'cancelled') { anuladas++; anuladasTotal += amount; continue; }
+      if (i.is_delivery) { delivery++; deliveryTotal += amount; continue; }
+      if (i.exclude_from_close) continue;
+      const m = String(i.payment_method ?? '');
+      if (m === 'cash') acc.cash += amount;
+      else if (m === 'card') acc.card += amount;
+      else if (m === 'sinpe') acc.sinpe += amount;
+      else if (m === 'credit') acc.credit += amount;
+      else if (m === 'transfer' || m === 'bank_transfer') acc.transfer += amount;
+      else acc.other += amount;
+      acc.count++; acc.total += amount;
+    }
+
+    const sessionsOut = list.map(s2 => ({
+      id: s2.id,
+      cashier: nameByUser.get(s2.user_id) ?? '',
+      opened_at: s2.opening_date, closed_at: s2.closing_date,
+      status: s2.status,
+      opening_amount: Number(s2.opening_amount ?? 0),
+      closing_amount: Number(s2.closing_amount ?? 0),
+      ...bySession.get(s2.id),
+    }));
+
+    const sum = (k: string) => sessionsOut.reduce((acc, s2: any) => acc + Number(s2[k] ?? 0), 0);
+    return ok(c, {
+      date,
+      sessions: sessionsOut,
+      totals: {
+        sesiones: sessionsOut.length,
+        abiertas: sessionsOut.filter(s2 => s2.status !== 'closed').length,
+        facturas: sum('count'),
+        cash: sum('cash'), card: sum('card'), sinpe: sum('sinpe'),
+        credit: sum('credit'), transfer: sum('transfer'), other: sum('other'),
+        ventas: sum('total'),
+        // Lo que se puede contar en caja (el crédito y la transferencia no).
+        arqueable: sum('cash') + sum('card') + sum('sinpe'),
+        fondos: sum('opening_amount'),
+        contado: sum('closing_amount'),
+        anuladas, anuladas_total: anuladasTotal,
+        delivery, delivery_total: deliveryTotal,
+      },
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // GET /movements-report?from=&to= — Entradas y salidas del FONDO de caja del tenant
 // (movimientos manuales + apertura/cierre; EXCLUYE las ventas). Para el reporte
 // descargable. Se filtra por tenant vía las sesiones (cash_movements no tiene tenant).

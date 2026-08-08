@@ -14,9 +14,12 @@ const ProductSchema = z.object({
   unit_price:      z.number().nonnegative().optional().nullable(),
   delivery_price:  z.number().nonnegative().optional().nullable(),   // precio para delivery
   cost_price:      z.number().nonnegative().optional().nullable(),
-  stock_quantity:  z.number().int().nonnegative().optional().default(0),
-  min_stock_level: z.number().int().nonnegative().optional().default(0),
-  max_stock_level: z.number().int().nonnegative().optional().default(100),
+  // Sin `.int()`: hay productos que se venden por PESO y su existencia son 2.5 kg,
+  // no 2. Con la validación de enteros el guardado se rechazaba (o se truncaba) y
+  // el inventario de la carnicería/verdulería nunca cuadraba.
+  stock_quantity:  z.number().nonnegative().optional().default(0),
+  min_stock_level: z.number().nonnegative().optional().default(0),
+  max_stock_level: z.number().nonnegative().optional().default(100),
   category_id:     z.string().uuid().optional().nullable(),
   unit_type_id:    z.string().uuid().optional().nullable(),
   supplier_id:     z.string().uuid().optional().nullable(),
