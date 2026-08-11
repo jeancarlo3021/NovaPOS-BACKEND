@@ -379,4 +379,94 @@ tableOrders.post('/:id/cancel', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+// POST /:id/move — pasa la cuenta a otra mesa.
+//
+// El cambio de mesa a media comida es rutina en un salón (se juntaron, había
+// corriente, llegó más gente) y hasta ahora obligaba a cerrar y volver a tomar
+// todo el pedido, con el riesgo de perder líneas por el camino.
+//
+// body: { table_id, table_label }
+tableOrders.post('/:id/move', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const id = c.req.param('id');
+    const b = await c.req.json().catch(() => ({} as any));
+    const tableId = String(b?.table_id ?? '').trim();
+    const tableLabel = String(b?.table_label ?? '').trim();
+    if (!tableId) return fail(c, 'Falta la mesa de destino', 422);
+
+    const { data: order } = await db.from('table_orders')
+      .select('id, table_id, table_label, status')
+      .eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+    if (!order) return fail(c, 'Cuenta no encontrada', 404);
+    if ((order as any).status !== 'open') return fail(c, 'La cuenta ya está cerrada.', 409);
+    if (String((order as any).table_id) === tableId) {
+      return fail(c, 'La cuenta ya está en esa mesa.', 409);
+    }
+
+    // La mesa destino no puede tener otra cuenta abierta: dos cuentas en la misma
+    // mesa es exactamente el enredo que este módulo existe para evitar. Juntarlas
+    // automáticamente sería peor —nadie podría separarlas después.
+    const { data: busy } = await db.from('table_orders')
+      .select('id, table_label').eq('tenant_id', tenantId)
+      .eq('table_id', tableId).eq('status', 'open').maybeSingle();
+    if (busy) {
+      return fail(c, `${tableLabel || 'Esa mesa'} ya tiene una cuenta abierta. Cobrala o movela antes.`, 409);
+    }
+
+    const patch: any = {
+      table_id: tableId,
+      table_label: tableLabel || null,
+      updated_at: new Date().toISOString(),
+    };
+    // Rastro del traslado. Si la migración 85 no corrió, se mueve igual: el
+    // traslado le sirve al salón hoy, la huella es deseable pero no bloqueante.
+    let res = await db.from('table_orders').update({
+      ...patch,
+      moved_from_label: (order as any).table_label ?? null,
+      moved_at: new Date().toISOString(),
+    }).eq('id', id).eq('tenant_id', tenantId).select('*').maybeSingle();
+    if (res.error && /moved_from_label|moved_at/.test(res.error.message ?? '')) {
+      res = await db.from('table_orders').update(patch)
+        .eq('id', id).eq('tenant_id', tenantId).select('*').maybeSingle();
+    }
+    if (res.error) throw new Error(res.error.message);
+    return ok(c, res.data);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// POST /:id/assign — cambia el mesero responsable de la cuenta.
+//
+// `opened_by` NO se toca: es el registro de quién tomó la mesa. Lo que cambia es
+// quién responde por ella ahora, que es lo que hace falta en el cambio de turno.
+//
+// body: { waiter_id }
+tableOrders.post('/:id/assign', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const id = c.req.param('id');
+    const b = await c.req.json().catch(() => ({} as any));
+    const waiterId = String(b?.waiter_id ?? '').trim();
+    if (!waiterId) return fail(c, 'Falta el mesero', 422);
+
+    // Que exista y sea del mismo negocio: asignar una cuenta a alguien de otra
+    // empresa sería una fuga de datos, no un error de dedo.
+    const { data: u } = await db.from('users')
+      .select('id, full_name').eq('id', waiterId).eq('tenant_id', tenantId).maybeSingle();
+    if (!u) return fail(c, 'Ese usuario no pertenece a este negocio.', 422);
+
+    const { data, error } = await db.from('table_orders')
+      .update({ waiter_id: waiterId, updated_at: new Date().toISOString() })
+      .eq('id', id).eq('tenant_id', tenantId).eq('status', 'open').select('*').maybeSingle();
+    if (error) {
+      if (/waiter_id/.test(error.message ?? '')) {
+        return fail(c, 'Falta correr la migración 85 para poder reasignar meseros.', 409);
+      }
+      throw new Error(error.message);
+    }
+    if (!data) return fail(c, 'La cuenta no existe o ya está cerrada.', 409);
+    return ok(c, { ...data, waiter_name: (u as any).full_name ?? null });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 export default tableOrders;

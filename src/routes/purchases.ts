@@ -169,6 +169,21 @@ purchases.post('/:id/receive', async (c) => {
       let touched = 0;
       let skipped = 0;
 
+      // Precio pagado por unidad, tomado de la ORDEN y no del body: el front
+      // manda solo producto y cantidad, y el costo tiene que salir de lo que
+      // quedó registrado en la compra.
+      const costByProduct = new Map<string, number>();
+      try {
+        const { data: pItems } = await db.from('purchase_items')
+          .select('product_id, unit_price').eq('purchase_id', id);
+        for (const pi of (pItems ?? []) as any[]) {
+          const v = Number(pi.unit_price) || 0;
+          if (pi.product_id && v > 0) costByProduct.set(String(pi.product_id), v);
+        }
+      } catch (e: any) {
+        console.warn('[RECEIVE] no se pudo leer el costo de la orden:', e?.message);
+      }
+
       for (const item of (items ?? [])) {
         const qty = Number(item.quantity ?? 0);
         if (!qty || qty <= 0) continue;
@@ -189,8 +204,21 @@ purchases.post('/:id/receive', async (c) => {
         const stockBefore = Number(p.stock_quantity ?? 0);
         const stockAfter  = stockBefore + qty;
 
+        // ── Costo del producto ────────────────────────────────────────────
+        // La recepción por comprobante electrónico ya actualizaba el costo, pero
+        // la compra MANUAL no: quien registra sus compras a mano se quedaba con
+        // el costo del día que creó el producto. Todo lo que depende del costo
+        // —margen, recetas, food cost— trabajaba con números viejos sin avisar.
+        //
+        // Se usa el precio de ESTA compra, no un promedio ponderado: es lo que
+        // el negocio acaba de pagar y lo que va a pagar la próxima vez. Un
+        // promedio suaviza justo la subida que hay que ver.
+        const unitCost = costByProduct.get(String(item.product_id)) ?? 0;
+        const costPatch = unitCost > 0 ? { cost_price: unitCost } : {};
+
         const { error: upErr } = await db.from('products').update({
           stock_quantity: stockAfter,
+          ...costPatch,
           updated_at: new Date().toISOString(),
         }).eq('id', item.product_id);
 

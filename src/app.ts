@@ -43,6 +43,8 @@ import routing          from './routes/routing.js';
 import cabys            from './routes/cabys.js';
 import taxWithholdings  from './routes/taxWithholdings.js';
 import recipesRoute     from './routes/recipes.js';
+import { digitalMenu, publicMenu } from './routes/digitalMenu.js';
+import windowOrders     from './routes/windowOrders.js';
 import exchangeRate     from './routes/exchangeRate.js';
 import tableOrders      from './routes/tableOrders.js';
 import salesAgents      from './routes/salesAgents.js';
@@ -116,6 +118,11 @@ app.route('/cron', cron);
 // Ver routes/feExternal.ts.
 app.route('/fe-external', feExternal);
 
+// Menú digital PÚBLICO — lo abre el cliente escaneando el QR de la mesa, sin
+// sesión. Va acá arriba, fuera del grupo con `auth`, porque justamente su razón
+// de ser es que no haga falta iniciar sesión para verlo.
+app.route('/public-menu', publicMenu);
+
 const api = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 api.use('*', auth);
 api.use('*', enforceActiveTenant);
@@ -156,6 +163,8 @@ api.route('/cabys',             cabys);
 api.route('/exchange-rate',     exchangeRate);
 api.route('/tax-withholdings',  taxWithholdings);
 api.route('/recipes',           recipesRoute);
+api.route('/digital-menu',      digitalMenu);
+api.route('/window-orders',     windowOrders);
 api.route('/table-orders',       tableOrders);
 api.route('/sales-agents',       salesAgents);
 api.route('/agent-orders',       agentOrders);

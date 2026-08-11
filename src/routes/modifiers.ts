@@ -15,6 +15,17 @@ const GroupSchema = z.object({
     name:        z.string().min(1),
     price_delta: z.number().optional().default(0),
     sort_order:  z.number().int().optional().default(0),
+    // Ingrediente que consume la opción. Un extra tenía precio pero no costo:
+    // "+ queso ₡500" sumaba ingreso sin descontar queso ni saber si dejaba
+    // margen. Es opcional: un "término medio" no consume nada.
+    ingredient:  z.object({
+      type:          z.enum(['product', 'subrecipe']).default('product'),
+      product_id:    z.string().uuid().optional().nullable(),
+      sub_recipe_id: z.string().uuid().optional().nullable(),
+      quantity:      z.number().nonnegative().default(0),
+      unit_code:     z.string().optional().nullable(),
+      waste_pct:     z.number().min(0).max(100).optional().default(0),
+    }).optional().nullable(),
   })).optional().default([]),
 });
 
@@ -40,9 +51,22 @@ modifiers.get('/', async (c) => {
       opts = data ?? [];
     }
 
+    // Ingrediente de cada opción (si la migración 84 corrió). Va en su propio
+    // try: sin ingredientes el menú tiene que seguir cargando igual.
+    const ingByModifier = new Map<string, any>();
+    try {
+      const optIds = opts.map(o => o.id);
+      if (optIds.length) {
+        const { data: ings } = await db.from('modifier_ingredients')
+          .select('*').eq('tenant_id', tenantId).in('modifier_id', optIds);
+        for (const i of (ings ?? []) as any[]) ingByModifier.set(i.modifier_id, i);
+      }
+    } catch { /* migración sin correr */ }
+
     const result = (groups ?? []).map((g: any) => ({
       ...g,
-      modifiers: opts.filter(o => o.group_id === g.id),
+      modifiers: opts.filter(o => o.group_id === g.id)
+        .map(o => ({ ...o, ingredient: ingByModifier.get(o.id) ?? null })),
     }));
     return ok(c, result);
   } catch (err: any) { return fail(c, err.message, 500); }
@@ -80,8 +104,31 @@ modifiers.put('/product/:productId', async (c) => {
           price_delta: m.price_delta ?? 0,
           sort_order:  m.sort_order ?? i,
         }));
-        const { error: mErr } = await db.from('product_modifiers').insert(rows);
+        const { data: mRows, error: mErr } = await db.from('product_modifiers').insert(rows).select('id, name');
         if (mErr) throw new Error(mErr.message);
+
+        // Ingredientes de las opciones que lo tengan. En un try aparte: si la
+        // migración 84 no corrió, los modificadores igual se guardan — perder el
+        // menú entero por el costo de un extra sería un mal negocio.
+        try {
+          const ingRows = g.modifiers.flatMap((m, i) => {
+            const ing = m.ingredient;
+            if (!ing || !(ing.quantity > 0)) return [];
+            const created = (mRows ?? [])[i];
+            if (!created?.id) return [];
+            return [{
+              tenant_id: tenantId, modifier_id: created.id,
+              type: ing.type ?? 'product',
+              product_id: ing.type === 'subrecipe' ? null : (ing.product_id ?? null),
+              sub_recipe_id: ing.type === 'subrecipe' ? (ing.sub_recipe_id ?? null) : null,
+              quantity: ing.quantity, unit_code: ing.unit_code || null,
+              waste_pct: ing.waste_pct ?? 0,
+            }];
+          });
+          if (ingRows.length) await db.from('modifier_ingredients').insert(ingRows);
+        } catch (e: any) {
+          console.warn('[modifiers] ingredientes no guardados:', e?.message);
+        }
       }
     }
     return ok(c, { ok: true });

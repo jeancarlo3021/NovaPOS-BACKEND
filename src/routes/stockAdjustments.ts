@@ -197,6 +197,82 @@ stockAdjustments.post('/physical-count', requirePermission('inventory', 'edit'),
   }
 });
 
+// POST /waste — MERMA de varios productos de una sola vez.
+//
+// El ajuste de a uno ya existía, pero al cierre de cocina se botan cinco cosas
+// juntas y entrar producto por producto hace que nadie lo registre. Y una merma
+// que no se registra no desaparece: reaparece como varianza sin explicar en el
+// food cost, que es el peor lugar donde encontrarla.
+//
+// body: { type: 'damage'|'expired'|'theft'|'decrease', reason, notes?,
+//         items: [{ product_id, quantity }] }
+const WasteSchema = z.object({
+  type: z.enum(['damage', 'expired', 'theft', 'decrease']),
+  reason: z.string().min(1),
+  notes: z.string().optional().nullable(),
+  user_email: z.string().optional().nullable(),
+  items: z.array(z.object({
+    product_id: z.string().uuid(),
+    quantity: z.number().positive(),
+  })).min(1),
+});
+
+stockAdjustments.post('/waste', requirePermission('inventory', 'edit'), async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const userId = c.get('userId');
+    const parsed = WasteSchema.safeParse(await c.req.json());
+    if (!parsed.success) return fail(c, parsed.error.errors[0]?.message ?? 'Datos inválidos', 422);
+    const { type, reason, notes, user_email, items } = parsed.data;
+
+    const ids = [...new Set(items.map(i => i.product_id))];
+    const { data: products, error: pErr } = await db.from('products')
+      .select('id, name, stock_quantity, tracks_stock, cost_price')
+      .eq('tenant_id', tenantId).in('id', ids);
+    if (pErr) throw new Error(pErr.message);
+    const byId = new Map((products ?? []).map((p: any) => [p.id, p]));
+
+    const adjRows: any[] = [];
+    const applied: any[] = [];
+    let totalCost = 0;
+
+    for (const it of items) {
+      const p = byId.get(it.product_id);
+      if (!p) continue;
+      // Un producto de stock infinito no tiene existencias que botar. Se omite en
+      // vez de fallar: en una lista de diez, una línea así no debe tumbar el resto.
+      if ((p as any).tracks_stock === false) continue;
+
+      const before = Number((p as any).stock_quantity ?? 0);
+      const after = before - it.quantity;
+      const cost = (Number((p as any).cost_price) || 0) * it.quantity;
+      totalCost += cost;
+
+      adjRows.push({
+        tenant_id: tenantId, product_id: it.product_id, user_id: userId ?? null,
+        user_email: user_email ?? null, type,
+        quantity: -it.quantity, stock_before: before, stock_after: after,
+        reason, notes: notes ?? null,
+      });
+      applied.push({ product_id: it.product_id, name: (p as any).name, quantity: it.quantity, cost });
+    }
+
+    if (adjRows.length === 0) return fail(c, 'Ninguno de los productos lleva control de stock.', 422);
+
+    // La bitácora primero: si no se puede registrar el porqué, no se toca el stock.
+    const { error: aErr } = await db.from('stock_adjustments').insert(adjRows);
+    if (aErr) throw new Error(aErr.message);
+
+    for (const r of adjRows) {
+      await db.from('products')
+        .update({ stock_quantity: r.stock_after, updated_at: new Date().toISOString() })
+        .eq('id', r.product_id).eq('tenant_id', tenantId);
+    }
+
+    return ok(c, { registered: applied.length, total_cost: totalCost, items: applied }, 201);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // GET /kardex?product_id=&from=&to= — Kardex (tarjeta de existencias) de un
 // producto: todos los movimientos con saldo corrido. Fuentes:
 //   • stock_adjustments → ajustes, tomas físicas y recepciones de compra.

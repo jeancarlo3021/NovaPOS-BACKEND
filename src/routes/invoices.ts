@@ -4,6 +4,9 @@ import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
 import { endOfDay } from '../utils/dateRange.js';
 import { createReceivable } from './accountsReceivable.js';
+import {
+  consumeForInvoice, applyConsumption, snapshotItemCosts, revertConsumption,
+} from '../services/recipeConsumption.js';
 
 const invoices = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
@@ -263,10 +266,33 @@ invoices.post('/', async (c) => {
     }
     if (itemErr) throw new Error(itemErr.message);
 
+    // ── Recetas: consumo de ingredientes ────────────────────────────────────
+    // Vender un plato con receta descuenta sus INGREDIENTES, no el plato. Se
+    // resuelve ANTES del descuento normal para saber qué productos ya quedaron
+    // cubiertos por su receta y no descontarlos dos veces.
+    //
+    // Todo esto queda inerte si el plan no trae `recipe_consumption`, y un fallo
+    // acá no puede tumbar la venta: el cliente ya pagó y la factura ya existe.
+    let recipeProductIds = new Set<string>();
+    let costByProduct = new Map<string, number>();
+    try {
+      const r = await consumeForInvoice(tenantId, inv.id, items as any[]);
+      recipeProductIds = r.recipeProductIds;
+      costByProduct = r.costByProduct;
+      if (r.lines.length) {
+        await applyConsumption(tenantId, r.lines, { invoice_id: inv.id });
+      }
+    } catch (e: any) {
+      console.warn('[recipes] no se pudo aplicar el consumo:', e?.message);
+    }
+
     // Decrement stock — SOLO productos que manejan inventario.
     // Los de stock infinito (tracks_stock === false) NO se descuentan.
     for (const item of items as any[]) {
       if (!item.product_id) continue;   // ad-hoc: sin producto que descontar
+      // Con receta, el inventario ya se movió por ingredientes: descontar además
+      // el plato sería contarlo dos veces.
+      if (recipeProductIds.has(item.product_id)) continue;
       const { data: p } = await db.from('products')
         .select('stock_quantity, tracks_stock').eq('id', item.product_id).maybeSingle();
       if (p && (p as any).tracks_stock !== false) {
@@ -276,6 +302,13 @@ invoices.post('/', async (c) => {
         }).eq('id', item.product_id);
       }
     }
+
+    // ── Costo CONGELADO de la venta ─────────────────────────────────────────
+    // El costo se recalculaba siempre con el `cost_price` de hoy, así que una
+    // venta vieja se recosteaba con el precio actual y el food cost histórico
+    // era ficción. Se guarda ahora o no se puede reconstruir nunca.
+    try { await snapshotItemCosts(tenantId, inv.id, items as any[], costByProduct); }
+    catch (e: any) { console.warn('[recipes] no se pudo congelar el costo:', e?.message); }
 
     // Venta a CRÉDITO → generar la cuenta por cobrar (vence en 30 días).
     if (inv.payment_method === 'credit') {
@@ -375,10 +408,33 @@ invoices.post('/:id/void', async (c) => {
 
     // 3) Devolver el stock al inventario — SOLO productos que rastrean stock.
     //    Los de stock infinito (tracks_stock=false) no se tocan.
+    //
+    //    Si la venta consumió ingredientes por receta, lo que hay que devolver
+    //    son los INGREDIENTES, no el plato: el plato nunca se descontó. Los
+    //    productos así devueltos se excluyen del bucle de abajo.
+    const recipeReturned = new Set<string>();
+    try {
+      const { data: cons } = await db.from('recipe_consumptions')
+        .select('product_id').eq('tenant_id', tenantId).eq('invoice_id', id).is('reverted_at', null);
+      if (cons?.length) {
+        await revertConsumption(tenantId, id);
+        // El plato en sí no se descontó al vender, así que tampoco se devuelve.
+        const { data: sold } = await db.from('invoice_items')
+          .select('product_id').eq('invoice_id', id);
+        const { data: recs } = await db.from('recipes')
+          .select('product_id').eq('tenant_id', tenantId).not('product_id', 'is', null);
+        const withRecipe = new Set((recs ?? []).map((r: any) => String(r.product_id)));
+        for (const s of (sold ?? []) as any[]) {
+          if (s.product_id && withRecipe.has(String(s.product_id))) recipeReturned.add(String(s.product_id));
+        }
+      }
+    } catch (e: any) { console.warn('[void] consumo de recetas:', e?.message); }
+
     const { data: items } = await db.from('invoice_items')
       .select('product_id, quantity').eq('invoice_id', id);
     for (const it of (items ?? []) as any[]) {
       if (!it.product_id) continue;
+      if (recipeReturned.has(String(it.product_id))) continue;
       const { data: p } = await db.from('products')
         .select('stock_quantity, tracks_stock').eq('id', it.product_id).maybeSingle();
       if (p && (p as any).tracks_stock !== false) {

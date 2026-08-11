@@ -50,7 +50,9 @@ reports.get('/delivery', async (c) => {
     const to   = endOfDay(c.req.query('to'));
 
     let q = db.from('invoices')
-      .select('id, invoice_number, customer_name, total, subtotal, tax_amount, delivery_commission_pct, delivery_net, delivery_platform, issued_at')
+      // fe_clave / fe_nc_clave: la pantalla necesita saber si la venta salió a
+      // Hacienda para avisar que anularla emite una Nota de Crédito.
+      .select('id, invoice_number, customer_name, total, subtotal, tax_amount, delivery_commission_pct, delivery_net, delivery_platform, issued_at, fe_clave, fe_nc_clave')
       .eq('tenant_id', tenantId).eq('is_delivery', true).neq('status', 'cancelled')
       .order('issued_at', { ascending: false }).limit(5000);
     if (from) q = q.gte('issued_at', from);
