@@ -2230,28 +2230,125 @@ export async function autoSendComprobanteToCustomer(tenantId: string, invoiceId:
   } catch (e: any) { console.warn('[FE email auto-accept] no se pudo enviar:', e?.message); }
 }
 
+// POST /resend-email — reenvía un comprobante por correo.
+//
+// body: { invoice_id, email, kind?: 'invoice' | 'nc' | 'nd' }
+//
+// `kind` decide QUÉ documento se manda. Antes siempre iba la factura, así que
+// una nota de crédito no se podía reenviar nunca: el cliente que anulaba una
+// compra se quedaba sin el comprobante que la respalda ante Hacienda, y desde la
+// bitácora no había forma de mandárselo.
+/**
+ * Envía la NOTA al cliente cuando Hacienda la ACEPTA.
+ *
+ * La factura ya se enviaba sola al aceptarse; la nota de crédito no, así que el
+ * cliente al que se le anulaba una compra nunca recibía el comprobante que la
+ * respalda. Para él eso importa tanto como la factura: es lo que sustenta que ya
+ * no debe ese IVA.
+ *
+ * La marca de «ya enviado» usa una columna propia si existe y, si no, se envía
+ * igual: duplicar un correo es molesto, pero no mandarlo le deja al cliente un
+ * hueco en su contabilidad.
+ */
+export async function autoSendNotaToCustomer(
+  tenantId: string, invoiceId: string, kind: 'nc' | 'nd',
+): Promise<void> {
+  try {
+    const claveCol = kind === 'nc' ? 'fe_nc_clave' : 'fe_nd_clave';
+    const docCol   = kind === 'nc' ? 'fe_nc_doc_id' : 'fe_nd_doc_id';
+    const sentCol  = kind === 'nc' ? 'fe_nc_emailed' : 'fe_nd_emailed';
+
+    const { data: inv } = await db.from('invoices')
+      .select(`invoice_number, total, customer_name, customer_id, document_type, ${claveCol}, ${docCol}`)
+      .eq('id', invoiceId).eq('tenant_id', tenantId).maybeSingle();
+    const i = inv as any;
+    if (!i?.[claveCol]) return;
+
+    // Si la columna de "ya enviado" existe y está marcada, no se repite.
+    try {
+      const { data: sent } = await db.from('invoices').select(sentCol).eq('id', invoiceId).maybeSingle();
+      if ((sent as any)?.[sentCol]) return;
+    } catch { /* la columna no existe: se envía igual */ }
+
+    if (!i.customer_id) return;
+    const { data: cust } = await db.from('customers').select('email').eq('id', i.customer_id).maybeSingle();
+    const email = (cust as any)?.email ?? null;
+    if (!email) return;   // sin correo del cliente no hay a dónde mandarlo
+
+    const cfg = await loadFEConfig(tenantId);
+    const label = kind === 'nc' ? 'Nota de crédito' : 'Nota de débito';
+    const atts = cfg.fe_provider === 'alanube'
+      ? await alanubeAttachments(cfg, i[docCol] ?? i[claveCol],
+          (kind === 'nc' ? 'creditNote' : 'debitNote') as any, i[claveCol],
+          (String(cfg.environment ?? 'production') === 'sandbox' ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id)
+      : undefined;
+
+    await sendComprobanteEmail(email, {
+      ...i,
+      fe_clave: i[claveCol],
+      invoice_number: `${label} · ${i.invoice_number}`,
+      fe_xml: null,   // el XML guardado es el de la factura, no el de la nota
+    } as any, atts);
+
+    await db.from('invoices').update({ [sentCol]: true })
+      .eq('id', invoiceId).eq('tenant_id', tenantId).then(() => {}, () => {});
+  } catch (e: any) {
+    console.warn('[FE email nota] no se pudo enviar:', e?.message);
+  }
+}
+
 hacienda.post('/resend-email', async (c) => {
   try {
     const tenantId = c.get('tenantId');
-    const { invoice_id, email } = await c.req.json().catch(() => ({}));
+    const { invoice_id, email, kind } = await c.req.json().catch(() => ({}));
     if (!invoice_id || !email) return fail(c, 'Falta invoice_id o email', 422);
+    const which: 'invoice' | 'nc' | 'nd' =
+      kind === 'nc' || kind === 'nd' ? kind : 'invoice';
 
     const { data: inv } = await db.from('invoices')
-      .select('invoice_number, fe_clave, fe_consecutivo, fe_status, fe_xml, total, customer_name, document_type')
+      .select('invoice_number, fe_clave, fe_consecutivo, fe_status, fe_xml, total, customer_name, document_type, '
+        + 'fe_nc_clave, fe_nc_doc_id, fe_nd_clave, fe_nd_doc_id')
       .eq('id', invoice_id).eq('tenant_id', tenantId).maybeSingle();
     if (!inv) return fail(c, 'Factura no encontrada', 404);
-    if (!(inv as any).fe_clave) return fail(c, 'La factura no fue emitida electrónicamente', 422);
+    const i = inv as any;
+
+    // Documento a mandar: clave, id de Alanube y cómo llamarlo en el correo.
+    const doc = which === 'nc'
+      ? { clave: i.fe_nc_clave, docId: i.fe_nc_doc_id ?? i.fe_nc_clave, kind: 'creditNote', label: 'Nota de crédito' }
+      : which === 'nd'
+        ? { clave: i.fe_nd_clave, docId: i.fe_nd_doc_id ?? i.fe_nd_clave, kind: 'debitNote', label: 'Nota de débito' }
+        : { clave: i.fe_clave, docId: i.fe_consecutivo, kind: feKindOf(i.document_type), label: null as string | null };
+
+    if (!doc.clave) {
+      return fail(c, which === 'invoice'
+        ? 'La factura no fue emitida electrónicamente'
+        : `Esta factura no tiene ${which === 'nc' ? 'nota de crédito' : 'nota de débito'} emitida.`, 422);
+    }
 
     // Con Alanube, bajamos XML + respuesta de Hacienda + PDF para adjuntar.
     const cfg = await loadFEConfig(tenantId);
     const attachments = cfg.fe_provider === 'alanube'
-      ? await alanubeAttachments(cfg, (inv as any).fe_consecutivo, feKindOf((inv as any).document_type), (inv as any).fe_clave,
+      ? await alanubeAttachments(cfg, doc.docId, doc.kind as any, doc.clave,
           (String(cfg.environment ?? 'production') === 'sandbox' ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id)
       : undefined;
-    await sendComprobanteEmail(email, inv as any, attachments);
-    // Marca que el comprobante ya se envió por correo (para el check en la bitácora).
-    await db.from('invoices').update({ fe_emailed: true }).eq('id', invoice_id).eq('tenant_id', tenantId).then(() => {}, () => {});
-    return ok(c, { ok: true, attachments: attachments?.length ?? 0 });
+
+    // El correo se arma con la clave y el número del documento que se manda: si
+    // fuera con los de la factura, el cliente recibiría una nota de crédito
+    // rotulada como factura y no sabría qué guardar.
+    await sendComprobanteEmail(email, {
+      ...i,
+      fe_clave: doc.clave,
+      invoice_number: doc.label ? `${doc.label} · ${i.invoice_number}` : i.invoice_number,
+      // El XML guardado es el de la FACTURA: no sirve para la nota.
+      fe_xml: which === 'invoice' ? i.fe_xml : null,
+    }, attachments);
+
+    // Solo la factura marca `fe_emailed`: ese check de la bitácora significa
+    // «el comprobante de venta ya se envió», y una nota no lo reemplaza.
+    if (which === 'invoice') {
+      await db.from('invoices').update({ fe_emailed: true }).eq('id', invoice_id).eq('tenant_id', tenantId).then(() => {}, () => {});
+    }
+    return ok(c, { ok: true, kind: which, attachments: attachments?.length ?? 0 });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
-import { autoSendComprobanteToCustomer, bumpConsecutivoOnDuplicate, loadFEConfig } from './hacienda.js';
+import { autoSendComprobanteToCustomer, autoSendNotaToCustomer, bumpConsecutivoOnDuplicate, loadFEConfig } from './hacienda.js';
 import { notifyFeError } from '../services/whatsappNotify.js';
 
 // Rutas PÚBLICAS para webhooks entrantes (Alanube nos llama; no hay sesión).
@@ -96,6 +96,15 @@ webhooks.post('/alanube', async (c) => {
           await db.from('invoices')
             .update({ [statusCol]: feStatus, updated_at: new Date().toISOString() })
             .eq(claveCol, claveDigits);
+          // Al ACEPTARSE, la nota también se le manda al cliente. Antes solo se
+          // enviaba la factura, así que a quien se le anulaba una compra nunca
+          // le llegaba el comprobante que la respalda.
+          if (feStatus === 'accepted') {
+            const kind = claveCol === 'fe_nc_clave' ? 'nc' : 'nd';
+            for (const n of notes as any[]) {
+              void autoSendNotaToCustomer(n.tenant_id, n.id, kind).catch(() => {});
+            }
+          }
           if (feStatus === 'rejected' || feStatus === 'error') {
             const govErr = d?.governmentResponse ?? d?.errorMessage
               ?? deepFind(body, /(governmentResponse|errorMessage)/i, 5000);
