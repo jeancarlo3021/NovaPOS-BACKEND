@@ -381,8 +381,17 @@ reports.get('/taxes', async (c) => {
       if (to)   qp = qp.lte('doc_date', to);
       const rp: any = await qp;
       purchases = ((rp.data ?? []) as any[]).map(p => {
-        const total = Number(p.total ?? 0);
-        const iva = Number(p.tax ?? 0);
+        // Una NOTA DE CRÉDITO del proveedor RESTA crédito fiscal: es plata que
+        // se devolvió o un descuento posterior, así que el IVA soportado deja de
+        // existir. Sumarla como una compra más —que es lo que se hacía— infla el
+        // crédito y termina en una declaración con IVA de menos.
+        //
+        // El tipo va embebido en la clave (posiciones 30-31) y ya se guarda al
+        // recibir el XML: 01 factura · 02 nota de débito · 03 nota de crédito.
+        // La nota de DÉBITO suma, porque agrega monto a lo comprado.
+        const sign = String(p.document_type ?? '') === '03' ? -1 : 1;
+        const total = Number(p.total ?? 0) * sign;
+        const iva = Number(p.tax ?? 0) * sign;
         return {
           clave: p.clave ?? '', issuer_name: p.issuer_name ?? '', issuer_id: p.issuer_id ?? '',
           document_type: p.document_type ?? '', doc_date: p.doc_date ?? '',

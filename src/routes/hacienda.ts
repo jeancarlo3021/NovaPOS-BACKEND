@@ -1953,6 +1953,91 @@ hacienda.post('/received/reconcile', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+// POST /received/credit-note — acepta una NOTA DE CRÉDITO del proveedor.
+//
+// Una NC no ingresa mercadería: o devuelve plata (descuento posterior) o devuelve
+// PRODUCTO. En el segundo caso el stock que entró con la factura original tiene
+// que salir, porque físicamente ya no está.
+//
+// `restock: false` es para la NC que es solo descuento —el precio bajó, la
+// mercadería se quedó—: ahí restar existencias inventaría un faltante que no
+// existe. Por eso se pregunta en vez de asumir.
+//
+// body: { id, restock?: boolean }
+hacienda.post('/received/credit-note', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const userId = c.get('userId');
+    const body = await c.req.json().catch(() => ({} as any));
+    const id = String(body?.id ?? '');
+    const restock = body?.restock !== false;   // por defecto sí devuelve producto
+    if (!id) return fail(c, 'Falta el id', 422);
+
+    const { data: doc } = await db.from('received_documents')
+      .select('*').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+    if (!doc) return fail(c, 'Comprobante no encontrado', 404);
+    const d = doc as any;
+
+    const tipo = String(d.document_type ?? '') || String(d.clave ?? '').slice(29, 31);
+    if (tipo !== '03') {
+      return fail(c, 'Este comprobante no es una nota de crédito.', 409);
+    }
+
+    const messages: string[] = [];
+    const applied: any[] = [];
+
+    if (restock) {
+      // Se emparejan las líneas igual que en una compra: por CABYS, código o
+      // nombre. Lo que no calce se informa en vez de inventarse un producto —
+      // crear catálogo desde una devolución no tiene ningún sentido.
+      const matched = await matchLines(tenantId, linesFromDoc(d));
+      for (const m of matched as any[]) {
+        const qty = Number(m.quantity) || 0;
+        if (!m.product_id || qty <= 0) {
+          if (qty > 0) messages.push(`⚠️ Sin producto que coincida: "${m.detail}" (${qty})`);
+          continue;
+        }
+        const { data: p } = await db.from('products')
+          .select('stock_quantity, tracks_stock, name, cost_price')
+          .eq('id', m.product_id).eq('tenant_id', tenantId).maybeSingle();
+        if (!p) continue;
+        if ((p as any).tracks_stock === false) {
+          messages.push(`∞ ${(p as any).name}: sin control de stock, no se descuenta.`);
+          continue;
+        }
+        const before = Number((p as any).stock_quantity ?? 0);
+        const after = before - qty;
+
+        // La bitácora primero: si no se puede registrar el porqué, no se mueve
+        // el inventario. Un faltante sin motivo aparece después como varianza.
+        const { error: aErr } = await db.from('stock_adjustments').insert({
+          tenant_id: tenantId, product_id: m.product_id, user_id: userId ?? null,
+          type: 'return', quantity: -qty, stock_before: before, stock_after: after,
+          reason: 'Nota de crédito de proveedor',
+          notes: `${d.issuer_name ?? ''} · Clave ${d.clave ?? ''}`.trim(),
+        });
+        if (aErr) { messages.push(`⚠️ No se pudo registrar ${(p as any).name}: ${aErr.message}`); continue; }
+
+        await db.from('products')
+          .update({ stock_quantity: after, updated_at: new Date().toISOString() })
+          .eq('id', m.product_id).eq('tenant_id', tenantId);
+        applied.push({ product_id: m.product_id, name: (p as any).name, quantity: qty });
+      }
+    }
+
+    await db.from('received_documents')
+      .update({ kind: 'compra', updated_at: new Date().toISOString() })
+      .eq('id', id).eq('tenant_id', tenantId);
+
+    messages.unshift(restock
+      ? `↩ Nota de crédito aceptada · ${applied.length} producto(s) devuelto(s) al proveedor.`
+      : '↩ Nota de crédito aceptada como descuento: no se tocó el inventario.');
+    messages.push(`💸 Resta ₡${Number(d.total ?? 0).toLocaleString('es-CR')} del crédito fiscal del período.`);
+
+    return ok(c, { ok: true, restocked: applied.length, items: applied, messages });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // POST /received/upload — registra un recibido a partir del XML del proveedor.
 // body: { xml: string }  (contenido del archivo .xml de la factura del proveedor)
 hacienda.post('/received/upload', async (c) => {
