@@ -2164,14 +2164,22 @@ async function alanubeAttachments(cfg: any, docId: string | null | undefined, ki
   if (xml) out.push({ filename: `${base}.xml`, content: xml });
   if (xmlHacienda) out.push({ filename: `${base}-respuesta-hacienda.xml`, content: xmlHacienda });
 
-  // 2) PDF por el endpoint dedicado (base64). Requiere idCompany.
-  try {
-    if (companyId) {
+  // 2) PDF por el endpoint dedicado (base64). Requiere idCompany y el tipo de
+  //    documento tal como lo nombra Alanube ('invoice', 'ticket', 'credit-note',
+  //    'debit-note'). Un tipo mal escrito no da error: devuelve vacío, y el
+  //    correo sale sin PDF sin que nada lo explique.
+  if (!companyId) {
+    console.warn(`[FE email] sin idCompany: no se puede pedir el PDF de ${base}`);
+  } else {
+    try {
       const r: any = await client.getDocumentPdf(String(docId), String(kind), String(companyId));
       const pdf = await toB64(r?.pdf ?? deepFind(r, /^pdf$/i, 12_000_000));
       if (pdf) out.push({ filename: `${base}.pdf`, content: pdf });
+      else console.warn(`[FE email] Alanube no devolvió PDF de ${base} (tipo "${kind}", doc ${docId})`);
+    } catch (e: any) {
+      console.warn(`[FE email] PDF no disponible de ${base} (tipo "${kind}"):`, e?.message);
     }
-  } catch (e: any) { console.warn('[FE email] PDF no disponible:', e?.message); }
+  }
 
   return out;
 }
@@ -2279,7 +2287,7 @@ export async function autoSendNotaToCustomer(
     const label = kind === 'nc' ? 'Nota de crédito' : 'Nota de débito';
     const atts = cfg.fe_provider === 'alanube'
       ? await alanubeAttachments(cfg, i[docCol] ?? i[claveCol],
-          (kind === 'nc' ? 'creditNote' : 'debitNote') as any, i[claveCol],
+          (kind === 'nc' ? 'credit-note' : 'debit-note') as any, i[claveCol],
           (String(cfg.environment ?? 'production') === 'sandbox' ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id)
       : undefined;
 
@@ -2314,9 +2322,9 @@ hacienda.post('/resend-email', async (c) => {
 
     // Documento a mandar: clave, id de Alanube y cómo llamarlo en el correo.
     const doc = which === 'nc'
-      ? { clave: i.fe_nc_clave, docId: i.fe_nc_doc_id ?? i.fe_nc_clave, kind: 'creditNote', label: 'Nota de crédito' }
+      ? { clave: i.fe_nc_clave, docId: i.fe_nc_doc_id ?? i.fe_nc_clave, kind: 'credit-note', label: 'Nota de crédito' }
       : which === 'nd'
-        ? { clave: i.fe_nd_clave, docId: i.fe_nd_doc_id ?? i.fe_nd_clave, kind: 'debitNote', label: 'Nota de débito' }
+        ? { clave: i.fe_nd_clave, docId: i.fe_nd_doc_id ?? i.fe_nd_clave, kind: 'debit-note', label: 'Nota de débito' }
         : { clave: i.fe_clave, docId: i.fe_consecutivo, kind: feKindOf(i.document_type), label: null as string | null };
 
     if (!doc.clave) {
@@ -2348,7 +2356,13 @@ hacienda.post('/resend-email', async (c) => {
     if (which === 'invoice') {
       await db.from('invoices').update({ fe_emailed: true }).eq('id', invoice_id).eq('tenant_id', tenantId).then(() => {}, () => {});
     }
-    return ok(c, { ok: true, kind: which, attachments: attachments?.length ?? 0 });
+    const hasPdf = (attachments ?? []).some(a => a.filename.toLowerCase().endsWith('.pdf'));
+    return ok(c, {
+      ok: true, kind: which, attachments: attachments?.length ?? 0, pdf: hasPdf,
+      // Se avisa en vez de fallar: el correo con los XML ya es un comprobante
+      // entregado, y el PDF es solo su representación gráfica.
+      warning: hasPdf ? null : 'Se envió sin PDF: Alanube no lo devolvió para este documento.',
+    });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
