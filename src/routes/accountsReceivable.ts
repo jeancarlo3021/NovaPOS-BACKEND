@@ -3,6 +3,8 @@ import { z } from 'zod';
 import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
 import { getUserZone } from '../utils/userZone.js';
+import { nextInvoiceNumber, consecutivoFloor } from './invoices.js';
+import { emitInvoiceCore } from './hacienda.js';
 
 const accountsReceivable = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
@@ -300,6 +302,105 @@ accountsReceivable.delete('/:id', async (c) => {
     const { error } = await db.from('accounts_receivable').delete().eq('id', id).eq('tenant_id', tenantId);
     if (error) throw new Error(error.message);
     return ok(c, { deleted: true });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// COMPROBANTE DE UN ABONO
+// ══════════════════════════════════════════════════════════════════════════
+//
+// body: { customer_id?, customer_name?, amount, document_type, batch_id?,
+//         payment_method? }
+//
+// ── Qué NO hace, y por qué ────────────────────────────────────────────────
+// No se emite por cuentas que YA tienen factura. Una venta a crédito emite su
+// comprobante al venderse, con condición de venta «crédito»; emitir otro al
+// cobrar declararía el mismo ingreso dos veces ante Hacienda. El front manda
+// solo el monto de las cuentas SIN comprobante previo, y acá se vuelve a exigir:
+// una regla fiscal no puede vivir solo en la pantalla.
+//
+// ── Sin caja ──────────────────────────────────────────────────────────────
+// `cash_session_id` queda en NULL a propósito. Un abono se cobra muchas veces
+// fuera del POS —en la oficina, o por depósito—, y meterlo al arqueo haría que
+// al cajero le sobre plata que nunca pasó por su gaveta.
+accountsReceivable.post('/emit-receipt', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const b = await c.req.json().catch(() => ({} as any));
+
+    const amount = Number(b?.amount);
+    if (!Number.isFinite(amount) || amount <= 0) return fail(c, 'Monto inválido', 422);
+
+    const docType = String(b?.document_type ?? '');
+    if (!['ticket', 'tiquete_electronico', 'factura_electronica'].includes(docType)) {
+      return fail(c, 'Tipo de comprobante inválido', 422);
+    }
+
+    // El monto recibido YA incluye el impuesto: el cliente pagó eso y el
+    // comprobante tiene que decir eso. Se despeja la base con el mismo criterio
+    // del POS (redondeo a colón), para que el total salga exacto.
+    const ivaRate = Number(b?.iva_rate ?? 13);
+    const base = ivaRate > 0 ? Math.round((amount / (1 + ivaRate / 100)) * 100) / 100 : amount;
+    const tax = Math.round(amount - base);
+    const total = Math.round(base) + tax;
+
+    const floor = await consecutivoFloor(tenantId);
+    let finalNumber = await nextInvoiceNumber(tenantId, 0, floor);
+    let inv: any = null;
+
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const res = await db.from('invoices').insert({
+        tenant_id: tenantId,
+        invoice_number: finalNumber,
+        customer_id: b?.customer_id ?? null,
+        customer_name: b?.customer_name ?? null,
+        subtotal: base, tax_amount: tax, total,
+        discount_amount: 0,
+        payment_method: b?.payment_method ?? 'cash',
+        status: 'completed',
+        // Sin caja: el abono no entra al arqueo (ver arriba).
+        cash_session_id: null,
+        cashier_id: c.get('userId') ?? null,
+        document_type: docType === 'ticket' ? 'ticket' : docType,
+        notes: b?.batch_id ? `Abono a cuenta · lote ${b.batch_id}` : 'Abono a cuenta',
+        issued_at: new Date().toISOString(),
+      }).select().single();
+
+      if (!res.error) { inv = res.data; break; }
+      const msg = (res.error as any)?.message ?? '';
+      const isDup = (res.error as any)?.code === '23505' || /duplicate key|invoice_number_key/i.test(msg);
+      if (!isDup) throw new Error(msg);
+      finalNumber = await nextInvoiceNumber(tenantId, attempt + 1, floor);
+    }
+    if (!inv) return fail(c, 'No se pudo generar el comprobante (número duplicado)', 409);
+
+    // Una sola línea: «Abono a cuenta». La cuenta manual no tiene productos de
+    // dónde sacar un detalle, y inventarlo sería declarar una venta que no fue.
+    await db.from('invoice_items').insert({
+      invoice_id: inv.id,
+      product_id: null,
+      product_name: 'Abono a cuenta',
+      quantity: 1,
+      unit_price: base,
+      subtotal: base,
+    }).then(() => {}, (e: any) => console.warn('[abono] línea:', e?.message));
+
+    // Electrónico: se emite. Si Hacienda lo rechaza, la factura queda creada con
+    // el error registrado — el abono ya se recibió y no se deshace por esto.
+    if (docType !== 'ticket') {
+      try {
+        return await emitInvoiceCore(c, tenantId, inv.id, {});
+      } catch (e: any) {
+        return ok(c, {
+          invoice_id: inv.id, invoice_number: inv.invoice_number,
+          emitted: false, error: e?.message ?? 'No se pudo emitir',
+        }, 201);
+      }
+    }
+
+    return ok(c, {
+      invoice_id: inv.id, invoice_number: inv.invoice_number, emitted: false,
+    }, 201);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

@@ -72,7 +72,7 @@ const InvoiceSchema = z.object({
 // 000001, 000002, ... — el mismo para ventas online y offline. Toma el MAYOR
 // número de secuencia ya usado por el tenant (los dígitos finales de cualquier
 // formato) y le suma 1. `attemptOffset` permite reintentar ante colisión.
-async function nextInvoiceNumber(tenantId: string, attemptOffset = 0, floor = 0): Promise<string> {
+export async function nextInvoiceNumber(tenantId: string, attemptOffset = 0, floor = 0): Promise<string> {
   // ⚠️ Paginado: Supabase trae máx 1000 filas por query. Con miles de facturas,
   // sin paginar/ordenar el máximo salía MÁS BAJO que el real → número DUPLICADO.
   // Solo consecutivos SIMPLES (1-6 dígitos puros); se ignoran fechas/claves de FE.
@@ -97,7 +97,7 @@ async function nextInvoiceNumber(tenantId: string, attemptOffset = 0, floor = 0)
 
 /** Piso de consecutivo migrado: el MAYOR de los "Próx. …" configurados en
  *  Datos de FE (se comparte un solo contador entre corriente y electrónico). */
-async function consecutivoFloor(tenantId: string): Promise<number> {
+export async function consecutivoFloor(tenantId: string): Promise<number> {
   try {
     const { data } = await db.from('settings').select('config')
       .eq('tenant_id', tenantId).eq('type', 'electronic-invoice').maybeSingle();
