@@ -176,7 +176,11 @@ accountsReceivable.post('/:id/pay', async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const { id } = c.req.param();
-    const { amount, method, note, created_at } = await c.req.json() as { amount: number; method?: string; note?: string; created_at?: string };
+    const { amount, method, note, created_at, batch_id } = await c.req.json() as {
+      amount: number; method?: string; note?: string; created_at?: string;
+      /** Agrupa los abonos de un mismo pago masivo. */
+      batch_id?: string;
+    };
     if (!amount || amount <= 0) return fail(c, 'Monto inválido', 422);
 
     const { data: ar } = await db.from('accounts_receivable')
@@ -195,12 +199,35 @@ accountsReceivable.post('/:id/pay', async (c) => {
     if (typeof created_at === 'string' && !isNaN(Date.parse(created_at))) {
       payment.created_at = created_at;
     }
-    await db.from('accounts_receivable_payments').insert(payment);
-    const { data, error } = await db.from('accounts_receivable')
-      .update({ paid_amount: newPaid, status, updated_at: new Date().toISOString() })
-      .eq('id', id).select().single();
-    if (error) throw new Error(error.message);
-    return ok(c, data);
+    if (batch_id) payment.batch_id = batch_id;
+
+    let ins = await db.from('accounts_receivable_payments').insert(payment);
+    // La columna `batch_id` es de la migración 89: si no corrió, el abono se
+    // registra igual sin agrupar. Perder el vínculo del pago masivo es molesto;
+    // perder el abono sería un descuadre de plata.
+    if (ins.error && /batch_id/.test(ins.error.message ?? '')) {
+      const { batch_id: _b, ...rest } = payment;
+      ins = await db.from('accounts_receivable_payments').insert(rest);
+    }
+    if (ins.error) throw new Error(ins.error.message);
+
+    const patch: Record<string, any> = {
+      paid_amount: newPaid, status, updated_at: new Date().toISOString(),
+    };
+    // Momento en que la cuenta queda CANCELADA. `updated_at` no sirve para esto:
+    // cambia con cualquier edición posterior, así que la fecha de cancelación se
+    // perdía apenas alguien tocaba la cuenta.
+    if (status === 'paid') {
+      patch.paid_at = payment.created_at ?? new Date().toISOString();
+    }
+
+    let upd = await db.from('accounts_receivable').update(patch).eq('id', id).select().single();
+    if (upd.error && /paid_at/.test(upd.error.message ?? '')) {
+      const { paid_at: _p, ...rest } = patch;
+      upd = await db.from('accounts_receivable').update(rest).eq('id', id).select().single();
+    }
+    if (upd.error) throw new Error(upd.error.message);
+    return ok(c, upd.data);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
@@ -247,9 +274,20 @@ accountsReceivable.post('/payments/:paymentId/void', async (c) => {
       .select('total_amount').eq('id', receivableId).eq('tenant_id', tenantId).maybeSingle();
     const total = Number((ar as any)?.total_amount ?? 0);
     const status = newPaid <= 0 ? 'pending' : newPaid >= total ? 'paid' : 'partial';
-    await db.from('accounts_receivable')
-      .update({ paid_amount: newPaid, status, updated_at: new Date().toISOString() })
+    const patch: Record<string, any> = {
+      paid_amount: newPaid, status, updated_at: new Date().toISOString(),
+    };
+    // Si la cuenta deja de estar cancelada, la fecha de cancelación se borra: una
+    // cuenta con saldo y con fecha de cancelación es un dato que se contradice a
+    // sí mismo, y después nadie sabe cuál de los dos creer.
+    if (status !== 'paid') patch.paid_at = null;
+    let upd = await db.from('accounts_receivable').update(patch)
       .eq('id', receivableId).eq('tenant_id', tenantId);
+    if (upd.error && /paid_at/.test(upd.error.message ?? '')) {
+      const { paid_at: _p, ...rest } = patch;
+      upd = await db.from('accounts_receivable').update(rest)
+        .eq('id', receivableId).eq('tenant_id', tenantId);
+    }
 
     return ok(c, { voided: true, amount: (pay as any).amount, new_paid: newPaid });
   } catch (err: any) { return fail(c, err.message, 500); }
