@@ -10,8 +10,21 @@ const accountsReceivable = new Hono<{ Variables: { userId: string; tenantId: str
 
 /** Mapa customer_id → zona, para filtrar/etiquetar CxC por zona. */
 async function customerZoneMap(tenantId: string): Promise<Map<string, string | null>> {
-  const { data } = await db.from('customers').select('id, zone').eq('tenant_id', tenantId);
-  return new Map((data ?? []).map((c: any) => [c.id, c.zone ?? null]));
+  // Paginado por el mismo motivo que la lista de cuentas: pasados los 1000
+  // clientes, los que quedaban fuera aparecían SIN zona y el filtro por zona los
+  // escondía a todos — un repartidor no veía sus cuentas y no había forma de
+  // saber por qué.
+  const PAGE = 1000;
+  const map = new Map<string, string | null>();
+  for (let from = 0; ; from += PAGE) {
+    const { data, error } = await db.from('customers')
+      .select('id, zone').eq('tenant_id', tenantId).range(from, from + PAGE - 1);
+    if (error) break;
+    const chunk = data ?? [];
+    for (const c of chunk as any[]) map.set(c.id, c.zone ?? null);
+    if (chunk.length < PAGE) break;
+  }
+  return map;
 }
 
 const ARSchema = z.object({
@@ -64,19 +77,57 @@ accountsReceivable.get('/', async (c) => {
     const tenantId = c.get('tenantId');
     const status = c.req.query('status');
     const customerId = c.req.query('customer_id');
-    let query = db.from('accounts_receivable').select('*')
-      .eq('tenant_id', tenantId).order('created_at', { ascending: false });
-    if (customerId) query = query.eq('customer_id', customerId);
-    const { data, error } = await query;
-    if (error) throw new Error(error.message);
-    let rows = (data ?? []).map(withDerivedStatus);
-    // Backfill del nº de factura para las cuentas que solo tienen invoice_id.
-    const needInv = rows.filter((r: any) => !r.invoice_number && r.invoice_id).map((r: any) => r.invoice_id);
-    if (needInv.length > 0) {
-      const { data: invs } = await db.from('invoices').select('id, invoice_number').in('id', needInv);
-      const map = new Map((invs ?? []).map((i: any) => [i.id, i.invoice_number]));
-      rows = rows.map((r: any) => (!r.invoice_number && r.invoice_id && map.get(r.invoice_id))
-        ? { ...r, invoice_number: map.get(r.invoice_id) } : r);
+    // Paginado: Supabase devuelve máximo 1000 filas por consulta. Sin esto, un
+    // negocio con muchas cuentas recibía solo las 1000 más recientes y las
+    // viejas —con sus clientes— simplemente no aparecían en la pantalla ni en
+    // los selectores de abono e impresión.
+    const PAGE = 1000;
+    const all: any[] = [];
+    for (let from = 0; ; from += PAGE) {
+      let query = db.from('accounts_receivable').select('*')
+        .eq('tenant_id', tenantId).order('created_at', { ascending: false })
+        .range(from, from + PAGE - 1);
+      if (customerId) query = query.eq('customer_id', customerId);
+      const { data, error } = await query;
+      if (error) throw new Error(error.message);
+      const chunk = data ?? [];
+      all.push(...chunk);
+      if (chunk.length < PAGE) break;   // última página
+    }
+    let rows = all.map(withDerivedStatus);
+    // Datos de la factura de origen: número y, sobre todo, si el comprobante
+    // llegó a HACIENDA.
+    //
+    // «Tiene factura» y «tiene comprobante electrónico» no son lo mismo: una
+    // venta documentada con tiquete CORRIENTE crea su factura interna pero nunca
+    // se declaró. Confundirlas hacía que al cobrar esas cuentas el sistema
+    // creyera que el ingreso ya estaba declarado y no emitiera nada.
+    const invIds = [...new Set(rows.filter((r: any) => r.invoice_id).map((r: any) => r.invoice_id))];
+    if (invIds.length > 0) {
+      const byId = new Map<string, any>();
+      // Paginado: un negocio con muchas cuentas supera las 1000 facturas.
+      const PAGE_I = 500;
+      for (let i = 0; i < invIds.length; i += PAGE_I) {
+        const { data: invs } = await db.from('invoices')
+          .select('id, invoice_number, fe_clave, document_type')
+          .in('id', invIds.slice(i, i + PAGE_I));
+        for (const inv of (invs ?? []) as any[]) byId.set(inv.id, inv);
+      }
+      rows = rows.map((r: any) => {
+        const inv = r.invoice_id ? byId.get(r.invoice_id) : null;
+        if (!inv) return { ...r, invoice_electronic: false };
+        return {
+          ...r,
+          invoice_number: r.invoice_number ?? inv.invoice_number,
+          // Electrónico = tiene clave de Hacienda. El tipo de documento por sí
+          // solo no basta: una venta marcada como electrónica que fue rechazada
+          // tampoco quedó declarada.
+          invoice_electronic: !!inv.fe_clave,
+          invoice_document_type: inv.document_type ?? null,
+        };
+      });
+    } else {
+      rows = rows.map((r: any) => ({ ...r, invoice_electronic: false }));
     }
     if (status) rows = rows.filter((r: any) => r.status === status);
 
