@@ -5,7 +5,7 @@ import { sendEmail, paymentReceiptEmailHtml, customInvoiceEmailHtml, planFeature
 import { alanube, AlanubeError, tenantAlanubeToken } from '../services/alanube.js';
 import { endOfDay } from '../utils/dateRange.js';
 import { whatsappEnabled, sendTemplate, normalizePhone } from '../services/whatsapp.js';
-import { refreshInvoiceStatus, refreshNoteStatus, emitInvoiceCore, emitCreditNoteCore, configuredNextConsecutivo } from './hacienda.js';
+import { refreshInvoiceStatus, refreshNoteStatus, emitInvoiceCore, emitCreditNoteCore, configuredNextConsecutivo, computeFeQuota } from './hacienda.js';
 import { notifyPaymentDue, businessContact } from '../services/whatsappNotify.js';
 import { clearPermissionCache } from '../middleware/permissions.js';
 
@@ -2416,14 +2416,37 @@ admin.post('/sync-customers', async (c) => {
 admin.post('/tenants/:id/fe-renew', async (c) => {
   try {
     const { id } = c.req.param();
+
+    // Lo que SOBRA de la bolsa vigente se arrastra a la nueva. Son comprobantes
+    // ya pagados: hacerlos caducar al renovar sería cobrar dos veces por lo
+    // mismo. Se mide ANTES de reiniciar, que es cuando el dato todavía existe.
+    let carryover = 0;
+    try {
+      const q: any = await computeFeQuota(id);
+      // Solo si la bolsa es limitada y quedó saldo. En sobregiro no se arrastra
+      // una deuda: el excedente ya se factura aparte, y meterlo en la bolsa nueva
+      // castigaría dos veces por el mismo consumo.
+      if (Number(q?.included) > 0 && Number(q?.available) > 0) {
+        carryover = Math.floor(Number(q.available));
+      }
+    } catch (e: any) {
+      console.warn('[fe-renew] no se pudo calcular el arrastre:', e?.message);
+    }
+
     const { data: row } = await db.from('settings')
       .select('config').eq('tenant_id', id).eq('type', 'electronic-invoice').maybeSingle();
-    const cfg = { ...((row as any)?.config ?? {}), fe_quota_start: new Date().toISOString() };
+    const cfg = {
+      ...((row as any)?.config ?? {}),
+      fe_quota_start: new Date().toISOString(),
+      // Reemplaza, no suma: el arrastre anterior ya estaba contado dentro del
+      // `available` que se acaba de medir. Sumarlo lo duplicaría en cada renovación.
+      fe_quota_carryover: carryover,
+    };
     await db.from('settings').upsert({
       tenant_id: id, type: 'electronic-invoice', config: cfg,
       updated_at: new Date().toISOString(),
     }, { onConflict: 'tenant_id,type' });
-    return ok(c, { ok: true, fe_quota_start: cfg.fe_quota_start });
+    return ok(c, { ok: true, fe_quota_start: cfg.fe_quota_start, carryover });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

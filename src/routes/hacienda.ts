@@ -175,7 +175,7 @@ async function groupMainTenantId(tenantId: string): Promise<string | null> {
   return mainId && mainId !== tenantId ? mainId : null;
 }
 
-async function computeFeQuota(tenantId: string) {
+export async function computeFeQuota(tenantId: string) {
   const cfg = await loadFEConfig(tenantId);
   // Un solo contador: facturas, tiquetes Y notas de crédito cuentan juntos.
   let included = Number(cfg.fe_included_docs ?? 0);         // comprobantes por bolsa (0 = ilimitado)
@@ -225,11 +225,26 @@ async function computeFeQuota(tenantId: string) {
   }
 
   const used = usedDocs + usedNc + usedNd;                  // facturas + tiquetes + NC + ND (sin rechazados)
-  const available = included > 0 ? included - used : null;  // null = ilimitado
-  const overage = included > 0 ? Math.max(0, used - included) : 0;
+
+  // ── Saldo que viene de la bolsa anterior ────────────────────────────────
+  // Al renovar, lo que no se usó NO se pierde: se guarda en `fe_quota_carryover`
+  // y se suma a la bolsa nueva. Son comprobantes ya pagados; hacerlos caducar
+  // cobraría dos veces por lo mismo.
+  const carryover = Math.max(0, Number(cfg.fe_quota_carryover ?? 0));
+  const totalIncluded = included > 0 ? included + carryover : included;
+
+  const available = totalIncluded > 0 ? totalIncluded - used : null;  // null = ilimitado
+  const overage = totalIncluded > 0 ? Math.max(0, used - totalIncluded) : 0;
 
   return {
-    included, extra_fee: extraFee, quota_start: startISO, months_elapsed: 1,
+    // `included` es la bolsa TOTAL disponible (plan + arrastre): es contra lo que
+    // se mide el consumo y lo que hay que mostrar como límite.
+    included: totalIncluded,
+    /** Lo que trae el plan por sí solo, sin el arrastre. */
+    included_plan: included,
+    /** Comprobantes que sobraron de la bolsa anterior. */
+    carryover,
+    extra_fee: extraFee, quota_start: startISO, months_elapsed: 1,
     used, used_docs: usedDocs, used_nc: usedNc, used_nd: usedNd,
     available,
     overage,

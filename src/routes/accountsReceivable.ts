@@ -364,11 +364,17 @@ accountsReceivable.delete('/:id', async (c) => {
 //         payment_method? }
 //
 // ── Qué NO hace, y por qué ────────────────────────────────────────────────
-// No se emite por cuentas que YA tienen factura. Una venta a crédito emite su
-// comprobante al venderse, con condición de venta «crédito»; emitir otro al
-// cobrar declararía el mismo ingreso dos veces ante Hacienda. El front manda
-// solo el monto de las cuentas SIN comprobante previo, y acá se vuelve a exigir:
-// una regla fiscal no puede vivir solo en la pantalla.
+// No se emite por cuentas cuyo ingreso YA se declaró a Hacienda. Una venta a
+// crédito documentada electrónicamente emitió su comprobante al venderse, con
+// condición de venta «crédito»; emitir otro al cobrar declararía el mismo
+// ingreso dos veces.
+//
+// «Ya se declaró» = la factura de origen tiene CLAVE de Hacienda. No basta con
+// que exista una factura: una venta con tiquete CORRIENTE crea su factura
+// interna y nunca se declaró, así que al cobrarla sí corresponde emitir.
+//
+// Si el front manda `account_ids`, acá se recalcula el monto elegible contra la
+// base: una regla fiscal no puede vivir solo en la pantalla.
 //
 // ── Sin caja ──────────────────────────────────────────────────────────────
 // `cash_session_id` queda en NULL a propósito. Un abono se cobra muchas veces
@@ -379,8 +385,35 @@ accountsReceivable.post('/emit-receipt', async (c) => {
     const tenantId = c.get('tenantId');
     const b = await c.req.json().catch(() => ({} as any));
 
-    const amount = Number(b?.amount);
+    let amount = Number(b?.amount);
     if (!Number.isFinite(amount) || amount <= 0) return fail(c, 'Monto inválido', 422);
+
+    // Verificación contra la BASE de qué cuentas no se han declarado. El front
+    // ya filtró, pero esto es lo que impide que un cliente viejo, una llamada
+    // directa o un error de pantalla dupliquen un ingreso ante Hacienda.
+    const accountIds: string[] = Array.isArray(b?.account_ids) ? b.account_ids : [];
+    if (accountIds.length > 0) {
+      const { data: accs } = await db.from('accounts_receivable')
+        .select('id, invoice_id').eq('tenant_id', tenantId).in('id', accountIds);
+      const invIds = [...new Set((accs ?? []).map((a: any) => a.invoice_id).filter(Boolean))];
+      const declared = new Set<string>();
+      if (invIds.length) {
+        const { data: invs } = await db.from('invoices')
+          .select('id, fe_clave').in('id', invIds as string[]);
+        for (const i of (invs ?? []) as any[]) if (i.fe_clave) declared.add(i.id);
+      }
+      const elegibles = (accs ?? []).filter((a: any) => !a.invoice_id || !declared.has(a.invoice_id));
+      if (elegibles.length === 0) {
+        return fail(c,
+          'Todas esas cuentas ya se declararon a Hacienda al venderse. '
+          + 'Emitir otro comprobante duplicaría el ingreso.', 409);
+      }
+      // No se topa el monto contra el saldo: este endpoint se llama DESPUÉS de
+      // aplicar los abonos, así que el saldo de esas cuentas ya es cero y el
+      // tope daría siempre 0. Lo que se valida acá es que exista al menos una
+      // cuenta sin declarar; el monto lo calcula quien aplicó los abonos, que es
+      // el único que sabe cuánto le tocó a cada una.
+    }
 
     const docType = String(b?.document_type ?? '');
     if (!['ticket', 'tiquete_electronico', 'factura_electronica'].includes(docType)) {

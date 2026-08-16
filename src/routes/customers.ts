@@ -70,18 +70,33 @@ customers.get('/', async (c) => {
     const tenantId = c.get('tenantId');
     if (!tenantId) return ok(c, []);
     const q = c.req.query('q')?.trim();
-    let query = db.from('customers')
-      .select('*').eq('tenant_id', tenantId).order('name').limit(500);
-    // Restricción por zona: si el usuario tiene zona asignada, solo ve esa zona.
     const userZone = await getUserZone(c.get('userId'));
-    if (userZone) query = query.eq('zone', userZone);
-    if (q) {
-      // ilike sobre name + identification + email
-      query = query.or(`name.ilike.%${q}%,identification.ilike.%${q}%,email.ilike.%${q}%,commercial_name.ilike.%${q}%`);
+
+    // Paginado en vez de `limit(500)`.
+    //
+    // Con el tope fijo, un negocio con más de 500 clientes solo recibía los
+    // primeros por orden alfabético: del resto no había rastro en el selector de
+    // cuentas por cobrar, ni en el buscador del POS, ni en ningún lado. Y no
+    // avisaba — simplemente no estaban.
+    const PAGE = 1000;
+    const all: any[] = [];
+    for (let from = 0; ; from += PAGE) {
+      let query = db.from('customers')
+        .select('*').eq('tenant_id', tenantId).order('name')
+        .range(from, from + PAGE - 1);
+      // Restricción por zona: si el usuario tiene zona asignada, solo ve esa zona.
+      if (userZone) query = query.eq('zone', userZone);
+      if (q) {
+        // ilike sobre name + identification + email
+        query = query.or(`name.ilike.%${q}%,identification.ilike.%${q}%,email.ilike.%${q}%,commercial_name.ilike.%${q}%`);
+      }
+      const { data, error } = await query;
+      if (error) throw new Error(error.message);
+      const chunk = data ?? [];
+      all.push(...chunk);
+      if (chunk.length < PAGE) break;   // última página
     }
-    const { data, error } = await query;
-    if (error) throw new Error(error.message);
-    return ok(c, data ?? []);
+    return ok(c, all);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
