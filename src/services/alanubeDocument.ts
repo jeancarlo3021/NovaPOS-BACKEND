@@ -183,9 +183,15 @@ export function buildAlanubeDocument(
   const shape = DISCOUNT_SHAPES[opts.discountShape ?? 0] ?? DISCOUNT_SHAPES[0];
 
   const itemDetails = priced.map((l) => {
-    const tarifa = Number(l.iva_rate ?? 0);
     const cantidad = Number(l.quantity);
     const bonus = isBonus(l);
+    // Hacienda valida el impuesto de la línea contra el MONTO TOTAL (antes del
+    // descuento), no contra la base: con 13% sobre una regalía al 100% pedía
+    // ₡1.345,50 de IVA que el cliente no pagó (rechazo -45). La regalía se
+    // declara EXENTA: el monto queda en el comprobante, el IVA en cero, y el
+    // total del documento sigue siendo lo que el cliente pagó.
+    const tarifaLinea = bonus ? 0 : Number(l.iva_rate ?? 0);
+    const tarifa = tarifaLinea;
     const neto = bonus ? r2(Number(l.unit_price) * cantidad) : r2(l.subtotal);
     // Precio unitario a 5 decimales = EXACTAMENTE el que enviamos en unitPrice.
     // En la regalía es el precio de lista: el descuento va aparte.
@@ -209,9 +215,9 @@ export function buildAlanubeDocument(
     // `taxes` del ítem; tienen que coincidir o Alanube rechaza (ver abajo).
     const feeCode = tarifa > 0 ? rateCode(tarifa) : '10';
     if (tarifa > 0) {
-      if (esServicio) totalServicesTaxable += base; else totalTaxedGoods += base;
+      if (esServicio) totalServicesTaxable += montoTotal; else totalTaxedGoods += montoTotal;
     } else {
-      if (esServicio) totalExemptServices += base; else totalExemptGoods += base;
+      if (esServicio) totalExemptServices += montoTotal; else totalExemptGoods += montoTotal;
     }
     // El desglose acumula TODOS los códigos de tarifa presentes en las líneas,
     // INCLUIDO el exento (10) con monto 0. Alanube valida que cada par
