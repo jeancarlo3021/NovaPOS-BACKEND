@@ -82,9 +82,16 @@ function fechaCR(_issuedAt?: string): string {
  * su API. Se prueban en orden hasta que el documento pase.
  */
 export const DISCOUNT_SHAPES: Array<(amount: string, nature: string) => Record<string, any>> = [
+  // Forma CONFIRMADA por Alanube (rechazo del 22/08/2026): el ítem pide
+  // `amountDiscount`, `discountCode` y `otherDiscountCode`, los tres presentes.
+  // discountCode '01' = bonificación en el catálogo de Hacienda 4.4.
+  (amount, nature) => ({ discounts: [{ amountDiscount: amount, discountCode: '01', otherDiscountCode: nature }] }),
+  // Si '01' no fuera el código de bonificación en el catálogo del emisor, se
+  // reintenta con '99' (otros) y el detalle en otherDiscountCode.
+  (amount, nature) => ({ discounts: [{ amountDiscount: amount, discountCode: '99', otherDiscountCode: nature }] }),
+  // Formas de versiones anteriores de la API, por si algún emisor sigue en ellas.
   (amount, nature) => ({ discounts: [{ amount, nature }] }),
   (amount, nature) => ({ discount: [{ discountAmount: amount, discountNature: nature }] }),
-  (amount, nature) => ({ discounts: [{ discountAmount: amount, natureDiscount: nature }] }),
 ];
 
 /** ¿El error de Alanube se queja del bloque de descuento? Entonces vale reintentar. */
