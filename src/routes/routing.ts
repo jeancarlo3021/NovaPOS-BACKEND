@@ -771,17 +771,34 @@ routing.post('/void-sale/:invoiceId', async (c) => {
       truckId = (route as any)?.warehouse_id ?? null;
     }
 
-    // Devolver el stock al camión.
+    // Devolver el stock al camión. Si la venta no quedó ligada a una ruta con
+    // camión (venta suelta, ruta sin bodega asignada), el stock se devuelve al
+    // inventario general: antes no se devolvía a NINGÚN lado y la mercadería
+    // anulada simplemente desaparecía del sistema.
     const { data: items } = await db.from('invoice_items')
       .select('product_id, quantity').eq('invoice_id', invoiceId);
-    if (truckId) {
-      for (const it of (items ?? []) as any[]) {
+    let restocked = 0;
+    for (const it of (items ?? []) as any[]) {
+      if (!it.product_id) continue;
+      if (truckId) {
         const { data: row } = await db.from('warehouse_stock')
           .select('quantity').eq('warehouse_id', truckId).eq('product_id', it.product_id).maybeSingle();
-        await db.from('warehouse_stock').upsert(
+        const up = await db.from('warehouse_stock').upsert(
           { warehouse_id: truckId, product_id: it.product_id, quantity: Number(row?.quantity ?? 0) + Number(it.quantity) },
           { onConflict: 'warehouse_id,product_id' });
+        if (!up.error) restocked++;
+        else console.warn('[void-sale] camión:', up.error.message);
+        continue;
       }
+      const { data: p } = await db.from('products')
+        .select('stock_quantity, tracks_stock').eq('id', it.product_id).eq('tenant_id', tenantId).maybeSingle();
+      if (!p || (p as any).tracks_stock === false) continue;
+      const upd = await db.from('products').update({
+        stock_quantity: Number((p as any).stock_quantity ?? 0) + Number(it.quantity),
+        updated_at: new Date().toISOString(),
+      }).eq('id', it.product_id).eq('tenant_id', tenantId);
+      if (!upd.error) restocked++;
+      else console.warn('[void-sale] inventario:', upd.error.message);
     }
 
     // Marcar anulada.
@@ -804,7 +821,7 @@ routing.post('/void-sale/:invoiceId', async (c) => {
       }
     }
 
-    return ok(c, { ok: true, returned_items: (items ?? []).length });
+    return ok(c, { ok: true, returned_items: restocked, restock_target: truckId ? 'truck' : 'inventory' });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

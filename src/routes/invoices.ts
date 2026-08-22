@@ -286,10 +286,45 @@ invoices.post('/', async (c) => {
       console.warn('[recipes] no se pudo aplicar el consumo:', e?.message);
     }
 
+    // Vender un KIT descuenta sus componentes, no el kit. Mismo criterio que
+    // las recetas, y también sin poder tumbar la venta si algo falla.
+    const kitProductIds = new Set<string>();
+    try {
+      const ids = (items as any[]).map(i => i.product_id).filter(Boolean);
+      if (ids.length) {
+        const { data: kitRows } = await db.from('product_kit_items')
+          .select('kit_id, component_id, quantity')
+          .eq('tenant_id', tenantId).in('kit_id', ids);
+        if (kitRows?.length) {
+          // Cuánto hay que bajar de cada componente, sumando kits repetidos.
+          const need = new Map<string, number>();
+          for (const item of items as any[]) {
+            for (const k of (kitRows as any[]).filter(r => String(r.kit_id) === String(item.product_id))) {
+              kitProductIds.add(String(item.product_id));
+              const q = Number(k.quantity) * Number(item.quantity);
+              need.set(String(k.component_id), (need.get(String(k.component_id)) ?? 0) + q);
+            }
+          }
+          for (const [componentId, qty] of need) {
+            const { data: p } = await db.from('products')
+              .select('stock_quantity, tracks_stock').eq('id', componentId).maybeSingle();
+            if (p && (p as any).tracks_stock !== false) {
+              await db.from('products').update({
+                stock_quantity: Math.max(0, (p.stock_quantity ?? 0) - qty),
+                updated_at: new Date().toISOString(),
+              }).eq('id', componentId);
+            }
+          }
+        }
+      }
+    } catch (e: any) { console.warn('[kits] no se pudo descontar componentes:', e?.message); }
+
     // Decrement stock — SOLO productos que manejan inventario.
     // Los de stock infinito (tracks_stock === false) NO se descuentan.
     for (const item of items as any[]) {
       if (!item.product_id) continue;   // ad-hoc: sin producto que descontar
+      // El kit ya movió inventario por sus componentes.
+      if (kitProductIds.has(String(item.product_id))) continue;
       // Con receta, el inventario ya se movió por ingredientes: descontar además
       // el plato sería contarlo dos veces.
       if (recipeProductIds.has(item.product_id)) continue;
@@ -432,18 +467,81 @@ invoices.post('/:id/void', async (c) => {
 
     const { data: items } = await db.from('invoice_items')
       .select('product_id, quantity').eq('invoice_id', id);
-    for (const it of (items ?? []) as any[]) {
-      if (!it.product_id) continue;
-      if (recipeReturned.has(String(it.product_id))) continue;
-      const { data: p } = await db.from('products')
-        .select('stock_quantity, tracks_stock').eq('id', it.product_id).maybeSingle();
-      if (p && (p as any).tracks_stock !== false) {
-        await db.from('products').update({
-          stock_quantity: (p.stock_quantity ?? 0) + Number(it.quantity),
-          updated_at: new Date().toISOString(),
-        }).eq('id', it.product_id);
+
+    // Los kits devuelven sus COMPONENTES: el kit nunca se descontó.
+    const kitReturned = new Set<string>();
+    try {
+      const ids = (items ?? []).map((i: any) => i.product_id).filter(Boolean);
+      if (ids.length) {
+        const { data: kitRows } = await db.from('product_kit_items')
+          .select('kit_id, component_id, quantity')
+          .eq('tenant_id', tenantId).in('kit_id', ids);
+        if (kitRows?.length) {
+          const back = new Map<string, number>();
+          for (const it of (items ?? []) as any[]) {
+            for (const k of (kitRows as any[]).filter(r => String(r.kit_id) === String(it.product_id))) {
+              kitReturned.add(String(it.product_id));
+              const q = Number(k.quantity) * Number(it.quantity);
+              back.set(String(k.component_id), (back.get(String(k.component_id)) ?? 0) + q);
+            }
+          }
+          for (const [componentId, qty] of back) {
+            const { data: p } = await db.from('products')
+              .select('stock_quantity, tracks_stock').eq('id', componentId).maybeSingle();
+            if (p && (p as any).tracks_stock !== false) {
+              await db.from('products').update({
+                stock_quantity: (p.stock_quantity ?? 0) + qty,
+                updated_at: new Date().toISOString(),
+              }).eq('id', componentId);
+            }
+          }
+        }
       }
+    } catch (e: any) { console.warn('[kits] no se pudo devolver componentes:', e?.message); }
+
+    // Venta de RUTA: el stock salió del camión, no de la bodega. Devolverlo a
+    // `products` inflaría el inventario general y dejaría el camión corto.
+    let truckId: string | null = null;
+    if ((data as any).route_id) {
+      const { data: route } = await db.from('routes')
+        .select('warehouse_id').eq('id', (data as any).route_id).eq('tenant_id', tenantId).maybeSingle();
+      truckId = (route as any)?.warehouse_id ?? null;
     }
+
+    let restocked = 0;
+    const skipped: string[] = [];
+    for (const it of (items ?? []) as any[]) {
+      if (!it.product_id) { skipped.push('línea sin producto'); continue; }
+      if (recipeReturned.has(String(it.product_id))) continue;
+      if (kitReturned.has(String(it.product_id))) continue;
+
+      if (truckId) {
+        const { data: row } = await db.from('warehouse_stock')
+          .select('quantity').eq('warehouse_id', truckId).eq('product_id', it.product_id).maybeSingle();
+        const up = await db.from('warehouse_stock').upsert({
+          warehouse_id: truckId, product_id: it.product_id,
+          quantity: Number((row as any)?.quantity ?? 0) + Number(it.quantity),
+        }, { onConflict: 'warehouse_id,product_id' });
+        if (up.error) { console.warn('[void] camión:', up.error.message); skipped.push(String(it.product_id)); }
+        else restocked++;
+        continue;
+      }
+
+      const { data: p, error: readP } = await db.from('products')
+        .select('stock_quantity, tracks_stock').eq('id', it.product_id).eq('tenant_id', tenantId).maybeSingle();
+      if (readP) { console.warn('[void] no se pudo leer el producto:', readP.message); skipped.push(String(it.product_id)); continue; }
+      // Producto borrado o de stock infinito: no hay nada que devolver.
+      if (!p) { skipped.push(String(it.product_id)); continue; }
+      if ((p as any).tracks_stock === false) continue;
+
+      const upd = await db.from('products').update({
+        stock_quantity: Number((p as any).stock_quantity ?? 0) + Number(it.quantity),
+        updated_at: new Date().toISOString(),
+      }).eq('id', it.product_id).eq('tenant_id', tenantId);
+      if (upd.error) { console.warn('[void] no se pudo devolver stock:', upd.error.message); skipped.push(String(it.product_id)); }
+      else restocked++;
+    }
+    if (skipped.length) console.warn('[void] líneas sin devolver:', skipped.join(', '));
 
     // 4) Revertir el movimiento de caja: registrar la salida por la anulación
     //    para que el cierre de caja cuadre (la venta había sumado efectivo).
@@ -482,7 +580,14 @@ invoices.post('/:id/void', async (c) => {
       }
     } catch (e) { console.warn('[void] no se pudo anular la CxC:', e); }
 
-    return ok(c, data);
+    // El resultado del reintegro viaja con la respuesta: si algo no se pudo
+    // devolver, la caja tiene que enterarse en el momento, no al hacer conteo.
+    return ok(c, {
+      ...(data as any),
+      restocked,
+      restock_target: truckId ? 'truck' : 'inventory',
+      restock_skipped: skipped.length,
+    });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

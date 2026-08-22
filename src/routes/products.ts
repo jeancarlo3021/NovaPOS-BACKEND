@@ -28,6 +28,8 @@ const ProductSchema = z.object({
   is_favorite:     z.boolean().optional(),
   image_url:       z.string().url().optional().nullable(),
   tracks_stock:    z.boolean().optional(),
+  /** Meses de garantía del producto (0 = sin garantía). */
+  warranty_months: z.number().int().nonnegative().optional(),
   cabys_code:      z.string().optional().nullable(),
   iva_rate:        z.number().nonnegative().max(100).optional().nullable(),
   exclude_from_fe: z.boolean().optional(),   // no enviar a Hacienda (productos sin precio)
