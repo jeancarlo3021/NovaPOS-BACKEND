@@ -4,7 +4,7 @@ import { ok, fail } from '../utils/response.js';
 import { obtenerToken, consultaEstatus, enviaDocumentoConsecutivoJson, FacturemosError } from '../services/facturemos.js';
 import { buildConsecutivo, buildDocumentoJson, tipoComprobante, type FELine } from '../services/feDocument.js';
 import { alanube, AlanubeError } from '../services/alanube.js';
-import { buildAlanubeDocument } from '../services/alanubeDocument.js';
+import { buildAlanubeDocument, DISCOUNT_SHAPES, isDiscountShapeError } from '../services/alanubeDocument.js';
 import { endOfDay } from '../utils/dateRange.js';
 import { sendEmail } from '../services/emailService.js';
 import { parseHaciendaXml } from '../services/receivedEmails.js';
@@ -785,8 +785,24 @@ export async function emitInvoiceCore(
     }
     // No se envían a Hacienda los productos SIN PRECIO (precio 0) ni los marcados
     // "no enviar a Hacienda". Igual quedan en la venta y en el ticket.
+    const priceOfLine = (it: any) => {
+      const qty = Number(it.quantity) || 0;
+      const net = Number(it.subtotal ?? 0);
+      // Precio EFECTIVO: es el que termina en `unitPrice` del comprobante.
+      return qty > 0 && net > 0 ? net / qty : Number(it.unit_price) || 0;
+    };
+    // La REGALÍA (precio efectivo 0 pero con precio de lista) sí se declara: va
+    // como bonificación, con su precio y un descuento del 100%. Solo se saca lo
+    // que no tiene ningún precio con qué declararse.
+    const declarable = (it: any) =>
+      priceOfLine(it) > 0 || Number(it.unit_price) > 0;
     const items = allItems.filter((it: any) =>
-      Number(it.unit_price) > 0 && !prodMap.get(it.product_id)?.exclude_from_fe);
+      declarable(it) && !prodMap.get(it.product_id)?.exclude_from_fe);
+    // Lo que quedó fuera se avisa: si no, el negocio descubre meses después que
+    // esas líneas nunca se declararon.
+    const sinPrecio = allItems
+      .filter((it: any) => !declarable(it) && !prodMap.get(it.product_id)?.exclude_from_fe)
+      .map((it: any) => prodMap.get(it.product_id)?.name ?? it.product_name ?? 'Producto');
     const defaultCabys = String(cfg.default_cabys ?? '').replace(/\D/g, '') || null;
     const lines: FELine[] = items.map((it: any) => {
       const p = prodMap.get(it.product_id) ?? {};
@@ -877,21 +893,62 @@ export async function emitInvoiceCore(
       // Consecutivo PROPIO del tipo. Antes iba el número interno de la factura,
       // así que factura y tiquete compartían secuencia y las notas heredaban el
       // número del documento que corrigen.
-      const doc = buildAlanubeDocument(emisor, inv as any, lines, receptor, {
+      // ¿Hay regalías? Entonces el documento lleva descuento por línea, y el
+      // nombre de esos campos cambia entre versiones de la API de Alanube. Se
+      // arranca por la forma que ya funcionó en este negocio (si hay una guardada).
+      const hasBonus = lines.some(l => {
+        const q = Number(l.quantity) || 0;
+        const net = Number(l.subtotal ?? 0);
+        return (q > 0 ? net / q : net) <= 0 && Number(l.unit_price) > 0;
+      });
+      const savedShape = Number(cfg.alanube_discount_shape ?? 0) || 0;
+      const consecReservado = await takeConsecutivo(String(cfg.sucursal ?? '1'), terminalOf(c, cfg));
+      const buildDoc = (shapeIdx: number) => buildAlanubeDocument(emisor, inv as any, lines, receptor, {
         tipoDoc,
         headquarters: cfg.sucursal, terminal: terminalOf(c, cfg),
-        numberOfDocument: await takeConsecutivo(String(cfg.sucursal ?? '1'), terminalOf(c, cfg)),
+        // El consecutivo se reserva UNA vez: reintentar la forma del descuento no
+        // puede quemar numeración (Hacienda rechaza los saltos con -99).
+        numberOfDocument: consecReservado,
+        discountShape: shapeIdx,
         // Empresa emisora en Alanube según el ambiente (para que emita el tenant y
         // no la 'main' de la cuenta). Sin id, Alanube usa la main por defecto.
         senderId: (String(cfg.environment ?? 'production') === 'sandbox'
           ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id,
       });
+
+      let doc = buildDoc(savedShape);
       if (debug) {
         return ok(c, { provider: 'alanube', environment: env, kind, company_id: cfg.alanube_company_id, payload: doc });
       }
       let resp: any;
       try {
-        resp = await alanube.forTenant(cfg).emitDocument(kind as any, doc, feCompanyId(cfg), { asCompany: cfg.alanube_company_type === 'associated' });
+        // Orden de intentos: la forma guardada primero, después las demás. Solo
+        // se reintenta cuando hay bonificación y el error habla del descuento —
+        // un 400 de validación significa que el documento NO se creó, así que no
+        // se duplica nada.
+        const shapes = hasBonus
+          ? [savedShape, ...DISCOUNT_SHAPES.map((_, i) => i).filter(i => i !== savedShape)]
+          : [savedShape];
+        let lastErr: any = null;
+        for (const idx of shapes) {
+          doc = buildDoc(idx);
+          try {
+            resp = await alanube.forTenant(cfg).emitDocument(kind as any, doc, feCompanyId(cfg), { asCompany: cfg.alanube_company_type === 'associated' });
+            if (idx !== savedShape) {
+              // Se recuerda para que la próxima venta con regalía salga al primer intento.
+              await db.from('settings').update({
+                config: { ...cfg, alanube_discount_shape: idx }, updated_at: new Date().toISOString(),
+              }).eq('tenant_id', tenantId).eq('type', 'electronic-invoice').then(() => {}, () => {});
+            }
+            lastErr = null;
+            break;
+          } catch (e: any) {
+            lastErr = e;
+            const msg = e instanceof AlanubeError ? e.message : (e?.message ?? '');
+            if (!(hasBonus && isDiscountShapeError(msg))) break;   // no es por el descuento
+          }
+        }
+        if (lastErr) throw lastErr;
       } catch (e: any) {
         // Guardar el JSON enviado para poder verlo en la bitácora aunque falle.
         await db.from('invoices').update({ fe_request: doc }).eq('id', invoice_id).eq('tenant_id', tenantId).then(() => {}, () => {});
@@ -921,7 +978,11 @@ export async function emitInvoiceCore(
       // XML + PDF), no al emitir — la respuesta de Hacienda aún no existe acá.
 
       void maybeNotifyQuotaLow(tenantId);
-      return ok(c, { ok: true, provider: 'alanube', clave, alanube_doc_id: docId, alanube_status: alanubeStatus, tipo: tipoDoc, response: resp });
+      return ok(c, {
+        ok: true, provider: 'alanube', clave, alanube_doc_id: docId,
+        alanube_status: alanubeStatus, tipo: tipoDoc, response: resp,
+        ...(sinPrecio.length ? { warning: `Sin precio de venta: no se pudieron declarar a Hacienda: ${[...new Set(sinPrecio)].join(', ')}.` } : {}),
+      });
     }
 
     // ── Proveedor FACTUREMOS (flujo existente) ────────────────────────────────
@@ -967,7 +1028,10 @@ export async function emitInvoiceCore(
     }).eq('id', invoice_id).eq('tenant_id', tenantId);
 
     void maybeNotifyQuotaLow(tenantId);
-    return ok(c, { ok: true, clave, consecutivo: consec, tipo: tipoDoc, response: resp });
+    return ok(c, {
+      ok: true, clave, consecutivo: consec, tipo: tipoDoc, response: resp,
+      ...(sinPrecio.length ? { warning: `Sin precio de venta: no se pudieron declarar a Hacienda: ${[...new Set(sinPrecio)].join(', ')}.` } : {}),
+    });
   } catch (err: any) {
     const status = err instanceof FacturemosError ? err.status : 500;
     const friendly = friendlyFEError(err.message);
@@ -1033,7 +1097,14 @@ export async function emitCreditNoteCore(
       for (const p of prods ?? []) prodMap.set((p as any).id, p);
     }
     const lines: FELine[] = items
-      .filter((it: any) => Number(it.unit_price) > 0 && !prodMap.get(it.product_id)?.exclude_from_fe)   // sin precio / marcado → no va a Hacienda
+      .filter((it: any) => {
+        // Precio EFECTIVO (subtotal ÷ cantidad): es el que va en `unitPrice`, y
+        // Hacienda rechaza el cero.
+        const qty = Number(it.quantity) || 0;
+        const net = Number(it.subtotal ?? 0);
+        const price = qty > 0 && net > 0 ? net / qty : Number(it.unit_price) || 0;
+        return price > 0 && !prodMap.get(it.product_id)?.exclude_from_fe;
+      })
       .map((it: any) => {
       const p = prodMap.get(it.product_id) ?? {};
       return {
@@ -1190,7 +1261,14 @@ hacienda.post('/debit-note', async (c) => {
       for (const p of prods ?? []) prodMap.set((p as any).id, p);
     }
     const lines: FELine[] = items
-      .filter((it: any) => Number(it.unit_price) > 0 && !prodMap.get(it.product_id)?.exclude_from_fe)   // sin precio / marcado → no va a Hacienda
+      .filter((it: any) => {
+        // Precio EFECTIVO (subtotal ÷ cantidad): es el que va en `unitPrice`, y
+        // Hacienda rechaza el cero.
+        const qty = Number(it.quantity) || 0;
+        const net = Number(it.subtotal ?? 0);
+        const price = qty > 0 && net > 0 ? net / qty : Number(it.unit_price) || 0;
+        return price > 0 && !prodMap.get(it.product_id)?.exclude_from_fe;
+      })
       .map((it: any) => {
       const p = prodMap.get(it.product_id) ?? {};
       return {

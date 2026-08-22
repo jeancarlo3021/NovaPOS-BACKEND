@@ -205,7 +205,9 @@ function normalizeLines(raw: any): FELine[] {
       iva_rate:     num(l.iva_rate ?? l.impuesto ?? 0),
       unit:         l.unit ?? l.unidad ?? l.medida ?? null,
     } as FELine;
-  }).filter(l => l.quantity > 0 && l.product_name);
+    // La línea sin precio la rechaza Hacienda ("Unit price must be greater than
+    // zero"), así que no se manda: se avisa aparte cuáles quedaron fuera.
+  }).filter(l => l.quantity > 0 && l.product_name && (l.subtotal / (l.quantity || 1)) > 0);
 }
 
 /** Ambiente + empresa emisora, tal como los manda la app externa. */
@@ -488,7 +490,12 @@ feExternal.post('/emit', async (c) => {
 
   // ── Líneas ────────────────────────────────────────────────────────────────
   const lines = normalizeLines(body?.lines ?? body?.items);
-  if (lines.length === 0) return fail(c, 'El comprobante no tiene líneas de detalle para emitir.', 422);
+  const rawCount = Array.isArray(body?.lines ?? body?.items) ? (body?.lines ?? body?.items).length : 0;
+  if (lines.length === 0) {
+    return fail(c, rawCount > 0
+      ? 'Ninguna línea tiene precio: Hacienda no acepta un comprobante en ¢0. Poneles precio de venta a los productos.'
+      : 'El comprobante no tiene líneas de detalle para emitir.', 422);
+  }
 
   // Hacienda exige CodigoCABYS en cada línea. Se avisa con el nombre del producto.
   const sinCabys = lines.filter(l => !l.cabys_code);

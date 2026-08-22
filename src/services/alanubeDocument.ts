@@ -74,6 +74,25 @@ function fechaCR(_issuedAt?: string): string {
   return cr.toISOString().replace(/\.\d{3}Z$/, '-06:00');
 }
 
+/**
+ * Formas conocidas del bloque de descuento por línea en Alanube CRI.
+ *
+ * Hacienda 4.4 lo llama `Descuento` con `MontoDescuento` + `NaturalezaDescuento`;
+ * Alanube lo traduce a camelCase, y el nombre exacto cambia entre versiones de
+ * su API. Se prueban en orden hasta que el documento pase.
+ */
+export const DISCOUNT_SHAPES: Array<(amount: string, nature: string) => Record<string, any>> = [
+  (amount, nature) => ({ discounts: [{ amount, nature }] }),
+  (amount, nature) => ({ discount: [{ discountAmount: amount, discountNature: nature }] }),
+  (amount, nature) => ({ discounts: [{ discountAmount: amount, natureDiscount: nature }] }),
+];
+
+/** ¿El error de Alanube se queja del bloque de descuento? Entonces vale reintentar. */
+export function isDiscountShapeError(msg: string): boolean {
+  const m = String(msg ?? '').toLowerCase();
+  return /discount|descuento|nature|naturaleza/.test(m);
+}
+
 export function buildAlanubeDocument(
   emisor: AlanubeEmisor,
   inv: AlanubeInvoiceMeta,
@@ -86,6 +105,13 @@ export function buildAlanubeDocument(
     numberOfDocument?: string;  // consecutivo interno
     senderId?: string;          // id de la empresa emisora en Alanube (sender.id).
                                 // Sin esto, Alanube emite con la empresa 'main' de la cuenta.
+    /**
+     * Nombre de los campos de descuento por línea en Alanube. La API los expone
+     * con distinto naming según la versión, y adivinar mal cuesta un rechazo:
+     * el emisor prueba las formas en orden hasta que una pasa (ver
+     * `DISCOUNT_SHAPES`) y guarda la que funcionó.
+     */
+    discountShape?: number;
     // Para nota de crédito (03): referencia al documento que anula.
     reference?: {
       documentType: string;     // tipo del doc original (01/04)
@@ -104,27 +130,71 @@ export function buildAlanubeDocument(
   // 5-9 = servicio (construcciones y servicios en la clasificación CPC/CABYS).
   let totalServicesTaxable = 0, totalExemptServices = 0;
   let totalTaxedGoods = 0, totalExemptGoods = 0;
-  let totalTax = 0, totalSale = 0;
+  let totalTax = 0, totalSale = 0, totalDiscounts = 0;
   // Desglose de impuesto por código de tarifa (TotalDesgloseImpuesto).
   const taxByRate: Record<string, number> = {};
 
   // Enfoque PRECIO EFECTIVO (igual que Facturemos): el descuento se absorbe en el
   // precio unitario, así amountTotal == subTotal y no hay que declarar descuento.
   // Evita todas las validaciones de "subTotal = amountTotal - descuentos".
-  const itemDetails = lines.map((l) => {
+  // Hacienda/Alanube rechazan la línea con precio 0 ("Unit price must be greater
+  // than zero"). Pasa con productos creados desde una recepción de compra sin
+  // precio de venta, y con REGALÍAS (lo que se da sin cobrar).
+  //
+  // Se sacan del comprobante y el resto queda intacto: el cliente pagó ₡X y el
+  // documento declara ₡X. La regalía no es una venta — su costo se maneja como
+  // gasto/autoconsumo, no como línea vendida en ₡0.
+  //
+  // La otra vía de Hacienda (línea con precio real + descuento de naturaleza
+  // "Bonificación") necesita el bloque de descuento por línea de Alanube, que
+  // este emisor todavía no arma: ver el comentario del enfoque PRECIO EFECTIVO.
+  const efectivo = (l: FELine) => {
+    const cantidad = Number(l.quantity) || 0;
+    const neto = Number(l.subtotal ?? 0);
+    return cantidad > 0 ? neto / cantidad : neto;
+  };
+  // REGALÍA (bonificación): el cliente no paga la línea, pero el producto TIENE
+  // precio de lista. Se declara con su precio y un descuento por el 100% de
+  // naturaleza "Bonificación", que es la forma que pide Hacienda: así la salida
+  // de inventario queda sustentada en el comprobante.
+  const isBonus = (l: FELine) => efectivo(l) <= 0 && Number(l.unit_price) > 0;
+  // Sin precio de lista no hay nada que declarar: esas sí se sacan.
+  const priced = lines.filter(l => efectivo(l) > 0 || isBonus(l));
+  const dropped = lines.filter(l => !priced.includes(l));
+  if (dropped.length) {
+    console.warn('[alanube] líneas sin precio excluidas del comprobante:',
+      dropped.map(l => l.product_name).join(', '));
+  }
+  if (priced.length === 0) {
+    throw new Error(
+      'Ninguna línea tiene precio: no se puede emitir un comprobante en ¢0. '
+      + 'Poneles precio de venta a los productos'
+      + (lines.length ? `: ${[...new Set(lines.map(l => l.product_name))].join(', ')}` : '') + '.',
+    );
+  }
+
+  const shape = DISCOUNT_SHAPES[opts.discountShape ?? 0] ?? DISCOUNT_SHAPES[0];
+
+  const itemDetails = priced.map((l) => {
     const tarifa = Number(l.iva_rate ?? 0);
     const cantidad = Number(l.quantity);
-    const neto = r2(l.subtotal);                             // subtotal (con descuento, sin IVA)
+    const bonus = isBonus(l);
+    const neto = bonus ? r2(Number(l.unit_price) * cantidad) : r2(l.subtotal);
     // Precio unitario a 5 decimales = EXACTAMENTE el que enviamos en unitPrice.
+    // En la regalía es el precio de lista: el descuento va aparte.
     const precioEfectivo = r5(cantidad > 0 ? neto / cantidad : neto);
     // amountTotal DEBE ser precioEfectivo × cantidad (así lo recalcula Alanube).
     // Se deriva del MISMO precio ya redondeado para que cuadre a 5 decimales y no
     // aparezca el "5198.03 != 5198.03001".
     const montoTotal = r5(precioEfectivo * cantidad);
+    // Bonificación: se descuenta el 100%, así que la base gravable y el IVA de la
+    // línea quedan en cero y el cliente no paga nada por ella.
+    const descuento = bonus ? montoTotal : 0;
+    const base = r5(montoTotal - descuento);
     // IVA y total de línea a PRECISIÓN PLENA (5 dec), sin redondear a 2: así
     // cuadran las validaciones exactas de Alanube (amount = base × fee, etc.).
-    const impuesto = r5(montoTotal * (tarifa / 100));
-    const lineTotal = r5(montoTotal + impuesto);
+    const impuesto = r5(base * (tarifa / 100));
+    const lineTotal = r5(base + impuesto);
 
     const cabys = String(l.cabys_code ?? '').replace(/\D/g, '');
     const esServicio = cabys.length > 0 && cabys[0] >= '5';   // CABYS 5-9 = servicio
@@ -132,9 +202,9 @@ export function buildAlanubeDocument(
     // `taxes` del ítem; tienen que coincidir o Alanube rechaza (ver abajo).
     const feeCode = tarifa > 0 ? rateCode(tarifa) : '10';
     if (tarifa > 0) {
-      if (esServicio) totalServicesTaxable += montoTotal; else totalTaxedGoods += montoTotal;
+      if (esServicio) totalServicesTaxable += base; else totalTaxedGoods += base;
     } else {
-      if (esServicio) totalExemptServices += montoTotal; else totalExemptGoods += montoTotal;
+      if (esServicio) totalExemptServices += base; else totalExemptGoods += base;
     }
     // El desglose acumula TODOS los códigos de tarifa presentes en las líneas,
     // INCLUIDO el exento (10) con monto 0. Alanube valida que cada par
@@ -143,6 +213,7 @@ export function buildAlanubeDocument(
     taxByRate[feeCode] = (taxByRate[feeCode] ?? 0) + impuesto;
     totalTax += impuesto;
     totalSale += montoTotal;
+    totalDiscounts += descuento;
 
     const item: Record<string, any> = {
       code: cabys,                                            // CABYS
@@ -153,8 +224,8 @@ export function buildAlanubeDocument(
       detail: l.product_name,
       unitPrice: precioEfectivo.toFixed(5),                  // 5 decimales para cuadrar el total
       amountTotal: money(montoTotal),
-      subTotal: money(montoTotal),
-      taxableBase: money(montoTotal),
+      subTotal: money(base),
+      taxableBase: money(base),
       taxNet: money(impuesto),
       amountTotalLine: money(lineTotal),
       // taxes: code=01 (IVA), feeCode=código de tarifa Hacienda (08=13%, 10=Exenta).
@@ -163,6 +234,7 @@ export function buildAlanubeDocument(
       // suma como Exentas) no cuadra → rechazo -481/-485/-107.
       taxes: [{ code: '01', feeCode, fee: Number(tarifa).toFixed(2), amount: money(impuesto) }],
     };
+    if (bonus) Object.assign(item, shape(money(descuento), 'Bonificacion'));
     if (l.sku) item.commercialCode = [{ typeCode: '04', code: String(l.sku) }];
     return item;
   });
@@ -208,8 +280,11 @@ export function buildAlanubeDocument(
     if (totalTaxable > 0) t.totalTaxable = money(totalTaxable);
     const totalExempt = totalExemptServices + totalExemptGoods;
     if (totalExempt > 0) t.totalExempt = money(totalExempt);
-    t.totalSale = money(totalSale);                 // suma de líneas sin IVA
-    t.totalNetSale = money(totalSale);              // venta neta (sin descuentos)
+    t.totalSale = money(totalSale);                 // suma de líneas sin IVA (bruto)
+    // Con bonificaciones, venta neta = venta − descuentos. Sin ellas es lo mismo
+    // que antes, así que las facturas normales no cambian de forma.
+    if (totalDiscounts > 0) t.totalDiscounts = money(totalDiscounts);
+    t.totalNetSale = money(totalSale - totalDiscounts);
     if (totalTax > 0) t.totalTax = money(totalTax);   // total impuesto
     // TotalDesgloseImpuesto: un renglón por CADA código de tarifa presente en las
     // líneas — incluido el exento (10) en 0. Va aunque totalTax sea 0 (comprobante
@@ -219,7 +294,7 @@ export function buildAlanubeDocument(
         code: '01', feeCode, totalTaxAmount: money(amt),
       }));
     }
-    t.totalVoucher = money(totalSale + totalTax);   // total del comprobante (con IVA)
+    t.totalVoucher = money(totalSale - totalDiscounts + totalTax);   // total del comprobante (con IVA)
     return t;
   }
 
