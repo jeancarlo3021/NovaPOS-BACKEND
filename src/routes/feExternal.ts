@@ -822,11 +822,17 @@ feExternal.get('/status/:docId', async (c) => {
   const kind = kindOfTipoDoc(tipoDocOf(c.req.query('document_type')));
   try {
     const r = await alanubeDocStatus(alanube.forEnv(environment), docId, { kind, companyId });
+    // Hacienda usa el MISMO campo para el motivo de un rechazo y para las
+    // observaciones de un comprobante aceptado (avisos de cumplimiento, como el
+    // del 1% en insumos agropecuarios). Mostrarlas como "error" hacía ver un
+    // comprobante válido como fallido, así que se separan según el estado.
+    const rechazado = r.status === 'rejected' || r.status === 'error';
     return ok(c, {
-      status: r.status,               // sent | accepted | rejected | error
-      raw_status: r.rawStatus,        // legalStatus crudo de Alanube/Hacienda
+      status: r.status,                             // sent | accepted | rejected | error
+      raw_status: r.rawStatus,                      // legalStatus crudo
       clave: r.clave,
-      error: r.error,                 // motivo del rechazo, ya legible
+      error: rechazado ? r.error : null,            // motivo real del rechazo
+      observaciones: rechazado ? null : r.error,    // avisos sobre un comprobante válido
       response: r.raw,
     });
   } catch (err: any) {
