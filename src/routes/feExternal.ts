@@ -262,9 +262,17 @@ feExternal.post('/test-connection', async (c) => {
 feExternal.get('/companies', async (c) => {
   const environment = alanube.normalizeEnv(c.req.query('environment'));
   const cedulaPropia = String(c.req.query('identification') ?? '').replace(/\D/g, '');
+  // IDs que el cliente ya tiene guardados. Son la vía más confiable: si con ellos
+  // se emite, existen. Las otras dos consultas pueden no estar disponibles según
+  // cómo esté armada la cuenta.
+  const idsConocidos = String(c.req.query('ids') ?? '')
+    .split(',').map(x => x.trim()).filter(Boolean);
   const client = alanube.forEnv(environment);
 
   const vistas = new Map<string, any>();
+  // Por qué falló cada vía. Antes se descartaban en silencio y una lista vacía no
+  // se distinguía de "no hay empresas", que es justo lo que hay que diagnosticar.
+  const fuentes: Array<{ fuente: string; ok: boolean; error?: string }> = [];
 
   const agregar = (co: any, tipo: string) => {
     const id = co?.id ?? co?.companyId ?? co?._id;
@@ -278,27 +286,44 @@ feExternal.get('/companies', async (c) => {
       nombre_comercial: co?.tradeName ?? null,
       identificacion: identificacion || null,
       tipo: co?.type ?? tipo,
-      // `propia` solo es informativo: evita que alguien borre la empresa de otro
-      // contribuyente por error, ya que la cuenta de Alanube es compartida.
       propia: cedulaPropia ? identificacion === cedulaPropia : null,
     });
   };
 
-  // La 'main' del token y las asociadas se consultan por separado en CRI.
+  // 1) La empresa 'main' del token.
   try {
     const main: any = await client.getMainCompany();
     agregar(main?.company ?? main?.data ?? main, 'main');
-  } catch { /* la cuenta puede no exponer /company */ }
+    fuentes.push({ fuente: 'main', ok: true });
+  } catch (err: any) {
+    fuentes.push({ fuente: 'main', ok: false, error: err?.message ?? 'error' });
+  }
 
+  // 2) Las empresas asociadas.
   try {
     const lista: any = await client.getAssociated(100);
     const arr: any[] = Array.isArray(lista)
       ? lista
       : (lista?.data ?? lista?.companies ?? lista?.results ?? lista?.rows ?? []);
     for (const co of arr ?? []) agregar(co, 'associated');
-  } catch { /* sin asociadas */ }
+    fuentes.push({ fuente: 'associated', ok: true });
+  } catch (err: any) {
+    fuentes.push({ fuente: 'associated', ok: false, error: err?.message ?? 'error' });
+  }
 
-  return ok(c, { environment, companies: [...vistas.values()] });
+  // 3) Los IDs que ya conoce el cliente, uno por uno.
+  for (const id of idsConocidos) {
+    if (vistas.has(id)) continue;
+    try {
+      const co: any = await client.getCompany(id);
+      agregar(co?.company ?? co?.data ?? co, 'conocida');
+      fuentes.push({ fuente: `id:${id}`, ok: true });
+    } catch (err: any) {
+      fuentes.push({ fuente: `id:${id}`, ok: false, error: err?.message ?? 'error' });
+    }
+  }
+
+  return ok(c, { environment, companies: [...vistas.values()], fuentes });
 });
 
 // ── DELETE /company/:id — da de baja una empresa (para limpiar duplicados) ────
