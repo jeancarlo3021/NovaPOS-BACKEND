@@ -188,29 +188,18 @@ function tipoDocOf(documentType?: string | null): string {
 const num = (v: any) => Number(v ?? 0) || 0;
 
 /**
- * Normaliza el código de actividad económica al formato de Hacienda: 6 dígitos.
+ * Valida el código de actividad económica SIN transformarlo.
  *
- * El ATV lo muestra como CLASE CIIU (4 díg.) + SUBDIVISIÓN nacional, separadas por
- * un punto y sin el cero: "4721.4". Hacienda lo quiere concatenado y con la
- * subdivisión en 2 dígitos → "472104". Pasa lo mismo con un valor de 5 dígitos
- * ("47214"), al que solo le falta ese cero.
- *
- * Devuelve '' si no se puede llevar a 6 dígitos de forma inequívoca.
+ * Alanube acepta DOS formatos y ambos están en su catálogo: 6 dígitos ("523101")
+ * y clase CIIU con subdivisión ("4721.4"), que es como lo muestra el ATV. Una
+ * versión anterior le quitaba el punto y enviaba "47214", valor que no existe en
+ * el catálogo: convertía un dato correcto en uno inválido. El valor viaja TAL
+ * CUAL y el catálogo de Alanube es la autoridad — su error de rechazo enumera
+ * todos los códigos aceptados.
  */
-function normalizarActividad(raw: any): string {
+function actividadValida(raw: any): boolean {
   const texto = String(raw ?? '').trim();
-  const digitos = texto.replace(/\D/g, '');
-
-  if (digitos.length === 6) return digitos;                       // ya está bien
-
-  // "4721.4" / "4721-4" → clase + subdivisión rellenada a 2 dígitos.
-  const conSeparador = texto.match(/^(\d{4})\D+(\d{1,2})$/);
-  if (conSeparador) return conSeparador[1] + conSeparador[2].padStart(2, '0');
-
-  // "47214" → 4 de clase + 1 de subdivisión, sin el cero.
-  if (digitos.length === 5) return digitos.slice(0, 4) + digitos.slice(4).padStart(2, '0');
-
-  return '';
+  return /^\d{6}$/.test(texto) || /^\d{4}\.\d$/.test(texto);
 }
 
 
@@ -456,13 +445,12 @@ feExternal.post('/company', async (c) => {
   const otrasSenas = String(e.address ?? '').trim();
   if (!otrasSenas) problemas.push('Otras señas (dirección exacta): vacío.');
 
-  const actividadCruda = String(e.economic_activity_code ?? '').trim();
-  const actividad = normalizarActividad(actividadCruda);
-  if (!actividadCruda) problemas.push('Actividad económica: vacía (el código lo asigna Hacienda).');
-  else if (!actividad) {
+  const actividad = String(e.economic_activity_code ?? '').trim();
+  if (!actividad) problemas.push('Actividad económica: vacía (el código lo asigna Hacienda).');
+  else if (!actividadValida(actividad)) {
     problemas.push(
-      `Actividad económica ("${actividadCruda}") no interpretable: Hacienda usa 6 dígitos `
-      + `(clase + subdivisión). El ATV la muestra como "4721.4", que equivale a "472104".`);
+      `Actividad económica ("${actividad}") con formato no reconocido: se espera 6 dígitos `
+      + `("523101") o clase con subdivisión ("4721.4"), tal como aparece en el ATV.`);
   }
 
   const email = String(e.email ?? '').trim();
@@ -697,20 +685,13 @@ feExternal.post('/emit', async (c) => {
   if (!emisor.economic_activity_code) {
     return fail(c, 'Falta el código de actividad económica del emisor (lo asigna Hacienda al inscribirse).', 422);
   }
-  // El ATV muestra "4721.4"; Hacienda espera "472104". Se normaliza en vez de
-  // rechazar, porque el usuario está copiando literalmente lo que ve en Hacienda.
-  const actividadEmisor = normalizarActividad(emisor.economic_activity_code);
-  if (!actividadEmisor) {
+  // Se valida la FORMA, nunca se transforma: el valor viaja tal como se configuró.
+  if (!actividadValida(emisor.economic_activity_code)) {
     return fail(c,
-      `No se pudo interpretar la actividad económica del emisor ("${emisor.economic_activity_code}"). `
-      + `Hacienda usa 6 dígitos: los 4 de la clase más 2 de la subdivisión `
-      + `(el ATV la muestra como "4721.4", que equivale a "472104"). `
-      + `Escribila así en la configuración.`, 422);
+      `La actividad económica del emisor ("${emisor.economic_activity_code}") no tiene un formato `
+      + `reconocido. Alanube acepta 6 dígitos ("523101") o clase con subdivisión ("4721.4"), `
+      + `que es como la muestra el ATV. Copiala exactamente de tu perfil de Hacienda.`, 422);
   }
-  if (actividadEmisor !== emisor.economic_activity_code) {
-    console.log(`[fe-external] Actividad económica normalizada: "${emisor.economic_activity_code}" → "${actividadEmisor}"`);
-  }
-  emisor.economic_activity_code = actividadEmisor;
 
   // ── Líneas ────────────────────────────────────────────────────────────────
   const lines = normalizeLines(body?.lines ?? body?.items);
