@@ -255,6 +255,98 @@ feExternal.post('/test-connection', async (c) => {
   }
 });
 
+// ── GET /companies — lista las empresas de la cuenta de Alanube ──────────────
+// Sirve para ver duplicados y elegir con cuál emitir. La cuenta es compartida,
+// así que puede haber empresas de otros contribuyentes: se marcan con `propia`
+// según la cédula que mande el cliente (?identification=).
+feExternal.get('/companies', async (c) => {
+  const environment = alanube.normalizeEnv(c.req.query('environment'));
+  const cedulaPropia = String(c.req.query('identification') ?? '').replace(/\D/g, '');
+  const client = alanube.forEnv(environment);
+
+  const vistas = new Map<string, any>();
+
+  const agregar = (co: any, tipo: string) => {
+    const id = co?.id ?? co?.companyId ?? co?._id;
+    if (!id || vistas.has(String(id))) return;
+    const identificacion = String(
+      co?.identificationNumber ?? co?.identification?.identificationNumber ?? ''
+    ).replace(/\D/g, '');
+    vistas.set(String(id), {
+      id: String(id),
+      nombre: co?.name ?? co?.legalName ?? co?.businessName ?? null,
+      nombre_comercial: co?.tradeName ?? null,
+      identificacion: identificacion || null,
+      tipo: co?.type ?? tipo,
+      // `propia` solo es informativo: evita que alguien borre la empresa de otro
+      // contribuyente por error, ya que la cuenta de Alanube es compartida.
+      propia: cedulaPropia ? identificacion === cedulaPropia : null,
+    });
+  };
+
+  // La 'main' del token y las asociadas se consultan por separado en CRI.
+  try {
+    const main: any = await client.getMainCompany();
+    agregar(main?.company ?? main?.data ?? main, 'main');
+  } catch { /* la cuenta puede no exponer /company */ }
+
+  try {
+    const lista: any = await client.getAssociated(100);
+    const arr: any[] = Array.isArray(lista)
+      ? lista
+      : (lista?.data ?? lista?.companies ?? lista?.results ?? lista?.rows ?? []);
+    for (const co of arr ?? []) agregar(co, 'associated');
+  } catch { /* sin asociadas */ }
+
+  return ok(c, { environment, companies: [...vistas.values()] });
+});
+
+// ── DELETE /company/:id — da de baja una empresa (para limpiar duplicados) ────
+// Requiere `identification` para confirmar que la empresa es del mismo
+// contribuyente: la cuenta de Alanube es compartida y un borrado equivocado
+// dejaría a otro emisor sin poder facturar.
+feExternal.delete('/company/:id', async (c) => {
+  const id = c.req.param('id');
+  const environment = alanube.normalizeEnv(c.req.query('environment'));
+  const cedulaPropia = String(c.req.query('identification') ?? '').replace(/\D/g, '');
+  const client = alanube.forEnv(environment);
+
+  if (!cedulaPropia) {
+    return fail(c, 'Falta la cédula del emisor para confirmar que la empresa es tuya.', 422);
+  }
+
+  let cedulaEmpresa = '';
+  try {
+    const co: any = await client.getCompany(id);
+    const d = co?.company ?? co?.data ?? co;
+    cedulaEmpresa = String(
+      d?.identificationNumber ?? d?.identification?.identificationNumber ?? ''
+    ).replace(/\D/g, '');
+  } catch (err: any) {
+    const status = err instanceof AlanubeError ? err.status : 502;
+    return fail(c, `No se pudo leer la empresa ${id}: ${err?.message ?? 'error'}`, status);
+  }
+
+  if (cedulaEmpresa && cedulaEmpresa !== cedulaPropia) {
+    return fail(c,
+      `Esa empresa pertenece a la cédula ${cedulaEmpresa}, no a la tuya (${cedulaPropia}). `
+      + 'No se elimina: la cuenta de Alanube es compartida con otros emisores.', 403);
+  }
+
+  try {
+    const res = await client.deleteCompany(id);
+    return ok(c, { ok: true, deleted: id, environment, response: res });
+  } catch (err: any) {
+    if (err instanceof AlanubeError && (err.status === 404 || err.status === 405)) {
+      return fail(c,
+        'Alanube no permite eliminar empresas por API en esta cuenta. '
+        + 'Hay que darla de baja desde el panel de Alanube o pidiéndoselo a su soporte.', 501);
+    }
+    const status = err instanceof AlanubeError ? err.status : 502;
+    return fail(c, err instanceof AlanubeError ? friendlyAlanubeError(err.message) : (err?.message ?? 'Error eliminando la empresa'), status);
+  }
+});
+
 // ── POST /company — da de alta (o actualiza) la empresa emisora en Alanube ────
 //
 // Es el paso previo a poder emitir: Alanube necesita el certificado de firma
@@ -339,9 +431,11 @@ feExternal.post('/company', async (c) => {
     name: nombre,
     identificationType: idType,
     identificationNumber: cedula,
-    // En CRI la emisión usa SIEMPRE la empresa 'main' de la cuenta (no hay
-    // parámetro idCompany al emitir), así que el emisor se crea como 'main'.
-    type: body?.company_type === 'associated' ? 'associated' : 'main',
+    // La cuenta de Alanube es COMPARTIDA con el POS, y en CRI solo puede haber una
+    // empresa 'main' por cuenta. Una app externa se registra por defecto como
+    // 'associated' y emite indicando `sender.id`; crearla como 'main' chocaría con
+    // la principal de la cuenta. Se puede forzar con company_type: 'main'.
+    type: body?.company_type === 'main' ? 'main' : 'associated',
     address: { province: provincia, canton, district: distrito, otrasSenas },
     // Certificado de firma (.p12) + su PIN.
     certificate: { extension: 'p12', content: p12, password: p12Pass },
@@ -365,6 +459,45 @@ feExternal.post('/company', async (c) => {
 
   let result: any;
   let actualizada = false;
+
+  // Si el cliente ya tiene un ID guardado y esa empresa existe en este ambiente,
+  // se ACTUALIZA en vez de crear otra. Sin esto, volver a registrar (por ejemplo
+  // para cambiar el certificado) dejaba empresas duplicadas para la misma cédula.
+  const idExistente = String(body?.company_id ?? '').trim();
+  if (idExistente) {
+    try {
+      const co: any = await client.getCompany(idExistente);
+      const d = co?.company ?? co?.data ?? co;
+      const cedulaExistente = String(
+        d?.identificationNumber ?? d?.identification?.identificationNumber ?? ''
+      ).replace(/\D/g, '');
+
+      if (cedulaExistente && cedulaExistente !== cedula) {
+        return fail(c,
+          `El ID de empresa configurado (${idExistente}) pertenece a la cédula ${cedulaExistente}, `
+          + `no a la tuya (${cedula}). Corregí el ID en la configuración antes de continuar.`, 409);
+      }
+
+      const updPayload: Record<string, any> = { ...payload };
+      delete updPayload.type;   // 'type' solo se define al crear
+      const actualizado = await client.updateCompany(idExistente, updPayload);
+      return ok(c, {
+        ok: true,
+        environment: client.env,
+        company_id: idExistente,
+        updated_existing: true,
+        message: 'Se actualizaron los datos y el certificado de la empresa ya registrada.',
+        response: actualizado,
+      });
+    } catch (err: any) {
+      // Si el ID guardado no existe en este ambiente, se sigue con el alta normal.
+      if (!(err instanceof AlanubeError && (err.status === 404 || err.status === 400))) {
+        const status = err instanceof AlanubeError ? (err.status === 401 ? 401 : 422) : 502;
+        return fail(c, err instanceof AlanubeError ? friendlyAlanubeError(err.message) : (err?.message ?? 'Error actualizando la empresa'), status);
+      }
+      console.warn(`[fe-external] El ID ${idExistente} no existe en ${client.env}; se creará una empresa nueva.`);
+    }
+  }
 
   try {
     result = await client.createCompany(payload);
@@ -434,6 +567,25 @@ feExternal.post('/company', async (c) => {
       });
     }
 
+    // GUARDA: no sobrescribir la empresa de otro contribuyente. La cuenta de
+    // Alanube es compartida, así que antes de actualizar se confirma que la
+    // empresa existente tenga LA MISMA cédula. Sin esto, un registro equivocado
+    // reemplazaba el certificado y los datos de otra empresa.
+    try {
+      const existente: any = await client.getCompany(String(existingId));
+      const co = existente?.company ?? existente?.data ?? existente;
+      const cedulaExistente = String(
+        co?.identificationNumber ?? co?.identification?.identificationNumber ?? ''
+      ).replace(/\D/g, '');
+      if (cedulaExistente && cedulaExistente !== cedula) {
+        return fail(c,
+          `La cuenta de Alanube ya tiene registrada la empresa con cédula ${cedulaExistente}, `
+          + `distinta de la que estás registrando (${cedula}). No se actualiza para no sobrescribir `
+          + `los datos de esa empresa. Registrala como empresa asociada o usá una cuenta de Alanube propia.`,
+          409);
+      }
+    } catch { /* si no se puede leer, se sigue con la actualización */ }
+
     const updPayload = { ...payload };
     delete (updPayload as any).type;   // 'type' solo se define al crear
     try {
@@ -487,6 +639,17 @@ feExternal.post('/emit', async (c) => {
   if (!emisor.economic_activity_code) {
     return fail(c, 'Falta el código de actividad económica del emisor (lo asigna Hacienda al inscribirse).', 422);
   }
+  // Hacienda usa 6 dígitos SIN puntuación (ej. 472199). Valores tipo "4721.9"
+  // —el código CIIU con decimal— hacen que Alanube responda un 500 genérico en
+  // vez de un error de validación, así que se corta acá con un mensaje claro.
+  const actividadEmisor = emisor.economic_activity_code.replace(/\D/g, '');
+  if (actividadEmisor.length !== 6) {
+    return fail(c,
+      `La actividad económica del emisor ("${emisor.economic_activity_code}") no es válida: Hacienda `
+      + `usa 6 dígitos sin puntos (ej. 472199) y esta tiene ${actividadEmisor.length}. `
+      + `Buscá el código exacto en tu perfil del ATV y corregilo en la configuración.`, 422);
+  }
+  emisor.economic_activity_code = actividadEmisor;
 
   // ── Líneas ────────────────────────────────────────────────────────────────
   const lines = normalizeLines(body?.lines ?? body?.items);
@@ -502,6 +665,24 @@ feExternal.post('/emit', async (c) => {
   if (sinCabys.length > 0) {
     const nombres = [...new Set(sinCabys.map(l => l.product_name))].join(', ');
     return fail(c, `Estos productos no tienen código CABYS: ${nombres}. Asignáselo en el producto (o configurá un CABYS por defecto).`, 422);
+  }
+
+  // El CABYS tiene SIEMPRE 13 dígitos. El error típico es perder el cero inicial
+  // (0134100000500 → 134100000500) cuando el código pasó por un campo numérico.
+  const cabysMalos = lines.filter(l => String(l.cabys_code).length !== 13);
+  if (cabysMalos.length > 0) {
+    const detalle = cabysMalos
+      .slice(0, 8)
+      .map(l => `${l.product_name} (${l.cabys_code} — ${String(l.cabys_code).length} díg.)`)
+      .join(', ');
+    const faltanCero = cabysMalos.filter(l => String(l.cabys_code).length === 12).length;
+    return fail(c,
+      `Estos productos tienen el CABYS con largo inválido (debe ser de 13 dígitos): ${detalle}`
+      + (cabysMalos.length > 8 ? ` …y ${cabysMalos.length - 8} más.` : '')
+      + (faltanCero > 0
+        ? `\n\n${faltanCero} de ellos tienen 12 dígitos: probablemente les falta el CERO INICIAL `
+          + `(ej. 0134100000500 y no 134100000500). Suele pasar cuando el código se cargó como número.`
+        : ''), 422);
   }
 
   // ── Receptor ──────────────────────────────────────────────────────────────
@@ -543,12 +724,11 @@ feExternal.post('/emit', async (c) => {
     },
   );
 
-  // Actividad económica del RECEPTOR (Hacienda v4.4). Solo se agrega si el cliente
-  // la tiene, para no alterar el payload de los comprobantes que no la usan.
-  const actividadReceptor = String(r?.economic_activity_code ?? r?.actividad_economica ?? '').trim();
-  if (actividadReceptor) {
-    (doc.header as Record<string, any>).receiverEconomicActivity = actividadReceptor;
-  }
+  // NOTA: NO existe un campo de actividad económica del RECEPTOR en el esquema CRI
+  // de Alanube. Se intentó con `receiverEconomicActivity` (por simetría con
+  // `senderEconomicActivity`) y la API lo rechaza con
+  // "Additional properties not allowed". La actividad del cliente se guarda en JKM
+  // como dato informativo, pero no viaja en el comprobante.
 
   // Modo debug: devuelve lo que se enviaría, sin emitir.
   if (debug) {

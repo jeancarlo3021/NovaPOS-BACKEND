@@ -384,7 +384,12 @@ export function friendlyAlanubeError(raw: string): string {
       + 'son los de la empresa registrada en Alanube. Para cambiarlos hay que corregir esa empresa.'],
     [/receiver\.identification|identificationnumber|identificationtype/i, 'La identificación del cliente (cédula) no corresponde al tipo seleccionado (física/jurídica/DIMEX).'],
     [/receiver\.email|receiver\.name/i, 'Faltan o son inválidos los datos del cliente (nombre o correo).'],
-    [/sendereconomicactivity|economicactivity/i, 'La actividad económica del emisor es inválida o falta en los Datos de FE.'],
+    // Va ANTES de la regla de actividad económica: un "campo no permitido" que
+    // menciona economicActivity no es un problema del dato, sino del esquema, y
+    // etiquetarlo como "actividad inválida" mandaba a revisar el campo equivocado.
+    [/additional properties not allowed|is not allowed|unknown (field|property)/i,
+      'El comprobante lleva un campo que Alanube no acepta. Es un problema del formato, no de tus datos: reportalo a soporte con el detalle técnico.'],
+    [/sendereconomicactivity/i, 'La actividad económica del emisor es inválida o falta en los Datos de FE. Hacienda usa 6 dígitos sin puntuación (ej. 472199).'],
     [/company not found|sender\.id|main company/i, 'La empresa emisora no está registrada en Alanube en este ambiente. Volvé a crear/activar la empresa.'],
     [/totaltaxbreakdown|totals\.|totaltaxable|totaltax/i, 'Hay un descuadre en los totales del comprobante. Revisá precios e IVA de las líneas.'],
     [/cabys|itemdetails\.\d+\.code/i, 'Un producto tiene un código CABYS inválido o vacío. Asignáselo en Inventario.'],
