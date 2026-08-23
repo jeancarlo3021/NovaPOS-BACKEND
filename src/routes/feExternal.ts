@@ -187,6 +187,33 @@ function tipoDocOf(documentType?: string | null): string {
 
 const num = (v: any) => Number(v ?? 0) || 0;
 
+/**
+ * Normaliza el código de actividad económica al formato de Hacienda: 6 dígitos.
+ *
+ * El ATV lo muestra como CLASE CIIU (4 díg.) + SUBDIVISIÓN nacional, separadas por
+ * un punto y sin el cero: "4721.4". Hacienda lo quiere concatenado y con la
+ * subdivisión en 2 dígitos → "472104". Pasa lo mismo con un valor de 5 dígitos
+ * ("47214"), al que solo le falta ese cero.
+ *
+ * Devuelve '' si no se puede llevar a 6 dígitos de forma inequívoca.
+ */
+function normalizarActividad(raw: any): string {
+  const texto = String(raw ?? '').trim();
+  const digitos = texto.replace(/\D/g, '');
+
+  if (digitos.length === 6) return digitos;                       // ya está bien
+
+  // "4721.4" / "4721-4" → clase + subdivisión rellenada a 2 dígitos.
+  const conSeparador = texto.match(/^(\d{4})\D+(\d{1,2})$/);
+  if (conSeparador) return conSeparador[1] + conSeparador[2].padStart(2, '0');
+
+  // "47214" → 4 de clase + 1 de subdivisión, sin el cero.
+  if (digitos.length === 5) return digitos.slice(0, 4) + digitos.slice(4).padStart(2, '0');
+
+  return '';
+}
+
+
 /** Normaliza las líneas del body al tipo FELine que espera el constructor. */
 function normalizeLines(raw: any): FELine[] {
   if (!Array.isArray(raw)) return [];
@@ -429,8 +456,14 @@ feExternal.post('/company', async (c) => {
   const otrasSenas = String(e.address ?? '').trim();
   if (!otrasSenas) problemas.push('Otras señas (dirección exacta): vacío.');
 
-  const actividad = String(e.economic_activity_code ?? '').trim();
-  if (!actividad) problemas.push('Actividad económica: vacía (el código lo asigna Hacienda).');
+  const actividadCruda = String(e.economic_activity_code ?? '').trim();
+  const actividad = normalizarActividad(actividadCruda);
+  if (!actividadCruda) problemas.push('Actividad económica: vacía (el código lo asigna Hacienda).');
+  else if (!actividad) {
+    problemas.push(
+      `Actividad económica ("${actividadCruda}") no interpretable: Hacienda usa 6 dígitos `
+      + `(clase + subdivisión). El ATV la muestra como "4721.4", que equivale a "472104".`);
+  }
 
   const email = String(e.email ?? '').trim();
   if (!email) problemas.push('Correo del emisor: vacío.');
@@ -664,15 +697,18 @@ feExternal.post('/emit', async (c) => {
   if (!emisor.economic_activity_code) {
     return fail(c, 'Falta el código de actividad económica del emisor (lo asigna Hacienda al inscribirse).', 422);
   }
-  // Hacienda usa 6 dígitos SIN puntuación (ej. 472199). Valores tipo "4721.9"
-  // —el código CIIU con decimal— hacen que Alanube responda un 500 genérico en
-  // vez de un error de validación, así que se corta acá con un mensaje claro.
-  const actividadEmisor = emisor.economic_activity_code.replace(/\D/g, '');
-  if (actividadEmisor.length !== 6) {
+  // El ATV muestra "4721.4"; Hacienda espera "472104". Se normaliza en vez de
+  // rechazar, porque el usuario está copiando literalmente lo que ve en Hacienda.
+  const actividadEmisor = normalizarActividad(emisor.economic_activity_code);
+  if (!actividadEmisor) {
     return fail(c,
-      `La actividad económica del emisor ("${emisor.economic_activity_code}") no es válida: Hacienda `
-      + `usa 6 dígitos sin puntos (ej. 472199) y esta tiene ${actividadEmisor.length}. `
-      + `Buscá el código exacto en tu perfil del ATV y corregilo en la configuración.`, 422);
+      `No se pudo interpretar la actividad económica del emisor ("${emisor.economic_activity_code}"). `
+      + `Hacienda usa 6 dígitos: los 4 de la clase más 2 de la subdivisión `
+      + `(el ATV la muestra como "4721.4", que equivale a "472104"). `
+      + `Escribila así en la configuración.`, 422);
+  }
+  if (actividadEmisor !== emisor.economic_activity_code) {
+    console.log(`[fe-external] Actividad económica normalizada: "${emisor.economic_activity_code}" → "${actividadEmisor}"`);
   }
   emisor.economic_activity_code = actividadEmisor;
 
