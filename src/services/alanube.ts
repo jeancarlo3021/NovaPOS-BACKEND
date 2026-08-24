@@ -72,14 +72,32 @@ export class AlanubeError extends Error {
   constructor(message: string, status = 502, body?: any) { super(message); this.status = status; this.body = body; }
 }
 
-const fetchWithTimeout: typeof fetch = (input, init) => {
+/** Timeout por defecto de una llamada a Alanube. */
+const DEFAULT_TIMEOUT_MS = 20_000;
+
+/**
+ * `fetch` con corte por tiempo.
+ *
+ * El abort lleva RAZÓN: sin ella, Node lanza "signal is aborted without reason",
+ * que era lo único que veía el usuario cuando un reporte tardaba de más — un
+ * mensaje que no dice ni qué se estaba pidiendo ni que fue por tiempo.
+ */
+const fetchWithTimeout = (input: any, init: RequestInit & { timeoutMs?: number } = {}) => {
+  const ms = init.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 20_000);
-  return fetch(input, { ...init, signal: ctrl.signal }).finally(() => clearTimeout(timer));
+  const timer = setTimeout(
+    () => ctrl.abort(new Error(`Alanube no respondió en ${Math.round(ms / 1000)} segundos`)),
+    ms,
+  );
+  const { timeoutMs: _omit, ...rest } = init;
+  return fetch(input, { ...rest, signal: ctrl.signal }).finally(() => clearTimeout(timer));
 };
 
 /** Llamada base al API de Alanube (Bearer + JSON) en un ambiente dado. */
-async function alanubeFetch<T = any>(base: string, tok: string, path: string, init: RequestInit = {}): Promise<T> {
+async function alanubeFetch<T = any>(
+  base: string, tok: string, path: string,
+  init: RequestInit & { timeoutMs?: number } = {},
+): Promise<T> {
   const url = `${base}${path.startsWith('/') ? path : `/${path}`}`;
   const res = await fetchWithTimeout(url, {
     ...init,
@@ -89,6 +107,13 @@ async function alanubeFetch<T = any>(base: string, tok: string, path: string, in
       ...(init.headers ?? {}),
     },
   }).catch((err) => {
+    // Corte por tiempo: se distingue de "no hay red" porque el arreglo es otro
+    // (achicar el rango de fechas / reintentar), no revisar la conexión.
+    if ((err as any)?.name === 'AbortError' || (err as any)?.name === 'TimeoutError') {
+      const why = (err as any)?.cause?.message
+        ?? `Alanube no respondió en ${Math.round((init.timeoutMs ?? DEFAULT_TIMEOUT_MS) / 1000)} segundos`;
+      throw new AlanubeError(`${why} (${path.split('?')[0]}). Probá con un rango de fechas más corto.`, 504);
+    }
     const cause = (err as any)?.cause;
     const detail = cause?.code || cause?.message || err?.message || 'fetch failed';
     throw new AlanubeError(`No se pudo conectar con Alanube (${base}): ${detail}`);
@@ -136,7 +161,8 @@ const EMIT_PATH: Record<string, string> = {
 function clientFor(env: AlanubeEnv, tokenOverride?: string | null) {
   const base = baseUrlFor(env);
   const tok = tokenFor(env, tokenOverride);
-  const f = <T = any>(path: string, init: RequestInit = {}) => alanubeFetch<T>(base, tok, path, init);
+  const f = <T = any>(path: string, init: RequestInit & { timeoutMs?: number } = {}) =>
+    alanubeFetch<T>(base, tok, path, init);
 
   return {
     env,
@@ -242,11 +268,15 @@ function clientFor(env: AlanubeEnv, tokenOverride?: string | null) {
       const qs = new URLSearchParams({ dateFrom: from, dateUntil: until });
       if (opts?.legalStatus) qs.set('legalStatus', opts.legalStatus);
       if (opts?.status) qs.set('status', opts.status);
-      return f(`/reports/emissions-per-company?${qs.toString()}`, { method: 'GET' });
+      // Los reportes recorren TODOS los documentos del rango, así que tardan más
+      // que una emisión. El tope son 25 s a propósito: la función de Vercel muere
+      // a los 30 s (vercel.json), y conviene cortar ANTES para poder devolver un
+      // mensaje que explique qué pasó en vez del 504 pelado de la plataforma.
+      return f(`/reports/emissions-per-company?${qs.toString()}`, { method: 'GET', timeoutMs: 25_000 });
     },
     reportEmissionsByUser: (from: string, until: string, legalStatus: string) => {
       const qs = new URLSearchParams({ dateFrom: from, dateUntil: until, legalStatus });
-      return f(`/reports/emissions-by-user?${qs.toString()}`, { method: 'GET' });
+      return f(`/reports/emissions-by-user?${qs.toString()}`, { method: 'GET', timeoutMs: 25_000 });
     },
   };
 }

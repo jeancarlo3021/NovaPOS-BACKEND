@@ -2819,25 +2819,32 @@ admin.get('/alanube/reports/emissions', async (c) => {
       } catch { /* si falla la fusión, devolvemos solo las que trajo Alanube */ }
     }
     // Agregar lo que reporten las cuentas PROPIAS de cada negocio.
+    // EN PARALELO a propósito: en serie, con varias cuentas propias, la suma de
+    // esperas pasaba el límite de 30 s de la función y la pantalla moría con un
+    // error de plataforma en vez de mostrar lo que sí se pudo traer.
     const extraDiag: any[] = [];
-    for (const { token, tenants } of extraTokens) {
-      try {
-        const own = alanube.forEnv(env, token);
-        const r: any = await own.reportEmissionsPerCompany(from, until, { legalStatus, status });
-        const rows = r?.data ?? r ?? [];
-        if (Array.isArray(rows) && Array.isArray(perC)) {
-          const present = new Set(perC.map((x: any) => String(x.idCompany ?? x.id ?? '')));
-          for (const row of rows) {
-            const id = String(row.idCompany ?? row.id ?? '');
-            if (id && present.has(id)) continue;
-            perC.push({ ...row, _ownAccount: true });
-          }
-        }
-        extraDiag.push({ tenants, ok: true, rows: Array.isArray(rows) ? rows.length : 0 });
-      } catch (e: any) {
-        extraDiag.push({ tenants, ok: false, error: e?.message ?? 'error' });
+    const extraResults = await Promise.allSettled(
+      extraTokens.map(({ token }) => alanube.forEnv(env, token)
+        .reportEmissionsPerCompany(from, until, { legalStatus, status })),
+    );
+    extraResults.forEach((res, i) => {
+      const tenants = extraTokens[i]?.tenants;
+      if (res.status === 'rejected') {
+        extraDiag.push({ tenants, ok: false, error: (res.reason as any)?.message ?? 'error' });
+        return;
       }
-    }
+      const r: any = res.value;
+      const rows = r?.data ?? r ?? [];
+      if (Array.isArray(rows) && Array.isArray(perC)) {
+        const present = new Set(perC.map((x: any) => String(x.idCompany ?? x.id ?? '')));
+        for (const row of rows) {
+          const id = String(row.idCompany ?? row.id ?? '');
+          if (id && present.has(id)) continue;
+          perC.push({ ...row, _ownAccount: true });
+        }
+      }
+      extraDiag.push({ tenants, ok: true, rows: Array.isArray(rows) ? rows.length : 0 });
+    });
 
     // Modo diagnóstico: devuelve la respuesta CRUDA de Alanube (tal cual, sin
     // desenvolver) para ver los nombres reales de los campos y corregir el mapeo.
