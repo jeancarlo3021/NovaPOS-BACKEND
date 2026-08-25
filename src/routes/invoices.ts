@@ -190,6 +190,47 @@ invoices.post('/', async (c) => {
     const attributedCashierId   = invoiceData.cashier_id   ?? callerUserId ?? null;
     const attributedCashierName = invoiceData.cashier_name ?? null;
 
+    // ── Sesión de caja: tiene que EXISTIR ────────────────────────────────────
+    // Una venta hecha sin conexión se guarda con el id LOCAL de la caja que se
+    // abrió offline. Si al sincronizar ese id no se remapeó al de verdad (otro
+    // dispositivo, cache limpiado, la sesión se sincronizó después), la factura
+    // entraba igual —el id es un uuid válido— pero apuntando a una sesión que no
+    // existe: la venta quedaba en la base y el CIERRE DE CAJA daba 0.
+    //
+    // Acá se comprueba y, si no existe, se reengancha a la caja abierta del
+    // cajero. Es preferible que la venta aparezca en el cierre de hoy a que
+    // desaparezca del arqueo para siempre.
+    let sessionWarning: string | null = null;
+    if (invoiceData.cash_session_id) {
+      const { data: sess } = await db.from('cash_sessions')
+        .select('id').eq('id', invoiceData.cash_session_id).eq('tenant_id', tenantId).maybeSingle();
+      if (!sess) {
+        const { data: open } = await db.from('cash_sessions')
+          .select('id, opening_date')
+          .eq('tenant_id', tenantId).eq('status', 'open')
+          .eq('user_id', attributedCashierId ?? callerUserId ?? '')
+          .order('opening_date', { ascending: false }).limit(1).maybeSingle();
+        // Sin caja del cajero, se busca cualquiera abierta del negocio: una venta
+        // sin sesión no la ve nadie en el arqueo.
+        const { data: anyOpen } = open ? { data: null } : await db.from('cash_sessions')
+          .select('id').eq('tenant_id', tenantId).eq('status', 'open')
+          .order('opening_date', { ascending: false }).limit(1).maybeSingle();
+        const target = (open as any)?.id ?? (anyOpen as any)?.id ?? null;
+        if (target) {
+          sessionWarning = `La caja de la venta offline (${invoiceData.cash_session_id}) ya no existe: se registró en la caja abierta actual.`;
+          console.warn('[invoices]', sessionWarning);
+          invoiceData.cash_session_id = target;
+        } else {
+          // Ninguna caja abierta: se rechaza para que la venta SIGA en la cola
+          // del dispositivo y se pueda sincronizar cuando abran caja, en vez de
+          // guardarse huérfana y no aparecer en ningún cierre.
+          return fail(c,
+            'La caja de esta venta no existe y no hay ninguna caja abierta. '
+            + 'Abrí la caja y volvé a sincronizar para que la venta entre en el arqueo.', 409);
+        }
+      }
+    }
+
     // Insert con reintento ante colisión de número (unique tenant_id+invoice_number).
     // Puede chocar si: 2 ventas casi simultáneas, o una venta offline trae un
     // número que ya existe online. Reintentamos regenerando el consecutivo.
@@ -360,7 +401,7 @@ invoices.post('/', async (c) => {
       } catch (e: any) { console.warn('[invoices] crear CxC:', e?.message); }
     }
 
-    return ok(c, inv, 201);
+    return ok(c, sessionWarning ? { ...(inv as any), session_warning: sessionWarning } : inv, 201);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

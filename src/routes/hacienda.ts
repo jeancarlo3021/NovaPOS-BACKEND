@@ -1627,6 +1627,80 @@ hacienda.post('/received', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+// POST /received/:id/resend-ack — reenvía a Hacienda el Mensaje Receptor de un
+// comprobante que se aceptó en el sistema pero cuyo envío falló (ack_id vacío).
+//
+// Sin esto, esas aceptaciones quedaban "aceptado · sin enviar" para siempre: el
+// crédito fiscal estaba tomado internamente pero Hacienda nunca se enteró.
+hacienda.post('/received/:id/resend-ack', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const id = c.req.param('id');
+
+    const { data: d } = await db.from('received_documents')
+      .select('*').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+    if (!d) return fail(c, 'Comprobante no encontrado', 404);
+    if ((d as any).ack_id) return fail(c, 'Este comprobante ya tiene su mensaje enviado a Hacienda', 409);
+
+    const st = String((d as any).ack_status ?? '').toLowerCase().includes('reject') ? '3' : '1';
+    const cfg = await loadFEConfig(tenantId);
+    if (!cfg) return fail(c, 'No hay configuración de facturación electrónica', 422);
+    if (cfg.fe_provider !== 'alanube') {
+      return fail(c, 'El mensaje receptor solo se envía con Alanube. Revisá el proveedor en Configuración → Facturación Electrónica.', 422);
+    }
+    const isSandboxEnv = String(cfg.environment ?? 'production') === 'sandbox';
+    const senderCompanyId = (isSandboxEnv ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id;
+    if (!senderCompanyId) {
+      return fail(c, `La empresa no está dada de alta en Alanube para el ambiente ${isSandboxEnv ? 'sandbox' : 'producción'}.`, 422);
+    }
+
+    const m5 = (n: any) => (Math.round(Number(n || 0) * 1e5) / 1e5).toFixed(5);
+    const issuerId = String((d as any).issuer_id ?? '').replace(/\D/g, '');
+    const issuerType = issuerId.length === 9 ? '01' : '02';
+    const { count: mrCount } = await db.from('received_documents')
+      .select('id', { count: 'exact', head: true })
+      .eq('tenant_id', tenantId).not('ack_id', 'is', null);
+    const totalDoc = Number((d as any).total ?? 0);
+    const taxDoc = Number((d as any).tax ?? 0);
+
+    const payload: Record<string, any> = {
+      idDoc: { key: String((d as any).clave ?? '').replace(/\D/g, '') },
+      sender: { identification: { identificationType: issuerType, identificationNumber: issuerId } },
+      receiver: {
+        id: String(senderCompanyId),
+        consecutiveNumber: {
+          headquarters: String(cfg.sucursal ?? '1').replace(/\D/g, '').padStart(3, '0').slice(-3),
+          terminal: String(cfg.terminal ?? '1').replace(/\D/g, '').padStart(5, '0').slice(-5),
+          numberOfDocument: String((mrCount ?? 0) + 1),
+        },
+      },
+      information: {
+        message: st,
+        activityCode: String(cfg.economic_activity_code ?? '').trim(),
+        taxCondition: '01',
+      },
+      totals: {
+        totalTaxCredit: m5(taxDoc),
+        totalApplicableExpense: m5(totalDoc - taxDoc),
+        totalTax: m5(taxDoc),
+        totalVoucher: m5(totalDoc),
+      },
+    };
+
+    const resp = await alanube.forTenant(cfg).sendReceiverMessage(payload, String(senderCompanyId));
+    const mrId = resp?.id ?? deepFind(resp, /(^id$|_id$)/i, 40) ?? null;
+    if (!mrId) return fail(c, 'Alanube respondió sin id de mensaje receptor. Revisá el reporte de Alanube.', 502);
+
+    await db.from('received_documents')
+      .update({ ack_id: mrId, updated_at: new Date().toISOString() })
+      .eq('id', id).eq('tenant_id', tenantId);
+
+    return ok(c, { ok: true, ack_id: mrId });
+  } catch (err: any) {
+    return fail(c, err instanceof AlanubeError ? friendlyAlanubeError(err.message) : err.message, 502);
+  }
+});
+
 // POST /received/classify — clasifica un recibido como 'gasto' o 'compra'.
 // body: { id, kind: 'gasto' | 'compra' }
 hacienda.post('/received/classify', async (c) => {
