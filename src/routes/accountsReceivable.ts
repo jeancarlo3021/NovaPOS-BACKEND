@@ -9,13 +9,30 @@ import { emitInvoiceCore } from './hacienda.js';
 const accountsReceivable = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
 /** Mapa customer_id → zona, para filtrar/etiquetar CxC por zona. */
-async function customerZoneMap(tenantId: string): Promise<Map<string, string | null>> {
-  // Paginado por el mismo motivo que la lista de cuentas: pasados los 1000
-  // clientes, los que quedaban fuera aparecían SIN zona y el filtro por zona los
-  // escondía a todos — un repartidor no veía sus cuentas y no había forma de
-  // saber por qué.
-  const PAGE = 1000;
+/**
+ * Zona de cada cliente.
+ *
+ * Se consultan SOLO los clientes que aparecen en las cuentas (por lotes), no el
+ * catálogo entero: con miles de clientes, recorrerlo completo en cada carga se
+ * comía el tiempo de la función y la pantalla terminaba vacía —sin cuentas y sin
+ * error— que es exactamente como se ve "no aparece ninguno".
+ */
+async function customerZoneMap(tenantId: string, ids?: string[]): Promise<Map<string, string | null>> {
   const map = new Map<string, string | null>();
+
+  if (ids && ids.length > 0) {
+    const CHUNK = 300;
+    for (let i = 0; i < ids.length; i += CHUNK) {
+      const { data, error } = await db.from('customers')
+        .select('id, zone').eq('tenant_id', tenantId).in('id', ids.slice(i, i + CHUNK));
+      if (error) break;
+      for (const c of (data ?? []) as any[]) map.set(c.id, c.zone ?? null);
+    }
+    return map;
+  }
+
+  // Sin lista de ids: catálogo completo, paginado (Supabase corta en 1000).
+  const PAGE = 1000;
   for (let from = 0; ; from += PAGE) {
     const { data, error } = await db.from('customers')
       .select('id, zone').eq('tenant_id', tenantId).range(from, from + PAGE - 1);
@@ -72,6 +89,31 @@ export async function createReceivable(tenantId: string, r: {
 }
 
 // GET /  ?status=&customer_id=
+// GET /scope — qué está viendo este usuario y por qué.
+//
+// Los usuarios con ZONA asignada solo ven las cuentas de su zona. Eso es
+// deliberado (un vendedor de ruta no cobra la cartera de otro), pero desde la
+// pantalla se veía igual que "faltan clientes": no había forma de saber que
+// había un filtro puesto por el rol.
+accountsReceivable.get('/scope', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const zone = await getUserZone(c.get('userId'));
+    // Cuántos clientes hay en total y cuántos entran en la zona del usuario.
+    let total = 0, enZona = 0;
+    const PAGE = 1000;
+    for (let from = 0; ; from += PAGE) {
+      const { data } = await db.from('customers')
+        .select('id, zone').eq('tenant_id', tenantId).range(from, from + PAGE - 1);
+      const chunk = data ?? [];
+      total += chunk.length;
+      if (zone) enZona += (chunk as any[]).filter(x => x.zone === zone).length;
+      if (chunk.length < PAGE) break;
+    }
+    return ok(c, { zone, customers_total: total, customers_visible: zone ? enZona : total });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 accountsReceivable.get('/', async (c) => {
   try {
     const tenantId = c.get('tenantId');
@@ -132,7 +174,8 @@ accountsReceivable.get('/', async (c) => {
     if (status) rows = rows.filter((r: any) => r.status === status);
 
     // Zona: restricción por usuario (repartidor) o filtro por query. Etiqueta cada CxC.
-    const zmap = await customerZoneMap(tenantId);
+    const zmap = await customerZoneMap(tenantId,
+      [...new Set(rows.map((r: any) => r.customer_id).filter(Boolean))] as string[]);
     rows = rows.map((r: any) => ({ ...r, zone: r.customer_id ? (zmap.get(r.customer_id) ?? null) : null }));
     const filterZone = (await getUserZone(c.get('userId'))) ?? c.req.query('zone') ?? null;
     if (filterZone) rows = rows.filter((r: any) => r.zone === filterZone);
@@ -150,7 +193,8 @@ accountsReceivable.get('/summary', async (c) => {
     let rows = (data ?? []).map(withDerivedStatus);
 
     // Zona por cliente + restricción/filtro.
-    const zmap = await customerZoneMap(tenantId);
+    const zmap = await customerZoneMap(tenantId,
+      [...new Set(rows.map((r: any) => r.customer_id).filter(Boolean))] as string[]);
     rows = rows.map((r: any) => ({ ...r, zone: r.customer_id ? (zmap.get(r.customer_id) ?? null) : null }));
     const filterZone = (await getUserZone(c.get('userId'))) ?? c.req.query('zone') ?? null;
     if (filterZone) rows = rows.filter((r: any) => r.zone === filterZone);

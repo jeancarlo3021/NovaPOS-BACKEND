@@ -202,30 +202,35 @@ invoices.post('/', async (c) => {
     // desaparezca del arqueo para siempre.
     let sessionWarning: string | null = null;
     if (invoiceData.cash_session_id) {
-      const { data: sess } = await db.from('cash_sessions')
+      const check = await db.from('cash_sessions')
         .select('id').eq('id', invoiceData.cash_session_id).eq('tenant_id', tenantId).maybeSingle();
-      if (!sess) {
-        const { data: open } = await db.from('cash_sessions')
-          .select('id, opening_date')
-          .eq('tenant_id', tenantId).eq('status', 'open')
-          .eq('user_id', attributedCashierId ?? callerUserId ?? '')
-          .order('opening_date', { ascending: false }).limit(1).maybeSingle();
-        // Sin caja del cajero, se busca cualquiera abierta del negocio: una venta
-        // sin sesión no la ve nadie en el arqueo.
-        const { data: anyOpen } = open ? { data: null } : await db.from('cash_sessions')
-          .select('id').eq('tenant_id', tenantId).eq('status', 'open')
-          .order('opening_date', { ascending: false }).limit(1).maybeSingle();
-        const target = (open as any)?.id ?? (anyOpen as any)?.id ?? null;
-        if (target) {
-          sessionWarning = `La caja de la venta offline (${invoiceData.cash_session_id}) ya no existe: se registró en la caja abierta actual.`;
+
+      // Si la CONSULTA falla (no es que la sesión no exista, es que no se pudo
+      // preguntar), se deja la venta como venía. Mover ventas de caja por un
+      // error de lectura sería peor que el problema que esto arregla.
+      if (check.error) {
+        console.warn('[invoices] no se pudo verificar la caja:', check.error.message);
+      } else if (!check.data) {
+        // La sesión NO existe. Se reengancha SOLO a la caja abierta de este mismo
+        // cajero: mandarla a "cualquier caja abierta" metería las ventas en el
+        // arqueo de otro compañero, que es justo lo que nadie puede cuadrar.
+        const ownerId = attributedCashierId ?? callerUserId ?? null;
+        const own = ownerId
+          ? await db.from('cash_sessions')
+              .select('id').eq('tenant_id', tenantId).eq('status', 'open').eq('user_id', ownerId)
+              .order('opening_date', { ascending: false }).limit(1).maybeSingle()
+          : { data: null, error: null };
+
+        if ((own as any)?.data?.id) {
+          sessionWarning = `La caja de la venta offline (${invoiceData.cash_session_id}) ya no existe: se registró en tu caja abierta.`;
           console.warn('[invoices]', sessionWarning);
-          invoiceData.cash_session_id = target;
+          invoiceData.cash_session_id = (own as any).data.id;
         } else {
-          // Ninguna caja abierta: se rechaza para que la venta SIGA en la cola
-          // del dispositivo y se pueda sincronizar cuando abran caja, en vez de
-          // guardarse huérfana y no aparecer en ningún cierre.
+          // Sin caja abierta propia: se rechaza para que la venta SIGA en la cola
+          // del dispositivo y se sincronice cuando abran caja, en vez de quedar
+          // huérfana y no aparecer en ningún cierre.
           return fail(c,
-            'La caja de esta venta no existe y no hay ninguna caja abierta. '
+            'La caja de esta venta no existe y no tenés ninguna caja abierta. '
             + 'Abrí la caja y volvé a sincronizar para que la venta entre en el arqueo.', 409);
         }
       }

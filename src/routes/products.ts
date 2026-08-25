@@ -140,11 +140,35 @@ products.put('/:id', requirePermission('inventory', 'edit'), async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const { id } = c.req.param();
-    const parsed = ProductSchema.partial().safeParse(await c.req.json());
+    const raw = await c.req.json().catch(() => ({} as any));
+    const parsed = ProductSchema.partial().safeParse(raw);
     if (!parsed.success) return fail(c, parsed.error.message, 422);
 
+    const patch: any = { ...parsed.data };
+
+    // ── El CABYS no se borra por accidente ──────────────────────────────────
+    // Un producto que YA tiene CABYS no puede perderlo porque una pantalla
+    // mandó el campo vacío (formulario a medio cargar, importación sin esa
+    // columna, edición rápida que reenvía todo el producto). Sin CABYS el
+    // producto deja de poder facturarse electrónicamente y nadie se entera
+    // hasta que Hacienda rechaza la venta.
+    //
+    // Para borrarlo de verdad hay que pedirlo explícito: { clear_cabys: true }.
+    const body: any = parsed.data;
+    if ('cabys_code' in body && !String(body.cabys_code ?? '').trim()) {
+      if (raw?.clear_cabys !== true) {
+        const { data: prev } = await db.from('products')
+          .select('cabys_code').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+        if (String((prev as any)?.cabys_code ?? '').trim()) {
+          console.warn(`[products] se ignoró el borrado del CABYS de ${id} `
+            + `(campos enviados: ${Object.keys(body).join(', ')})`);
+          delete patch.cabys_code;
+        }
+      }
+    }
+
     const { data, error } = await db.from('products')
-      .update({ ...parsed.data, updated_at: new Date().toISOString() })
+      .update({ ...patch, updated_at: new Date().toISOString() })
       .eq('id', id).eq('tenant_id', tenantId)
       .select().single();
     if (error) throw new Error(error.message);
