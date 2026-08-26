@@ -61,9 +61,30 @@ cashSessions.post('/open', async (c) => {
 
     // Solo una caja abierta POR USUARIO (no por tenant). Así cada cajero
     // maneja su propia sesión sin bloquear a los demás.
-    const { data: existing } = await db.from('cash_sessions').select('id')
-      .eq('tenant_id', tenantId).eq('user_id', userId).eq('status', 'open').maybeSingle();
-    if (existing) return fail(c, 'Ya tenés una caja abierta', 409);
+    //
+    // Se piden hasta 2 filas a propósito: con `maybeSingle()`, un usuario que ya
+    // tuviera DOS cajas abiertas hacía que la consulta devolviera error y `data`
+    // null — el guard pasaba y se abría una TERCERA. Así se acumulaban sesiones
+    // fantasma: la caja "se cerraba sola" (el POS pasaba a ver otra) y después no
+    // dejaba abrir.
+    const { data: abiertas } = await db.from('cash_sessions')
+      .select('*').eq('tenant_id', tenantId).eq('user_id', userId).eq('status', 'open')
+      .order('opening_date', { ascending: false }).limit(2);
+
+    if ((abiertas ?? []).length > 0) {
+      const actual: any = (abiertas ?? [])[0];
+      if ((abiertas ?? []).length > 1) {
+        console.warn(`[caja] el usuario ${userId} tiene ${(abiertas ?? []).length}+ cajas abiertas`);
+      }
+      // Se devuelve LA QUE YA ESTÁ para que el POS la adopte, en vez de dejar al
+      // cajero trabado con "Ya tenés una caja abierta" sin poder hacer nada.
+      return c.json({
+        success: false,
+        error: 'Ya tenés una caja abierta',
+        existing_session: actual,
+        duplicates: (abiertas ?? []).length,
+      }, 409);
+    }
 
     const { data, error } = await db.from('cash_sessions').insert({
       tenant_id:      tenantId,
@@ -137,6 +158,29 @@ cashSessions.post('/:id/close', async (c) => {
     const { id }   = c.req.param();
     const parsed   = CloseSchema.safeParse(await c.req.json());
     if (!parsed.success) return fail(c, parsed.error.message, 422);
+
+    // Cajas fantasma: si el usuario tenía más de una abierta, cerrar solo la
+    // actual dejaba la vieja viva — y al rato el POS la mostraba como si la caja
+    // se hubiera reabierto sola. Se cierran las demás con nota, sin montos.
+    try {
+      const { data: sess } = await db.from('cash_sessions')
+        .select('user_id').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+      const owner = (sess as any)?.user_id;
+      if (owner) {
+        const { data: otras } = await db.from('cash_sessions')
+          .select('id').eq('tenant_id', tenantId).eq('user_id', owner)
+          .eq('status', 'open').neq('id', id);
+        for (const o of (otras ?? []) as any[]) {
+          await db.from('cash_sessions').update({
+            status: 'closed',
+            closing_date: new Date().toISOString(),
+            notes: 'Cerrada automáticamente: quedó abierta por duplicado',
+            updated_at: new Date().toISOString(),
+          }).eq('id', o.id).eq('tenant_id', tenantId);
+          console.warn(`[caja] se cerró la sesión duplicada ${o.id} del usuario ${owner}`);
+        }
+      }
+    } catch (e: any) { console.warn('[caja] limpieza de duplicadas:', e?.message); }
 
     const { data, error } = await db.from('cash_sessions').update({
       closing_amount: parsed.data.closing_amount,
