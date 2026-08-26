@@ -30,4 +30,19 @@ const handler = async (c: any) => {
 cron.get('/fetch-received-emails', handler);
 cron.post('/fetch-received-emails', handler);
 
+// Limpieza de demos vencidas. `?debug=1` solo informa qué borraría, sin borrar:
+// conviene mirarlo la primera vez antes de dejarlo suelto.
+const purgeHandler = async (c: any) => {
+  if (!authorized(c)) return fail(c, 'No autorizado', 401);
+  try {
+    const { purgeExpiredDemos } = await import('../services/demoCleanup.js');
+    const res = await purgeExpiredDemos({ dryRun: c.req.query('debug') === '1' });
+    return ok(c, { ok: true, ...res });
+  } catch (err: any) {
+    return fail(c, err?.message ?? 'Error al limpiar demos', 500);
+  }
+};
+cron.get('/purge-demos', purgeHandler);
+cron.post('/purge-demos', purgeHandler);
+
 export default cron;

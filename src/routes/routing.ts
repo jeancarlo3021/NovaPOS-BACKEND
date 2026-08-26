@@ -1017,6 +1017,48 @@ routing.post('/:id/close', async (c) => {
       addMethod(i.payment_method ?? 'cash', Number(i.total ?? 0));
     }
 
+    // El camión aparece VACÍO pero se había cargado: el stock del camión se
+    // perdió (carga hecha por traslado, corrección manual, migración vieja). En
+    // vez de imprimir "sin sobrante" —que es afirmar algo falso— se reconstruye
+    // con lo cargado menos lo vendido y se avisa de dónde salió el dato.
+    let returnedSource: 'truck' | 'reconstructed' | 'none' =
+      returnedDetail.length > 0 ? 'truck' : 'none';
+    if (returnedDetail.length === 0) {
+      const { data: rr } = await db.from('routes')
+        .select('loaded_summary').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+      const loaded: Record<string, number> = ((rr as any)?.loaded_summary ?? {});
+      if (Object.keys(loaded).length > 0) {
+        const { data: invIds } = await db.from('invoices')
+          .select('id, status').eq('tenant_id', tenantId).eq('route_id', id);
+        const ids = (invIds ?? []).filter((i: any) => i.status !== 'cancelled').map((i: any) => i.id);
+        const sold: Record<string, number> = {};
+        if (ids.length > 0) {
+          const { data: lines } = await db.from('invoice_items')
+            .select('product_id, quantity').in('invoice_id', ids);
+          for (const l of (lines ?? []) as any[]) {
+            sold[l.product_id] = Number(sold[l.product_id] ?? 0) + Number(l.quantity);
+          }
+        }
+        const pend = Object.keys(loaded)
+          .map(pid => ({ pid, qty: Number(loaded[pid]) - Number(sold[pid] ?? 0) }))
+          .filter(x => x.qty > 0.0001);
+        if (pend.length > 0) {
+          const { data: prods } = await db.from('products')
+            .select('id, name').in('id', pend.map(x => x.pid));
+          const names = new Map((prods ?? []).map((p: any) => [String(p.id), p.name]));
+          for (const x of pend) {
+            returnedDetail.push({
+              name: names.get(x.pid) ?? 'Producto',
+              quantity: Math.round(x.qty * 1000) / 1000,
+            });
+          }
+          returnedSource = 'reconstructed';
+          console.warn(`[ruta ${id}] el camión estaba vacío en warehouse_stock: `
+            + `sobrante reconstruido de lo cargado (${pend.length} producto/s).`);
+        }
+      }
+    }
+
     returnedDetail.sort((a, b) => a.name.localeCompare(b.name, 'es'));
 
     // 2b) Abonos de CxC cobrados por el repartidor ese día (efectivo/tarjeta/SINPE
@@ -1070,8 +1112,10 @@ routing.post('/:id/close', async (c) => {
       sales_count: sales.length,
       sales_total: salesTotal,
       voids_count: voids.length,
-      returned_items: returnedItems.length,
+      returned_items: returnedDetail.length,
       returned: returnedDetail,
+      // De dónde salió el sobrante: del camión, reconstruido, o de verdad no hubo.
+      returned_source: returnedSource,
       by_method: byMethod,
       // Abonos de CxC del día (repartidor) y gastos del día.
       ar_payments: { by_method: { cash: abonos.cash, card: abonos.card, sinpe: abonos.sinpe }, total: abonos.total, list: abonosList },
@@ -1118,11 +1162,34 @@ routing.get('/:id/close-summary', async (c) => {
       else byMethod.cash += Number(i.total ?? 0);
     }
 
-    // Sobrante: 1) el guardado en close_summary; si no, 2) reconstruir cargado − vendido.
+    // Sobrante: 1) el guardado en close_summary; 2) lo que HAY hoy en el camión
+    // (si la ruta sigue abierta); 3) reconstruir cargado − vendido.
     let returned: Array<{ name: string; quantity: number }> = stored?.returned ?? [];
+    let returnedSource: string = returned.length > 0 ? 'stored' : 'none';
+
+    if (returned.length === 0) {
+      const { data: rw } = await db.from('routes')
+        .select('warehouse_id, status').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+      if ((rw as any)?.status !== 'closed' && (rw as any)?.warehouse_id) {
+        const { data: stock } = await db.from('warehouse_stock')
+          .select('product_id, quantity').eq('warehouse_id', (rw as any).warehouse_id);
+        const conStock = (stock ?? []).filter((x: any) => Number(x.quantity) > 0);
+        if (conStock.length > 0) {
+          const { data: prods } = await db.from('products')
+            .select('id, name').in('id', conStock.map((x: any) => x.product_id));
+          const names = new Map((prods ?? []).map((p: any) => [String(p.id), p.name]));
+          returned = conStock.map((x: any) => ({
+            name: names.get(String(x.product_id)) ?? 'Producto',
+            quantity: Number(x.quantity),
+          }));
+          returnedSource = 'truck';
+        }
+      }
+    }
     if (returned.length === 0) {
       const loaded: Record<string, number> = (route as any).loaded_summary ?? {};
       if (Object.keys(loaded).length > 0) {
+        returnedSource = 'reconstructed';
         // Vendido por producto (facturas no anuladas de la ruta).
         const saleIds = sales.map((i: any) => i.id);
         const sold: Record<string, number> = {};
@@ -1147,6 +1214,7 @@ routing.get('/:id/close-summary', async (c) => {
 
     return ok(c, {
       route_id: id, truck, route_date: (route as any).route_date,
+      returned_source: returnedSource,
       sales_count: stored?.sales_count ?? sales.length,
       sales_total: stored?.sales_total ?? sales.reduce((s: number, i: any) => s + Number(i.total ?? 0), 0),
       voids_count: stored?.voids_count ?? voids.length,

@@ -79,6 +79,58 @@ cashSessions.post('/open', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+// GET /:id/invoices — ventas de una caja, resueltas del lado del SERVIDOR.
+//
+// El cierre pedía las facturas por `cash_session_id` desde el navegador, y si esa
+// caja se abrió sin conexión (id local) o el enlace se rompió, no venía ninguna:
+// el arqueo salía en 0 con la plata en el cajón. Acá, cuando la sesión no tiene
+// facturas ligadas, se buscan las del PERÍODO de esa caja y del mismo cajero, y
+// se avisa de dónde salieron para que la pantalla lo diga.
+cashSessions.get('/:id/invoices', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { id } = c.req.param();
+
+    const { data: sess } = await db.from('cash_sessions')
+      .select('id, user_id, opening_date, closing_date, status')
+      .eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+    if (!sess) return fail(c, 'Caja no encontrada', 404);
+
+    const { data: ligadas, error } = await db.from('invoices').select('*')
+      .eq('tenant_id', tenantId).eq('cash_session_id', id)
+      .order('issued_at', { ascending: false }).limit(2000);
+    if (error) throw new Error(error.message);
+
+    if ((ligadas ?? []).length > 0) {
+      return ok(c, { invoices: ligadas, source: 'session', session_id: id });
+    }
+
+    // Sin facturas ligadas: se busca por ventana de tiempo. Se excluye lo que ya
+    // pertenece a OTRA caja, para no contar dos veces la misma venta.
+    const desde = (sess as any).opening_date;
+    const hasta = (sess as any).closing_date ?? new Date().toISOString();
+    let q = db.from('invoices').select('*')
+      .eq('tenant_id', tenantId)
+      .gte('issued_at', desde).lte('issued_at', hasta)
+      .order('issued_at', { ascending: false }).limit(2000);
+    const { data: delPeriodo } = await q;
+
+    const candidatas = (delPeriodo ?? []).filter((i: any) => {
+      if (i.cash_session_id && i.cash_session_id !== id) return false;
+      const owner = (sess as any).user_id;
+      if (owner && i.cashier_id && i.cashier_id !== owner) return false;
+      return true;
+    });
+
+    return ok(c, {
+      invoices: candidatas,
+      source: candidatas.length > 0 ? 'window' : 'empty',
+      session_id: id,
+      window: { from: desde, to: hasta },
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 cashSessions.post('/:id/close', async (c) => {
   try {
     const tenantId = c.get('tenantId');
