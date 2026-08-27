@@ -158,9 +158,27 @@ routing.get('/live', async (c) => {
       for (const w of ws ?? []) truckName.set((w as any).id, (w as any).name || (w as any).code || 'Camión');
     }
     const driverName = new Map<string, string>();
+    const driverRole = new Map<string, string>();
     if (driverIds.length) {
-      const { data: us } = await db.from('users').select('id, full_name, email, ticket_alias').in('id', driverIds as string[]);
-      for (const u of us ?? []) driverName.set((u as any).id, (u as any).ticket_alias || (u as any).full_name || (u as any).email || 'Repartidor');
+      const { data: us } = await db.from('users')
+        .select('id, full_name, email, ticket_alias, role').in('id', driverIds as string[]);
+      for (const u of us ?? []) {
+        driverName.set((u as any).id, (u as any).ticket_alias || (u as any).full_name || (u as any).email || 'Repartidor');
+        driverRole.set((u as any).id, String((u as any).role ?? ''));
+      }
+
+      // Quién es AGENTE DE VENTA: el nombre del agente es el que reconoce la
+      // oficina ("Marvin de la ruta sur"), no el del usuario del sistema. Sin
+      // esto, en el mapa todos salían rotulados igual y no se distinguía al
+      // agente del repartidor.
+      const { data: agents } = await db.from('sales_agents')
+        .select('user_id, name').eq('tenant_id', tenantId).in('user_id', driverIds as string[]);
+      for (const a of (agents ?? []) as any[]) {
+        if (a.user_id) {
+          if (a.name) driverName.set(a.user_id, a.name);
+          driverRole.set(a.user_id, 'agente');
+        }
+      }
     }
 
     // Avance de paradas + ventas por ruta.
@@ -196,6 +214,10 @@ routing.get('/live', async (c) => {
         ?? (p.driver_id ? (driverName.get(p.driver_id) ?? 'En ruta') : 'En ruta'),
       /** true = no hay camión detrás: es una persona/carro. */
       is_person: !truckName.has(p.truck_id),
+      /** 'agente' | 'repartidor' | el rol del usuario: para rotular el pin. */
+      person_role: p.driver_id
+        ? (driverRole.get(p.driver_id) || 'repartidor')
+        : 'repartidor',
       driver_id: p.driver_id,
       driver_name: p.driver_id ? (driverName.get(p.driver_id) ?? 'Repartidor') : 'Sin chofer',
       route_id: p.route_id,
