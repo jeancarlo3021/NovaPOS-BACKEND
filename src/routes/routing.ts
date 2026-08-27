@@ -190,7 +190,12 @@ routing.get('/live', async (c) => {
 
     const trucks = positions.map(p => ({
       truck_id: p.truck_id,
-      truck_name: truckName.get(p.truck_id) ?? 'Camión',
+      // Sin camión (una persona compartiendo su ubicación en un carro), el
+      // nombre útil es el de ella: rotularlo "Camión" confunde al que mira.
+      truck_name: truckName.get(p.truck_id)
+        ?? (p.driver_id ? (driverName.get(p.driver_id) ?? 'En ruta') : 'En ruta'),
+      /** true = no hay camión detrás: es una persona/carro. */
+      is_person: !truckName.has(p.truck_id),
       driver_id: p.driver_id,
       driver_name: p.driver_id ? (driverName.get(p.driver_id) ?? 'Repartidor') : 'Sin chofer',
       route_id: p.route_id,
