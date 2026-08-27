@@ -193,6 +193,29 @@ reports.get('/vouchers', async (c) => {
 // por factura, columnas por tarifa). El IVA no se guarda en la factura: sale de la
 // tarifa de cada producto, así que se reconstruye leyendo los ítems.
 // Mismos filtros que /taxes: from, to, environment.
+/**
+ * Trae TODAS las filas de una consulta, por páginas.
+ *
+ * Supabase corta en 1000 filas por consulta, sin avisar y sin importar el
+ * `.limit()` que uno ponga. En el reporte de IVA eso significaba que a un
+ * negocio con más de mil facturas en el período le faltaban comprobantes en la
+ * declaración — y el faltante no se veía por ningún lado.
+ */
+async function fetchAllRows<T = any>(
+  make: (from: number, to: number) => any,
+): Promise<{ data: T[]; error: any }> {
+  const PAGE = 1000;
+  const all: T[] = [];
+  for (let from = 0; ; from += PAGE) {
+    const { data, error } = await make(from, from + PAGE - 1);
+    if (error) return { data: all, error };
+    const chunk = (data ?? []) as T[];
+    all.push(...chunk);
+    if (chunk.length < PAGE) break;
+  }
+  return { data: all, error: null };
+}
+
 reports.get('/taxes/breakdown', async (c) => {
   try {
     const tenantId = c.get('tenantId');
@@ -207,15 +230,18 @@ reports.get('/taxes/breakdown', async (c) => {
         .select('id, invoice_number, customer_name, customer_id, subtotal, tax_amount, total, '
           + 'issued_at, status, document_type, fe_clave, fe_nc_clave, fe_nd_clave, fe_environment'
           + (withIdent ? ', customer_identification' : ''))
-        .eq('tenant_id', tenantId).limit(20000);
+        .eq('tenant_id', tenantId);
       if (from) q = q.gte('issued_at', from);
       if (to)   q = q.lte('issued_at', to);
       if (environment === 'sandbox') q = q.eq('fe_environment', 'sandbox');
       else if (environment !== 'all') q = q.or('fe_environment.is.null,fe_environment.neq.sandbox');
       return q;
     };
-    let { data: invs, error } = await build(true);
-    if (error && /customer_identification/i.test(error.message)) ({ data: invs, error } = await build(false));
+    // Paginado: sin esto, pasadas las 1000 facturas el desglose salía cortado.
+    let { data: invs, error } = await fetchAllRows((a, b) => build(true).range(a, b));
+    if (error && /customer_identification/i.test(error.message)) {
+      ({ data: invs, error } = await fetchAllRows((a, b) => build(false).range(a, b)));
+    }
     if (error) throw new Error(error.message);
     const rows = (invs ?? []) as any[];
     if (rows.length === 0) return ok(c, { rows: [], rates: [0, 1, 2, 4, 13] });
@@ -230,9 +256,13 @@ reports.get('/taxes/breakdown', async (c) => {
 
     const ids = rows.map(r => r.id);
     const items: any[] = [];
+    // Las LÍNEAS también se paginan: 200 facturas pueden traer más de 1000
+    // líneas, y ese corte silencioso dejaba comprobantes con la base incompleta
+    // — el IVA por tarifa salía mal sin ninguna señal.
     for (let i = 0; i < ids.length; i += 200) {
-      const { data } = await db.from('invoice_items')
-        .select('invoice_id, product_id, subtotal').in('invoice_id', ids.slice(i, i + 200));
+      const chunk = ids.slice(i, i + 200);
+      const { data } = await fetchAllRows((a, b) => db.from('invoice_items')
+        .select('invoice_id, product_id, subtotal').in('invoice_id', chunk).range(a, b));
       items.push(...(data ?? []));
     }
     const pids = [...new Set(items.map(it => it.product_id).filter(Boolean))];
@@ -295,32 +325,44 @@ reports.get('/taxes', async (c) => {
     //  1) Ventas VÁLIDAS (no anuladas).
     //  2) Facturas con NOTA DE CRÉDITO (aunque estén anuladas).
     //  3) Facturas con NOTA DE DÉBITO.
-    let qVentas = db.from('invoices').select(sel).eq('tenant_id', tenantId).neq('status', 'cancelled');
-    let qNc     = db.from('invoices').select(sel).eq('tenant_id', tenantId).not('fe_nc_clave', 'is', null);
-    let qNd     = db.from('invoices').select(sel).eq('tenant_id', tenantId).not('fe_nd_clave', 'is', null);
-    if (from) { qVentas = qVentas.gte('issued_at', from); qNc = qNc.gte('issued_at', from); qNd = qNd.gte('issued_at', from); }
-    if (to)   { qVentas = qVentas.lte('issued_at', to);   qNc = qNc.lte('issued_at', to);   qNd = qNd.lte('issued_at', to); }
-    // Filtro por ambiente. 'production' incluye las filas SIN ambiente (ventas
-    // corrientes y facturas históricas = reales). 'sandbox' solo las de prueba.
-    if (environment === 'sandbox') {
-      qVentas = qVentas.eq('fe_environment', 'sandbox');
-      qNc     = qNc.eq('fe_environment', 'sandbox');
-      qNd     = qNd.eq('fe_environment', 'sandbox');
-    } else if (environment !== 'all') {   // production (default)
-      qVentas = qVentas.or('fe_environment.is.null,fe_environment.neq.sandbox');
-      qNc     = qNc.or('fe_environment.is.null,fe_environment.neq.sandbox');
-      qNd     = qNd.or('fe_environment.is.null,fe_environment.neq.sandbox');
-    }
-    let [rVentas, rNc, rNd]: [any, any, any] = await Promise.all([qVentas, qNc, qNd]);
+    // Cada consulta se ARMA de nuevo en cada página: un query builder de Supabase
+    // es de un solo uso, y reutilizarlo entre páginas devuelve resultados raros.
+    const baseQuery = (kind: 'ventas' | 'nc' | 'nd', selection: string) => {
+      let q = db.from('invoices').select(selection).eq('tenant_id', tenantId);
+      if (kind === 'ventas') q = q.neq('status', 'cancelled');
+      if (kind === 'nc')     q = q.not('fe_nc_clave', 'is', null);
+      if (kind === 'nd')     q = q.not('fe_nd_clave', 'is', null);
+      if (from) q = q.gte('issued_at', from);
+      if (to)   q = q.lte('issued_at', to);
+      // Filtro por ambiente. 'production' incluye las filas SIN ambiente (ventas
+      // corrientes y facturas históricas = reales). 'sandbox' solo las de prueba.
+      if (environment === 'sandbox') q = q.eq('fe_environment', 'sandbox');
+      else if (environment !== 'all') q = q.or('fe_environment.is.null,fe_environment.neq.sandbox');
+      return q;
+    };
+    // Las tres consultas van PAGINADAS: con más de 1000 comprobantes en el
+    // período, la declaración salía incompleta y nadie lo notaba.
+    let [rVentas, rNc, rNd]: [any, any, any] = await Promise.all([
+      fetchAllRows((a, b) => baseQuery('ventas', sel).range(a, b)),
+      fetchAllRows((a, b) => baseQuery('nc', sel).range(a, b)),
+      fetchAllRows((a, b) => baseQuery('nd', sel).range(a, b)),
+    ]);
     // Si columnas nuevas aún no existen (migraciones sin correr), reintenta con el
     // set mínimo (muestra todo, sin ND ni ambiente).
     if ([rVentas, rNc, rNd].some(r => r.error && /fe_environment|fe_nd_clave|document_type/.test(r.error.message))) {
       const sel2 = 'id, invoice_number, customer_name, customer_id, total, subtotal, tax_amount, issued_at, status, fe_clave, fe_status, fe_nc_clave';
-      let v = db.from('invoices').select(sel2).eq('tenant_id', tenantId).neq('status', 'cancelled');
-      let n = db.from('invoices').select(sel2).eq('tenant_id', tenantId).not('fe_nc_clave', 'is', null);
-      if (from) { v = v.gte('issued_at', from); n = n.gte('issued_at', from); }
-      if (to)   { v = v.lte('issued_at', to);   n = n.lte('issued_at', to); }
-      [rVentas, rNc] = await Promise.all([v, n]);
+      const legacy = (kind: 'ventas' | 'nc') => {
+        let q = db.from('invoices').select(sel2).eq('tenant_id', tenantId);
+        if (kind === 'ventas') q = q.neq('status', 'cancelled');
+        else q = q.not('fe_nc_clave', 'is', null);
+        if (from) q = q.gte('issued_at', from);
+        if (to)   q = q.lte('issued_at', to);
+        return q;
+      };
+      [rVentas, rNc] = await Promise.all([
+        fetchAllRows((a, b) => legacy('ventas').range(a, b)),
+        fetchAllRows((a, b) => legacy('nc').range(a, b)),
+      ]);
       rNd = { data: [], error: null };
     }
     if (rVentas.error) throw new Error(rVentas.error.message);

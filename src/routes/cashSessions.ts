@@ -152,6 +152,44 @@ cashSessions.get('/:id/invoices', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+// PATCH /:id/opening — corrige el FONDO de una caja que ya está abierta.
+//
+// Hace falta porque la caja puede haberse abierto sola en ₡0 (negocios con "no
+// abrir caja") o porque el cajero se equivocó al contar el fondo. Sin esto, el
+// arqueo del día entero arrastra un fondo que no es, y el cierre marca faltante
+// o sobrante por una diferencia que nunca existió.
+cashSessions.patch('/:id/opening', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { id } = c.req.param();
+    const body = await c.req.json().catch(() => ({} as any));
+    const monto = Number(body?.opening_amount);
+    if (!Number.isFinite(monto) || monto < 0) return fail(c, 'Monto de apertura inválido', 422);
+
+    const { data: sess } = await db.from('cash_sessions')
+      .select('id, status, opening_amount, notes').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+    if (!sess) return fail(c, 'Caja no encontrada', 404);
+    if ((sess as any).status !== 'open') return fail(c, 'La caja ya está cerrada', 409);
+
+    const anterior = Number((sess as any).opening_amount ?? 0);
+    // Queda registro del cambio: un fondo que se corrige sin rastro es la forma
+    // más fácil de tapar un faltante.
+    const nota = [
+      (sess as any).notes,
+      `Fondo corregido: ₡${anterior.toLocaleString('es-CR')} → ₡${monto.toLocaleString('es-CR')} (${new Date().toISOString()})`,
+    ].filter(Boolean).join(' | ');
+
+    const { data, error } = await db.from('cash_sessions').update({
+      opening_amount: monto,
+      opening_usd: Number(body?.opening_usd ?? (sess as any).opening_usd ?? 0),
+      notes: nota,
+      updated_at: new Date().toISOString(),
+    }).eq('id', id).eq('tenant_id', tenantId).select().single();
+    if (error) throw new Error(error.message);
+    return ok(c, data);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 cashSessions.post('/:id/close', async (c) => {
   try {
     const tenantId = c.get('tenantId');
