@@ -40,6 +40,18 @@ products.get('/', async (c) => {
     const tenantId = c.get('tenantId');
     const search   = c.req.query('search');
     const category = c.req.query('category');
+    /**
+     * Solo lo que cambió desde esta fecha.
+     *
+     * El POS ya tiene el catálogo guardado; volver a bajar 3.000 productos en
+     * cada arranque es tráfico y espera para no enterarse de nada nuevo. Con
+     * `since` la respuesta habitual son cero filas o un puñado.
+     *
+     * Los BORRADOS también viajan (con su `deleted_at`), porque si no, un
+     * producto eliminado se quedaría para siempre en el catálogo del aparato:
+     * el cajero lo seguiría vendiendo.
+     */
+    const since = c.req.query('since');
 
     // Paginamos para traer TODOS los productos: Supabase corta en 1000 filas por
     // defecto, así que un catálogo grande (importado por Excel) no aparecía completo.
@@ -50,7 +62,11 @@ products.get('/', async (c) => {
       for (let from = 0; ; from += PAGE) {
         let query = db.from('products').select('*').eq('tenant_id', tenantId).order('name')
           .range(from, from + PAGE - 1);
-        if (filterDeleted) query = query.is('deleted_at', null);
+        // Con `since` se piden los cambios, borrados incluidos. `gte` y no `gt`:
+        // repetir una fila que ya se tenía no molesta —se pisa con la misma—,
+        // pero perderse una guardada en el mismo milisegundo sí.
+        if (since) query = query.gte('updated_at', since);
+        else if (filterDeleted) query = query.is('deleted_at', null);
         if (search)   query = query.or(`name.ilike.%${search}%,sku.ilike.%${search}%,sku2.ilike.%${search}%`);
         if (category) query = query.eq('category_id', category);
         const { data, error } = await query;

@@ -17,6 +17,15 @@ const CloseSchema = z.object({
   closing_balance: z.number().nonnegative().optional(), // alias for backward compat
   closing_usd: z.number().nonnegative().optional(),     // dólares contados en cierre
   notes: z.string().optional().nullable(),
+  /**
+   * Cuándo se cerró DE VERDAD.
+   *
+   * Un cierre hecho sin conexión sube horas después. Sellarlo con la hora de la
+   * subida deja el arqueo diciendo que la caja se cerró a las diez de la mañana
+   * del día siguiente, y el cuadre contra las ventas del día deja de tener
+   * sentido.
+   */
+  closed_at: z.string().optional().nullable(),
 }).transform(d => ({
   ...d,
   closing_amount: d.closing_amount ?? d.closing_balance ?? 0,
@@ -220,10 +229,24 @@ cashSessions.post('/:id/close', async (c) => {
       }
     } catch (e: any) { console.warn('[caja] limpieza de duplicadas:', e?.message); }
 
+    // Ya cerrada: NO se vuelve a cerrar.
+    //
+    // Un cierre encolado sin conexión puede subir dos veces (reintento tras una
+    // respuesta perdida). Repetir el update pisaba el monto y la hora del cierre
+    // bueno con los de la subida, y el arqueo original se perdía sin dejar
+    // rastro. Se devuelve la sesión tal como quedó.
+    {
+      const { data: yaCerrada } = await db.from('cash_sessions')
+        .select('*').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+      if ((yaCerrada as any)?.status === 'closed') {
+        return ok(c, { ...(yaCerrada as any), already_closed: true });
+      }
+    }
+
     const { data, error } = await db.from('cash_sessions').update({
       closing_amount: parsed.data.closing_amount,
       closing_usd:    parsed.data.closing_usd ?? null,
-      closing_date:   new Date().toISOString(),
+      closing_date:   parsed.data.closed_at ?? new Date().toISOString(),
       status:         'closed',
       notes:          parsed.data.notes,
       updated_at:     new Date().toISOString(),

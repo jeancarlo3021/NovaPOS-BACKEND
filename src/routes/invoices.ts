@@ -27,6 +27,8 @@ const InvoiceSchema = z.object({
   cash_session_id:  z.string().uuid(),
   customer_id:      z.string().uuid().optional().nullable(),
   invoice_number:   z.string().optional().nullable(), // auto-generated if absent
+  /** Id local de una venta hecha sin conexión: evita subirla dos veces. */
+  offline_id:       z.string().max(64).optional().nullable(),
   customer_name:    z.string().optional().nullable(),
   customer_email:   z.string().optional().nullable(),
   customer_phone:   z.string().optional().nullable(),
@@ -183,6 +185,24 @@ invoices.post('/', async (c) => {
     if (!parsed.success) return fail(c, parsed.error.message, 422);
 
     const { items, invoice_number, ...invoiceData } = parsed.data;
+
+    /**
+     * ¿Esta venta offline ya se subió?
+     *
+     * El aparato reintenta cuando no le llega respuesta, y una llamada puede
+     * haber entrado igual (se cortó la señal justo después, venció el tiempo de
+     * espera). Sin esta comprobación se crea una SEGUNDA factura: la venta
+     * queda cobrada dos veces, el inventario se descuenta de nuevo y el cierre
+     * muestra plata que nadie recibió. Se devuelve la que ya existe.
+     */
+    if (invoiceData.offline_id) {
+      const { data: yaEsta } = await db.from('invoices')
+        .select('*, invoice_items(*)')
+        .eq('tenant_id', tenantId)
+        .eq('offline_id', invoiceData.offline_id)
+        .maybeSingle();
+      if (yaEsta) return ok(c, { ...(yaEsta as any), already_synced: true });
+    }
 
     // Cajero atribuido: si vino cashier_id (kiosk mode), usamos ese; si no,
     // el user del JWT. Esto permite que el reporte de cajeros muestre quién
