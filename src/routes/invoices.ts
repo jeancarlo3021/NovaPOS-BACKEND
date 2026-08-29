@@ -257,6 +257,58 @@ invoices.post('/', async (c) => {
     }
     if (sinColumnaOffline) delete (invoiceData as any).offline_id;
 
+    /**
+     * DOBLE COBRO: la misma venta entrando dos veces en segundos.
+     *
+     * ── Por qué acá y no solo en el botón ──────────────────────────────────
+     * El botón de cobrar ya tiene candado, pero eso vive en el navegador: no
+     * cubre una tablet con la versión vieja, ni un toque que llega por dos vías
+     * (el dedo y el evento de teclado), ni una petición que el navegador
+     * reintenta solo. Los duplicados encontrados en la base son de 1 a 10
+     * segundos: seis tiquetes idénticos en catorce segundos no los hace nadie a
+     * propósito.
+     *
+     * Ventana corta —8 segundos— y comparación EXACTA: misma caja, mismo total,
+     * mismo método, mismo cliente y las mismas líneas. Dos ventas iguales de
+     * verdad (una soda vendiendo el mismo combo) tardan más que eso en armarse,
+     * y si aun así cayeran adentro, el cajero ve el aviso y puede volver a
+     * cobrar; en cambio un doble cobro que pasa NO lo ve nadie hasta el cierre.
+     */
+    {
+      const desde = new Date(Date.now() - 8_000).toISOString();
+      const { data: recientes } = await db.from('invoices')
+        .select('id, invoice_number, total, payment_method, customer_name, created_at, invoice_items(product_id, quantity)')
+        .eq('tenant_id', tenantId)
+        .eq('cash_session_id', invoiceData.cash_session_id)
+        .eq('total', invoiceData.total)
+        .neq('status', 'cancelled')
+        .gte('created_at', desde)
+        .limit(5);
+
+      const mismasLineas = (a: any[], b: any[]) => {
+        if (a.length !== b.length) return false;
+        const clave = (x: any) => `${x.product_id ?? ''}|${Number(x.quantity ?? 0)}`;
+        const ord = (xs: any[]) => xs.map(clave).sort().join('~');
+        return ord(a) === ord(b);
+      };
+
+      const gemela = (recientes ?? []).find((r: any) =>
+        String(r.payment_method ?? '') === String(invoiceData.payment_method ?? '')
+        && String(r.customer_name ?? '') === String(invoiceData.customer_name ?? '')
+        && mismasLineas(r.invoice_items ?? [], items as any[]));
+
+      if (gemela) {
+        console.warn(`[facturas] doble cobro evitado en ${tenantId}: ya existe ${(gemela as any).invoice_number}`);
+        return c.json({
+          success: false,
+          error: `Esta venta ya se cobró hace unos segundos (factura ${(gemela as any).invoice_number}).`
+            + ' Si es una venta DISTINTA por el mismo monto, volvé a cobrarla.',
+          code: 'duplicate_sale',
+          existing_invoice: gemela,
+        }, 409);
+      }
+    }
+
     // Cajero atribuido: si vino cashier_id (kiosk mode), usamos ese; si no,
     // el user del JWT. Esto permite que el reporte de cajeros muestre quién
     // operó cada venta en un terminal compartido.
