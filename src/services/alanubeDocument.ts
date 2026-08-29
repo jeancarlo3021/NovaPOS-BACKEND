@@ -1,5 +1,5 @@
 // Construye el payload de comprobante electrónico para Alanube (Costa Rica / CRI)
-// a partir de los mismos datos que usa Facturemos (emisor, factura, líneas,
+// a partir de los datos del comprobante (emisor, factura, líneas,
 // receptor). Estructura top-level confirmada de la doc CRI:
 //   currency, header, sender, receiver, itemDetails, otherCharges, totals.
 //
@@ -154,7 +154,7 @@ export function buildAlanubeDocument(
   // Desglose de impuesto por código de tarifa (TotalDesgloseImpuesto).
   const taxByRate: Record<string, number> = {};
 
-  // Enfoque PRECIO EFECTIVO (igual que Facturemos): el descuento se absorbe en el
+  // Enfoque PRECIO EFECTIVO: el descuento se absorbe en el
   // precio unitario, así amountTotal == subTotal y no hay que declarar descuento.
   // Evita todas las validaciones de "subTotal = amountTotal - descuentos".
   // Hacienda/Alanube rechazan la línea con precio 0 ("Unit price must be greater

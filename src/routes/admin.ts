@@ -12,6 +12,63 @@ import { forgetCachedTenant } from '../middleware/tenantStatus.js';
 
 const admin = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
+/**
+ * PORTÓN del panel de administración del SaaS.
+ *
+ * ── Lo que estaba pasando ──────────────────────────────────────────────────
+ * De las rutas de este archivo, solo una parte comprobaba quién llamaba. El
+ * resto se conformaba con que hubiera un token válido — y `GET /admin/owners`
+ * devuelve TODOS los negocios de la plataforma con su plan, su precio y su
+ * facturación. Cualquier cajero de cualquier cliente podía pedirla y ver el
+ * negocio de la competencia.
+ *
+ * Peor: el middleware de autenticación, para dejar pasar al administrador (que
+ * no tiene negocio propio), le asigna rol «admin» a cualquier usuario SIN
+ * negocio asignado que toque una ruta /admin/. Sumado a la falta de
+ * verificación, alcanzaba con una cuenta huérfana para entrar.
+ *
+ * Ahora se comprueba UNA vez, acá, y vale para las 77 rutas: solo pasa quien
+ * tiene `admin_dashboard` en su plan, que es la misma condición con la que el
+ * frontend decide mostrar el panel.
+ */
+const adminCache = new Map<string, { at: number; ok: boolean }>();
+const ADMIN_TTL_MS = 60_000;
+
+async function esAdminDelSaas(userId: string): Promise<boolean> {
+  const hit = adminCache.get(userId);
+  if (hit && Date.now() - hit.at < ADMIN_TTL_MS) return hit.ok;
+  let permitido = false;
+  try {
+    const { data: u } = await db.from('users').select('tenant_id').eq('id', userId).maybeSingle();
+    const tid = (u as any)?.tenant_id;
+    if (tid) {
+      const { data: t } = await db.from('tenants').select('plan_id').eq('id', tid).maybeSingle();
+      const planId = (t as any)?.plan_id;
+      if (planId) {
+        const { data: p } = await db.from('subscription_plans')
+          .select('features').eq('id', planId).maybeSingle();
+        permitido = ((p as any)?.features)?.admin_dashboard === true;
+      }
+    } else {
+      // Sin negocio propio: es dueño de la plataforma solo si además figura como
+      // dueño de algún tenant. Una cuenta huérfana no alcanza.
+      const { data: own } = await db.from('tenants')
+        .select('id').eq('owner_id', userId).limit(1).maybeSingle();
+      permitido = !!own;
+    }
+  } catch { permitido = false; }
+  adminCache.set(userId, { at: Date.now(), ok: permitido });
+  return permitido;
+}
+
+admin.use('*', async (c, next) => {
+  const userId = c.get('userId');
+  if (!userId || !(await esAdminDelSaas(userId))) {
+    return fail(c, 'Solo el administrador de la plataforma puede usar esta sección', 403);
+  }
+  await next();
+});
+
 // Correo + nombre del dueño y nombre del negocio (para comprobantes por email).
 async function ownerAndBusiness(tenantId: string): Promise<{ email?: string; businessName: string }> {
   const { data: t } = await db.from('tenants').select('name, owner_id').eq('id', tenantId).maybeSingle();
@@ -99,7 +156,7 @@ admin.get('/owners', async (c) => {
       const { data: feRows } = await db.from('settings')
         .select('tenant_id, config').eq('type', 'electronic-invoice').in('tenant_id', tenantIds);
       for (const r of (feRows ?? []) as any[]) {
-        feProviderByTenant[r.tenant_id] = r.config?.fe_provider === 'alanube' ? 'alanube' : 'facturemos';
+        feProviderByTenant[r.tenant_id] = 'alanube';
       }
     } catch (e: any) { console.warn('[owners] fe_provider lookup:', e?.message); }
 
@@ -133,7 +190,7 @@ admin.get('/owners', async (c) => {
           group_kind:    g?.group_kind ?? null,  // 'branches' | 'accounting'
           group_billing: groupBilling,            // total mensual del grupo (saas + FE)
           custom_price:  customPrice ?? null,     // precio personalizado (si hay)
-          fe_provider:   feProviderByTenant[o.id] ?? 'facturemos',
+          fe_provider:   feProviderByTenant[o.id] ?? 'alanube',
           // El precio efectivo de venta: personalizado si existe, si no el del plan.
           plan_price:    customPrice ?? o.plan_price,
         };
@@ -1019,7 +1076,7 @@ admin.get('/tenants/:id/fe-test', async (c) => {
       .eq('tenant_id', id).eq('type', 'electronic-invoice').maybeSingle();
     const cfg: Record<string, any> = { ...((row as any)?.config ?? {}) };
     const enabled = !!cfg.enabled;
-    const provider = cfg.fe_provider === 'alanube' ? 'alanube' : 'facturemos';
+    const provider = 'alanube';
     const checks: Array<{ label: string; ok: boolean; detail?: string }> = [];
     const add = (label: string, okv: boolean, detail?: string) => checks.push({ label, ok: okv, detail });
 
@@ -1059,9 +1116,9 @@ admin.get('/tenants/:id/fe-test', async (c) => {
       return ok(c, { provider, environment: client.env, company_id: companyId ?? null, ok: allOk, checks });
     }
 
-    // Facturemos.
-    add('ApiKey del emisor', !!cfg.api_key_emisor, cfg.api_key_emisor ? 'Configurada' : 'Falta la ApiKey del emisor');
-    return ok(c, { provider, ok: checks.every(x => x.ok), checks });
+    // Sin empresa en Alanube no hay nada más que revisar.
+    add('Empresa en Alanube', false, 'Creá la empresa desde «Crear empresa en Alanube»');
+    return ok(c, { provider, ok: false, checks });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
@@ -2644,7 +2701,8 @@ admin.get('/fe-quotas', async (c) => {
       }
       // Traemos las filas con alguna clave de Hacienda y contamos cada comprobante
       // (factura/tiquete + NC + ND), separando por PROVEEDOR. El proveedor se
-      // deduce del consecutivo: Alanube usa un ULID (con letras), Facturemos uno
+      // deduce del consecutivo: Alanube usa un ULID (con letras), el proveedor
+      // anterior usaba uno
       // numérico. Así se puede aislar la parte de Alanube y compararla con su reporte.
       // Se EXCLUYEN los comprobantes RECHAZADOS/ERROR (no consumen bolsa).
       const failed = (s: any) => s === 'rejected' || s === 'error';
@@ -2656,7 +2714,9 @@ admin.get('/fe-quotas', async (c) => {
         sel = await db.from('invoices').select('fe_consecutivo, fe_clave, fe_status')
           .eq('tenant_id', r.tenant_id).gte('created_at', start).not('fe_clave', 'is', null);
       }
-      let docs = 0, ncs = 0, nds = 0, usedAlanube = 0, usedFacturemos = 0;
+      // `usedPrevio` cuenta los comprobantes que quedaron del proveedor anterior:
+      // el negocio ya los emitió y siguen contando en su bolsa del período.
+      let docs = 0, ncs = 0, nds = 0, usedAlanube = 0, usedPrevio = 0;
       for (const row of (sel.data ?? []) as any[]) {
         const isAlanube = /[A-Za-z]/.test(String(row.fe_consecutivo ?? ''));
         const okDoc = row.fe_clave && !failed(row.fe_status);
@@ -2666,14 +2726,14 @@ admin.get('/fe-quotas', async (c) => {
         if (okDoc) docs++;
         if (okNc) ncs++;
         if (okNd) nds++;
-        if (isAlanube) usedAlanube += inRow; else usedFacturemos += inRow;
+        if (isAlanube) usedAlanube += inRow; else usedPrevio += inRow;
       }
       const used = docs + ncs + nds;
       const extraFee = Number(cfg.fe_extra_fee ?? 0);          // ₡ por comprobante extra (del plan)
       const overage = Math.max(0, used - included);            // comprobantes sobre la bolsa
       result[r.tenant_id] = {
         included, used, available: included - used,
-        used_alanube: usedAlanube, used_facturemos: usedFacturemos,
+        used_alanube: usedAlanube, used_facturemos: usedPrevio,
         overage, extra_fee: extraFee, extra_charge: overage * extraFee,
         quota_start: start,
         expires_at: new Date(new Date(start).getTime() + YEAR_MS).toISOString(),

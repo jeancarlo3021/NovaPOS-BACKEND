@@ -59,4 +59,51 @@ sharedDocs.post('/', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+/**
+ * POST /logo — sube el logo del negocio.
+ *
+ * Antes el navegador lo subía DIRECTO a Storage con la sesión del usuario, así
+ * que dependía de que el bucket existiera y de que sus permisos dejaran escribir
+ * en la carpeta del negocio. Cuando algo de eso no estaba, el error que salía
+ * («new row violates row-level security policy») no le dice nada a nadie y el
+ * logo simplemente no subía.
+ *
+ * Acá lo sube el servidor, que sí puede crear el bucket y escribir siempre. El
+ * bucket es PÚBLICO a propósito: el logo se muestra en tiquetes, facturas y en
+ * la carta digital que abren los clientes desde su teléfono.
+ */
+const LOGO_BUCKET = 'logos';
+const MAX_LOGO_BYTES = 4 * 1024 * 1024;
+
+sharedDocs.post('/logo', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    if (!tenantId) return fail(c, 'Sin negocio asignado', 403);
+
+    const body = await c.req.json().catch(() => ({} as any));
+    const b64 = String(body?.content_base64 ?? '');
+    const tipo = String(body?.content_type ?? 'image/jpeg');
+    if (!b64) return fail(c, 'Falta la imagen', 422);
+    if (!/^image\//.test(tipo)) return fail(c, 'El archivo tiene que ser una imagen', 422);
+
+    const bytes = Buffer.from(b64, 'base64');
+    if (!bytes.length) return fail(c, 'La imagen llegó vacía', 422);
+    if (bytes.length > MAX_LOGO_BYTES) return fail(c, 'La imagen es muy grande (máximo 4 MB)', 413);
+
+    try { await db.storage.createBucket(LOGO_BUCKET, { public: true }); } catch { /* ya existe */ }
+
+    // Nombre fijo por negocio: reemplazar el logo no deja basura acumulada.
+    const ext = tipo.includes('png') ? 'png' : tipo.includes('webp') ? 'webp' : 'jpg';
+    const path = `${tenantId}/logo.${ext}`;
+    const { error: upErr } = await db.storage.from(LOGO_BUCKET)
+      .upload(path, bytes, { contentType: tipo, upsert: true, cacheControl: '3600' });
+    if (upErr) throw new Error(upErr.message);
+
+    const { data } = db.storage.from(LOGO_BUCKET).getPublicUrl(path);
+    // El sufijo de tiempo obliga al navegador a recargar la imagen: sin él, el
+    // logo viejo se sigue viendo porque quedó guardado en su caché.
+    return ok(c, { url: `${data.publicUrl}?t=${Date.now()}` });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 export default sharedDocs;

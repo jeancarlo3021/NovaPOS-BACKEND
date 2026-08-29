@@ -238,14 +238,24 @@ invoices.post('/', async (c) => {
      * queda cobrada dos veces, el inventario se descuenta de nuevo y el cierre
      * muestra plata que nadie recibió. Se devuelve la que ya existe.
      */
+    let sinColumnaOffline = false;
     if (invoiceData.offline_id) {
-      const { data: yaEsta } = await db.from('invoices')
+      const { data: yaEsta, error: eBusca } = await db.from('invoices')
         .select('*, invoice_items(*)')
         .eq('tenant_id', tenantId)
         .eq('offline_id', invoiceData.offline_id)
         .maybeSingle();
-      if (yaEsta) return ok(c, { ...(yaEsta as any), already_synced: true });
+      // Migración 103 sin correr: la columna no existe todavía. Se factura igual
+      // —cobrar es más importante— pero SIN la protección contra el doble cobro,
+      // y queda dicho en el registro para que se note.
+      if (eBusca && /offline_id/i.test(eBusca.message ?? '')) {
+        sinColumnaOffline = true;
+        console.warn('[facturas] falta la migración 103: sin protección contra facturas duplicadas');
+      } else if (yaEsta) {
+        return ok(c, { ...(yaEsta as any), already_synced: true });
+      }
     }
+    if (sinColumnaOffline) delete (invoiceData as any).offline_id;
 
     // Cajero atribuido: si vino cashier_id (kiosk mode), usamos ese; si no,
     // el user del JWT. Esto permite que el reporte de cajeros muestre quién
@@ -324,6 +334,11 @@ invoices.post('/', async (c) => {
 
       invErr = res.error;
       const msg = (res.error as any)?.message ?? '';
+      // Igual que arriba, por si la columna falta y el fallo aparece al insertar.
+      if (/offline_id/i.test(msg)) {
+        delete (invoiceData as any).offline_id;
+        continue;
+      }
       const isDup = (res.error as any)?.code === '23505' || /duplicate key|invoice_number_key/i.test(msg);
       if (!isDup) break;  // otro error → no reintentar
 

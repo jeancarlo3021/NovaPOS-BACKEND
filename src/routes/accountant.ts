@@ -135,7 +135,7 @@ export async function ensureAlanubeCompany(tenantId: string): Promise<{
     .eq('tenant_id', tenantId).eq('type', 'electronic-invoice').maybeSingle();
   const cfg: Record<string, any> = { ...((row as any)?.config ?? {}) };
 
-  // Solo aplica a Alanube: con Facturemos no hay empresa que registrar.
+  // Alta de la empresa en Alanube.
   if (cfg.fe_provider !== 'alanube') {
     return { ok: false, message: 'El proveedor no es Alanube: no hay empresa que registrar.' };
   }
