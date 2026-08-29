@@ -1764,30 +1764,95 @@ admin.post('/tenants/:id/products-import', async (c) => {
       let maxStock = Math.max(0, Math.round(Number(r.max_stock_level) || 0));
       if (maxStock < minStock) maxStock = minStock;   // evita violar max>=min
       if (maxStock === 0) maxStock = Math.max(minStock, 100);
+      /**
+       * Lo que el archivo NO trae, no se toca.
+       *
+       * Al reimportar, el archivo suele traer solo unas columnas —precios, por
+       * ejemplo—. Si las ausentes viajaran como vacías, actualizar precios
+       * BORRARÍA el CABYS, la descripción y el proveedor de todo el catálogo, y
+       * con el CABYS en blanco Hacienda rechaza las facturas. Solo se manda lo
+       * que viene con valor.
+       */
+      const traido = (v: any) => v !== undefined && v !== null && String(v).trim() !== '';
+      const opcional: Record<string, any> = {};
+      if (traido(r.sku2))        opcional.sku2 = String(r.sku2);
+      if (traido(r.description)) opcional.description = r.description;
+      if (traido(r.cabys_code))  opcional.cabys_code = String(r.cabys_code);
+      if (traido(r.cost_price))  opcional.cost_price = Number(r.cost_price) || 0;
+      if (traido(r.stock_quantity)) {
+        opcional.stock_quantity = Math.max(0, Math.round(Number(r.stock_quantity) || 0));
+      }
+      if (category_id)  opcional.category_id = category_id;
+      if (unit_type_id) opcional.unit_type_id = unit_type_id;
+      if (hasSupplierCol && supplier_id) opcional.supplier_id = supplier_id;
+
       toInsert.push({
         tenant_id: id,
         name: String(r.name).trim(),
         sku: r.sku ? String(r.sku) : '',
-        sku2: r.sku2 ? String(r.sku2) : null,
-        description: r.description ?? null,
         unit_price: Number(r.unit_price) || 0,
-        cost_price: Number(r.cost_price) || 0,
-        stock_quantity: Math.max(0, Math.round(Number(r.stock_quantity) || 0)),
         min_stock_level: minStock,
         max_stock_level: maxStock,
         tracks_stock: r.tracks_stock !== false,
-        category_id, unit_type_id,
-        cabys_code: r.cabys_code ? String(r.cabys_code) : null,
         iva_rate: r.iva_rate ?? 13,
-        ...(hasSupplierCol && supplier_id ? { supplier_id } : {}),
+        ...opcional,
       });
     }
 
-    // 2) Insertar por LOTE (rápido). Si un lote falla, caemos a fila-por-fila
-    // para contar exactamente cuántos entraron y capturar el error real.
+    /**
+     * 2) Guardar por LOTE, ACTUALIZANDO lo que ya existe.
+     *
+     * Un catálogo se importa varias veces: la primera carga, la corrección de
+     * precios, el archivo del proveedor al mes siguiente. Con `insert` a secas,
+     * el segundo intento moría entero —«duplicate key ... products_sku_tenant_unique»—
+     * y no entraba NI UN producto, ni siquiera los nuevos: para actualizar
+     * precios había que borrar el catálogo primero.
+     *
+     * Con `upsert` sobre (tenant_id, sku), el que ya está se actualiza y el que
+     * no, se crea. El SKU es la identidad del producto; sin SKU no hay contra
+     * qué comparar, así que esos van por inserción normal.
+     */
     const CHUNK = 200;
-    for (let i = 0; i < toInsert.length; i += CHUNK) {
-      const batch = toInsert.slice(i, i + CHUNK);
+    let updated = 0;
+
+    /**
+     * Se consulta qué SKU ya existen en vez de usar `upsert`.
+     *
+     * `upsert` necesita que el índice único de la base calce EXACTO con las
+     * columnas declaradas; si está definido distinto (parcial, u otro orden),
+     * falla en las 5.000 filas con un error que no dice nada útil. Preguntar qué
+     * hay funciona con cualquier definición del índice, y de paso permite
+     * informar por separado cuántos se crearon y cuántos se actualizaron.
+     */
+    const conSku = toInsert.filter(r => String(r.sku ?? '').trim() !== '');
+    const sinSku = toInsert.filter(r => String(r.sku ?? '').trim() === '');
+
+    // Mapa sku → id de lo que YA está en el catálogo del negocio.
+    const idPorSku = new Map<string, string>();
+    for (let i = 0; i < conSku.length; i += CHUNK) {
+      const skus = conSku.slice(i, i + CHUNK).map(r => String(r.sku));
+      const { data } = await db.from('products')
+        .select('id, sku').eq('tenant_id', id).in('sku', skus);
+      for (const p of (data ?? []) as any[]) {
+        if (p.sku) idPorSku.set(String(p.sku), String(p.id));
+      }
+    }
+
+    const nuevos = conSku.filter(r => !idPorSku.has(String(r.sku))).concat(sinSku);
+    const existentes = conSku.filter(r => idPorSku.has(String(r.sku)));
+
+    // Los que ya estaban: se actualizan uno por uno (cada uno con su id).
+    for (const row of existentes) {
+      const { tenant_id: _t, sku: _s, ...patch } = row;
+      const { error } = await db.from('products')
+        .update(patch).eq('id', idPorSku.get(String(row.sku))!).eq('tenant_id', id);
+      if (error) { errors++; firstError = firstError ?? error.message; } else updated++;
+    }
+
+    // Los nuevos: por lote, y fila por fila solo si el lote falla, para que una
+    // fila mala no se lleve puestas a las otras 199.
+    for (let i = 0; i < nuevos.length; i += CHUNK) {
+      const batch = nuevos.slice(i, i + CHUNK);
       const { error } = await db.from('products').insert(batch);
       if (!error) { created += batch.length; continue; }
       for (const row of batch) {
@@ -1795,7 +1860,8 @@ admin.post('/tenants/:id/products-import', async (c) => {
         if (e2) { errors++; firstError = firstError ?? e2.message; } else created++;
       }
     }
-    return ok(c, { created, errors, error_detail: firstError });
+
+    return ok(c, { created, updated, errors, error_detail: firstError });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

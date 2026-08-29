@@ -450,6 +450,14 @@ export async function bumpConsecutivoOnDuplicate(
 ): Promise<number | null> {
   const s = String(errText ?? '');
   if (!/-99/.test(s) || !/numeraci[oó]n consecutiva/i.test(s)) return null;
+  // Rechazo típico de quien VIENE DE OTRO SISTEMA: Hacienda ya tiene esa
+  // numeración a nombre de la misma cédula. Subir de a uno funciona, pero si el
+  // sistema anterior emitió miles de comprobantes hacen falta miles de intentos:
+  // lo que corresponde es configurar el consecutivo inicial de una vez.
+  console.warn(
+    '[fe] Hacienda reporta numeración ya usada. Si el negocio facturaba con otro'
+    + ' sistema, cargá el ÚLTIMO consecutivo emitido allá en Datos de FE.',
+  );
   // Todos los consecutivos de 20 díg del mensaje (puede citar más de uno): usamos el mayor.
   const found = [...s.matchAll(/\b(\d{20})\b/g)].map(m => parseInt(m[1].slice(-10), 10))
     .filter(n => Number.isFinite(n) && n > 0);
@@ -472,6 +480,31 @@ export async function bumpConsecutivoOnDuplicate(
       tenant_id: tenantId, type: 'electronic-invoice', config: merged,
       updated_at: new Date().toISOString(),
     }, { onConflict: 'tenant_id,type' });
+    /**
+     * El contador REAL también sube, no solo el piso configurado.
+     *
+     * Son dos cosas distintas: el piso vive en los datos de FE y el número que
+     * se entrega sale de `fe_consecutivos`. Subir solo el piso funcionaba de
+     * casualidad —porque la función toma el mayor de los dos— pero dejaba el
+     * contador atrasado, y cualquier camino que no pasara por el piso volvía a
+     * chocar con el mismo número.
+     */
+    const tipo = docType === 'factura_electronica' ? '01'
+      : docType === 'tiquete_electronico' ? '04'
+      : docType === 'nota_debito' ? '02' : '03';
+    try {
+      await db.from('fe_consecutivos').upsert({
+        tenant_id: tenantId,
+        sucursal: String(cfg?.sucursal ?? '001'),
+        terminal: String(cfg?.terminal ?? '1').padStart(5, '0'),
+        tipo,
+        last_number: nextFloor - 1,   // el próximo que entregue será nextFloor
+        updated_at: new Date().toISOString(),
+      }, { onConflict: 'tenant_id,sucursal,terminal,tipo' });
+    } catch (e: any) {
+      console.warn('[fe] no se pudo subir el contador de consecutivos:', e?.message);
+    }
+
     console.warn(`[fe] consecutivo duplicado (-99) en ${tenantId}: ${key} → ${nextFloor}`);
     return nextFloor;
   } catch (e: any) {
@@ -2392,15 +2425,35 @@ export async function autoSendComprobanteToCustomer(tenantId: string, invoiceId:
   try {
     const cfg = await loadFEConfig(tenantId);
     const { data: inv } = await db.from('invoices')
-      .select('invoice_number, fe_clave, fe_consecutivo, fe_status, fe_xml, total, customer_name, customer_id, document_type, fe_emailed')
+      .select('invoice_number, fe_clave, fe_consecutivo, fe_status, fe_xml, total, customer_name, customer_id, customer_email, document_type, fe_emailed')
       .eq('id', invoiceId).eq('tenant_id', tenantId).maybeSingle();
     if (!inv || (inv as any).fe_emailed) return;   // ya se envió
-    let email: string | null = null;
-    if ((inv as any).customer_id) {
+
+    /**
+     * El correo puede venir de dos lados, y hay que mirar los DOS.
+     *
+     * Antes solo se leía la ficha del cliente. Pero al cobrar se le pide el
+     * correo a quien no está registrado —el que llega una vez y pide factura— y
+     * ese dato queda en la factura, no en una ficha. A esa gente el comprobante
+     * nunca le llegaba, aunque lo hubiera dictado en el mostrador.
+     *
+     * Manda el de la factura: es el que dio para ESTA compra.
+     */
+    let email: string | null = String((inv as any).customer_email ?? '').trim() || null;
+    if (!email && (inv as any).customer_id) {
       const { data: cust } = await db.from('customers').select('email').eq('id', (inv as any).customer_id).maybeSingle();
-      email = (cust as any)?.email ?? null;
+      email = String((cust as any)?.email ?? '').trim() || null;
     }
-    if (!email) return;   // sin correo del cliente, no se envía
+    // Correo mal escrito: mejor no intentarlo y dejarlo dicho, porque el envío
+    // fallido se pierde en el log y nadie se entera de que el cliente no recibió.
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      console.warn(`[FE email] correo inválido en la factura ${(inv as any).invoice_number}: ${email}`);
+      email = null;
+    }
+    if (!email) {
+      console.log(`[FE email] la factura ${(inv as any).invoice_number} no tiene correo de destino`);
+      return;
+    }
     const atts = cfg.fe_provider === 'alanube'
       ? await alanubeAttachments(cfg, (inv as any).fe_consecutivo, feKindOf((inv as any).document_type), (inv as any).fe_clave,
           (String(cfg.environment ?? 'production') === 'sandbox' ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id)
@@ -2408,6 +2461,34 @@ export async function autoSendComprobanteToCustomer(tenantId: string, invoiceId:
     await sendComprobanteEmail(email, inv as any, atts);
     await db.from('invoices').update({ fe_emailed: true }).eq('id', invoiceId).eq('tenant_id', tenantId).then(() => {}, () => {});
   } catch (e: any) { console.warn('[FE email auto-accept] no se pudo enviar:', e?.message); }
+}
+
+/**
+ * Manda el comprobante electrónico de una factura a un correo.
+ *
+ * Es lo mismo que hace «reenviar» desde la bitácora, pero como función, para que
+ * otras pantallas —la caja, por ejemplo— manden el comprobante DE VERDAD (XML
+ * firmado + respuesta de Hacienda + PDF) en vez de un resumen en HTML.
+ */
+export async function sendComprobanteToCustomer(
+  tenantId: string, invoiceId: string, to: string,
+): Promise<void> {
+  const { data: inv } = await db.from('invoices')
+    .select('invoice_number, fe_clave, fe_consecutivo, fe_status, fe_xml, total, customer_name, document_type')
+    .eq('id', invoiceId).eq('tenant_id', tenantId).maybeSingle();
+  const i = inv as any;
+  if (!i?.fe_clave) throw new Error('La factura no fue emitida electrónicamente');
+
+  const cfg = await loadFEConfig(tenantId);
+  const attachments = cfg.fe_provider === 'alanube'
+    ? await alanubeAttachments(cfg, i.fe_consecutivo, feKindOf(i.document_type), i.fe_clave,
+        (String(cfg.environment ?? 'production') === 'sandbox'
+          ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id)
+    : undefined;
+
+  await sendComprobanteEmail(to, i, attachments);
+  await db.from('invoices').update({ fe_emailed: true })
+    .eq('id', invoiceId).eq('tenant_id', tenantId).then(() => {}, () => {});
 }
 
 // POST /resend-email — reenvía un comprobante por correo.

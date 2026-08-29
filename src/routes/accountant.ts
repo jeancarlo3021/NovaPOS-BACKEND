@@ -542,6 +542,78 @@ accountant.get('/clients/:id/invoices', async (c) => {
 // ── Cartera del contador (solo super-admin) ─────────────────────────────────
 // Se escribe en `user_tenants`, igual que al dar acceso a una sucursal: el
 // contador pasa a ver ese negocio en el selector de empresa y puede trabajarlo.
+/**
+ * Código para enlazar un negocio ya existente con su contador.
+ *
+ * Lo genera EL NEGOCIO, no el contador: enganchar la cartera de un contador a un
+ * negocio cualquiera le daría acceso a la facturación de gente que no es su
+ * cliente. Se dicta por teléfono, dura poco y se usa una sola vez.
+ */
+const LINK_CODE_TTL_MS = 72 * 60 * 60 * 1000;   // 3 días: alcanza para pasarlo y usarlo
+
+/** Código corto y dictable: sin 0/O ni 1/I, que se confunden al leerlos. */
+function nuevoCodigo(): string {
+  const abc = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let out = '';
+  for (let i = 0; i < 8; i++) out += abc[Math.floor(Math.random() * abc.length)];
+  return `${out.slice(0, 4)}-${out.slice(4)}`;
+}
+
+// POST /link-code — el NEGOCIO genera el código para dárselo a su contador.
+accountant.post('/link-code', async (c) => {
+  try {
+    const role = String(c.get('role') ?? '');
+    if (!['owner', 'admin', 'gerente'].includes(role)) {
+      return fail(c, 'Solo el dueño o el gerente pueden autorizar a un contador', 403);
+    }
+    const tenantId = c.get('tenantId');
+    if (!tenantId) return fail(c, 'Sin negocio asignado', 403);
+
+    const code = nuevoCodigo();
+    const expires_at = new Date(Date.now() + LINK_CODE_TTL_MS).toISOString();
+    const { data, error } = await db.from('accountant_link_codes')
+      .insert({ tenant_id: tenantId, code, created_by: c.get('userId'), expires_at })
+      .select('code, expires_at').single();
+    if (error) throw new Error(error.message);
+    return ok(c, data, 201);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// POST /link — el CONTADOR canjea el código y suma el negocio a su cartera.
+accountant.post('/link', async (c) => {
+  try {
+    const userId = c.get('userId');
+    const raw = await c.req.json().catch(() => ({} as any));
+    const code = String(raw?.code ?? '').trim().toUpperCase();
+    if (!code) return fail(c, 'Escribí el código que te dio el negocio', 422);
+
+    const { data: fila } = await db.from('accountant_link_codes')
+      .select('*').ilike('code', code).maybeSingle();
+    // Mismo mensaje para «no existe» y «ya se usó»: distinguirlos le diría a
+    // quien prueba códigos al azar cuáles existen.
+    if (!fila) return fail(c, 'Ese código no es válido o ya se usó', 404);
+    if ((fila as any).used_at) return fail(c, 'Ese código no es válido o ya se usó', 409);
+    if (new Date((fila as any).expires_at).getTime() < Date.now()) {
+      return fail(c, 'Ese código ya venció. Pedile uno nuevo al negocio.', 410);
+    }
+
+    const tenantId = (fila as any).tenant_id as string;
+    const { error: upErr } = await db.from('user_tenants').upsert({
+      user_id: userId, tenant_id: tenantId, role: 'staff', is_default: false,
+    }, { onConflict: 'user_id,tenant_id' });
+    if (upErr) throw new Error(upErr.message);
+
+    // Se quema el código: uno solo por enlace, para que no circule después.
+    await db.from('accountant_link_codes')
+      .update({ used_at: new Date().toISOString(), used_by: userId })
+      .eq('id', (fila as any).id);
+
+    const { data: t } = await db.from('tenants')
+      .select('name').eq('id', tenantId).maybeSingle();
+    return ok(c, { tenant_id: tenantId, business_name: (t as any)?.name ?? null }, 201);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 accountant.post('/assign', async (c) => {
   try {
     const role = c.get('role');

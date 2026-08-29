@@ -138,6 +138,21 @@ email.post('/invoice/:id', async (c) => {
     const recipient = to || (inv as any).customer_email;
     if (!recipient) return fail(c, 'No hay correo de destino para esta factura', 422);
 
+    /**
+     * Factura ELECTRÓNICA: se manda el comprobante de verdad, no un resumen.
+     *
+     * Este correo arma una tabla bonita con los renglones, que sirve para un
+     * tiquete corriente. Pero si el documento es electrónico, lo que el cliente
+     * necesita es el XML firmado y la respuesta de Hacienda: eso es lo que su
+     * contador registra. Un resumen en HTML no le sirve de comprobante, y el
+     * cajero creía que ya se lo había mandado.
+     */
+    if ((inv as any).fe_clave) {
+      const { sendComprobanteToCustomer } = await import('./hacienda.js');
+      await sendComprobanteToCustomer(tenantId, id, recipient);
+      return ok(c, { to: recipient, comprobante: true });
+    }
+
     // Nombres de producto
     const rawItems = (inv as any).invoice_items ?? [];
     const productIds = [...new Set(rawItems.map((it: any) => it.product_id).filter(Boolean))] as string[];
