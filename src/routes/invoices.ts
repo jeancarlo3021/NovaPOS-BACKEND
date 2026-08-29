@@ -23,6 +23,49 @@ const ItemSchema = z.object({
   subtotal:         z.number().nonnegative(),
 }).passthrough(); // ignore extra fields like 'product', 'promo'
 
+/**
+ * Baja de inventario de varias líneas a la vez.
+ *
+ * ── Por qué no una por una ─────────────────────────────────────────────────
+ * Antes cada línea hacía DOS viajes a la base en fila: leer el stock y
+ * escribirlo. Una factura de 40 líneas eran 80 viajes encadenados; con el
+ * servidor y la base en centros de datos distintos, cada viaje cuesta cerca de
+ * 100 ms y el cobro se iba a más de diez segundos, hasta que el POS cortaba por
+ * tiempo agotado y el cajero no sabía si la venta había entrado.
+ *
+ * Acá se lee TODO de una consulta y las bajas van de a 6 en paralelo: una
+ * factura grande pasa de decenas de viajes en serie a unos pocos turnos.
+ *
+ * Las cantidades del mismo producto se suman antes: si aparece en dos líneas,
+ * dos escrituras sobre la misma fila se pisan y una de las dos bajas se pierde.
+ */
+async function descontarStock(lineas: Array<{ id: string; qty: number }>): Promise<void> {
+  if (lineas.length === 0) return;
+
+  const porProducto = new Map<string, number>();
+  for (const l of lineas) {
+    if (!l.id || !Number.isFinite(l.qty)) continue;
+    porProducto.set(l.id, (porProducto.get(l.id) ?? 0) + Number(l.qty));
+  }
+  const ids = [...porProducto.keys()];
+  if (ids.length === 0) return;
+
+  const { data: prods } = await db.from('products')
+    .select('id, stock_quantity, tracks_stock').in('id', ids);
+
+  const pendientes = (prods ?? []).filter((p: any) => p.tracks_stock !== false);
+  const ahora = new Date().toISOString();
+
+  const CONCURRENCIA = 6;
+  for (let i = 0; i < pendientes.length; i += CONCURRENCIA) {
+    await Promise.all(pendientes.slice(i, i + CONCURRENCIA).map((p: any) =>
+      db.from('products').update({
+        stock_quantity: Math.max(0, Number(p.stock_quantity ?? 0) - (porProducto.get(String(p.id)) ?? 0)),
+        updated_at: ahora,
+      }).eq('id', p.id)));
+  }
+}
+
 const InvoiceSchema = z.object({
   cash_session_id:  z.string().uuid(),
   customer_id:      z.string().uuid().optional().nullable(),
@@ -371,38 +414,22 @@ invoices.post('/', async (c) => {
               need.set(String(k.component_id), (need.get(String(k.component_id)) ?? 0) + q);
             }
           }
-          for (const [componentId, qty] of need) {
-            const { data: p } = await db.from('products')
-              .select('stock_quantity, tracks_stock').eq('id', componentId).maybeSingle();
-            if (p && (p as any).tracks_stock !== false) {
-              await db.from('products').update({
-                stock_quantity: Math.max(0, (p.stock_quantity ?? 0) - qty),
-                updated_at: new Date().toISOString(),
-              }).eq('id', componentId);
-            }
-          }
+          // Una sola lectura para todos los componentes, y las bajas en paralelo.
+          await descontarStock([...need.entries()].map(([id, qty]) => ({ id, qty })));
         }
       }
     } catch (e: any) { console.warn('[kits] no se pudo descontar componentes:', e?.message); }
 
     // Decrement stock — SOLO productos que manejan inventario.
     // Los de stock infinito (tracks_stock === false) NO se descuentan.
-    for (const item of items as any[]) {
-      if (!item.product_id) continue;   // ad-hoc: sin producto que descontar
-      // El kit ya movió inventario por sus componentes.
-      if (kitProductIds.has(String(item.product_id))) continue;
-      // Con receta, el inventario ya se movió por ingredientes: descontar además
-      // el plato sería contarlo dos veces.
-      if (recipeProductIds.has(item.product_id)) continue;
-      const { data: p } = await db.from('products')
-        .select('stock_quantity, tracks_stock').eq('id', item.product_id).maybeSingle();
-      if (p && (p as any).tracks_stock !== false) {
-        await db.from('products').update({
-          stock_quantity: Math.max(0, (p.stock_quantity ?? 0) - Number(item.quantity)),
-          updated_at: new Date().toISOString(),
-        }).eq('id', item.product_id);
-      }
-    }
+    await descontarStock((items as any[])
+      .filter(item => item.product_id
+        // El kit ya movió inventario por sus componentes.
+        && !kitProductIds.has(String(item.product_id))
+        // Con receta, el inventario ya se movió por ingredientes: descontar
+        // además el plato sería contarlo dos veces.
+        && !recipeProductIds.has(item.product_id))
+      .map(item => ({ id: String(item.product_id), qty: Number(item.quantity) })));
 
     // ── Costo CONGELADO de la venta ─────────────────────────────────────────
     // El costo se recalculaba siempre con el `cost_price` de hoy, así que una

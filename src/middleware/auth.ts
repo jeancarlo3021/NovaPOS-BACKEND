@@ -3,6 +3,33 @@ import { db } from '../db/client.js';
 
 type Variables = { userId: string; tenantId: string; role: string };
 
+/**
+ * Memoria corta de «qué usuario es este token».
+ *
+ * Vive en el proceso: en un servidor sin estado cada instancia tiene la suya y
+ * se pierde al reciclarse. Aun así ayuda, porque las peticiones de una misma
+ * pantalla caen casi siempre en la misma instancia y llegan en ráfaga.
+ */
+const USER_TTL_MS = 30_000;
+const userCache = new Map<string, { at: number; row: { id: string; tenant_id: string | null; role: string | null } }>();
+
+function readUserCache(userId: string) {
+  const hit = userCache.get(userId);
+  if (!hit || Date.now() - hit.at > USER_TTL_MS) return null;
+  return hit.row;
+}
+
+function writeUserCache(userId: string, row: any) {
+  // Tope de tamaño: sin él, un servidor de larga vida acumula usuarios sin fin.
+  if (userCache.size > 500) userCache.clear();
+  userCache.set(userId, { at: Date.now(), row });
+}
+
+/** Para invalidar a mano cuando se cambia el rol o el negocio de un usuario. */
+export function forgetCachedUser(userId: string): void {
+  userCache.delete(userId);
+}
+
 export const auth = createMiddleware<{ Variables: Variables }>(async (c, next) => {
   const token = c.req.header('Authorization')?.replace('Bearer ', '');
   if (!token) {
@@ -64,12 +91,34 @@ export const auth = createMiddleware<{ Variables: Variables }>(async (c, next) =
     }, 401);
   }
 
-  // First try: Check users table
-  const { data: userData, error: userDbError } = await db
-    .from('users')
-    .select('id, tenant_id, role')
-    .eq('id', userId)
-    .maybeSingle();
+  /**
+   * Quién es el usuario, con memoria corta.
+   *
+   * Esta consulta corre en TODA petición del sistema. Además de costar un viaje
+   * a la base por request, es de las que más sufre cuando la base tiene una de
+   * sus rachas malas: si falla, la petición muere aunque el trabajo real no
+   * tuviera nada que ver con el usuario.
+   *
+   * Treinta segundos de memoria: un cambio de rol tarda a lo sumo eso en
+   * aplicarse —imperceptible— y a cambio la mayoría de las peticiones seguidas
+   * de un mismo cajero dejan de tocar la base.
+   */
+  const cacheHit = readUserCache(userId);
+  let userData: { id: string; tenant_id: string | null; role: string | null } | null = null;
+  let userDbError: any = null;
+
+  if (cacheHit) {
+    userData = cacheHit;
+  } else {
+    const r = await db
+      .from('users')
+      .select('id, tenant_id, role')
+      .eq('id', userId)
+      .maybeSingle();
+    userData = (r.data as any) ?? null;
+    userDbError = r.error;
+    if (userData?.tenant_id) writeUserCache(userId, userData);
+  }
 
   if (userDbError) {
     console.warn('[AUTH] Error en query users:', userDbError.message);

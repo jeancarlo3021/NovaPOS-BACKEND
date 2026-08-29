@@ -8,6 +8,7 @@ import { whatsappEnabled, sendTemplate, normalizePhone } from '../services/whats
 import { refreshInvoiceStatus, refreshNoteStatus, emitInvoiceCore, emitCreditNoteCore, configuredNextConsecutivo, computeFeQuota } from './hacienda.js';
 import { notifyPaymentDue, businessContact } from '../services/whatsappNotify.js';
 import { clearPermissionCache } from '../middleware/permissions.js';
+import { forgetCachedTenant } from '../middleware/tenantStatus.js';
 
 const admin = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
@@ -292,6 +293,9 @@ admin.patch('/tenants/:id/status', async (c) => {
     const { status, subscription_id } = await c.req.json();
 
     const { error: te } = await db.from('tenants').update({ status }).eq('id', id);
+    // Suspender o reactivar tiene que sentirse YA, no cuando venza la memoria
+    // corta del middleware.
+    forgetCachedTenant(id);
     if (te) throw new Error(te.message);
 
     if (subscription_id) {
@@ -1841,12 +1845,25 @@ admin.post('/tenants/:id/products-import', async (c) => {
     const nuevos = conSku.filter(r => !idPorSku.has(String(r.sku))).concat(sinSku);
     const existentes = conSku.filter(r => idPorSku.has(String(r.sku)));
 
-    // Los que ya estaban: se actualizan uno por uno (cada uno con su id).
-    for (const row of existentes) {
-      const { tenant_id: _t, sku: _s, ...patch } = row;
-      const { error } = await db.from('products')
-        .update(patch).eq('id', idPorSku.get(String(row.sku))!).eq('tenant_id', id);
-      if (error) { errors++; firstError = firstError ?? error.message; } else updated++;
+    /**
+     * Los que ya estaban se actualizan DE A 6 EN PARALELO.
+     *
+     * Cada actualización es un viaje a la base. En serie, un lote de 50 filas son
+     * 50 viajes encadenados —varios segundos— y con miles de productos la
+     * petición se pasaba del tiempo máximo del servidor. De a seis, el mismo
+     * lote se resuelve en un puñado de turnos sin castigar a la base.
+     */
+    const CONCURRENCIA = 6;
+    for (let i = 0; i < existentes.length; i += CONCURRENCIA) {
+      const tanda = existentes.slice(i, i + CONCURRENCIA);
+      const res = await Promise.all(tanda.map(row => {
+        const { tenant_id: _t, sku: _s, ...patch } = row;
+        return db.from('products')
+          .update(patch).eq('id', idPorSku.get(String(row.sku))!).eq('tenant_id', id);
+      }));
+      for (const r of res) {
+        if (r.error) { errors++; firstError = firstError ?? r.error.message; } else updated++;
+      }
     }
 
     // Los nuevos: por lote, y fila por fila solo si el lote falla, para que una

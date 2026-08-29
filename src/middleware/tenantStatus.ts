@@ -4,6 +4,15 @@ import { maybeResetDemo } from '../services/demoReset.js';
 
 type Variables = { userId: string; tenantId: string; role: string };
 
+/** Memoria corta del estado del negocio (ver el porqué más abajo). */
+const TENANT_TTL_MS = 20_000;
+const tenantCache = new Map<string, { at: number; row: any }>();
+
+/** Se olvida al cambiar el estado del negocio, para que aplique al instante. */
+export function forgetCachedTenant(tenantId: string): void {
+  tenantCache.delete(tenantId);
+}
+
 // Estados del tenant que cortan acceso al API.
 const BLOCKED = new Set(['suspended', 'inactive', 'cancelled']);
 
@@ -30,11 +39,31 @@ export const enforceActiveTenant = createMiddleware<{ Variables: Variables }>(as
   const tenantId = c.get('tenantId');
   if (!tenantId) return next();
 
-  const { data, error } = await db
-    .from('tenants')
-    .select('status, is_demo, demo_reset_at')
-    .eq('id', tenantId)
-    .maybeSingle();
+  /**
+   * Estado del negocio, con memoria corta.
+   *
+   * Corre en toda petición y consulta `tenants`, otra de las tablas que se caen
+   * durante las rachas malas de la base. Veinte segundos de memoria: suspender
+   * una cuenta sigue surtiendo efecto casi al instante, y el sistema deja de
+   * preguntar lo mismo decenas de veces por minuto.
+   */
+  const hit = tenantCache.get(tenantId);
+  let data: any = null;
+  let error: any = null;
+  if (hit && Date.now() - hit.at < TENANT_TTL_MS) {
+    data = hit.row;
+  } else {
+    const r = await db
+      .from('tenants')
+      .select('status, is_demo, demo_reset_at')
+      .eq('id', tenantId)
+      .maybeSingle();
+    data = r.data; error = r.error;
+    if (!error && data) {
+      if (tenantCache.size > 500) tenantCache.clear();
+      tenantCache.set(tenantId, { at: Date.now(), row: data });
+    }
+  }
 
   if (error) {
     // No queremos romper la app por una query fallida; dejamos pasar

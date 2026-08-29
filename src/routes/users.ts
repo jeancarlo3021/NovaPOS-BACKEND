@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
 import { db } from '../db/client.js';
+import { forgetCachedUser } from '../middleware/auth.js';
 import { ok, fail } from '../utils/response.js';
 import { clearPermissionCache } from '../middleware/permissions.js';
 
@@ -287,6 +288,9 @@ users.put('/:id', async (c) => {
       .single();
 
     if (error) throw new Error(error.message);
+    // Cambiarle el rol a alguien tiene que aplicarse en la siguiente pantalla,
+    // no cuando venza la memoria corta del middleware de autenticación.
+    forgetCachedUser(id);
     return ok(c, updated);
   } catch (err: any) {
     return fail(c, err.message, 500);
