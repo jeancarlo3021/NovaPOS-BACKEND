@@ -5,9 +5,21 @@
 -- editor SQL de Supabase y ver qué cobros salieron dos veces.
 --
 -- Qué busca: dos facturas del MISMO negocio, por el MISMO monto, en la MISMA
--- caja y con menos de 3 minutos de diferencia. Esa combinación no ocurre por
--- casualidad: es el doble toque en el botón de cobrar o un reintento que entró
--- dos veces.
+-- caja y con MENOS DE 12 SEGUNDOS de diferencia.
+--
+-- ── Por qué doce segundos y no tres minutos ────────────────────────────────
+-- Con una ventana de minutos, la consulta marca montones de ventas legítimas:
+-- un distribuidor que vende la misma caja de ₡18.500 a cinco pulperías seguidas,
+-- o una soda que cobra el mismo combo de ₡3.700 toda la mañana. Eso es su
+-- negocio funcionando, no un error.
+--
+-- Un duplicado de verdad nace de UN solo cobro: el doble toque en el botón o un
+-- reintento que entró dos veces. Ninguno de los dos tarda medio minuto. Doce
+-- segundos deja pasar el doble toque (1-2 s) y el reintento por tiempo agotado
+-- (hasta ~10 s) sin arrastrar la venta repetida de verdad.
+--
+-- Además se exige el MISMO cliente: dos ventas del mismo monto a clientes
+-- distintos son dos ventas, por más juntas que estén.
 --
 -- Las anuladas quedan fuera: si ya se corrigió, no hay nada que revisar.
 -- ════════════════════════════════════════════════════════════════════════════
@@ -43,7 +55,11 @@ with pares as (
     )
     -- `b` es la copia: la que entró DESPUÉS, dentro de la misma ventana.
     and b.issued_at > a.issued_at
-    and b.issued_at <= a.issued_at + interval '3 minutes'
+    and b.issued_at <= a.issued_at + interval '12 seconds'
+    -- Mismo cliente (o ninguno en ambas): si son clientes distintos, son ventas
+    -- distintas aunque cueste lo mismo.
+    and coalesce(b.customer_name, '') = coalesce(a.customer_name, '')
+    and coalesce(b.customer_id::text, '') = coalesce(a.customer_id::text, '')
   where coalesce(a.status, '') <> 'cancelled'
     and coalesce(b.status, '') <> 'cancelled'
     and a.total > 0
