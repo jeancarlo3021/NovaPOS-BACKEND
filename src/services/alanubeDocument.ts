@@ -30,6 +30,8 @@ export interface AlanubeReceptor {
 
 export interface AlanubeInvoiceMeta {
   payment_method?: string;   // cash|card|sinpe|credit|...
+  /** Venta por plataforma de delivery: el dinero lo recauda un tercero. */
+  is_delivery?: boolean;
   issued_at?: string;
 }
 
@@ -130,7 +132,18 @@ export function buildAlanubeDocument(
   },
 ) {
   const condicionVenta = inv.payment_method === 'credit' ? '02' : '01';
-  const medioPago = MEDIO_PAGO[inv.payment_method ?? 'cash'] ?? '01';
+  /**
+   * Medio de pago ante Hacienda.
+   *
+   * En una venta por DELIVERY el cliente le paga a la plataforma y la
+   * plataforma le deposita al negocio: el código correcto es el 05, «recaudado
+   * por terceros». Declararlo como efectivo —lo que salía por defecto— dice que
+   * entró plata a la caja que nunca entró, y no cuadra con el depósito de la
+   * plataforma cuando Hacienda cruza la información.
+   */
+  const medioPago = inv.is_delivery
+    ? '05'
+    : (MEDIO_PAGO[inv.payment_method ?? 'cash'] ?? '01');
 
   // Acumuladores del RESUMEN, separando MERCANCÍA vs SERVICIO. Hacienda clasifica
   // cada línea por su CABYS (no por la unidad): el primer dígito 0-4 = mercancía,
