@@ -272,11 +272,18 @@ function clientFor(env: AlanubeEnv, tokenOverride?: string | null) {
       // que una emisión. El tope son 25 s a propósito: la función de Vercel muere
       // a los 30 s (vercel.json), y conviene cortar ANTES para poder devolver un
       // mensaje que explique qué pasó en vez del 504 pelado de la plataforma.
-      return f(`/reports/emissions-per-company?${qs.toString()}`, { method: 'GET', timeoutMs: 25_000 });
+      // 12 s por cuenta, no 25.
+      //
+      // El reporte consulta VARIAS cuentas y después cruza todo contra la base,
+      // y el servidor entero muere a los 30 s. Con 25 por llamada bastaba una
+      // cuenta lenta para que el reporte completo se cayera sin devolver nada.
+      // Con 12, una cuenta lenta se reporta como «no respondió» y las demás
+      // salen igual: un reporte incompleto y avisado sirve; uno caído, no.
+      return f(`/reports/emissions-per-company?${qs.toString()}`, { method: 'GET', timeoutMs: 12_000 });
     },
     reportEmissionsByUser: (from: string, until: string, legalStatus: string) => {
       const qs = new URLSearchParams({ dateFrom: from, dateUntil: until, legalStatus });
-      return f(`/reports/emissions-by-user?${qs.toString()}`, { method: 'GET', timeoutMs: 25_000 });
+      return f(`/reports/emissions-by-user?${qs.toString()}`, { method: 'GET', timeoutMs: 12_000 });
     },
   };
 }
