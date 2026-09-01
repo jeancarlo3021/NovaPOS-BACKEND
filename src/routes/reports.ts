@@ -201,6 +201,32 @@ reports.get('/vouchers', async (c) => {
  * negocio con más de mil facturas en el período le faltaban comprobantes en la
  * declaración — y el faltante no se veía por ningún lado.
  */
+/**
+ * Trae TODAS las filas de una consulta, de mil en mil.
+ *
+ * ⚠️ La consulta que se le pasa TIENE que venir ordenada por una columna única
+ * (`id` sirve siempre). Sin orden, la base no garantiza que las páginas sean
+ * consistentes entre sí: la segunda página puede repetir filas de la primera y,
+ * peor, SALTARSE otras. Así es como la declaración de impuestos salía con menos
+ * facturas de las que hay, sin ningún error a la vista.
+ */
+/**
+ * Qué documento se emitió DE VERDAD.
+ *
+ * `document_type` guarda lo que el cajero eligió al cobrar; la CLAVE guarda lo
+ * que Hacienda recibió. Cuando difieren, manda la clave: un tiquete electrónico
+ * que nunca se emitió es, para la declaración, un comprobante corriente.
+ * Posiciones 29-30 de la clave: 01 factura · 04 tiquete.
+ */
+export function tipoRealDeDocumento(r: any): string {
+  if (!r?.fe_clave) return 'ticket';
+  const clave = String(r.fe_clave);
+  const t = clave.length === 50 ? clave.slice(29, 31) : '';
+  if (t === '01') return 'factura_electronica';
+  if (t === '04') return 'tiquete_electronico';
+  return r.document_type === 'factura_electronica' ? 'factura_electronica' : 'tiquete_electronico';
+}
+
 async function fetchAllRows<T = any>(
   make: (from: number, to: number) => any,
 ): Promise<{ data: T[]; error: any }> {
@@ -235,7 +261,7 @@ reports.get('/taxes/breakdown', async (c) => {
       if (to)   q = q.lte('issued_at', to);
       if (environment === 'sandbox') q = q.eq('fe_environment', 'sandbox');
       else if (environment !== 'all') q = q.or('fe_environment.is.null,fe_environment.neq.sandbox');
-      return q;
+      return q.order('id', { ascending: true });   // orden estable para paginar
     };
     // Paginado: sin esto, pasadas las 1000 facturas el desglose salía cortado.
     let { data: invs, error } = await fetchAllRows((a, b) => build(true).range(a, b));
@@ -262,7 +288,8 @@ reports.get('/taxes/breakdown', async (c) => {
     for (let i = 0; i < ids.length; i += 200) {
       const chunk = ids.slice(i, i + 200);
       const { data } = await fetchAllRows((a, b) => db.from('invoice_items')
-        .select('invoice_id, product_id, subtotal').in('invoice_id', chunk).range(a, b));
+        .select('invoice_id, product_id, subtotal').in('invoice_id', chunk)
+        .order('invoice_id', { ascending: true }).range(a, b));
       items.push(...(data ?? []));
     }
     const pids = [...new Set(items.map(it => it.product_id).filter(Boolean))];
@@ -290,7 +317,10 @@ reports.get('/taxes/breakdown', async (c) => {
       const row: Record<string, any> = {
         invoice_id: r.id,
         fecha: r.issued_at ?? '',
-        tipo: r.document_type ?? '',
+        // El MISMO criterio que el reporte de impuestos: lo que se emitió de
+        // verdad. Si acá dijera otra cosa, las dos descargas del mismo período
+        // clasificarían distinto el mismo comprobante.
+        tipo: tipoRealDeDocumento(r),
         numero: r.invoice_number ?? '',
         cliente: r.customer_name ?? '',
         cedula: r.customer_identification ?? (r.customer_id ? (cedByCustomer.get(r.customer_id) ?? '') : ''),
@@ -338,7 +368,9 @@ reports.get('/taxes', async (c) => {
       // corrientes y facturas históricas = reales). 'sandbox' solo las de prueba.
       if (environment === 'sandbox') q = q.eq('fe_environment', 'sandbox');
       else if (environment !== 'all') q = q.or('fe_environment.is.null,fe_environment.neq.sandbox');
-      return q;
+      // Orden ESTABLE por id: sin él, las páginas se pisan entre sí y la
+      // declaración sale con menos comprobantes de los que hay.
+      return q.order('id', { ascending: true });
     };
     // Las tres consultas van PAGINADAS: con más de 1000 comprobantes en el
     // período, la declaración salía incompleta y nadie lo notaba.
@@ -357,7 +389,7 @@ reports.get('/taxes', async (c) => {
         else q = q.not('fe_nc_clave', 'is', null);
         if (from) q = q.gte('issued_at', from);
         if (to)   q = q.lte('issued_at', to);
-        return q;
+        return q.order('id', { ascending: true });
       };
       [rVentas, rNc] = await Promise.all([
         fetchAllRows((a, b) => legacy('ventas').range(a, b)),
@@ -387,9 +419,22 @@ reports.get('/taxes', async (c) => {
       const iva = Number(r.tax_amount ?? 0);
       const base = Number(r.subtotal ?? (sales - iva));
       const sign = kind === 'nc' ? -1 : 1;   // NC resta; venta y ND suman
-      // Tipo de documento para poder separar tiquete vs factura electrónica.
-      const dt = kind === 'nc' ? 'nota_credito' : kind === 'nd' ? 'nota_debito'
-        : (r.document_type || (r.fe_clave ? 'factura_electronica' : 'ticket'));
+      /**
+       * Tipo de documento: lo que REALMENTE se emitió, no lo que se pensaba emitir.
+       *
+       * `document_type` guarda la INTENCIÓN del cajero al cobrar. Pero una venta
+       * marcada como tiquete electrónico que nunca llegó a Hacienda —se cayó la
+       * conexión, faltaba la configuración— es, ante Hacienda, un comprobante
+       * corriente. Clasificarla por la intención la metía en la descarga de
+       * electrónicos y la sacaba de la de corrientes: la declaración terminaba
+       * con documentos que Hacienda no tiene y sin otros que sí ocurrieron.
+       *
+       * La CLAVE manda: sus posiciones 29-30 llevan el tipo real que se emitió
+       * (01 factura · 04 tiquete). Sin clave, es corriente y punto.
+       */
+      const dt = kind === 'nc' ? 'nota_credito'
+        : kind === 'nd' ? 'nota_debito'
+        : tipoRealDeDocumento(r);
       invoices.push({
         kind, document_type: dt,
         invoice_number: r.invoice_number ?? '', customer_name: r.customer_name ?? '',
@@ -407,9 +452,21 @@ reports.get('/taxes', async (c) => {
     // Cédula del cliente (identificación) — batch desde customers por customer_id.
     const custIds = [...new Set(invoices.map(i => i.customer_id).filter(Boolean))] as string[];
     if (custIds.length) {
-      const { data: custs } = await db.from('customers').select('id, identification').in('id', custIds);
+      /**
+       * Las cédulas se piden DE A 200.
+       *
+       * Con muchos clientes distintos en el período, una sola consulta con
+       * cientos de ids arma una dirección larguísima que el servidor rechaza; y
+       * aunque pasara, la respuesta se corta en 1000 filas. El resultado era una
+       * declaración con la columna de cédula vacía justo en los negocios
+       * grandes, que son los que la necesitan.
+       */
       const idMap = new Map<string, string>();
-      for (const c2 of (custs ?? []) as any[]) idMap.set(c2.id, c2.identification ?? '');
+      for (let i = 0; i < custIds.length; i += 200) {
+        const { data: custs } = await db.from('customers')
+          .select('id, identification').in('id', custIds.slice(i, i + 200));
+        for (const c2 of (custs ?? []) as any[]) idMap.set(c2.id, c2.identification ?? '');
+      }
       for (const inv of invoices) if (inv.customer_id) inv.customer_identification = idMap.get(inv.customer_id) ?? '';
     }
 

@@ -35,7 +35,10 @@ async function customerZoneMap(tenantId: string, ids?: string[]): Promise<Map<st
   const PAGE = 1000;
   for (let from = 0; ; from += PAGE) {
     const { data, error } = await db.from('customers')
-      .select('id, zone').eq('tenant_id', tenantId).range(from, from + PAGE - 1);
+      .select('id, zone').eq('tenant_id', tenantId)
+      // Orden estable: paginar sin orden hace que algunas filas se repitan y
+      // otras no salgan nunca — acá, clientes que quedaban sin zona.
+      .order('id', { ascending: true }).range(from, from + PAGE - 1);
     if (error) break;
     const chunk = data ?? [];
     for (const c of chunk as any[]) map.set(c.id, c.zone ?? null);
@@ -104,7 +107,10 @@ accountsReceivable.get('/scope', async (c) => {
     const PAGE = 1000;
     for (let from = 0; ; from += PAGE) {
       const { data } = await db.from('customers')
-        .select('id, zone').eq('tenant_id', tenantId).range(from, from + PAGE - 1);
+        .select('id, zone').eq('tenant_id', tenantId)
+      // Orden estable: paginar sin orden hace que algunas filas se repitan y
+      // otras no salgan nunca — acá, clientes que quedaban sin zona.
+      .order('id', { ascending: true }).range(from, from + PAGE - 1);
       const chunk = data ?? [];
       total += chunk.length;
       if (zone) enZona += (chunk as any[]).filter(x => x.zone === zone).length;

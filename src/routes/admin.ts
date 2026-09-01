@@ -3023,7 +3023,17 @@ admin.get('/alanube/reports/emissions', async (c) => {
     });
   } catch (err: any) {
     const st = err instanceof AlanubeError ? err.status : 500;
-    return fail(c, err.message, st);
+    /**
+     * Un corte por tiempo llega como AbortError, y su mensaje puede ser el
+     * críptico «signal is aborted without reason» o el de la razón que le dimos.
+     * En cualquiera de los dos casos, lo que el usuario necesita saber es que
+     * tardó de más y que achicando el rango de fechas se arregla.
+     */
+    const msg = String(err?.name === 'AbortError' || /abort/i.test(err?.message ?? '')
+      ? (err?.cause?.message
+        || 'El reporte tardó demasiado. Probá con un rango de fechas más corto.')
+      : err.message);
+    return fail(c, msg, st);
   }
 });
 

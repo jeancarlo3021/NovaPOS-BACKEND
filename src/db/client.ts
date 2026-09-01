@@ -1,7 +1,14 @@
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 
-/** Corte por consulta. Bajo a propósito: ver abajo por qué. */
-const QUERY_TIMEOUT_MS = 6_000;
+/**
+ * Corte por consulta: nueve segundos, no seis.
+ *
+ * Con seis, las consultas pesadas —los reportes, que traen miles de
+ * comprobantes— se cortaban en cuanto la base tenía un momento lento. Con nueve
+ * más el reintento, el peor caso son 18 s y todavía queda margen bajo el techo
+ * de 30 s del servidor.
+ */
+const QUERY_TIMEOUT_MS = 9_000;
 
 /**
  * Una consulta, con corte de tiempo y UN reintento si el fallo fue pasajero.
@@ -32,7 +39,16 @@ const fetchWithTimeout: typeof fetch = async (input, init) => {
 
   const intentar = async (): Promise<Response> => {
     const ctrl  = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), QUERY_TIMEOUT_MS);
+    // El abort lleva RAZÓN. Sin ella, Node lanza «signal is aborted without
+    // reason» y eso es todo lo que llega a la pantalla: ni qué se pedía, ni que
+    // fue por tiempo, ni que reintentar o achicar el rango puede servir.
+    const timer = setTimeout(
+      () => ctrl.abort(new Error(
+        `La base de datos no respondió en ${Math.round(QUERY_TIMEOUT_MS / 1000)} segundos.`
+        + ' Probá de nuevo; si el período es muy grande, achicá el rango de fechas.',
+      )),
+      QUERY_TIMEOUT_MS,
+    );
     try {
       return await fetch(input, { ...init, signal: ctrl.signal });
     } finally {
