@@ -2917,6 +2917,20 @@ admin.get('/alanube/reports/emissions', async (c) => {
       for (const [token, tenants] of byToken) extraTokens.push({ token, tenants });
     } catch (e: any) { console.warn('[alanube reports] tokens propios:', e?.message); }
 
+    /**
+     * TODAS las cuentas se consultan a la vez.
+     *
+     * Antes iban en dos tandas: primero la cuenta principal y después, recién
+     * cuando esa terminaba, las de los negocios con token propio. Los tiempos se
+     * SUMABAN, y con eso el reporte se pasaba del límite del servidor y moría
+     * sin devolver nada. Lanzadas juntas, el reporte tarda lo que tarda la
+     * cuenta más lenta.
+     */
+    const extrasEnCurso = Promise.allSettled(
+      extraTokens.map(({ token }) => alanube.forEnv(env, token)
+        .reportEmissionsPerCompany(from, until, { legalStatus, status })),
+    );
+
     const [perCompany, byUser] = await Promise.allSettled([
       client.reportEmissionsPerCompany(from, until, { legalStatus, status }),
       client.reportEmissionsByUser(from, until, legalStatus || 'ACCEPTED'),
@@ -2966,10 +2980,7 @@ admin.get('/alanube/reports/emissions', async (c) => {
     // esperas pasaba el límite de 30 s de la función y la pantalla moría con un
     // error de plataforma en vez de mostrar lo que sí se pudo traer.
     const extraDiag: any[] = [];
-    const extraResults = await Promise.allSettled(
-      extraTokens.map(({ token }) => alanube.forEnv(env, token)
-        .reportEmissionsPerCompany(from, until, { legalStatus, status })),
-    );
+    const extraResults = await extrasEnCurso;   // ya venían corriendo desde arriba
     extraResults.forEach((res, i) => {
       const tenants = extraTokens[i]?.tenants;
       if (res.status === 'rejected') {
