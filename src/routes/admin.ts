@@ -1724,9 +1724,34 @@ admin.put('/tenants/:id/alanube/company', async (c) => {
 admin.get('/tenants/:id/products', async (c) => {
   try {
     const { id } = c.req.param();
-    const { data: prods, error } = await db.from('products')
-      .select('id, name, sku, sku2, unit_price, cost_price, stock_quantity, tracks_stock, cabys_code, iva_rate, category_id, unit_type_id, supplier_id, created_at')
-      .eq('tenant_id', id).order('created_at', { ascending: false }).limit(3000);
+
+    /**
+     * Página, búsqueda y TOTAL de verdad.
+     *
+     * El `.limit(3000)` de antes era ilusorio: la base corta en 1000 filas por
+     * respuesta, así que un catálogo de 5.000 productos se veía como «1000
+     * producto(s)» y las otras 4.000 no existían para quien revisaba la carga.
+     * Peor: parecía que la importación había fallado.
+     *
+     * Ahora se pide una página a la vez y se devuelve la CUENTA REAL, así el
+     * modal puede decir «101-200 de 5.065» y no mentir. La búsqueda va al
+     * servidor por lo mismo: filtrar en pantalla solo filtraría lo que ya bajó.
+     */
+    const pageSize = Math.min(200, Math.max(20, parseInt(c.req.query('page_size') ?? '100', 10) || 100));
+    const page = Math.max(1, parseInt(c.req.query('page') ?? '1', 10) || 1);
+    const search = String(c.req.query('search') ?? '').trim();
+    const desde = (page - 1) * pageSize;
+
+    let q = db.from('products')
+      .select('id, name, sku, sku2, unit_price, cost_price, stock_quantity, tracks_stock, cabys_code, iva_rate, category_id, unit_type_id, supplier_id, created_at',
+        { count: 'exact' })
+      .eq('tenant_id', id);
+    if (search) q = q.or(`name.ilike.%${search}%,sku.ilike.%${search}%,sku2.ilike.%${search}%`);
+
+    const { data: prods, error, count } = await q
+      .order('created_at', { ascending: false })
+      .order('id', { ascending: true })   // desempate estable entre páginas
+      .range(desde, desde + pageSize - 1);
     if (error) throw new Error(error.message);
     const rows = (prods as any[]) ?? [];
 
@@ -1756,7 +1781,12 @@ admin.get('/tenants/:id/products', async (c) => {
       supplier: r.supplier_id ? sups.get(r.supplier_id) ?? null : null,
       created_at: r.created_at,
     }));
-    return ok(c, { products, count: products.length });
+    return ok(c, {
+      products,
+      count: products.length,        // lo que trae ESTA página
+      total: count ?? products.length,   // lo que hay en total
+      page, page_size: pageSize,
+    });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

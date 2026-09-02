@@ -57,6 +57,7 @@ import agentOrders      from './routes/agentOrders.js';
 import returnsRoute     from './routes/returns.js';
 import accountant       from './routes/accountant.js';
 import sharedDocs       from './routes/sharedDocs.js';
+import reservations     from './routes/reservations.js';
 
 // basePath('/api') matches Vercel's catch-all at api/[[...route]].ts
 const app = new Hono().basePath('/api');
@@ -182,6 +183,7 @@ api.route('/agent-orders',       agentOrders);
 api.route('/returns',            returnsRoute);
 api.route('/accountant',         accountant);
 api.route('/shared-docs',        sharedDocs);
+api.route('/reservations',       reservations);
 
 app.route('/', api);
 
