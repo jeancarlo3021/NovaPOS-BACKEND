@@ -79,6 +79,9 @@ app.use('*', cors({
   },
   allowHeaders: ['Content-Type', 'Authorization', 'x-branch-id', 'x-terminal'],
   allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  // Sin esto el navegador ESCONDE estas cabeceras al código de la página, y las
+  // pantallas que paginan no podrían saber cuántos registros hay en total.
+  exposeHeaders: ['X-Total-Count', 'X-Page', 'X-Page-Size'],
 }));
 
 // Health check — no auth, no Supabase, responds immediately

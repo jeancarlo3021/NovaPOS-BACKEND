@@ -328,6 +328,76 @@ users.patch('/:id/password', async (c) => {
   }
 });
 
+/**
+ * PUT /:id/email — cambia el correo (y con él, el USUARIO con el que entra).
+ *
+ * ── Por qué hace falta ─────────────────────────────────────────────────────
+ * El correo no es un dato de contacto: es la identidad con la que se inicia
+ * sesión. Se equivocaron al crearlo, la persona cambió de correo, o el negocio
+ * quiere pasar de un usuario interno («caja1») a su correo real — y hasta ahora
+ * la única salida era borrar el usuario y crearlo de nuevo, perdiendo su
+ * historial: qué vendió, qué anuló, qué cajas cerró.
+ *
+ * Se cambia en LOS DOS lados: en el sistema de acceso (que es quien valida el
+ * ingreso) y en la ficha del usuario. Si el primero falla, no se toca el
+ * segundo: dejar la ficha diciendo un correo con el que no se puede entrar es
+ * peor que no cambiar nada.
+ */
+users.put('/:id/email', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { id } = c.req.param();
+    if (!['owner', 'admin', 'gerente'].includes(String(c.get('role')))) {
+      return fail(c, 'Solo el dueño, el administrador o el gerente pueden cambiar el correo', 403);
+    }
+
+    const body = await c.req.json().catch(() => ({} as any));
+    const bruto = String(body?.email ?? '').trim().toLowerCase();
+    if (!bruto) return fail(c, 'Escribí el correo o el nombre de usuario', 422);
+
+    // Sin arroba se asume nombre de usuario, igual que al crearlo: «caja1» pasa
+    // a ser caja1@nexoerp.local, que es con lo que el sistema de acceso trabaja.
+    const email = bruto.includes('@') ? bruto : `${bruto}@nexoerp.local`;
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return fail(c, 'Ese correo no es válido', 422);
+    }
+
+    const { data: user } = await db.from('users')
+      .select('id, email').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+    if (!user) return fail(c, 'Usuario no encontrado', 404);
+    if (String((user as any).email ?? '').toLowerCase() === email) {
+      return ok(c, { message: 'Ese ya es su correo', email });
+    }
+
+    // Ocupado por otra persona: cambiarlo dejaría a dos usuarios con la misma
+    // identidad y ninguno podría entrar con seguridad.
+    const { data: ocupado } = await db.from('users')
+      .select('id').eq('email', email).neq('id', id).maybeSingle();
+    if (ocupado) return fail(c, 'Ya hay otro usuario con ese correo', 409);
+
+    // 1) El sistema de acceso primero: es el que decide si se puede entrar.
+    const { error: authErr } = await db.auth.admin.updateUserById(id, {
+      email, email_confirm: true,
+    });
+    if (authErr) {
+      return fail(c, /already|registrado|exists/i.test(authErr.message)
+        ? 'Ese correo ya está registrado en el sistema'
+        : authErr.message, 409);
+    }
+
+    // 2) Recién ahora la ficha.
+    const { data, error } = await db.from('users')
+      .update({ email, updated_at: new Date().toISOString() })
+      .eq('id', id).eq('tenant_id', tenantId).select('id, email, full_name, role').single();
+    if (error) throw new Error(error.message);
+
+    // El middleware recuerda al usuario unos segundos: se olvida para que el
+    // cambio aplique de inmediato.
+    forgetCachedUser(id);
+    return ok(c, { ...(data as any), message: 'Correo actualizado. La próxima vez entra con el nuevo.' });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // ── Permissions ───────────────────────────────────────────────────────────────
 
 /*

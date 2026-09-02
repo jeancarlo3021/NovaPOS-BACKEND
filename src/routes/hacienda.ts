@@ -1260,32 +1260,53 @@ hacienda.get('/invoices', async (c) => {
     const to = c.req.query('to');
     // Columnas base + FE. Las de Nota de Crédito (fe_nc_*) pueden no existir si
     // no se corrió la migración 33; si falla, reintentamos sin ellas.
+    /**
+     * Página y TOTAL de verdad.
+     *
+     * Antes había un `.limit(500)`: un negocio con más de quinientos
+     * comprobantes en el rango solo veía los primeros, sin ningún aviso. Parecía
+     * que faltaban facturas —y para quien revisa lo declarado, eso es grave—
+     * cuando en realidad estaban, solo que no se pedían.
+     */
+    const pageSize = Math.min(500, Math.max(20, parseInt(c.req.query('page_size') ?? '200', 10) || 200));
+    const page = Math.max(1, parseInt(c.req.query('page') ?? '1', 10) || 1);
+    const desde = (page - 1) * pageSize;
+
     const buildQuery = (cols: string) => {
-      let q = db.from('invoices').select(cols)
+      let q = db.from('invoices').select(cols, { count: 'exact' })
         .eq('tenant_id', tenantId)
-        .or('document_type.eq.tiquete_electronico,document_type.eq.factura_electronica,fe_clave.not.is.null')
-        .order('issued_at', { ascending: false })
-        .limit(500);
+        .or('document_type.eq.tiquete_electronico,document_type.eq.factura_electronica,fe_clave.not.is.null');
       if (status) q = q.eq('fe_status', status);
       if (from) q = q.gte('issued_at', from);
       if (to)   q = q.lte('issued_at', endOfDay(to));
-      return q;
+      // Desempate por id: al paginar sin un orden único, las páginas se pisan y
+      // algunas facturas no salen en ninguna.
+      return q.order('issued_at', { ascending: false })
+        .order('id', { ascending: true })
+        .range(desde, desde + pageSize - 1);
     };
     const base = 'id, invoice_number, customer_name, total, issued_at, created_at, document_type, payment_method, status, fe_clave, fe_consecutivo, fe_status, fe_error, fe_emailed';
     // Intento con columnas de NC y ND; si alguna no existe (migración sin correr),
     // reintentamos con menos columnas.
     const baseNoEmail = base.replace(', fe_emailed', '');
-    let { data, error } = await buildQuery(`${base}, fe_nc_clave, fe_nc_status, fe_nd_clave, fe_nd_status`);
+    let { data, error, count } = await buildQuery(`${base}, fe_nc_clave, fe_nc_status, fe_nd_clave, fe_nd_status`);
     if (error && /fe_nd_/.test(error.message)) {
-      ({ data, error } = await buildQuery(`${base}, fe_nc_clave, fe_nc_status`));   // sin ND
+      ({ data, error, count } = await buildQuery(`${base}, fe_nc_clave, fe_nc_status`));   // sin ND
     }
     if (error && /fe_nc_/.test(error.message)) {
-      ({ data, error } = await buildQuery(base));   // sin NC ni ND
+      ({ data, error, count } = await buildQuery(base));   // sin NC ni ND
     }
     if (error && /fe_emailed/.test(error.message)) {
-      ({ data, error } = await buildQuery(baseNoEmail));   // sin fe_emailed (migración 56)
+      ({ data, error, count } = await buildQuery(baseNoEmail));   // sin fe_emailed (migración 56)
     }
     if (error) throw new Error(error.message);
+
+    // El total viaja en una CABECERA: así la respuesta sigue siendo el arreglo
+    // que las pantallas ya esperan, sin romper ninguna, y la que quiera paginar
+    // lee cuántos hay en total.
+    c.header('X-Total-Count', String(count ?? (data ?? []).length));
+    c.header('X-Page', String(page));
+    c.header('X-Page-Size', String(pageSize));
     return ok(c, data ?? []);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
