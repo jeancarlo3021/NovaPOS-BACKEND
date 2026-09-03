@@ -283,11 +283,11 @@ function clientFor(env: AlanubeEnv, tokenOverride?: string | null) {
        * que todas las cuentas se consulten A LA VEZ: así el reporte tarda lo que
        * tarda la cuenta más lenta, no la suma de todas.
        */
-      return f(`/reports/emissions-per-company?${qs.toString()}`, { method: 'GET', timeoutMs: 22_000 });
+      return f(`/reports/emissions-per-company?${qs.toString()}`, { method: 'GET', timeoutMs: 16_000 });
     },
     reportEmissionsByUser: (from: string, until: string, legalStatus: string) => {
       const qs = new URLSearchParams({ dateFrom: from, dateUntil: until, legalStatus });
-      return f(`/reports/emissions-by-user?${qs.toString()}`, { method: 'GET', timeoutMs: 22_000 });
+      return f(`/reports/emissions-by-user?${qs.toString()}`, { method: 'GET', timeoutMs: 16_000 });
     },
   };
 }

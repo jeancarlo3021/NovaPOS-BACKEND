@@ -388,8 +388,13 @@ users.put('/:id/email', async (c) => {
     // 2) Recién ahora la ficha.
     const { data, error } = await db.from('users')
       .update({ email, updated_at: new Date().toISOString() })
-      .eq('id', id).eq('tenant_id', tenantId).select('id, email, full_name, role').single();
+      .eq('id', id).eq('tenant_id', tenantId).select('id, email, full_name, role').maybeSingle();
     if (error) throw new Error(error.message);
+    if (!data) {
+      return fail(c,
+        'El correo de ingreso se cambió, pero no se pudo actualizar la ficha del usuario. '
+        + 'Avisá para revisarlo: la persona ya entra con el correo nuevo.', 409);
+    }
 
     // El middleware recuerda al usuario unos segundos: se olvida para que el
     // cambio aplique de inmediato.

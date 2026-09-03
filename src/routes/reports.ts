@@ -350,7 +350,7 @@ reports.get('/taxes', async (c) => {
     // Ambiente: 'production' (default, excluye pruebas) · 'sandbox' (solo QA) · 'all'.
     const environment = String(c.req.query('environment') || 'production');
 
-    const sel = 'id, invoice_number, customer_name, customer_id, total, subtotal, tax_amount, issued_at, status, document_type, fe_clave, fe_status, fe_nc_clave, fe_nd_clave, fe_environment';
+    const sel = 'id, invoice_number, customer_name, customer_id, total, subtotal, tax_amount, issued_at, status, document_type, fe_clave, fe_status, fe_error, fe_nc_clave, fe_nd_clave, fe_environment';
     // Tres consultas (más robusto que un .or con is-not-null):
     //  1) Ventas VÁLIDAS (no anuladas).
     //  2) Facturas con NOTA DE CRÉDITO (aunque estén anuladas).
@@ -500,7 +500,36 @@ reports.get('/taxes', async (c) => {
       }).sort((a, b) => (a.doc_date || '').localeCompare(b.doc_date || ''));
     } catch { purchases = []; }
 
-    return ok(c, { invoices, purchases });
+    /**
+     * Qué se dejó AFUERA y por qué.
+     *
+     * El reporte excluye los comprobantes electrónicos que Hacienda rechazó o que
+     * quedaron en error: no son comprobantes válidos y declararlos sería declarar
+     * ventas que Hacienda no tiene. Pero excluirlos EN SILENCIO hace que el
+     * contador cuente 9 facturas donde esperaba 40 y no tenga forma de saber si
+     * el sistema falló o si de verdad hay 31 rechazadas que nadie reemitió.
+     *
+     * Se informa el número y el detalle para que la diferencia se pueda explicar
+     * —y, sobre todo, para que esas ventas se reemitan antes de declarar.
+     */
+    const rechazados: Array<{ invoice_number: string; issued_at: string; total: number; fe_status: string; fe_error?: string | null }> = [];
+    for (const r of ([...(rVentas.data ?? []), ...(rNc.data ?? []), ...(rNd.data ?? [])] as any[])) {
+      if (!feFailed(r)) continue;
+      if (rechazados.some(x => x.invoice_number === (r.invoice_number ?? ''))) continue;
+      rechazados.push({
+        invoice_number: r.invoice_number ?? '',
+        issued_at: r.issued_at ?? '',
+        total: Number(r.total ?? 0),
+        fe_status: r.fe_status ?? '',
+        fe_error: r.fe_error ?? null,
+      });
+    }
+
+    return ok(c, {
+      invoices,
+      purchases,
+      excluded_failed: rechazados.sort((a, b) => (a.issued_at || '').localeCompare(b.issued_at || '')),
+    });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

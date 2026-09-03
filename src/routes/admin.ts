@@ -5,10 +5,11 @@ import { sendEmail, paymentReceiptEmailHtml, customInvoiceEmailHtml, planFeature
 import { alanube, AlanubeError, tenantAlanubeToken } from '../services/alanube.js';
 import { endOfDay } from '../utils/dateRange.js';
 import { whatsappEnabled, sendTemplate, normalizePhone } from '../services/whatsapp.js';
-import { refreshInvoiceStatus, refreshNoteStatus, emitInvoiceCore, emitCreditNoteCore, configuredNextConsecutivo, computeFeQuota } from './hacienda.js';
+import { refreshInvoiceStatus, refreshNoteStatus, emitInvoiceCore, emitCreditNoteCore, configuredNextConsecutivo, computeFeQuota, loadFEConfig } from './hacienda.js';
 import { notifyPaymentDue, businessContact } from '../services/whatsappNotify.js';
 import { clearPermissionCache } from '../middleware/permissions.js';
 import { forgetCachedTenant } from '../middleware/tenantStatus.js';
+import { forgetCachedUser } from '../middleware/auth.js';
 
 const admin = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
@@ -379,6 +380,15 @@ admin.post('/delete-owner', async (c) => {
   try {
     const { tenantId, ownerId } = await c.req.json();
     // Use service role to delete directly (edge function not available from backend)
+    //
+    // La base impide borrar facturas YA EMITIDAS a Hacienda (migración 109). Acá
+    // se está borrando el negocio entero, que es el único caso donde eso sí
+    // corresponde, así que se abre la válvula a propósito. Si la función no
+    // existe todavía, se sigue: el borrado funcionará igual salvo que haya
+    // facturas emitidas, y en ese caso el error dice exactamente qué falta.
+    try { await db.rpc('permitir_borrado_masivo'); }
+    catch { /* migración 109 sin correr */ }
+
     // Delete in dependency order
     await db.from('invoice_items').delete().eq('tenant_id', tenantId);
     await db.from('invoices').delete().eq('tenant_id', tenantId);
@@ -2630,12 +2640,36 @@ const VALID_ROLES = [
 admin.get('/tenants/:id/users', async (c) => {
   try {
     const { id } = c.req.param();
+    const cols = 'id, full_name, email, role, phone, ticket_alias, created_at';
+
     const { data, error } = await db.from('users')
-      .select('id, full_name, email, role, phone, ticket_alias, created_at')
-      .eq('tenant_id', id)
-      .order('full_name');
+      .select(cols).eq('tenant_id', id).order('full_name');
     if (error) throw new Error(error.message);
-    return ok(c, data ?? []);
+    const lista = [...((data as any[]) ?? [])];
+
+    /**
+     * El DUEÑO también va en la lista.
+     *
+     * Su ficha suele tener el negocio vacío —el vínculo va por
+     * `tenants.owner_id`— así que filtrando por negocio no salía. Resultado: la
+     * persona más importante del negocio no aparecía en «Usuarios de la
+     * empresa», y no había forma de corregirle el correo, el nombre ni el rol
+     * desde el panel.
+     */
+    try {
+      const { data: t } = await db.from('tenants')
+        .select('owner_id').eq('id', id).maybeSingle();
+      const ownerId = (t as any)?.owner_id;
+      if (ownerId && !lista.some(u => u.id === ownerId)) {
+        const { data: dueño } = await db.from('users')
+          .select(cols).eq('id', ownerId).maybeSingle();
+        // Se marca para que la pantalla lo distinga: al dueño no se le puede
+        // quitar el acceso ni borrarlo como a un empleado.
+        if (dueño) lista.unshift({ ...(dueño as any), is_owner: true });
+      }
+    } catch (e: any) { console.warn('[admin users] dueño:', e?.message); }
+
+    return ok(c, lista);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
@@ -2696,11 +2730,485 @@ admin.patch('/tenants/:id/users/:uid', async (c) => {
     }
     if (body.phone !== undefined) patch.phone = body.phone || null;
     if (body.ticket_alias !== undefined) patch.ticket_alias = body.ticket_alias ? String(body.ticket_alias).slice(0, 60) : null;
-    const { data, error } = await db.from('users')
-      .update(patch).eq('id', uid).eq('tenant_id', id)
-      .select('id, full_name, email, role, phone, ticket_alias, created_at').single();
+
+    /**
+     * CORREO: es la llave de entrada, no un dato de contacto.
+     *
+     * Se cambia primero en el sistema de acceso —el que decide si la persona
+     * puede entrar— y solo si eso funciona se toca la ficha. Al revés, la ficha
+     * mostraría un correo con el que nadie puede iniciar sesión, que es peor que
+     * no haber cambiado nada.
+     */
+    if (body.email !== undefined) {
+      const bruto = String(body.email ?? '').trim().toLowerCase();
+      if (!bruto) return fail(c, 'Escribí el correo o el nombre de usuario', 422);
+
+      /**
+       * Se comprueba que el usuario EXISTA en este negocio antes de tocar nada.
+       *
+       * Sin esto, el correo se cambiaba primero en el sistema de acceso y recién
+       * después fallaba la actualización de la ficha —porque la fila no estaba—
+       * dejando a la persona con un correo de ingreso que su ficha desconoce. Es
+       * exactamente el estado a medias que hay que evitar.
+       */
+      const { data: existe } = await db.from('users')
+        .select('id, tenant_id').eq('id', uid).maybeSingle();
+      if (!existe) return fail(c, 'Ese usuario no existe.', 404);
+      if ((existe as any).tenant_id && (existe as any).tenant_id !== id) {
+        return fail(c, 'Ese usuario pertenece a otro negocio.', 409);
+      }
+      // Dueño del negocio: su ficha suele tener el negocio VACÍO, porque el
+      // vínculo va por `tenants.owner_id`. Filtrar por negocio no lo encontraba
+      // y la actualización no calzaba con ninguna fila.
+      if (!(existe as any).tenant_id) {
+        const { data: dueño } = await db.from('tenants')
+          .select('id').eq('id', id).eq('owner_id', uid).maybeSingle();
+        if (!dueño) return fail(c, 'Ese usuario no pertenece a este negocio.', 409);
+      }
+      // Sin arroba se asume nombre de usuario, igual que al crearlo.
+      const email = bruto.includes('@') ? bruto : `${bruto}@nexoerp.local`;
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return fail(c, 'Ese correo no es válido', 422);
+
+      const { data: ocupado } = await db.from('users')
+        .select('id').eq('email', email).neq('id', uid).maybeSingle();
+      if (ocupado) return fail(c, 'Ya hay otro usuario con ese correo', 409);
+
+      const { error: authErr } = await db.auth.admin.updateUserById(uid, { email, email_confirm: true });
+      if (authErr) {
+        return fail(c, /already|registrado|exists/i.test(authErr.message)
+          ? 'Ese correo ya está registrado en el sistema'
+          : authErr.message, 409);
+      }
+      patch.email = email;
+      forgetCachedUser(uid);
+    }
+
+    // `maybeSingle` y no `single`: si no calza ninguna fila hay que poder decir
+    // QUÉ pasó, no reventar con «Cannot coerce the result to a single JSON object».
+    /**
+     * El filtro por negocio se aplica SOLO si la ficha lo tiene.
+     *
+     * La pertenencia ya se verificó arriba (por `tenant_id` o por ser el dueño),
+     * así que exigirlo otra vez acá dejaba fuera justamente al dueño —cuya ficha
+     * no lleva negocio— y la actualización no tocaba ninguna fila.
+     */
+    const { data: fichaActual } = await db.from('users')
+      .select('tenant_id').eq('id', uid).maybeSingle();
+
+    let q = db.from('users').update(patch).eq('id', uid);
+    if ((fichaActual as any)?.tenant_id) q = q.eq('tenant_id', id);
+
+    const { data, error } = await q
+      .select('id, full_name, email, role, phone, ticket_alias, created_at').maybeSingle();
     if (error) throw new Error(error.message);
+    if (!data) {
+      return fail(c,
+        'No se actualizó la ficha del usuario: no aparece dentro de este negocio. '
+        + (patch.email ? 'OJO: el correo de ingreso SÍ se cambió, así que ahora entra con el nuevo.' : ''),
+        409);
+    }
     return ok(c, data);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/**
+ * POST /tenants/:id/fe-import — trae de Alanube un comprobante que NO está en la
+ * base y lo registra.
+ *
+ * ── Cuándo hace falta ──────────────────────────────────────────────────────
+ * Un comprobante puede existir en Hacienda y no acá: se emitió desde otra vía,
+ * o la emisión salió bien pero la respuesta se perdió antes de guardarse. Esa
+ * venta queda fuera de los reportes, del cierre y de la declaración, y nadie se
+ * entera hasta que el contador cuadra y no le da.
+ *
+ * Esto lo rescata: se le pasa la CLAVE, se busca en Alanube y se crea la factura
+ * con lo que Alanube tiene. Queda marcada como importada para que se sepa que no
+ * nació de una venta del punto de venta.
+ *
+ * body: { clave, doc_id?, cash_session_id? }
+ * `doc_id` es el id de Alanube; si no se manda, se intenta con la clave.
+ */
+admin.post('/tenants/:id/fe-import', async (c) => {
+  try {
+    const { id: tenantId } = c.req.param();
+    const b = await c.req.json().catch(() => ({} as any));
+    const clave = String(b?.clave ?? '').replace(/\D/g, '');
+    if (clave.length !== 50) return fail(c, 'La clave debe tener 50 dígitos', 422);
+
+    /**
+     * Si ya está, se COMPLETA en vez de rechazar.
+     *
+     * Una importación anterior pudo haber quedado a medias —sin las líneas,
+     * porque no se logró bajar el XML—. Rechazarla sin más obligaba a borrar la
+     * factura para volver a traerla… y borrar una factura emitida es justamente
+     * lo que la base ahora impide, con razón. Así que acá se rellena lo que
+     * falte y no se toca lo que ya está bien.
+     */
+    const { data: yaEsta } = await db.from('invoices')
+      .select('id, invoice_number').eq('tenant_id', tenantId).eq('fe_clave', clave).maybeSingle();
+
+    let completarId: string | null = null;
+    if (yaEsta) {
+      const { count } = await db.from('invoice_items')
+        .select('id', { count: 'exact', head: true }).eq('invoice_id', (yaEsta as any).id);
+      if ((count ?? 0) > 0) {
+        return fail(c, `Esa factura ya está registrada y completa (${(yaEsta as any).invoice_number}).`, 409);
+      }
+      completarId = (yaEsta as any).id;
+    }
+
+    const cfg = await loadFEConfig(tenantId);
+    const companyId = (String(cfg.environment ?? 'production') === 'sandbox'
+      ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id;
+
+    // El tipo va en la clave (posiciones 30-31) y decide en qué colección buscar.
+    const tipo = clave.slice(29, 31);
+    const kind = tipo === '01' ? 'invoice' : tipo === '03' ? 'credit-note'
+      : tipo === '02' ? 'debit-note' : 'ticket';
+
+    const docId = String(b?.doc_id ?? '').trim() || clave;
+
+    /**
+     * Se prueba con VARIAS empresas y VARIAS cuentas.
+     *
+     * Un comprobante emitido por la pasarela externa lleva el `company_id` que
+     * mandó la aplicación que la llamó, y ese puede no ser el que tiene guardado
+     * este negocio. Alanube entonces responde «Company not found» —que suena a
+     * «no existe el documento» pero significa otra cosa— y el rescate fallaba
+     * por buscar en el lugar equivocado.
+     *
+     * Se intenta, en orden: la empresa que se indicó a mano, la del negocio, y
+     * sin empresa; primero con el token del negocio y después con el de la
+     * cuenta principal.
+     */
+    const empresas = [String(b?.company_id ?? '').trim() || null, companyId ?? null, null]
+      .filter((v, i, a) => a.indexOf(v) === i);
+
+    /**
+     * Se prueban los DOS ambientes, no solo el configurado.
+     *
+     * Un comprobante emitido en producción no se encuentra buscándolo en el
+     * ambiente de pruebas, y al revés — y Alanube responde igual en los dos
+     * casos: «Company not found». Ese mensaje no distingue «la empresa no
+     * existe» de «no existe EN ESTA CUENTA» ni de «estás en el ambiente
+     * equivocado», así que probarlos todos es la única forma de saberlo.
+     */
+    const ambientes = b?.environment
+      ? [String(b.environment)]
+      : ['production', 'sandbox'];
+
+    const cuentas: Array<{ nombre: string; cli: any }> = [];
+    for (const amb of ambientes) {
+      cuentas.push({ nombre: `negocio/${amb}`, cli: alanube.forTenant({ ...cfg, environment: amb }) });
+      cuentas.push({ nombre: `cuenta principal/${amb}`, cli: alanube.forEnv(amb as any) });
+    }
+
+    let doc: any = null;
+    /**
+     * Con QUÉ cuenta y QUÉ empresa se encontró.
+     *
+     * Hace falta recordarlo: el XML se pide después, y pedirlo con una cuenta
+     * distinta a la que encontró el documento devuelve «no existe». Eso fue lo
+     * que dejó la primera importación sin el detalle de productos.
+     */
+    let clienteOk: any = null;
+    let empresaOk: string | null = null;
+
+    // Cada intento queda anotado: sin esto, «no se encontró» no dice DÓNDE se
+    // buscó, y no hay manera de saber qué falta configurar.
+    const intentos: Array<{ cuenta: string; empresa: string; error: string }> = [];
+
+    for (const { nombre, cli } of cuentas) {
+      for (const emp of empresas) {
+        try {
+          doc = await cli.getDocument(docId, { kind: kind as any, companyId: emp ?? undefined });
+          clienteOk = cli; empresaOk = emp;
+          break;
+        } catch (e: any) {
+          intentos.push({ cuenta: nombre, empresa: emp ?? '(sin empresa)', error: e?.message ?? 'sin detalle' });
+        }
+      }
+      if (doc) break;
+    }
+
+    if (!doc) {
+      return c.json({
+        success: false,
+        error: 'Alanube no devolvió ese comprobante en ninguna cuenta ni ambiente.',
+        pista: 'Si TODOS los intentos dicen «Company not found», el token con el que estamos '
+          + 'consultando no pertenece a la cuenta que emitió ese documento. Ese comprobante salió '
+          + 'con las credenciales de otra cuenta de Alanube — hay que consultarlo con ese token.',
+        doc_id: docId,
+        tipo,
+        intentos,
+      }, 404);
+    }
+
+    const d = doc?.document ?? doc?.invoice ?? doc?.ticket ?? doc?.data ?? doc;
+
+    /**
+     * Los montos se BUSCAN en toda la respuesta.
+     *
+     * Alanube no siempre devuelve el resumen en el mismo nivel ni con el mismo
+     * nombre: según el tipo de documento y la versión de la API puede venir como
+     * `totalComprobante`, dentro de `summary`, o anidado más abajo. Apuntar a un
+     * nombre fijo hacía fallar el rescate por un detalle de forma, teniendo el
+     * documento ya en la mano.
+     */
+    const buscarNumero = (obj: any, nombres: RegExp, prof = 6): number | null => {
+      if (!obj || prof < 0) return null;
+      if (Array.isArray(obj)) {
+        for (const x of obj) { const v = buscarNumero(x, nombres, prof - 1); if (v != null) return v; }
+        return null;
+      }
+      if (typeof obj !== 'object') return null;
+      for (const [k, v] of Object.entries(obj)) {
+        if (nombres.test(k)) {
+          const n = Number(v);
+          if (Number.isFinite(n) && n > 0) return n;
+        }
+      }
+      for (const v of Object.values(obj)) {
+        const r = buscarNumero(v, nombres, prof - 1);
+        if (r != null) return r;
+      }
+      return null;
+    };
+
+    /**
+     * El monto se lee de campos ESPECÍFICOS, nunca de uno llamado «total».
+     *
+     * Un rastreo genérico por `total` agarra cualquier acumulado que venga en la
+     * respuesta —conteos, sumas de la cuenta— y registra una venta con un monto
+     * inventado. Pasó: importó ₡6.794.905 donde el comprobante era de ₡97.500.
+     * Un monto equivocado en una factura es peor que no poder importarla: entra
+     * a los reportes y a la declaración como si fuera cierto.
+     *
+     * Por eso solo se aceptan nombres inequívocos, y ante la duda se pide el
+     * monto a mano en vez de suponerlo.
+     */
+    const manual = Number(b?.total ?? 0);
+    const total = manual > 0
+      ? manual
+      : (buscarNumero(doc, /^(totalComprobante|totalVoucher|grandTotal)$/i, 4)
+        ?? (Number(d?.total) > 0 ? Number(d.total) : 0));
+    const iva = Number(b?.tax ?? 0) > 0
+      ? Number(b.tax)
+      : (buscarNumero(doc, /^(totalImpuesto|totalTax)$/i, 4) ?? 0);
+
+    const fecha = d?.issueDate ?? d?.fechaEmision ?? d?.date ?? d?.createdAt ?? null;
+
+    /**
+     * Modo CONSULTA: trae el documento y no guarda nada.
+     *
+     * Sirve para dos cosas: ver con qué nombres viene cada campo antes de
+     * confiar en la lectura automática, y revisar un comprobante sin el riesgo
+     * de registrar una venta equivocada. Importar es irreversible en la práctica
+     * —queda en reportes y en la declaración—, así que mirar primero debe ser
+     * posible sin comprometerse.
+     */
+    if (b?.preview === true || b?.solo_ver === true) {
+      /**
+       * En modo consulta se pide TAMBIÉN la versión con archivos.
+       *
+       * Es la única forma de ver dónde viene el XML en esta cuenta: Alanube lo
+       * devuelve con nombres distintos según la versión y el tipo de documento,
+       * y sin verlo no hay manera de saber qué campo leer.
+       */
+      let conArchivos: any = null;
+      let errorArchivos: string | null = null;
+      try {
+        conArchivos = await clienteOk.getDocument(docId, {
+          kind: kind as any,
+          companyId: empresaOk ?? undefined,
+          // Con GUIONES: Alanube rechaza la coma («must be separated by dashes»).
+          documents: 'xml-xmlHacienda',
+        });
+      } catch (e: any) { errorArchivos = e?.message ?? 'sin detalle'; }
+
+      // Se listan las LLAVES en vez del contenido: un XML entero en base64 llena
+      // la pantalla y no deja ver lo que importa, que es cómo se llama el campo.
+      const llaves = (o: any, prefijo = '', prof = 3): string[] => {
+        if (!o || typeof o !== 'object' || prof < 0) return [];
+        return Object.entries(o).flatMap(([k, v]) => {
+          const ruta = prefijo ? `${prefijo}.${k}` : k;
+          const tipoV = Array.isArray(v) ? 'array'
+            : v && typeof v === 'object' ? 'objeto'
+            : typeof v === 'string' ? `texto(${(v as string).length})`
+            : typeof v;
+          return [`${ruta}: ${tipoV}`, ...llaves(v, ruta, prof - 1)];
+        });
+      };
+
+      return ok(c, {
+        preview: true,
+        encontrado_con: { doc_id: docId, tipo, empresa: empresaOk ?? '(sin empresa)' },
+        monto_leido: total,
+        iva_leido: iva,
+        fecha_leida: fecha,
+        archivos_error: errorArchivos,
+        archivos_campos: conArchivos ? llaves(conArchivos).slice(0, 60) : [],
+        respuesta: doc,
+      });
+    }
+
+    if (!(total > 0)) {
+      // Se devuelve la respuesta cruda: con el documento a la vista se ve qué
+      // nombre trae el monto y se puede pasar a mano sin adivinar.
+      return c.json({
+        success: false,
+        error: 'Alanube devolvió el comprobante pero no se pudo leer el monto.',
+        pista: 'Pasá el monto en el campo `total` (y el IVA en `tax` si lo sabés). '
+          + 'Abajo va la respuesta tal cual la mandó Alanube.',
+        respuesta: doc,
+      }, 422);
+    }
+
+    const consecutivo = clave.slice(31, 41);
+    /**
+     * Se trae el XML para reconstruir la factura COMPLETA.
+     *
+     * El resumen de Alanube alcanza para el encabezado, pero una factura sin sus
+     * líneas es media factura: no sirve para reimprimirla, ni para saber qué se
+     * vendió, ni para los reportes por producto. El XML es el documento tal cual
+     * lo recibió Hacienda, así que es la fuente más fiel que existe.
+     *
+     * Si no se puede bajar, se registra igual con el encabezado: recuperar la
+     * venta a medias es mejor que no recuperarla.
+     */
+    let lineas: Array<{ product_name: string; quantity: number; unit_price: number; subtotal: number }> = [];
+    /** Qué pasó al leer el XML, para poder decirlo en vez de un «no se pudo». */
+    let xmlDiagnostico = 'No se intentó leer el XML.';
+    let clienteXml: string | null = null;
+    let subtotalXml = 0;
+    let ivaXml = 0;
+    let fechaXml: string | null = null;
+
+    try {
+      // Con la MISMA cuenta y empresa que encontró el documento, y pidiendo los
+      // archivos en la misma llamada.
+      const conArchivos: any = await clienteOk.getDocument(docId, {
+        kind: kind as any,
+        companyId: empresaOk ?? undefined,
+        documents: 'xml-xmlHacienda',   // guiones, no comas
+      });
+      const dd = conArchivos?.document ?? conArchivos?.invoice ?? conArchivos?.ticket ?? conArchivos?.data ?? conArchivos;
+      const bruto = dd?.xml ?? dd?.xmlSigned ?? dd?.documentXml ?? conArchivos?.xml ?? null;
+
+      // Alanube puede devolver el XML como texto, en base64 o como un enlace.
+      let texto = '';
+      if (typeof bruto === 'string' && bruto.trim()) {
+        if (/^https?:\/\//i.test(bruto)) {
+          const r = await fetch(bruto);
+          if (r.ok) texto = await r.text();
+        } else if (bruto.trim().startsWith('<')) {
+          texto = bruto;
+        } else {
+          texto = Buffer.from(bruto, 'base64').toString('utf8');
+        }
+      }
+      {
+        if (!texto.startsWith('<')) {
+          xmlDiagnostico = `Alanube devolvió el XML pero no se pudo interpretar (empieza con «${texto.slice(0, 20)}»).`;
+        }
+        if (texto.startsWith('<')) {
+          const { XMLParser } = await import('fast-xml-parser');
+          const doc2: any = new XMLParser({
+            ignoreAttributes: true,
+            parseTagValue: true,
+            ignoreDeclaration: true,   // sin esto, el primer nodo es `<?xml ?>`
+            removeNSPrefix: true,      // el comprobante viene con espacio de nombres
+          }).parse(texto);
+          // El nodo raíz es el primero que NO empiece con «?» (la declaración) ni
+          // con «#» (texto suelto). Tomar el primero a secas agarraba la
+          // declaración y dejaba la factura sin leer.
+          const raizKey = Object.keys(doc2).find(k => !k.startsWith('?') && !k.startsWith('#'));
+          const raiz: any = (raizKey ? doc2[raizKey] : null) ?? {};
+          clienteXml = raiz?.Receptor?.Nombre ?? null;
+          fechaXml = raiz?.FechaEmision ?? null;
+          const resumen = raiz?.ResumenFactura ?? {};
+          subtotalXml = Number(resumen?.TotalVentaNeta ?? 0);
+          ivaXml = Number(resumen?.TotalImpuesto ?? 0);
+
+          const det = raiz?.DetalleServicio?.LineaDetalle;
+          const arr = Array.isArray(det) ? det : det ? [det] : [];
+          lineas = arr.map((l: any) => ({
+            product_name: String(l?.Detalle ?? 'Producto'),
+            quantity: Number(l?.Cantidad ?? 1),
+            unit_price: Number(l?.PrecioUnitario ?? 0),
+            subtotal: Number(l?.MontoTotalLinea ?? l?.SubTotal ?? 0),
+          }));
+          xmlDiagnostico = lineas.length
+            ? `XML leído: ${lineas.length} línea(s).`
+            : `El XML se leyó pero no trae líneas. Nodo raíz: «${raizKey ?? '?'}». `
+              + `Campos de primer nivel: ${Object.keys(raiz).join(', ') || '(ninguno)'}.`;
+        }
+      }
+    } catch (e: any) {
+      xmlDiagnostico = `Alanube falló al entregar el XML: ${e?.message ?? 'sin detalle'}`;
+      console.warn('[fe-import] no se pudo leer el XML:', e?.message);
+    }
+
+    // Completar la que ya existe: se le agregan las líneas y se corrigen los
+    // montos y el cliente con lo que dice el XML, sin crear una segunda venta.
+    if (completarId) {
+      if (!lineas.length) {
+        return c.json({
+          success: false,
+          error: 'La factura ya está registrada, pero no se pudieron leer sus líneas del XML.',
+          pista: xmlDiagnostico,
+        }, 422);
+      }
+      await db.from('invoice_items').insert(
+        lineas.map(l => ({ ...l, invoice_id: completarId })));
+      const patch: Record<string, any> = { updated_at: new Date().toISOString() };
+      if (subtotalXml > 0) patch.subtotal = subtotalXml;
+      if (ivaXml > 0) patch.tax_amount = ivaXml;
+      if (clienteXml) patch.customer_name = String(clienteXml).slice(0, 120);
+      const { data: act } = await db.from('invoices')
+        .update(patch).eq('id', completarId).eq('tenant_id', tenantId).select('*').single();
+      return ok(c, { ...(act as any), lineas: lineas.length, completa: true, completada: true });
+    }
+
+    const { data: creada, error } = await db.from('invoices').insert({
+      tenant_id: tenantId,
+      invoice_number: consecutivo.replace(/^0+/, '') || consecutivo,
+      // Del XML si está: son los montos exactos que recibió Hacienda.
+      subtotal: subtotalXml > 0 ? subtotalXml : Math.max(0, total - (ivaXml || iva)),
+      tax_amount: ivaXml > 0 ? ivaXml : iva,
+      total: total || Number(b.total),
+      payment_method: 'cash',
+      status: 'completed',
+      document_type: tipo === '01' ? 'factura_electronica' : 'tiquete_electronico',
+      fe_clave: clave,
+      fe_status: 'accepted',
+      fe_environment: cfg.environment ?? 'production',
+      fe_response: doc,
+      issued_at: fechaXml ?? fecha ?? new Date().toISOString(),
+      customer_name: (b?.customer_name ?? clienteXml) ? String(b?.customer_name ?? clienteXml).slice(0, 120) : null,
+      // Sin sesión de caja a propósito: esta venta NO ocurrió en una caja de este
+      // sistema, y meterla en un arqueo ya cerrado lo descuadraría.
+      cash_session_id: b?.cash_session_id ?? null,
+      notes: 'Importada desde Alanube (emitida fuera del sistema)',
+    }).select('*').single();
+    if (error) throw new Error(error.message);
+
+    // Las líneas, si el XML las trajo.
+    let lineasGuardadas = 0;
+    if (lineas.length) {
+      const { error: eLin } = await db.from('invoice_items').insert(
+        lineas.map(l => ({ ...l, invoice_id: (creada as any).id })));
+      if (eLin) console.warn('[fe-import] no se pudieron guardar las líneas:', eLin.message);
+      else lineasGuardadas = lineas.length;
+    }
+
+    return ok(c, {
+      ...(creada as any),
+      lineas: lineasGuardadas,
+      // Se dice si quedó completa o solo el encabezado: una factura sin líneas
+      // no se puede reimprimir ni desglosar, y quien la importó debe saberlo.
+      completa: lineasGuardadas > 0,
+    }, 201);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
@@ -2961,9 +3469,31 @@ admin.get('/alanube/reports/emissions', async (c) => {
         .reportEmissionsPerCompany(from, until, { legalStatus, status })),
     );
 
-    const [perCompany, byUser] = await Promise.allSettled([
-      client.reportEmissionsPerCompany(from, until, { legalStatus, status }),
-      client.reportEmissionsByUser(from, until, legalStatus || 'ACCEPTED'),
+    /**
+     * PLAZO GENERAL: el reporte SIEMPRE contesta, aunque venga incompleto.
+     *
+     * El servidor se corta a los 30 segundos y muere sin decir nada («Internal
+     * Server Error»). Antes se esperaba a Alanube sin techo propio: si una
+     * cuenta tardaba, el reporte entero moría y el usuario no veía ni los datos
+     * que sí habían llegado.
+     *
+     * Con un plazo de 18 s, lo que respondió se muestra y lo que no se informa
+     * como «no respondió». Un reporte parcial y avisado sirve; uno caído, no.
+     */
+    const PLAZO_MS = 18_000;
+    const aTiempo = <T>(p: Promise<T>): Promise<PromiseSettledResult<T>> =>
+      Promise.race([
+        p.then(value => ({ status: 'fulfilled', value } as PromiseSettledResult<T>),
+               reason => ({ status: 'rejected', reason } as PromiseSettledResult<T>)),
+        new Promise<PromiseSettledResult<T>>(res => setTimeout(() => res({
+          status: 'rejected',
+          reason: new Error('Alanube no respondió dentro del tiempo del reporte. Probá con un rango más corto.'),
+        } as PromiseSettledResult<T>), PLAZO_MS)),
+      ]);
+
+    const [perCompany, byUser] = await Promise.all([
+      aTiempo(client.reportEmissionsPerCompany(from, until, { legalStatus, status })),
+      aTiempo(client.reportEmissionsByUser(from, until, legalStatus || 'ACCEPTED')),
     ]);
     const unwrap = (r: PromiseSettledResult<any>) => {
       if (r.status === 'fulfilled') return r.value?.data ?? r.value ?? [];
@@ -3010,7 +3540,12 @@ admin.get('/alanube/reports/emissions', async (c) => {
     // esperas pasaba el límite de 30 s de la función y la pantalla moría con un
     // error de plataforma en vez de mostrar lo que sí se pudo traer.
     const extraDiag: any[] = [];
-    const extraResults = await extrasEnCurso;   // ya venían corriendo desde arriba
+    // Las cuentas extra también con plazo: una lenta no puede tumbar el reporte.
+    const extraResults = await aTiempo(extrasEnCurso).then(r =>
+      r.status === 'fulfilled' ? r.value : extraTokens.map(() => ({
+        status: 'rejected' as const,
+        reason: new Error('No respondió dentro del tiempo del reporte'),
+      })));
     extraResults.forEach((res, i) => {
       const tenants = extraTokens[i]?.tenants;
       if (res.status === 'rejected') {
