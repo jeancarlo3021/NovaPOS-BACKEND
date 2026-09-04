@@ -1441,6 +1441,29 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
     const client = alanube.forTenant(cfg);
     const payload = buildAlanubeCompanyPayload(cfg, p12Base64, client.env);
 
+    // Resumen de lo enviado, para poder mostrarlo si Alanube contesta genérico.
+    // Solo se dice si los secretos venían o no, nunca su contenido.
+    const vino = (v: any) => (v ? 'ok' : 'FALTA');
+    datosEnviados = {
+      ambiente: client.env,
+      cedula: payload.identificationNumber || 'FALTA',
+      tipo_cedula: payload.identificationType || 'FALTA',
+      nombre: payload.name || 'FALTA',
+      nombre_comercial: payload.tradeName || '(vacío)',
+      tipo_empresa: payload.type,
+      provincia: payload.address?.province || 'FALTA',
+      canton: payload.address?.canton || 'FALTA',
+      distrito: payload.address?.district || 'FALTA',
+      otras_senas: payload.address?.otrasSenas || 'FALTA',
+      actividades: (payload.economicActivities ?? []).join(', ') || 'FALTA',
+      correos: (payload.emails ?? []).join(', ') || 'FALTA',
+      telefono: payload.phone?.phoneNumber || payload.phoneNumber || '(vacío)',
+      certificado_p12: vino(payload.certificate?.content),
+      clave_del_p12: vino(payload.certificate?.password),
+      usuario_atv: payload.token?.username || 'FALTA',
+      clave_atv: vino(payload.token?.password),
+    };
+
     // ?debug=1 — devuelve el payload que se le manda a Alanube, SIN secretos, para
     // poder diagnosticar cuando responden "Something went wrong" sin detalle.
     if (c.req.query('debug') === '1') {
@@ -1624,7 +1647,24 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
           + Object.entries(datosEnviados).map(([k, v]) => `• ${k}: ${v}`).join('\n')
           + '\n\nRevisá los que digan FALTA o (vacío): son los candidatos.';
       }
-      else detail = '\n\nRespuesta cruda de Alanube:\n' + JSON.stringify(body).slice(0, 1200);
+      if (!detail) detail = '\n\nRespuesta cruda de Alanube:\n' + JSON.stringify(body).slice(0, 1200);
+      /**
+       * EPR500 = error INTERNO de Alanube, no un campo mal puesto.
+       *
+       * Alanube devuelve este código cuando algo revienta de su lado (a menudo al
+       * validar el .p12 contra Hacienda, o cuando la cédula ya tiene empresa
+       * creada en su cuenta). No hay campo que corregir a ciegas: lo que sirve es
+       * ver qué se mandó y, si todo va completo, escribirles con el código.
+       */
+      if (/EPR500/i.test(JSON.stringify(body))) {
+        detail += '\n\n👉 EPR500 es un error INTERNO de Alanube, no un dato mal puesto de acá.\n'
+          + 'Si el listado de arriba va completo, las causas típicas son:\n'
+          + '• La cédula YA tiene una empresa creada en esa cuenta de Alanube (no deja crearla dos veces).\n'
+          + '• El certificado .p12 no abre con esa clave, está vencido, o no corresponde a esa cédula.\n'
+          + '• Las credenciales de ATV no son las del ambiente activo (producción vs. pruebas).\n'
+          + 'Si todo está bien, es de su lado: escribile a soporte de Alanube con el código EPR500 y la cédula.';
+      }
+
       // Pista concreta para el error más común al dar de alta una empresa: las
       // credenciales de ATV son POR CÉDULA y no son el PIN del .p12.
       if (/invalid credentials|hacienda system/i.test(JSON.stringify(body))) {
