@@ -294,6 +294,14 @@ async function createTenantForRequest(req: any, opts: {
     user_id: authData.user.id, tenant_id: tenantId, role: 'owner', is_default: true,
   }, { onConflict: 'user_id,tenant_id' });
 
+  // El negocio nace con el vendedor como dueño porque el usuario del cliente
+  // todavía no existe. Ya que existe, pasa a su nombre: si no, el vendedor queda
+  // de dueño de todos los negocios que vendió.
+  const { error: ownErr } = await db.from('tenants')
+    .update({ owner_id: authData.user.id, updated_at: new Date().toISOString() })
+    .eq('id', tenantId);
+  if (ownErr) console.warn('[demo] no se pudo pasar la propiedad al cliente:', ownErr.message);
+
   return { tenantId, authId: authData.user.id, email, user, password: pass };
 }
 
@@ -515,6 +523,25 @@ demoRequests.post('/:id/convert', async (c) => {
       const nuevo = await createTenantForRequest(r, {
         ownerId: c.get('userId'), demo: false, planId,
       });
+      // Mismo criterio que al convertir una demo: si se indicaron correo y clave
+      // definitivos, la cuenta nace directamente con ellos.
+      const correoPedido = String(body?.email ?? '').trim().toLowerCase();
+      const clavePedida  = String(body?.password ?? '');
+      if (correoPedido && correoPedido !== nuevo.email) {
+        if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(correoPedido)) {
+          return fail(c, `El correo "${correoPedido}" no tiene un formato válido`, 422);
+        }
+        const { error: aErr } = await db.auth.admin.updateUserById(nuevo.authId, { email: correoPedido, email_confirm: true });
+        if (aErr) return fail(c, `El negocio se creó, pero no se pudo poner el correo: ${aErr.message}`, 400);
+        await db.from('users').update({ email: correoPedido }).eq('id', nuevo.authId);
+        nuevo.email = correoPedido;
+      }
+      if (clavePedida) {
+        if (clavePedida.length < 6) return fail(c, 'La contraseña necesita al menos 6 caracteres', 422);
+        const { error: pErr } = await db.auth.admin.updateUserById(nuevo.authId, { password: clavePedida });
+        if (pErr) return fail(c, `El negocio se creó, pero no se pudo poner la contraseña: ${pErr.message}`, 400);
+        nuevo.password = clavePedida;
+      }
       const { data: directo } = await db.from('demo_requests').update({
         status: 'convertida',
         demo_tenant_id: nuevo.tenantId,
@@ -539,6 +566,45 @@ demoRequests.post('/:id/convert', async (c) => {
       name: cleanName, is_demo: false, plan_id: planId, status: 'active',
     }).eq('id', demoTenant);
     if (tErr) throw new Error(tErr.message);
+
+    /**
+     * El negocio queda a nombre del CLIENTE y, si se pidió, con sus credenciales
+     * definitivas.
+     *
+     * Durante la prueba el acceso es desechable: un usuario inventado y una clave
+     * generada. Al pasar a cliente esa cuenta se vuelve la de verdad —la que va a
+     * recibir los avisos y los comprobantes—, así que este es el momento de
+     * ponerle el correo real y la clave que el cliente eligió. Hacerlo después
+     * significaba buscarlo en otra pantalla y, muchas veces, no hacerlo.
+     */
+    const cuenta = await dueñoDelNegocio(demoTenant, (r as any).demo_user);
+    if (cuenta) {
+      const { error: ownErr } = await db.from('tenants')
+        .update({ owner_id: cuenta.id, updated_at: new Date().toISOString() })
+        .eq('id', demoTenant);
+      if (ownErr) console.warn('[demo] no se pudo pasar la propiedad al cliente:', ownErr.message);
+
+      const nuevoCorreo = String(body?.email ?? '').trim().toLowerCase();
+      const nuevaClave  = String(body?.password ?? '');
+      if (nuevoCorreo && nuevoCorreo !== cuenta.email) {
+        if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(nuevoCorreo)) {
+          return fail(c, `El correo "${nuevoCorreo}" no tiene un formato válido`, 422);
+        }
+        const { data: ocupado } = await db.from('users')
+          .select('id').eq('email', nuevoCorreo).neq('id', cuenta.id).maybeSingle();
+        if (ocupado) return fail(c, `Ya hay otro usuario con el correo ${nuevoCorreo}`, 409);
+
+        const { error: aErr } = await db.auth.admin.updateUserById(cuenta.id, { email: nuevoCorreo, email_confirm: true });
+        if (aErr) return fail(c, `No se pudo cambiar el correo: ${aErr.message}`, 400);
+        await db.from('users').update({ email: nuevoCorreo }).eq('id', cuenta.id);
+        cuenta.email = nuevoCorreo;
+      }
+      if (nuevaClave) {
+        if (nuevaClave.length < 6) return fail(c, 'La contraseña necesita al menos 6 caracteres', 422);
+        const { error: pErr } = await db.auth.admin.updateUserById(cuenta.id, { password: nuevaClave });
+        if (pErr) return fail(c, `No se pudo cambiar la contraseña: ${pErr.message}`, 400);
+      }
+    }
 
     // 2) Suscripción real con el ciclo del plan. La de la prueba se cancela para
     //    que no queden dos activas peleando por la misma fecha de corte.
@@ -565,9 +631,32 @@ demoRequests.post('/:id/convert', async (c) => {
       updated_at: new Date().toISOString(),
     }).eq('id', id).eq('tenant_id', tenantId).select('*').single();
 
-    return ok(c, updated);
+    return ok(c, { ...(updated as any), account: cuenta ?? null });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
+
+/**
+ * Encuentra la cuenta del CLIENTE de un negocio de prueba.
+ *
+ * Se busca por el negocio y no por el correo de la solicitud porque el usuario
+ * pudo haber cambiado de correo durante la prueba. El nombre de usuario de la
+ * solicitud queda como último recurso para las demos viejas.
+ */
+async function dueñoDelNegocio(tenantId: string, demoUser?: string | null):
+  Promise<{ id: string; email: string; full_name?: string } | null> {
+  const { data: porNegocio } = await db.from('users')
+    .select('id, email, full_name, role').eq('tenant_id', tenantId).order('created_at', { ascending: true });
+  const lista = (porNegocio ?? []) as any[];
+  const dueño = lista.find(u => u.role === 'owner') ?? lista[0];
+  if (dueño) return { id: dueño.id, email: dueño.email, full_name: dueño.full_name };
+
+  const usuario = String(demoUser ?? '').trim().toLowerCase();
+  if (!usuario) return null;
+  const correo = usuario.includes('@') ? usuario : `${usuario}@nexoerp.local`;
+  const { data: porCorreo } = await db.from('users')
+    .select('id, email, full_name').eq('email', correo).maybeSingle();
+  return porCorreo ? { id: (porCorreo as any).id, email: (porCorreo as any).email, full_name: (porCorreo as any).full_name } : null;
+}
 
 // POST /:id/credentials — vuelve a generar usuario y clave de la demo.
 demoRequests.post('/:id/credentials', async (c) => {
