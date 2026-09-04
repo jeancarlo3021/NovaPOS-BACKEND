@@ -1049,6 +1049,28 @@ admin.get('/tenants/:id/alanube/verify', async (c) => {
         const apiStatus = main?.company?.apiStatus ?? main?.apiStatus ?? null;
         const cedula = main?.company?.identificationNumber ?? main?.identificationNumber
           ?? main?.company?.identification?.identificationNumber ?? null;
+        /**
+         * La empresa principal de la cuenta es de OTRA cédula.
+         *
+         * Guardarla acá dejaría a este negocio apuntando a la empresa de otro
+         * emisor, y terminaría facturando con la cédula ajena. Se informa el
+         * conflicto en vez de adoptarla: es el dato que explica por qué «Crear
+         * empresa» falla, porque en CRI cada cuenta admite UNA sola principal.
+         */
+        const miCedula = String(cfg.emisor_identification ?? '').replace(/\D/g, '');
+        const suCedula = String(cedula ?? '').replace(/\D/g, '');
+        if (mainId && miCedula && suCedula && miCedula !== suCedula) {
+          return ok(c, { ...out, company_id: null, exists: false, api_status: apiStatus,
+            identification: cedula,
+            note: `⚠️ Esta cuenta de Alanube (${client.env}) YA tiene su empresa principal, `
+              + `pero es de la cédula ${cedula} — NO la de este negocio (${miCedula}).\n\n`
+              + `Por eso «Crear empresa» falla: cada cuenta/token de Alanube admite UNA sola `
+              + `empresa emisora. No se guardó nada, para no dejar este negocio facturando con `
+              + `la cédula ajena.\n\n`
+              + `SOLUCIÓN: creá una cuenta nueva en Alanube para ${miCedula}, copiá su token de `
+              + `${client.env === 'sandbox' ? 'QA/Sandbox' : 'producción'} y pegalo en «Datos de FE» `
+              + `→ «Token de la cuenta de Alanube». Después volvé a «Crear empresa».` });
+        }
         if (mainId) {
           cfg.alanube_env = client.env;
           if (client.env === 'sandbox') cfg.alanube_company_id_sandbox = mainId;
@@ -1458,6 +1480,7 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
       actividades: (payload.economicActivities ?? []).join(', ') || 'FALTA',
       correos: (payload.emails ?? []).join(', ') || 'FALTA',
       telefono: payload.phone?.phoneNumber || payload.phoneNumber || '(vacío)',
+      webhooks: payload.webhooks ? 'sí (recepción)' : 'no',
       certificado_p12: vino(payload.certificate?.content),
       clave_del_p12: vino(payload.certificate?.password),
       usuario_atv: payload.token?.username || 'FALTA',
@@ -1505,8 +1528,42 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
     // idempotente y no deja al usuario trabado.
     let result: any;
     let updatedExisting = false;
+    let variante = '';
     try {
-      result = await client.createCompany(payload);
+      /**
+       * Alta con REINTENTO progresivo.
+       *
+       * Alanube contesta «Something went wrong» (EPR500) sin decir qué campo le
+       * cayó mal, así que no hay forma de corregir a ciegas. Se reintenta
+       * quitando los bloques OPCIONALES —los que Hacienda no exige— uno por
+       * uno: si una variante pasa, el bloque que se quitó ES el culpable, y
+       * queda dicho en la respuesta. Los datos obligatorios (cédula, nombre,
+       * dirección, actividades, certificado y token) nunca se tocan.
+       */
+      const variantes: Array<{ nombre: string; arma: () => Record<string, any> }> = [
+        { nombre: '', arma: () => payload },
+        { nombre: 'webhooks', arma: () => { const { webhooks, ...r } = payload; return r; } },
+        { nombre: 'webhooks + teléfono', arma: () => { const { webhooks, phone, ...r } = payload; return r; } },
+        { nombre: 'webhooks + teléfono + nombre comercial', arma: () => { const { webhooks, phone, tradeName, ...r } = payload; return r; } },
+      ];
+      let ultimo: any = null;
+      for (const v of variantes) {
+        if (v.nombre && !payload.webhooks && v.nombre.startsWith('webhooks')) {
+          // Sin webhooks configurados no hay nada que quitar en esa variante.
+          if (v.nombre === 'webhooks') continue;
+        }
+        try {
+          result = await client.createCompany(v.arma());
+          variante = v.nombre;
+          ultimo = null;
+          break;
+        } catch (e2: any) {
+          ultimo = e2;
+          // Solo tiene sentido reintentar ante el error genérico de su servidor.
+          if (!(e2 instanceof AlanubeError && e2.status >= 500)) break;
+        }
+      }
+      if (ultimo) throw ultimo;
     } catch (e: any) {
       // Como asociada no hay conflicto con la principal: si Alanube igual se queja,
       // se reporta tal cual en vez de adoptar/pisar la empresa de otro emisor.
@@ -1631,7 +1688,17 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
     await db.from('settings').upsert({
       tenant_id: id, type: 'electronic-invoice', config: cfg, updated_at: new Date().toISOString(),
     }, { onConflict: 'tenant_id,type' });
-    return ok(c, { ok: true, company_id: companyId, env: client.env, updated_existing: updatedExisting, result });
+    return ok(c, {
+      ok: true, company_id: companyId, env: client.env, updated_existing: updatedExisting, result,
+      // Si hubo que quitar algo para que Alanube aceptara, se dice cuál fue: ese
+      // bloque es el que su API rechaza y hay que reclamarles.
+      omitido: variante || null,
+      message: variante
+        ? `Empresa creada, pero Alanube solo la aceptó al quitar: ${variante}. `
+          + `Ese bloque es el que su API está rechazando.`
+        : undefined,
+      result_final: undefined,
+    });
   } catch (err: any) {
     const status = err instanceof AlanubeError ? err.status : 500;
     // El CUERPO del error de Alanube trae el detalle real (qué campo rechazó y por
