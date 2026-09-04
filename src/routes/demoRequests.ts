@@ -416,6 +416,29 @@ demoRequests.post('/:id/provision', async (c) => {
       user_id: authData.user.id, tenant_id: createdTenantId, role: 'owner', is_default: true,
     }, { onConflict: 'user_id,tenant_id' });
 
+    /**
+     * El negocio queda a nombre del CLIENTE, no de quien armó la demo.
+     *
+     * Se crea con el vendedor como dueño porque en ese momento el usuario del
+     * cliente todavía no existe —hay que crear el negocio antes de poder colgarle
+     * un usuario—. Pero dejarlo así traía dos problemas de verdad:
+     *
+     *  · El vendedor terminaba siendo dueño de todos los negocios que armó, y
+     *    corregirle el correo se los cambiaba TODOS de una.
+     *  · Al pasar la demo a cliente, el negocio seguía sin ser suyo, y había que
+     *    acordarse de traspasarlo a mano.
+     *
+     * Ahora, apenas existe el usuario del cliente, el negocio pasa a su nombre.
+     */
+    const { error: ownErr } = await db.from('tenants')
+      .update({ owner_id: authData.user.id, updated_at: new Date().toISOString() })
+      .eq('id', createdTenantId);
+    if (ownErr) {
+      // No se aborta el alta por esto: la demo ya funciona y el dueño se puede
+      // corregir después con «Hacer dueño». Pero queda dicho en el registro.
+      console.warn('[demo] no se pudo pasar la propiedad al cliente:', ownErr.message);
+    }
+
     // 4) La solicitud queda entregada, con a dónde apunta y hasta cuándo dura.
     // Se borra sola 30 días después de que venza la prueba, salvo que la
     // conviertan a cliente. Sin esta fecha, las demos se acumulan para siempre.

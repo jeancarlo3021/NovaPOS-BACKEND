@@ -285,6 +285,24 @@ function clientFor(env: AlanubeEnv, tokenOverride?: string | null) {
        */
       return f(`/reports/emissions-per-company?${qs.toString()}`, { method: 'GET', timeoutMs: 16_000 });
     },
+    /**
+     * Total emitido por UNA empresa.
+     *
+     * Es el mismo reporte, pero acotado a una sola empresa por su id. Sirve para
+     * revisar un negocio puntual sin traer la cuenta entera —que es lo que hace
+     * lento y frágil el reporte general— y para cuadrar contra lo que tiene la
+     * base cuando los números no coinciden.
+     */
+    reportEmissionsOfCompany: (
+      companyId: string, from: string, until: string,
+      opts?: { legalStatus?: string; status?: string },
+    ) => {
+      const qs = new URLSearchParams({ dateFrom: from, dateUntil: until });
+      if (opts?.legalStatus) qs.set('legalStatus', opts.legalStatus);
+      if (opts?.status) qs.set('status', opts.status);
+      return f(`/reports/emissions-per-company/${encodeURIComponent(companyId)}?${qs.toString()}`,
+        { method: 'GET', timeoutMs: 16_000 });
+    },
     reportEmissionsByUser: (from: string, until: string, legalStatus: string) => {
       const qs = new URLSearchParams({ dateFrom: from, dateUntil: until, legalStatus });
       return f(`/reports/emissions-by-user?${qs.toString()}`, { method: 'GET', timeoutMs: 16_000 });

@@ -1195,8 +1195,41 @@ export function buildAlanubeCompanyPayload(cfg: Record<string, any>, p12Base64: 
     },
   };
   if (cfg.emisor_commercial_name) payload.tradeName = String(cfg.emisor_commercial_name).trim();
-  if (activity) payload.economicActivities = [activity];
-  if (email) payload.emails = [email];
+
+  /**
+   * VARIAS actividades económicas y VARIOS correos.
+   *
+   * Un contribuyente puede tener más de una actividad inscrita ante Hacienda —una
+   * soda que además alquila salón, una ferretería que también da servicio— y el
+   * comprobante se rechaza si declara una que no le corresponde. Alanube ya
+   * recibe listas; acá se mandaba una sola porque el sistema solo guardaba una.
+   *
+   * `economic_activity_code` sigue siendo la PRINCIPAL, la que va por defecto en
+   * cada factura. Las demás quedan disponibles para elegir.
+   */
+  const actividades = [
+    activity,
+    ...(Array.isArray(cfg.economic_activities) ? cfg.economic_activities : []),
+  ].map((x: any) => String(x ?? '').trim())
+    .filter(Boolean)
+    .filter((v, i, a) => a.indexOf(v) === i);
+  if (actividades.length) payload.economicActivities = actividades;
+
+  const correos = [
+    email,
+    ...(Array.isArray(cfg.emisor_emails) ? cfg.emisor_emails : []),
+  ].map((x: any) => String(x ?? '').trim())
+    .filter(Boolean)
+    .filter((v, i, a) => a.indexOf(v) === i);
+  if (correos.length) payload.emails = correos;
+
+  /**
+   * El teléfono de Hacienda es UNO SOLO.
+   *
+   * El formato del comprobante electrónico admite un único número, así que acá
+   * va el principal. Los demás se guardan igual y salen en el tiquete y en la
+   * factura en PDF, que es donde al cliente le sirven para llamar.
+   */
   if (phone) payload.phone = { countryCode: '506', phoneNumber: phone };
 
   // Webhook de RECEPCIÓN: Alanube nos avisa cuando un proveedor emite un
@@ -2673,6 +2706,157 @@ admin.get('/tenants/:id/users', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+/**
+ * PATCH /tenants/:id — cambia el nombre del negocio.
+ *
+ * El nombre se escribe al crear la cuenta, muchas veces a las apuradas o con un
+ * error de dedo, y después aparece en el tiquete, en la factura, en el menú y en
+ * los correos al cliente. Hasta ahora no había forma de corregirlo sin tocar la
+ * base a mano.
+ *
+ * OJO: el nombre COMERCIAL que sale en el comprobante electrónico es otro campo
+ * —vive en Datos de FE— porque ante Hacienda vale la razón social inscrita, no
+ * como le decimos al negocio en el panel.
+ */
+admin.patch('/tenants/:id', async (c) => {
+  try {
+    const { id } = c.req.param();
+    const b = await c.req.json().catch(() => ({} as any));
+    const nombre = String(b?.name ?? '').trim();
+    if (nombre.length < 2) return fail(c, 'El nombre necesita al menos 2 letras', 422);
+    if (nombre.length > 120) return fail(c, 'El nombre es demasiado largo', 422);
+
+    const { data, error } = await db.from('tenants')
+      .update({ name: nombre, updated_at: new Date().toISOString() })
+      .eq('id', id).select('id, name').maybeSingle();
+    if (error) throw new Error(error.message);
+    if (!data) return fail(c, 'Negocio no encontrado', 404);
+
+    forgetCachedTenant(id);
+    return ok(c, data);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/**
+ * DELETE /tenants/:id/users/:uid — saca a una persona de UN negocio.
+ *
+ * ── Lo que NO hace, a propósito ────────────────────────────────────────────
+ * No borra la cuenta de la persona. El mismo usuario puede estar en varios
+ * negocios —el vendedor que armó tres demos, el contador que atiende a cinco
+ * clientes— y borrarlo lo dejaría sin acceso a todos de una. Acá se corta el
+ * vínculo con ESTE negocio y nada más.
+ *
+ * La cuenta se borra de verdad solo si no le queda ningún otro negocio: si no,
+ * quedaría un usuario que puede iniciar sesión y no llega a ninguna parte.
+ */
+admin.delete('/tenants/:id/users/:uid', async (c) => {
+  try {
+    const { id, uid } = c.req.param();
+
+    const { data: t } = await db.from('tenants')
+      .select('id, owner_id').eq('id', id).maybeSingle();
+    if (!t) return fail(c, 'Negocio no encontrado', 404);
+
+    // El dueño no se puede quitar: dejaría el negocio sin responsable.
+    if ((t as any).owner_id === uid) {
+      return fail(c, 'Es el dueño del negocio. Pasá la propiedad a otra persona antes de quitarlo.', 409);
+    }
+
+    await db.from('user_tenants').delete().eq('user_id', uid).eq('tenant_id', id);
+
+    const { data: otros } = await db.from('user_tenants')
+      .select('tenant_id').eq('user_id', uid).limit(1);
+    const { data: propios } = await db.from('tenants')
+      .select('id').eq('owner_id', uid).limit(1);
+    const leQuedaAlgo = (otros ?? []).length > 0 || (propios ?? []).length > 0;
+
+    if (leQuedaAlgo) {
+      // Si su ficha apuntaba a este negocio, se la mueve al que le quede.
+      const { data: u } = await db.from('users').select('tenant_id').eq('id', uid).maybeSingle();
+      if ((u as any)?.tenant_id === id) {
+        const destino = (otros ?? [])[0]?.tenant_id ?? (propios ?? [])[0]?.id ?? null;
+        await db.from('users').update({ tenant_id: destino }).eq('id', uid);
+      }
+      forgetCachedUser(uid);
+      return ok(c, { ok: true, cuenta_borrada: false,
+        aviso: 'Se le quitó el acceso a este negocio. Su cuenta sigue activa porque tiene otros.' });
+    }
+
+    await db.from('users').delete().eq('id', uid);
+    try { await db.auth.admin.deleteUser(uid); } catch (e: any) {
+      console.warn('[admin users] no se pudo borrar del sistema de acceso:', e?.message);
+    }
+    forgetCachedUser(uid);
+    return ok(c, { ok: true, cuenta_borrada: true,
+      aviso: 'No tenía otros negocios, así que se borró la cuenta completa.' });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/**
+ * POST /tenants/:id/transfer-owner — pasa el negocio a otro usuario.
+ *
+ * ── Para qué ───────────────────────────────────────────────────────────────
+ * El negocio suele crearlo quien lo vende, con su propio usuario. Cuando se
+ * entrega al cliente hay que pasarle la propiedad — y hasta ahora la única
+ * salida era cambiarle el correo a ese usuario, que es peligroso: **ese mismo
+ * usuario puede ser dueño de otros negocios**, y cambiarle el correo se los
+ * cambia todos de una.
+ *
+ * Acá se traspasa el NEGOCIO, no la identidad de nadie: el vendedor conserva su
+ * cuenta y sus otros clientes; el cliente recibe este negocio.
+ *
+ * body: { user_id }  — el usuario que queda como dueño.
+ */
+admin.post('/tenants/:id/transfer-owner', async (c) => {
+  try {
+    const { id } = c.req.param();
+    const b = await c.req.json().catch(() => ({} as any));
+    const nuevoId = String(b?.user_id ?? '').trim();
+    if (!nuevoId) return fail(c, 'Indicá el usuario que queda como dueño', 422);
+
+    const { data: t } = await db.from('tenants')
+      .select('id, name, owner_id').eq('id', id).maybeSingle();
+    if (!t) return fail(c, 'Negocio no encontrado', 404);
+    if ((t as any).owner_id === nuevoId) return fail(c, 'Ese usuario ya es el dueño', 409);
+
+    const { data: nuevo } = await db.from('users')
+      .select('id, email, full_name, tenant_id').eq('id', nuevoId).maybeSingle();
+    if (!nuevo) return fail(c, 'Ese usuario no existe', 404);
+
+    // Tiene que ser de ESTE negocio: pasarle un negocio a alguien de otro le
+    // daría acceso a datos que no le corresponden.
+    if ((nuevo as any).tenant_id && (nuevo as any).tenant_id !== id) {
+      return fail(c, 'Ese usuario pertenece a otro negocio.', 409);
+    }
+
+    const { error } = await db.from('tenants')
+      .update({ owner_id: nuevoId, updated_at: new Date().toISOString() }).eq('id', id);
+    if (error) throw new Error(error.message);
+
+    // El nuevo dueño queda con rol de dueño y con el negocio en su ficha.
+    await db.from('users')
+      .update({ role: 'owner', tenant_id: id, updated_at: new Date().toISOString() })
+      .eq('id', nuevoId);
+    forgetCachedUser(nuevoId);
+
+    /**
+     * Al anterior NO se le quita nada automáticamente.
+     *
+     * Puede seguir necesitando entrar para acompañar al cliente los primeros
+     * días. Quitarle el acceso sin avisar es la clase de decisión que el sistema
+     * no debe tomar sola: se informa quién era y que hay que decidirlo.
+     */
+    forgetCachedTenant(id);
+    return ok(c, {
+      ok: true,
+      negocio: (t as any).name,
+      nuevo_dueño: (nuevo as any).email,
+      anterior_dueño_id: (t as any).owner_id,
+      aviso: 'El dueño anterior conserva su usuario y su acceso. Si ya no debe entrar, quitalo desde Usuarios.',
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // POST /tenants/:id/users — crear un usuario en una empresa (bypass de acceso: es super-admin).
 admin.post('/tenants/:id/users', async (c) => {
   try {
@@ -2833,7 +3017,22 @@ admin.post('/tenants/:id/fe-import', async (c) => {
     const { id: tenantId } = c.req.param();
     const b = await c.req.json().catch(() => ({} as any));
     const clave = String(b?.clave ?? '').replace(/\D/g, '');
-    if (clave.length !== 50) return fail(c, 'La clave debe tener 50 dígitos', 422);
+
+    /**
+     * Sin clave = factura CORRIENTE cargada a mano.
+     *
+     * No todo lo que falta es electrónico: una venta anotada en un talonario, un
+     * tiquete de un sistema viejo, una venta que se hizo fuera del sistema. Esas
+     * no tienen clave de Hacienda y nunca la van a tener, pero forman parte de
+     * los ingresos del negocio y tienen que aparecer en los reportes.
+     *
+     * Exigir la clave dejaba fuera justamente a las más simples de recuperar.
+     */
+    const esCorriente = b?.manual === true && !clave;
+    if (!esCorriente && clave.length !== 50) {
+      return fail(c, 'La clave debe tener 50 dígitos. Si es una factura corriente (sin comprobante '
+        + 'electrónico), marcá «Cargarla a mano» y dejá la clave vacía.', 422);
+    }
 
     /**
      * Si ya está, se COMPLETA en vez de rechazar.
@@ -2844,8 +3043,15 @@ admin.post('/tenants/:id/fe-import', async (c) => {
      * lo que la base ahora impide, con razón. Así que acá se rellena lo que
      * falte y no se toca lo que ya está bien.
      */
-    const { data: yaEsta } = await db.from('invoices')
-      .select('id, invoice_number').eq('tenant_id', tenantId).eq('fe_clave', clave).maybeSingle();
+    const { data: yaEsta } = clave
+      ? await db.from('invoices')
+        .select('id, invoice_number').eq('tenant_id', tenantId).eq('fe_clave', clave).maybeSingle()
+      : { data: null };
+
+    const cfg0 = await loadFEConfig(tenantId);
+    // El tipo va en la clave (posiciones 30-31) y lo usan las dos vías: la carga
+    // a mano y la que baja el documento de Alanube.
+    const tipo = clave ? clave.slice(29, 31) : '';
 
     let completarId: string | null = null;
     if (yaEsta) {
@@ -2857,12 +3063,63 @@ admin.post('/tenants/:id/fe-import', async (c) => {
       completarId = (yaEsta as any).id;
     }
 
-    const cfg = await loadFEConfig(tenantId);
+    /**
+     * Carga A MANO: cuando el comprobante no está en Alanube.
+     *
+     * Pasa con lo emitido desde el ATV o desde otro sistema: existe en Hacienda,
+     * el negocio lo tiene en papel, pero no hay de dónde bajarlo. Sin esta vía,
+     * esas ventas quedaban afuera de los reportes para siempre.
+     *
+     * Se exige el monto porque no hay nada de dónde deducirlo, y queda marcada
+     * como cargada a mano: quien la mire después tiene que saber que sus datos
+     * los escribió una persona, no el comprobante.
+     */
+    if (b?.manual === true) {
+      const totalManual = Number(b?.total ?? 0);
+      if (!(totalManual > 0)) return fail(c, 'Poné el monto total de la factura', 422);
+
+      const ivaManual = Number(b?.tax ?? 0);
+      const numero = String(b?.invoice_number ?? '').trim()
+        || (clave ? clave.slice(31, 41).replace(/^0+/, '') : '')
+        || 'MANUAL';
+      if (esCorriente && !String(b?.invoice_number ?? '').trim()) {
+        return fail(c, 'Poné el número de la factura: sin clave y sin número no hay cómo identificarla.', 422);
+      }
+
+      const { data: creadaManual, error: eManual } = await db.from('invoices').insert({
+        tenant_id: tenantId,
+        invoice_number: numero,
+        subtotal: Math.max(0, totalManual - ivaManual),
+        tax_amount: ivaManual,
+        total: totalManual,
+        payment_method: String(b?.payment_method ?? 'cash'),
+        status: 'completed',
+        // Sin clave es una venta corriente: no se le inventa estado de Hacienda.
+        document_type: esCorriente ? 'ticket'
+          : tipo === '01' ? 'factura_electronica' : 'tiquete_electronico',
+        fe_clave: clave || null,
+        fe_status: esCorriente ? null : 'accepted',
+        fe_environment: esCorriente ? null : (cfg0.environment ?? 'production'),
+        customer_name: b?.customer_name ? String(b.customer_name).slice(0, 120) : null,
+        // De la clave si no se indicó: la fecha de emisión va adentro y es más
+        // confiable que la de hoy.
+        issued_at: b?.issued_at
+          || (clave ? `20${clave.slice(7, 9)}-${clave.slice(5, 7)}-${clave.slice(3, 5)}T12:00:00` : null)
+          || new Date().toISOString(),
+        cash_session_id: null,
+        notes: esCorriente
+          ? 'Factura corriente cargada a mano'
+          : 'Cargada a mano (el comprobante no estaba en Alanube)',
+      }).select('*').single();
+      if (eManual) throw new Error(eManual.message);
+      return ok(c, { ...(creadaManual as any), manual: true, lineas: 0, completa: false }, 201);
+    }
+
+    const cfg = cfg0;
     const companyId = (String(cfg.environment ?? 'production') === 'sandbox'
       ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id;
 
-    // El tipo va en la clave (posiciones 30-31) y decide en qué colección buscar.
-    const tipo = clave.slice(29, 31);
+    // El tipo decide en qué colección buscar dentro de Alanube.
     const kind = tipo === '01' ? 'invoice' : tipo === '03' ? 'credit-note'
       : tipo === '02' ? 'debit-note' : 'ticket';
 
@@ -2997,6 +3254,19 @@ admin.post('/tenants/:id/fe-import', async (c) => {
       : (buscarNumero(doc, /^(totalImpuesto|totalTax)$/i, 4) ?? 0);
 
     const fecha = d?.issueDate ?? d?.fechaEmision ?? d?.date ?? d?.createdAt ?? null;
+
+    /**
+     * La fecha SIEMPRE se puede sacar de la clave.
+     *
+     * Sus posiciones 4 a 9 son día, mes y año de emisión. Sin esto, cuando ni el
+     * XML ni el resumen traían fecha se usaba la de HOY — y una factura de agosto
+     * importada en septiembre se declaraba en el mes equivocado. Un error de mes
+     * en una declaración no lo detecta nadie hasta que Hacienda lo cruza.
+     */
+    const dd = clave.slice(3, 5), mm = clave.slice(5, 7), aa = clave.slice(7, 9);
+    const fechaDeLaClave = /^\d{2}$/.test(dd) && /^\d{2}$/.test(mm) && /^\d{2}$/.test(aa)
+      ? `20${aa}-${mm}-${dd}T12:00:00`
+      : null;
 
     /**
      * Modo CONSULTA: trae el documento y no guarda nada.
@@ -3184,7 +3454,7 @@ admin.post('/tenants/:id/fe-import', async (c) => {
       fe_status: 'accepted',
       fe_environment: cfg.environment ?? 'production',
       fe_response: doc,
-      issued_at: fechaXml ?? fecha ?? new Date().toISOString(),
+      issued_at: fechaXml ?? fecha ?? fechaDeLaClave ?? new Date().toISOString(),
       customer_name: (b?.customer_name ?? clienteXml) ? String(b?.customer_name ?? clienteXml).slice(0, 120) : null,
       // Sin sesión de caja a propósito: esta venta NO ocurrió en una caja de este
       // sistema, y meterla en un arqueo ya cerrado lo descuadraría.
@@ -3427,6 +3697,39 @@ admin.put('/tenants/:id/role-permissions/:role', async (c) => {
 // Para monitoreo del super-admin: ver emisiones y detectar errores rápido.
 // Filtros: ?tenant_id= (una empresa) · ?search= (cliente/consecutivo/clave/factura)
 //          · ?from= ?to= (fecha) · ?status= (error/accepted/sent/rejected)
+/**
+ * GET /alanube/reports/emissions/:companyId — total emitido por UNA empresa.
+ *
+ * El reporte general consulta todas las cuentas y a veces no cabe en el tiempo
+ * del servidor. Este mira una sola empresa: es rápido, y es el que sirve cuando
+ * hay que cuadrar un negocio puntual contra lo que muestra la base.
+ */
+admin.get('/alanube/reports/emissions/:companyId', async (c) => {
+  try {
+    const env = c.req.query('env') === 'sandbox' ? 'sandbox' : 'production';
+    const from = c.req.query('from');
+    const until = c.req.query('until');
+    if (!from || !until) return fail(c, 'Indicá el rango de fechas (desde/hasta).', 422);
+
+    const companyId = c.req.param('companyId');
+    const legalStatus = c.req.query('legalStatus') || undefined;
+    const status = c.req.query('status') || undefined;
+
+    // Si se indica el negocio, se usa SU cuenta de Alanube: una empresa de una
+    // cuenta propia no aparece consultando con el token global.
+    const tenantId = c.req.query('tenant');
+    const client = tenantId
+      ? alanube.forTenant({ ...(await loadFEConfig(tenantId)), environment: env })
+      : alanube.forEnv(env);
+
+    const r: any = await client.reportEmissionsOfCompany(companyId, from, until, { legalStatus, status });
+    return ok(c, r?.data ?? r ?? null);
+  } catch (err: any) {
+    const st = err instanceof AlanubeError ? err.status : 500;
+    return fail(c, err.message, st);
+  }
+});
+
 // GET /alanube/reports/emissions — reportes de Alanube (conteo de comprobantes
 // por empresa y por usuario en un rango de fechas). Usa el token del ambiente
 // (cuenta), así que devuelve TODAS las empresas de la cuenta = todos los tenants.

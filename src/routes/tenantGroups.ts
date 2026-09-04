@@ -636,6 +636,19 @@ export async function createGroupClient(
       await db.from('user_tenants').upsert({
         user_id: authData.user.id, tenant_id: tenantId, role: 'owner', is_default: true,
       }, { onConflict: 'user_id,tenant_id' });
+
+      /**
+       * El negocio queda a nombre del CLIENTE, no de quien lo dio de alta.
+       *
+       * Se crea con el vendedor como dueño porque el usuario del cliente todavía
+       * no existe en ese momento. Si se deja así, el vendedor termina siendo
+       * dueño de todos los negocios que abrió — y como el correo es una sola
+       * identidad, corregirle el suyo se los cambia todos de una.
+       */
+      const { error: ownErr } = await db.from('tenants')
+        .update({ owner_id: authData.user.id, updated_at: new Date().toISOString() })
+        .eq('id', tenantId);
+      if (ownErr) console.warn('[alta cliente] no se pudo pasar la propiedad:', ownErr.message);
     }
 
     return { ok: true, tenant_id: tenantId, user_email: email };

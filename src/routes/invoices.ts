@@ -366,11 +366,32 @@ invoices.post('/', async (c) => {
     // número que ya existe online. Reintentamos regenerando el consecutivo.
     let inv: any = null;
     let invErr: any = null;
-    // Consecutivo unificado: el backend SIEMPRE asigna el número (ignora el que
-    // venga del cliente) para que online y offline compartan una sola secuencia.
-    void invoice_number;
+    /**
+     * El número del TIQUETE se respeta, si está libre.
+     *
+     * ── Por qué ────────────────────────────────────────────────────────────
+     * Una venta sin conexión imprime su tiquete en el momento y el cliente se lo
+     * lleva con un número impreso. Si al sincronizar el servidor le asigna otro,
+     * ese papel deja de corresponderse con nada: no se puede buscar la factura
+     * por el número que el cliente tiene en la mano, ni cuadrar un reclamo.
+     *
+     * Ahora, si la venta trae número propio y ese número está libre, se conserva.
+     * Si ya está tomado —dos cajas offline que coincidieron— se asigna el
+     * siguiente, que es justo lo que el reintento de abajo resuelve.
+     *
+     * Solo se acepta el número cuando viene de una venta offline (`offline_id`):
+     * en una venta en línea el servidor manda, para que nadie pueda elegir el
+     * número de su factura desde afuera.
+     */
     const floor = await consecutivoFloor(tenantId);
     let finalNumber = await nextInvoiceNumber(tenantId, 0, floor);
+
+    const propuesto = String(invoice_number ?? '').replace(/\D/g, '');
+    if (invoiceData.offline_id && propuesto) {
+      const { data: tomado } = await db.from('invoices')
+        .select('id').eq('tenant_id', tenantId).eq('invoice_number', propuesto).maybeSingle();
+      if (!tomado) finalNumber = propuesto;
+    }
 
     for (let attempt = 0; attempt < 8; attempt++) {
       const res = await db.from('invoices').insert({
