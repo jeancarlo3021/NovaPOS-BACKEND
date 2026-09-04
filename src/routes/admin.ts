@@ -1411,6 +1411,9 @@ export function validateEmisorForAlanube(cfg: Record<string, any>, env: 'sandbox
 // POST /tenants/:id/alanube/company — crea/da de alta la empresa en Alanube.
 admin.post('/tenants/:id/alanube/company', async (c) => {
   const { id } = c.req.param();
+  // Resumen de lo enviado a Alanube. Vive fuera del `try` para poder mostrarlo
+  // cuando Alanube responde algo genérico y no dice qué campo rechazó.
+  let datosEnviados: Record<string, any> | null = null;
   try {
     const { data: row } = await db.from('settings').select('config')
       .eq('tenant_id', id).eq('type', 'electronic-invoice').maybeSingle();
@@ -1607,6 +1610,20 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
       walk(body);
       const uniq = [...new Set(parts)].filter(x => x !== err.message);
       if (uniq.length) detail = '\n\nDetalle de Alanube:\n• ' + uniq.join('\n• ');
+
+      /**
+       * Alanube contestó algo GENÉRICO: se muestra qué se le mandó.
+       *
+       * «Something went wrong» no dice qué campo rechazó, y sin ver el envío no
+       * hay forma de saber si faltó la cédula, la ubicación, la actividad o el
+       * certificado. Se listan los campos con lo que llevaban —el certificado y
+       * las contraseñas, solo si venían o no— para poder ubicar el que falta.
+       */
+      if (datosEnviados && /something went wrong|unexpected error/i.test(JSON.stringify(body))) {
+        detail += '\n\nEsto es lo que se le mandó a Alanube:\n'
+          + Object.entries(datosEnviados).map(([k, v]) => `• ${k}: ${v}`).join('\n')
+          + '\n\nRevisá los que digan FALTA o (vacío): son los candidatos.';
+      }
       else detail = '\n\nRespuesta cruda de Alanube:\n' + JSON.stringify(body).slice(0, 1200);
       // Pista concreta para el error más común al dar de alta una empresa: las
       // credenciales de ATV son POR CÉDULA y no son el PIN del .p12.
