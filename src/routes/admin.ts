@@ -1540,12 +1540,42 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
        * queda dicho en la respuesta. Los datos obligatorios (cédula, nombre,
        * dirección, actividades, certificado y token) nunca se tocan.
        */
+      // La actividad puede venir como clase CIIU con subdivisión ("4752.1"), que
+      // es como la muestra el ATV. Su equivalente en el catálogo de Hacienda son
+      // 6 dígitos ("475201"): clase + subdivisión rellenada a dos. Se prueba como
+      // variante porque la actividad es obligatoria y no se puede quitar.
+      const seisDigitos = (a: string) => {
+        const m = /^(\d{4})\.(\d{1,2})$/.exec(a);
+        return m ? m[1] + m[2].padStart(2, '0') : a;
+      };
+      const actsNorm = (payload.economicActivities ?? []).map(seisDigitos);
+      const cambiaActs = JSON.stringify(actsNorm) !== JSON.stringify(payload.economicActivities ?? []);
+
       const variantes: Array<{ nombre: string; arma: () => Record<string, any> }> = [
         { nombre: '', arma: () => payload },
         { nombre: 'webhooks', arma: () => { const { webhooks, ...r } = payload; return r; } },
         { nombre: 'webhooks + teléfono', arma: () => { const { webhooks, phone, ...r } = payload; return r; } },
         { nombre: 'webhooks + teléfono + nombre comercial', arma: () => { const { webhooks, phone, tradeName, ...r } = payload; return r; } },
       ];
+      if (cambiaActs) {
+        variantes.splice(1, 0, {
+          nombre: `actividad en 6 dígitos (${actsNorm.join(', ')})`,
+          arma: () => ({ ...payload, economicActivities: actsNorm }),
+        });
+      }
+      /**
+       * Última variante: SIN las credenciales de ATV.
+       *
+       * Es la única forma de separar las dos causas que quedan cuando todo lo
+       * opcional ya se descartó. Si el alta pasa sin el token, el certificado
+       * está bien y el problema son las credenciales de ATV; si también falla,
+       * el problema es el certificado. La empresa queda creada pero sin poder
+       * emitir hasta cargar el token — se avisa en la respuesta.
+       */
+      variantes.push({
+        nombre: 'credenciales de ATV (¡la empresa queda SIN poder emitir!)',
+        arma: () => { const { webhooks, phone, tradeName, token, ...r } = payload; return r; },
+      });
       let ultimo: any = null;
       for (const v of variantes) {
         if (v.nombre && !payload.webhooks && v.nombre.startsWith('webhooks')) {
@@ -1744,12 +1774,18 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
        * ver qué se mandó y, si todo va completo, escribirles con el código.
        */
       if (/EPR500/i.test(JSON.stringify(body))) {
-        detail += '\n\n👉 EPR500 es un error INTERNO de Alanube, no un dato mal puesto de acá.\n'
-          + 'Si el listado de arriba va completo, las causas típicas son:\n'
-          + '• La cédula YA tiene una empresa creada en esa cuenta de Alanube (no deja crearla dos veces).\n'
-          + '• El certificado .p12 no abre con esa clave, está vencido, o no corresponde a esa cédula.\n'
-          + '• Las credenciales de ATV no son las del ambiente activo (producción vs. pruebas).\n'
-          + 'Si todo está bien, es de su lado: escribile a soporte de Alanube con el código EPR500 y la cédula.';
+        detail += '\n\n👉 EPR500 es un error INTERNO de Alanube, no un dato mal puesto de acá.\n\n'
+          + 'Ya se probó el alta quitando TODO lo opcional (webhooks, teléfono, nombre comercial),\n'
+          + 'con la actividad en los dos formatos, y hasta sin las credenciales de ATV.\n'
+          + 'Todas las variantes fallaron igual, y la cuenta no tiene ninguna empresa creada.\n\n'
+          + 'Quedan dos causas posibles, y ninguna se arregla desde acá:\n'
+          + '• El certificado .p12: no abre con esa clave, está vencido, o no es de esa cédula.\n'
+          + '• Un problema del lado de Alanube.\n\n'
+          + 'QUÉ HACER:\n'
+          + '1) Verificá el .p12 y su PIN (probalo en el ATV de Hacienda: si no abre ahí, es el certificado).\n'
+          + '2) Si el certificado está bien, escribile a soporte de Alanube con: código EPR500,\n'
+          + `   cédula ${datosEnviados?.cedula ?? '(la del emisor)'}, ambiente ${datosEnviados?.ambiente ?? ''}, `
+          + 'y que el alta falla incluso con el payload mínimo.';
       }
 
       // Pista concreta para el error más común al dar de alta una empresa: las
