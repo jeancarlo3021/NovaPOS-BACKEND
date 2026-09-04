@@ -1,0 +1,9 @@
+# Nada de esto se ejecuta en Vercel: solo alarga la subida y el build.
+tests/
+test-results/
+playwright-report/
+playwright.config.ts
+migrations/
+sql/
+whatsapp-worker/
+railway.toml

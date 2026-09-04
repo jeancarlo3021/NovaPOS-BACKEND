@@ -1,5 +1,5 @@
 {
-  "buildCommand": "npm install",
+  "buildCommand": "npm ci --omit=dev",
   "functions": {
     "api/index.ts": { "maxDuration": 30 }
   },
