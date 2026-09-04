@@ -1540,29 +1540,12 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
        * queda dicho en la respuesta. Los datos obligatorios (cédula, nombre,
        * dirección, actividades, certificado y token) nunca se tocan.
        */
-      // La actividad puede venir como clase CIIU con subdivisión ("4752.1"), que
-      // es como la muestra el ATV. Su equivalente en el catálogo de Hacienda son
-      // 6 dígitos ("475201"): clase + subdivisión rellenada a dos. Se prueba como
-      // variante porque la actividad es obligatoria y no se puede quitar.
-      const seisDigitos = (a: string) => {
-        const m = /^(\d{4})\.(\d{1,2})$/.exec(a);
-        return m ? m[1] + m[2].padStart(2, '0') : a;
-      };
-      const actsNorm = (payload.economicActivities ?? []).map(seisDigitos);
-      const cambiaActs = JSON.stringify(actsNorm) !== JSON.stringify(payload.economicActivities ?? []);
-
       const variantes: Array<{ nombre: string; arma: () => Record<string, any> }> = [
         { nombre: '', arma: () => payload },
         { nombre: 'webhooks', arma: () => { const { webhooks, ...r } = payload; return r; } },
         { nombre: 'webhooks + teléfono', arma: () => { const { webhooks, phone, ...r } = payload; return r; } },
         { nombre: 'webhooks + teléfono + nombre comercial', arma: () => { const { webhooks, phone, tradeName, ...r } = payload; return r; } },
       ];
-      if (cambiaActs) {
-        variantes.splice(1, 0, {
-          nombre: `actividad en 6 dígitos (${actsNorm.join(', ')})`,
-          arma: () => ({ ...payload, economicActivities: actsNorm }),
-        });
-      }
       /**
        * Última variante: SIN las credenciales de ATV.
        *
@@ -1576,24 +1559,33 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
         nombre: 'credenciales de ATV (¡la empresa queda SIN poder emitir!)',
         arma: () => { const { webhooks, phone, tradeName, token, ...r } = payload; return r; },
       });
-      let ultimo: any = null;
-      for (const v of variantes) {
-        if (v.nombre && !payload.webhooks && v.nombre.startsWith('webhooks')) {
-          // Sin webhooks configurados no hay nada que quitar en esa variante.
-          if (v.nombre === 'webhooks') continue;
-        }
+      /**
+       * El error que se REPORTA es el del envío real (la primera variante).
+       *
+       * Las demás son sondas: si una falla, solo dice que ESA sonda no sirve, y
+       * mostrar su error taparía el problema verdadero. (Pasó: la sonda que
+       * probaba otro formato de actividad devolvió un 400 de validación y ese
+       * mensaje reemplazó al error original.)
+       */
+      let primerError: any = null;
+      for (const [i, v] of variantes.entries()) {
+        if (v.nombre === 'webhooks' && !payload.webhooks) continue;  // nada que quitar
         try {
           result = await client.createCompany(v.arma());
           variante = v.nombre;
-          ultimo = null;
+          primerError = null;
           break;
         } catch (e2: any) {
-          ultimo = e2;
-          // Solo tiene sentido reintentar ante el error genérico de su servidor.
-          if (!(e2 instanceof AlanubeError && e2.status >= 500)) break;
+          if (i === 0) {
+            primerError = e2;
+            // Un error que NO es del servidor de ellos ya trae el detalle real:
+            // no hay nada que sondear, se reporta tal cual.
+            if (!(e2 instanceof AlanubeError && e2.status >= 500)) break;
+          }
+          // Sonda fallida: se sigue con la siguiente.
         }
       }
-      if (ultimo) throw ultimo;
+      if (primerError) throw primerError;
     } catch (e: any) {
       // Como asociada no hay conflicto con la principal: si Alanube igual se queja,
       // se reporta tal cual en vez de adoptar/pisar la empresa de otro emisor.
