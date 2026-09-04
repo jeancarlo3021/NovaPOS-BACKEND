@@ -3,6 +3,7 @@ import { db, anonClient } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
 import { sendEmail, paymentReceiptEmailHtml, customInvoiceEmailHtml, planFeatureLabels } from '../services/emailService.js';
 import { alanube, AlanubeError, tenantAlanubeToken } from '../services/alanube.js';
+import { revisarP12, resumenP12 } from '../services/p12Check.js';
 import { endOfDay } from '../utils/dateRange.js';
 import { whatsappEnabled, sendTemplate, normalizePhone } from '../services/whatsapp.js';
 import { refreshInvoiceStatus, refreshNoteStatus, emitInvoiceCore, emitCreditNoteCore, configuredNextConsecutivo, computeFeQuota, loadFEConfig } from './hacienda.js';
@@ -1436,6 +1437,8 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
   // Resumen de lo enviado a Alanube. Vive fuera del `try` para poder mostrarlo
   // cuando Alanube responde algo genérico y no dice qué campo rechazó.
   let datosEnviados: Record<string, any> | null = null;
+  // Diagnóstico del certificado, para poder mostrarlo si el alta falla.
+  let certChequeo: string | null = null;
   try {
     const { data: row } = await db.from('settings').select('config')
       .eq('tenant_id', id).eq('type', 'electronic-invoice').maybeSingle();
@@ -1465,6 +1468,16 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
 
     // Resumen de lo enviado, para poder mostrarlo si Alanube contesta genérico.
     // Solo se dice si los secretos venían o no, nunca su contenido.
+    // El .p12 se revisa ACÁ, sin depender de Alanube: si está vencido, la clave
+    // no lo abre o es de otra cédula, el error genérico de ellos ya queda explicado.
+    try {
+      certChequeo = resumenP12(revisarP12(
+        p12Base64,
+        String(payload.certificate?.password ?? ''),
+        String(cfg.emisor_identification ?? ''),
+      ));
+    } catch { certChequeo = null; }
+
     const vino = (v: any) => (v ? 'ok' : 'FALTA');
     datosEnviados = {
       ambiente: client.env,
@@ -1765,16 +1778,20 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
        * creada en su cuenta). No hay campo que corregir a ciegas: lo que sirve es
        * ver qué se mandó y, si todo va completo, escribirles con el código.
        */
+      // Resultado de abrir el .p12 acá mismo: convierte «puede ser el certificado»
+      // en un dato concreto (abre / no abre / vencido / de otra cédula).
+      if (certChequeo) detail += `\n\nREVISIÓN DEL CERTIFICADO (hecha acá, sin Alanube):\n${certChequeo}`;
+
       if (/EPR500/i.test(JSON.stringify(body))) {
         detail += '\n\n👉 EPR500 es un error INTERNO de Alanube, no un dato mal puesto de acá.\n\n'
           + 'Ya se probó el alta quitando TODO lo opcional (webhooks, teléfono, nombre comercial),\n'
           + 'con la actividad en los dos formatos, y hasta sin las credenciales de ATV.\n'
           + 'Todas las variantes fallaron igual, y la cuenta no tiene ninguna empresa creada.\n\n'
-          + 'Quedan dos causas posibles, y ninguna se arregla desde acá:\n'
-          + '• El certificado .p12: no abre con esa clave, está vencido, o no es de esa cédula.\n'
-          + '• Un problema del lado de Alanube.\n\n'
+          + 'Mirá la REVISIÓN DEL CERTIFICADO de arriba:\n'
+          + '• Si marca un ❌, ese es el problema y se arregla acá (renovar el .p12 o corregir su clave).\n'
+          + '• Si sale todo ✅, el certificado está bien y el problema es de Alanube.\n\n'
           + 'QUÉ HACER:\n'
-          + '1) Verificá el .p12 y su PIN (probalo en el ATV de Hacienda: si no abre ahí, es el certificado).\n'
+          + '1) Corregí lo que marque la revisión del certificado, si marcó algo.\n'
           + '2) Si el certificado está bien, escribile a soporte de Alanube con: código EPR500,\n'
           + `   cédula ${datosEnviados?.cedula ?? '(la del emisor)'}, ambiente ${datosEnviados?.ambiente ?? ''}, `
           + 'y que el alta falla incluso con el payload mínimo.';
