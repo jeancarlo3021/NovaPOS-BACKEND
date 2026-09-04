@@ -1515,7 +1515,27 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
       const alreadyMain = e instanceof AlanubeError
         && (e.status === 400 || e.status === 409)
         && /already has (a )?main company|ya tiene.*empresa|main company/i.test(msg);
-      if (!alreadyMain) throw e;
+
+      /**
+       * Alanube contestó un 500 genérico («Something went wrong», EPR500).
+       *
+       * Ese error no dice nada, pero la causa más común es que la cuenta YA
+       * tenga su empresa principal: en vez de responder «already has main
+       * company» revienta. Como no se puede distinguir por el mensaje, se le
+       * PREGUNTA a la cuenta qué empresa tiene. Si hay una, el error deja de
+       * ser un callejón sin salida y se sigue por el camino normal (adoptarla
+       * si es de esta cédula, o avisar que el token es de otro emisor).
+       */
+      if (!alreadyMain) {
+        const genErr = e instanceof AlanubeError && e.status >= 500;
+        if (!genErr) throw e;
+        const sonda = await getMainCompanyInfo(client);
+        if (!sonda.id) {
+          // La cuenta está vacía: el 500 es realmente de Alanube, no un choque
+          // con una empresa existente. Se reporta tal cual.
+          throw e;
+        }
+      }
 
       // Ya existe la 'main' en la cuenta: ubicamos su id y la actualizamos.
       //   1) Del CUERPO del error (Alanube suele devolver el id de la empresa
