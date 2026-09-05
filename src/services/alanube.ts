@@ -257,6 +257,53 @@ function clientFor(env: AlanubeEnv, tokenOverride?: string | null) {
       }
       throw lastErr ?? new AlanubeError('Documento no encontrado', 404);
     },
+    /**
+     * LISTA los comprobantes emitidos hacia un receptor, con su CLAVE.
+     *
+     * Es la única forma de recuperar las claves de comprobantes que están en
+     * Hacienda pero no en la base: el reporte de emisiones solo da conteos, y
+     * para traer un documento hay que saber su clave de antemano.
+     *
+     * Se consulta POR RECEPTOR, no por fecha —así lo expone Alanube—, así que
+     * hay que preguntar cédula por cédula. Cada resultado trae también las notas
+     * de crédito y débito asociadas a ese comprobante.
+     *
+     * `limit` tope 50 y `offset` obligatorio: para traer todo hay que paginar.
+     */
+    queryDocumentsByReceiver: (opts: {
+      identificationType: string;
+      identificationNumber: string;
+      companyId?: string;
+      offset?: number;
+      limit?: number;
+    }) => {
+      const qs = new URLSearchParams({
+        receiverIdentificationType: String(opts.identificationType),
+        receiverIdentificationNumber: String(opts.identificationNumber).replace(/\D/g, ''),
+        offset: String(opts.offset ?? 0),
+        limit: String(Math.min(50, Math.max(1, opts.limit ?? 50))),
+      });
+      if (opts.companyId) qs.set('idCompany', String(opts.companyId));
+      return f(`/documents/query?${qs.toString()}`, { method: 'GET', timeoutMs: 16_000 });
+    },
+    /**
+     * Datos de un comprobante A PARTIR DE SU CLAVE.
+     *
+     * Los demás endpoints piden el id interno de Alanube (el ULID que sale en el
+     * correo). Cuando lo único que se tiene es la clave —lo normal al recuperar
+     * un comprobante que no quedó en la base— este es el único camino.
+     *
+     * Devuelve encabezado, no detalle: total, impuesto, cliente, fecha, tipo y
+     * estado ante Hacienda. Las LÍNEAS no vienen; para eso hace falta el id.
+     */
+    getDocumentStatusByKey: (key: string, companyId?: string) => {
+      // OJO: acá `idCompany` es OBLIGATORIO —Alanube responde «requires property
+      // idCompany» sin él—, al revés que /documents/query, que falla cuando SÍ
+      // se lo mandan. Son dos endpoints con reglas opuestas.
+      const qs = companyId ? `?idCompany=${encodeURIComponent(companyId)}` : '';
+      return f(`/documents/key/${encodeURIComponent(key)}/status${qs}`,
+        { method: 'GET', timeoutMs: 14_000 });
+    },
     sendReceiverMessage: (payload: Record<string, any>, _companyId?: string) => {
       return f('/receiver-messages', { method: 'POST', body: JSON.stringify(payload) });
     },
@@ -271,17 +318,18 @@ function clientFor(env: AlanubeEnv, tokenOverride?: string | null) {
       const qs = new URLSearchParams({ dateFrom: from, dateUntil: until });
       if (opts?.legalStatus) qs.set('legalStatus', opts.legalStatus);
       if (opts?.status) qs.set('status', opts.status);
-      // Los reportes recorren TODOS los documentos del rango, así que tardan más
-      // que una emisión. El tope son 25 s a propósito: la función de Vercel muere
-      // a los 30 s (vercel.json), y conviene cortar ANTES para poder devolver un
-      // mensaje que explique qué pasó en vez del 504 pelado de la plataforma.
       /**
-       * 22 segundos: lo que Alanube necesita de verdad para estos reportes.
+       * 16 segundos por cuenta.
        *
-       * El techo real es el servidor, que muere a los 30 s. Por eso lo que se
-       * arregló NO fue acortar la espera —12 s no le alcanzaban ni a Alanube— sino
-       * que todas las cuentas se consulten A LA VEZ: así el reporte tarda lo que
-       * tarda la cuenta más lenta, no la suma de todas.
+       * Los reportes recorren todos los documentos del rango, así que tardan
+       * bastante más que una emisión. El techo real es el servidor, que muere a
+       * los 30 s (vercel.json) sin decir nada útil. Este tope va por DEBAJO del
+       * plazo del reporte completo (18 s en admin.ts) para que una cuenta lenta
+       * se reporte como «no respondió» en vez de tumbar todo.
+       *
+       * Lo que hizo rápido el reporte no fue acortar la espera —12 s no le
+       * alcanzaban ni a Alanube— sino consultar todas las cuentas A LA VEZ: así
+       * tarda lo que la más lenta, no la suma de todas.
        */
       return f(`/reports/emissions-per-company?${qs.toString()}`, { method: 'GET', timeoutMs: 16_000 });
     },

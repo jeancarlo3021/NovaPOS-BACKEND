@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
+import { sincronizarEmpresaEnAlanube } from './admin.js';
 
 const settings = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
@@ -33,17 +34,40 @@ settings.put('/:type', async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const { type } = c.req.param();
-    const config = await c.req.json();
+    let config = await c.req.json();
 
-    // El AMBIENTE de facturación electrónica solo lo cambia el super-admin.
-    // Si no lo es, se conserva el ambiente ya guardado (no se puede pasar a producción).
-    if (type === 'electronic-invoice') {
-      if (!(await isSuperAdmin(c.get('userId')))) {
-        const { data: prev } = await db.from('settings').select('config')
-          .eq('tenant_id', tenantId).eq('type', type).maybeSingle();
-        const prevEnv = (prev?.config as any)?.environment ?? 'sandbox';
-        config.environment = prevEnv;
+    /**
+     * Facturación electrónica: el negocio solo puede tocar SUS DATOS DE CONTACTO.
+     *
+     * Lo demás —cédula, razón social, ubicación, actividad, certificado, token,
+     * credenciales de ATV, ambiente— tiene que coincidir con lo inscrito ante
+     * Hacienda: cambiarlo no corrige nada, hace que los comprobantes se rechacen
+     * o, peor, que se emitan a nombre equivocado.
+     *
+     * Antes esto se guardaba enviando el objeto ENTERO: quien llamara al API
+     * podía reescribir la cédula o dejar la configuración sin certificado. La
+     * pantalla tenía el cuidado de leer lo guardado y mezclar, pero eso es una
+     * cortesía del cliente, no una protección.
+     *
+     * Ahora, salvo el super-admin, solo pasan los campos de esta lista y se
+     * mezclan sobre lo que ya estaba guardado.
+     */
+    if (type === 'electronic-invoice' && !(await isSuperAdmin(c.get('userId')))) {
+      const { data: prev } = await db.from('settings').select('config')
+        .eq('tenant_id', tenantId).eq('type', type).maybeSingle();
+      const guardado: Record<string, any> = { ...((prev?.config as any) ?? {}) };
+
+      const EDITABLES = [
+        'emisor_commercial_name',   // nombre comercial (rótulo, no la razón social)
+        'emisor_phone', 'emisor_phones',
+        'emisor_address',           // otras señas / dirección exacta
+        'emisor_email', 'emisor_emails',
+        'default_document_type',    // qué comprobante sale por defecto en el POS
+      ];
+      for (const k of EDITABLES) {
+        if (Object.prototype.hasOwnProperty.call(config, k)) guardado[k] = config[k];
       }
+      config = guardado;
     }
 
     const { data, error } = await db.from('settings').upsert({
@@ -52,7 +76,28 @@ settings.put('/:type', async (c) => {
     }, { onConflict: 'tenant_id,type' }).select().single();
 
     if (error) throw new Error(error.message);
-    return ok(c, data?.config ?? config);
+
+    /**
+     * Los datos de contacto también se mandan a Alanube.
+     *
+     * El teléfono, el correo, la dirección y el nombre comercial salen impresos
+     * en el comprobante que emite Alanube, no en el nuestro. Guardarlos solo acá
+     * dejaba el comprobante con los datos viejos, y quien los corrigió no tenía
+     * cómo enterarse: parecía guardado y funcionando.
+     *
+     * Si falla no se pierde el cambio —ya quedó guardado— pero se avisa, porque
+     * hasta que se sincronice el comprobante sigue saliendo con lo anterior.
+     */
+    let alanube: { ok: boolean; motivo?: string } | null = null;
+    if (type === 'electronic-invoice') {
+      alanube = await sincronizarEmpresaEnAlanube(tenantId);
+    }
+
+    return ok(c, {
+      ...(data?.config ?? config),
+      alanube_sync: alanube?.ok ?? null,
+      alanube_motivo: alanube?.ok === false ? alanube.motivo : undefined,
+    });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

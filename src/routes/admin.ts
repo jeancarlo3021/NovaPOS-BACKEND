@@ -896,7 +896,21 @@ admin.put('/tenants/:id/fe-config', async (c) => {
       try { await syncTenantsToCustomers(c.get('tenantId'), id); customer_synced = true; }
       catch (e: any) { console.warn('[fe-config] sync customer:', e?.message); }
     }
-    return ok(c, { ok: true, customer_synced });
+    /**
+     * Los datos también viajan a Alanube.
+     *
+     * Es Alanube quien arma el comprobante: cambiar la dirección o el teléfono
+     * solo en la base dejaba la factura saliendo con los datos viejos, y el
+     * cambio parecía aplicado. Solo se intenta si la empresa ya está creada.
+     */
+    let alanube_synced: boolean | null = null;
+    let alanube_motivo: string | undefined;
+    if (fe) {
+      const r = await sincronizarEmpresaEnAlanube(id);
+      alanube_synced = r.ok;
+      if (!r.ok) alanube_motivo = r.motivo;
+    }
+    return ok(c, { ok: true, customer_synced, alanube_synced, alanube_motivo });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
@@ -1909,6 +1923,52 @@ admin.delete('/tenants/:id/alanube/company', async (c) => {
 
 // PUT /tenants/:id/alanube/company — actualiza la empresa en Alanube (ej. para
 // activar el webhook de recepción sin volver a registrarla).
+/**
+ * Empuja a Alanube los datos de la empresa de un negocio.
+ *
+ * Vive aparte de la ruta del panel porque también se usa cuando el propio
+ * negocio corrige sus datos de contacto: si el cambio se guarda solo acá, el
+ * comprobante sigue saliendo con el teléfono y la dirección viejos, y quien lo
+ * cambió no tiene forma de saberlo.
+ *
+ * Nunca tira la operación que la llamó: devuelve qué pasó y el llamante decide.
+ */
+export async function sincronizarEmpresaEnAlanube(tenantId: string): Promise<{
+  ok: boolean; motivo?: string; company_id?: string;
+}> {
+  try {
+    const { data: row } = await db.from('settings').select('config')
+      .eq('tenant_id', tenantId).eq('type', 'electronic-invoice').maybeSingle();
+    const cfg: Record<string, any> = { ...((row as any)?.config ?? {}) };
+    const isSandbox = String(cfg.environment ?? 'production') === 'sandbox';
+
+    const companyId = (isSandbox ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production)
+      ?? cfg.alanube_company_id;
+    // Sin empresa creada no hay nada que actualizar, y no es un error: el negocio
+    // puede estar configurando sus datos antes de darse de alta.
+    if (!companyId) return { ok: false, motivo: 'La empresa todavía no está creada en Alanube.' };
+
+    const cert = resolveCert(cfg);
+    if (!cert) return { ok: false, motivo: 'Falta el certificado .p12 para poder actualizar la empresa.' };
+    const { data: file, error: dlErr } = await db.storage.from(FE_CERT_BUCKET).download(cert.path);
+    if (dlErr || !file) return { ok: false, motivo: `No se pudo leer el certificado: ${dlErr?.message ?? 'vacío'}` };
+
+    const client = alanube.forTenant(cfg);
+    const payload = buildAlanubeCompanyPayload(cfg, Buffer.from(await file.arrayBuffer()).toString('base64'), client.env);
+    // Al ACTUALIZAR, Alanube no acepta `type` (solo se define al crear).
+    delete (payload as any).type;
+    await client.updateCompany(String(companyId), payload);
+
+    cfg.alanube_updated_at = new Date().toISOString();
+    await db.from('settings').upsert({
+      tenant_id: tenantId, type: 'electronic-invoice', config: cfg, updated_at: new Date().toISOString(),
+    }, { onConflict: 'tenant_id,type' });
+    return { ok: true, company_id: String(companyId) };
+  } catch (e: any) {
+    return { ok: false, motivo: e?.message ?? 'error al actualizar en Alanube' };
+  }
+}
+
 admin.put('/tenants/:id/alanube/company', async (c) => {
   const { id } = c.req.param();
   try {
@@ -3301,7 +3361,54 @@ admin.post('/tenants/:id/fe-import', async (c) => {
           : 'Cargada a mano (el comprobante no estaba en Alanube)',
       }).select('*').single();
       if (eManual) throw new Error(eManual.message);
-      return ok(c, { ...(creadaManual as any), manual: true, lineas: 0, completa: false }, 201);
+
+      /**
+       * LÍNEAS de la carga a mano.
+       *
+       * Cuando el comprobante no está en Alanube o solo se encontró por clave, el
+       * detalle no se puede bajar de ningún lado — pero sí está en el PDF que el
+       * cliente recibió. Aceptarlas acá es lo que convierte una factura recuperada
+       * «solo encabezado» en una factura de verdad, con qué se vendió.
+       */
+      const crudas: any[] = Array.isArray(b?.lines) ? b.lines : [];
+      let lineasManual = 0;
+      if (crudas.length > 0) {
+        const filas = crudas.map((l: any) => {
+          const cant = Number(l?.quantity ?? l?.cantidad ?? 1) || 1;
+          const precio = Number(l?.unit_price ?? l?.precio ?? 0) || 0;
+          const sub = Number(l?.subtotal ?? 0) || Math.round(cant * precio * 100) / 100;
+          return {
+            invoice_id: (creadaManual as any).id,
+            product_id: null,
+            product_name: String(l?.product_name ?? l?.name ?? l?.detalle ?? 'Producto').slice(0, 200),
+            quantity: cant,
+            unit_price: precio,
+            discount_percent: 0,
+            discount_amount: 0,
+            subtotal: sub,
+          };
+        }).filter(f => f.quantity > 0);
+
+        let { error: eLin } = await db.from('invoice_items').insert(filas);
+        // La columna product_name puede no existir (migración 70 sin correr).
+        if (eLin && /product_name/i.test(eLin.message)) {
+          ({ error: eLin } = await db.from('invoice_items')
+            .insert(filas.map(({ product_name, ...r }: any) => r)));
+        }
+        if (eLin) {
+          // La factura ya quedó: no se pierde el encabezado por fallar el detalle.
+          console.warn('[fe-import manual] no se pudieron guardar las líneas:', eLin.message);
+        } else {
+          lineasManual = filas.length;
+        }
+      }
+
+      return ok(c, {
+        ...(creadaManual as any),
+        manual: true,
+        lineas: lineasManual,
+        completa: lineasManual > 0,
+      }, 201);
     }
 
     const cfg = cfg0;
@@ -3377,7 +3484,35 @@ admin.post('/tenants/:id/fe-import', async (c) => {
       if (doc) break;
     }
 
-    if (!doc) {
+    /**
+     * RESPALDO: buscar por CLAVE cuando el id interno no sirve.
+     *
+     * Los endpoints de documento piden el id de Alanube (el ULID del correo).
+     * Al recuperar un comprobante que no quedó en la base casi nunca se tiene
+     * ese id —solo la clave—, y entonces la importación moría con «no devolvió
+     * ese comprobante» aunque Alanube sí lo tuviera.
+     *
+     * La consulta por clave no trae las LÍNEAS (su API no las expone así), pero
+     * sí el encabezado real: total, impuesto, cliente, fecha y tipo. Con eso la
+     * venta entra bien; el detalle se completa después indicando el id.
+     */
+    let porClave: any = null;
+    if (!doc && clave.length === 50) {
+      for (const { nombre, cli } of cuentas) {
+        try {
+          const r: any = await cli.getDocumentStatusByKey(clave, empresas.find(Boolean) ?? undefined);
+          const g = r?.data?.governmentResponse ?? r?.governmentResponse ?? r?.data ?? r;
+          if (g?.key || g?.consecutiveNumber || g?.totalVoucher != null) {
+            porClave = g; clienteOk = cli;
+            break;
+          }
+        } catch (e: any) {
+          intentos.push({ cuenta: `${nombre} (por clave)`, empresa: '—', error: e?.message ?? 'sin detalle' });
+        }
+      }
+    }
+
+    if (!doc && !porClave) {
       return c.json({
         success: false,
         error: 'Alanube no devolvió ese comprobante en ninguna cuenta ni ambiente.',
@@ -3390,7 +3525,11 @@ admin.post('/tenants/:id/fe-import', async (c) => {
       }, 404);
     }
 
-    const d = doc?.document ?? doc?.invoice ?? doc?.ticket ?? doc?.data ?? doc;
+    // Encontrado por clave: se usa esa respuesta como si fuera el documento. Trae
+    // los mismos datos de encabezado, solo que con otros nombres de campo.
+    const d = doc
+      ? (doc?.document ?? doc?.invoice ?? doc?.ticket ?? doc?.data ?? doc)
+      : porClave;
 
     /**
      * Los montos se BUSCAN en toda la respuesta.
@@ -3436,11 +3575,11 @@ admin.post('/tenants/:id/fe-import', async (c) => {
     const manual = Number(b?.total ?? 0);
     const total = manual > 0
       ? manual
-      : (buscarNumero(doc, /^(totalComprobante|totalVoucher|grandTotal)$/i, 4)
+      : (buscarNumero(doc ?? porClave, /^(totalComprobante|totalVoucher|grandTotal)$/i, 4)
         ?? (Number(d?.total) > 0 ? Number(d.total) : 0));
     const iva = Number(b?.tax ?? 0) > 0
       ? Number(b.tax)
-      : (buscarNumero(doc, /^(totalImpuesto|totalTax)$/i, 4) ?? 0);
+      : (buscarNumero(doc ?? porClave, /^(totalImpuesto|totalTax)$/i, 4) ?? 0);
 
     const fecha = d?.issueDate ?? d?.fechaEmision ?? d?.date ?? d?.createdAt ?? null;
 
@@ -3543,14 +3682,34 @@ admin.post('/tenants/:id/fe-import', async (c) => {
     let ivaXml = 0;
     let fechaXml: string | null = null;
 
+    if (!doc) {
+      // Sin id interno no hay XML posible: Alanube no expone el detalle por clave.
+      xmlDiagnostico = 'Encontrado por CLAVE. Alanube no entrega las líneas por clave: '
+        + 'poné el «Consecutivo de Alanube» del correo y volvé a importar para traer el detalle.';
+    }
     try {
+      if (!doc) throw new Error(xmlDiagnostico);
       // Con la MISMA cuenta y empresa que encontró el documento, y pidiendo los
       // archivos en la misma llamada.
-      const conArchivos: any = await clienteOk.getDocument(docId, {
-        kind: kind as any,
-        companyId: empresaOk ?? undefined,
-        documents: 'xml-xmlHacienda',   // guiones, no comas
-      });
+      /**
+       * El XML tiene PLAZO: si tarda, se registra igual el encabezado.
+       *
+       * Bajar el XML es lo más lento de la importación, y el servidor muere a
+       * los 30 s. Sin plazo propio, un XML lento tumbaba toda la importación y
+       * no quedaba nada —ni siquiera el encabezado, que ya se había resuelto—.
+       * Con plazo, la factura entra y el detalle se completa repitiendo.
+       */
+      const PLAZO_XML_MS = 12_000;
+      const conArchivos: any = await Promise.race([
+        clienteOk.getDocument(docId, {
+          kind: kind as any,
+          companyId: empresaOk ?? undefined,
+          documents: 'xml-xmlHacienda',   // guiones, no comas
+        }),
+        new Promise((_, rej) => setTimeout(
+          () => rej(new Error(`Alanube no entregó el XML en ${PLAZO_XML_MS / 1000} segundos`)),
+          PLAZO_XML_MS)),
+      ]);
       const dd = conArchivos?.document ?? conArchivos?.invoice ?? conArchivos?.ticket ?? conArchivos?.data ?? conArchivos;
       const bruto = dd?.xml ?? dd?.xmlSigned ?? dd?.documentXml ?? conArchivos?.xml ?? null;
 
@@ -3612,9 +3771,16 @@ admin.post('/tenants/:id/fe-import', async (c) => {
     // montos y el cliente con lo que dice el XML, sin crear una segunda venta.
     if (completarId) {
       if (!lineas.length) {
+        // El caso normal no es «falló el XML» sino que se encontró por CLAVE, y
+        // por clave Alanube no entrega el detalle. Decir «no se pudo» a secas
+        // deja al usuario reintentando algo que nunca va a funcionar.
         return c.json({
           success: false,
-          error: 'La factura ya está registrada, pero no se pudieron leer sus líneas del XML.',
+          error: doc
+            ? 'La factura ya está registrada, pero no se pudieron leer sus líneas del XML.'
+            : 'La factura ya está registrada con su monto y su fecha. Le faltan las LÍNEAS: '
+              + 'Alanube no entrega el detalle a partir de la clave. Poné el «Consecutivo de '
+              + 'Alanube» que viene en el correo, o subí el PDF del comprobante.',
           pista: xmlDiagnostico,
         }, 422);
       }
@@ -3629,9 +3795,31 @@ admin.post('/tenants/:id/fe-import', async (c) => {
       return ok(c, { ...(act as any), lineas: lineas.length, completa: true, completada: true });
     }
 
+    /**
+     * El número interno puede estar OCUPADO.
+     *
+     * Se usa el consecutivo de Hacienda como número interno porque es el que
+     * reconoce el negocio, pero son dos numeraciones distintas: la interna ya
+     * puede tener ese número usado por una venta corriente. Cuando pasa, el alta
+     * moría con «duplicate key» y la factura no entraba nunca.
+     *
+     * El número interno es solo una etiqueta; el dato fiscal es la clave, que va
+     * completa en `fe_clave`. Así que se busca el primero libre y se deja anotado
+     * a qué consecutivo de Hacienda corresponde.
+     */
+    const numeroBase = consecutivo.replace(/^0+/, '') || consecutivo;
+    let numeroLibre = numeroBase;
+    for (let i = 0; i < 50; i++) {
+      const { data: ocupado } = await db.from('invoices')
+        .select('id').eq('tenant_id', tenantId).eq('invoice_number', numeroLibre).maybeSingle();
+      if (!ocupado) break;
+      numeroLibre = `${numeroBase}-${i + 2}`;
+    }
+    const numeroCambiado = numeroLibre !== numeroBase;
+
     const { data: creada, error } = await db.from('invoices').insert({
       tenant_id: tenantId,
-      invoice_number: consecutivo.replace(/^0+/, '') || consecutivo,
+      invoice_number: numeroLibre,
       // Del XML si está: son los montos exactos que recibió Hacienda.
       subtotal: subtotalXml > 0 ? subtotalXml : Math.max(0, total - (ivaXml || iva)),
       tax_amount: ivaXml > 0 ? ivaXml : iva,
@@ -3648,7 +3836,8 @@ admin.post('/tenants/:id/fe-import', async (c) => {
       // Sin sesión de caja a propósito: esta venta NO ocurrió en una caja de este
       // sistema, y meterla en un arqueo ya cerrado lo descuadraría.
       cash_session_id: b?.cash_session_id ?? null,
-      notes: 'Importada desde Alanube (emitida fuera del sistema)',
+      notes: 'Importada desde Alanube (emitida fuera del sistema)'
+        + (numeroCambiado ? ` · consecutivo de Hacienda ${numeroBase} (el número interno ya estaba usado)` : ''),
     }).select('*').single();
     if (error) throw new Error(error.message);
 
@@ -3887,6 +4076,244 @@ admin.put('/tenants/:id/role-permissions/:role', async (c) => {
 // Filtros: ?tenant_id= (una empresa) · ?search= (cliente/consecutivo/clave/factura)
 //          · ?from= ?to= (fecha) · ?status= (error/accepted/sent/rejected)
 /**
+ * GET /alanube/documents/query — LISTA los comprobantes emitidos a un receptor.
+ *
+ * El reporte de emisiones dice CUÁNTOS hay, no cuáles. Cuando la base tiene
+ * menos comprobantes que Hacienda, esto es lo que permite saber exactamente
+ * cuáles faltan: devuelve la clave de cada uno y marca si ya está en la base.
+ *
+ * Alanube expone esta consulta por RECEPTOR (no por fecha), así que se pregunta
+ * cédula por cédula. Las fechas, si se indican, se filtran acá.
+ */
+admin.get('/alanube/documents/query', async (c) => {
+  try {
+    const env = c.req.query('env') === 'sandbox' ? 'sandbox' : 'production';
+    const cedula = String(c.req.query('cedula') ?? '').replace(/\D/g, '');
+    if (!cedula) return fail(c, 'Indicá la cédula del receptor (el cliente al que se le facturó).', 422);
+    // 01 física · 02 jurídica · 03 DIMEX · 04 NITE. Se deduce por el largo si no viene.
+    const tipo = String(c.req.query('tipo') ?? '').trim() || (cedula.length >= 10 ? '02' : '01');
+
+    const tenantId = c.req.query('tenant');
+    const cfg = tenantId ? await loadFEConfig(tenantId) : null;
+    const client = cfg
+      ? alanube.forTenant({ ...cfg, environment: env })
+      : alanube.forEnv(env);
+    // Empresa emisora del tenant, según el ambiente (misma regla que la emisión).
+    const idDeEmpresa = (x: any) =>
+      (env === 'sandbox' ? x?.alanube_company_id_sandbox : x?.alanube_company_id_production)
+      ?? x?.alanube_company_id ?? '';
+    const companyId = c.req.query('company') || (cfg ? String(idDeEmpresa(cfg)) : '') || undefined;
+
+    /**
+     * `idCompany` se manda, pero NO siempre corresponde.
+     *
+     * Ese parámetro sirve para apuntar a una empresa ASOCIADA dentro de una
+     * cuenta. Cuando el token ya es de la cuenta cuya empresa es la principal,
+     * mandarlo hace que Alanube conteste «Company not found» —el id existe, pero
+     * no como asociada de esa cuenta—. Se intenta con él y, si no aparece, se
+     * repite sin él, que es la consulta correcta para una empresa principal.
+     */
+    const traerPagina = (offset: number, conEmpresa: boolean) =>
+      client.queryDocumentsByReceiver({
+        identificationType: tipo, identificationNumber: cedula,
+        companyId: conEmpresa ? companyId : undefined,
+        offset, limit: 50,
+      });
+
+    // Esta consulta es LENTA de su lado (llega a contestar 504). Si una página
+    // falla por eso, se reintenta UNA vez: casi siempre pasa al segundo intento.
+    const conReintento = async (offset: number, conEmpresa: boolean) => {
+      try { return await traerPagina(offset, conEmpresa); }
+      catch (e: any) {
+        const puertaDeEnlace = e instanceof AlanubeError && [502, 503, 504].includes(e.status);
+        if (!puertaDeEnlace) throw e;
+        return await traerPagina(offset, conEmpresa);
+      }
+    };
+
+    const paginaDe = (r: any): any[] => {
+      const gov = r?.data?.governmentResponse ?? r?.governmentResponse ?? r?.data ?? r;
+      return gov?.documents ?? [];
+    };
+
+    // La primera página se pide UNA sola vez y se reusa: antes se pedía dos
+    // veces (una para probar el idCompany y otra para leerla), y con un endpoint
+    // que ya venía lento eso era la mitad del tiempo tirado.
+    let usoEmpresa = !!companyId;
+    let primera: any;
+    try {
+      primera = await conReintento(0, usoEmpresa);
+    } catch (e: any) {
+      const noExiste = e instanceof AlanubeError
+        && (e.status === 404 || /company not found/i.test(String(e.message)));
+      if (!noExiste || !usoEmpresa) throw e;
+      // El id de empresa no aplica en esta cuenta: se pregunta sin él.
+      usoEmpresa = false;
+      primera = await conReintento(0, false);
+    }
+
+    /**
+     * Plazo propio: mejor una lista PARCIAL que un error de plataforma.
+     *
+     * El servidor muere a los 30 s. Traer diez páginas de una consulta que a
+     * veces tarda quince segundos no cabe, y al reventar no se devolvía nada
+     * —ni siquiera las páginas que sí habían llegado—.
+     */
+    const LIMITE_MS = 20_000;
+    const arranque = Date.now();
+    const docs: any[] = [...paginaDe(primera)];
+    let completo = docs.length < 50;
+    if (!completo) {
+      for (let offset = 50; offset < 500; offset += 50) {
+        if (Date.now() - arranque > LIMITE_MS) break;
+        const page = paginaDe(await conReintento(offset, usoEmpresa));
+        docs.push(...page);
+        if (page.length < 50) { completo = true; break; }
+      }
+    }
+
+    // Filtro de fechas, que la consulta de Alanube no ofrece.
+    const desde = c.req.query('from');
+    const hasta = c.req.query('until');
+    const enRango = (d: any) => {
+      const f = String(d?.date ?? '').slice(0, 10);
+      if (!f) return true;
+      if (desde && f < desde) return false;
+      if (hasta && f > hasta) return false;
+      return true;
+    };
+    const filtrados = docs.filter(enRango);
+
+    /**
+     * Se marca cuáles YA están en la base.
+     *
+     * Es la mitad del trabajo: sin esto habría que ir clave por clave
+     * comparando a mano contra la base para saber qué importar.
+     */
+    const claves = filtrados.map(d => String(d?.key ?? '')).filter(Boolean);
+    const presentes = new Set<string>();
+    if (claves.length > 0) {
+      const { data: enBase } = await db.from('invoices')
+        .select('fe_clave').in('fe_clave', claves);
+      for (const r of enBase ?? []) presentes.add(String((r as any).fe_clave));
+    }
+
+    /**
+     * Para los que FALTAN se pide además el monto.
+     *
+     * La lista de Alanube trae la clave y el receptor, pero no el importe — y sin
+     * importe la importación no puede registrar la venta. La consulta por clave
+     * sí lo devuelve, así que se pide solo para los que no están en la base: en
+     * paralelo y con plazo, porque son una llamada por comprobante.
+     */
+    const faltantes = filtrados.filter(d => !presentes.has(String(d?.key ?? '')));
+    const montos = new Map<string, { total: number; iva: number; estado: string | null }>();
+    // Por qué NO se pudo traer el monto de cada uno: sin esto, «sin monto» no
+    // dice nada y no hay forma de saber qué corregir.
+    const sinMonto = new Map<string, string>();
+    if (faltantes.length > 0) {
+      const PLAZO_MONTOS_MS = 12_000;
+      /**
+       * El monto se busca EN TODA la respuesta, no en una ruta fija.
+       *
+       * Alanube envuelve el resultado distinto según el endpoint y la versión
+       * (`data.governmentResponse`, `data`, o plano), y apuntar a una ruta hacía
+       * fallar la lectura teniendo el dato a la vista.
+       */
+      const buscar = (o: any, re: RegExp, prof = 6): number | null => {
+        if (!o || prof < 0) return null;
+        if (Array.isArray(o)) {
+          for (const x of o) { const v = buscar(x, re, prof - 1); if (v != null) return v; }
+          return null;
+        }
+        if (typeof o !== 'object') return null;
+        for (const [k, v] of Object.entries(o)) {
+          if (re.test(k)) { const n = Number(v); if (Number.isFinite(n) && n > 0) return n; }
+        }
+        for (const v of Object.values(o)) { const r = buscar(v, re, prof - 1); if (r != null) return r; }
+        return null;
+      };
+
+      const pedir = faltantes.slice(0, 30).map(async (d: any) => {
+        const key = String(d.key);
+        // Sin empresa este endpoint no contesta: se dice qué falta en vez de
+        // gastar una llamada y devolver un error de validación críptico.
+        if (!companyId) {
+          sinMonto.set(key, 'falta el id de la empresa en Alanube: ponelo en «Buscar por empresa» arriba.');
+          return;
+        }
+        try {
+          const r: any = await client.getDocumentStatusByKey(key, companyId);
+          const total = buscar(r, /^(totalVoucher|totalComprobante|grandTotal)$/i);
+          if (total) {
+            montos.set(key, {
+              total,
+              iva: buscar(r, /^(totalTax|totalImpuesto)$/i) ?? 0,
+              estado: r?.data?.governmentResponse?.legalStatus ?? r?.governmentResponse?.legalStatus
+                ?? r?.legalStatus ?? null,
+            });
+          } else {
+            // Contestó, pero sin un total reconocible: se anotan las llaves que
+            // sí vinieron, que es lo que dice qué campo leer.
+            const llaves = (o: any, prof = 2): string[] =>
+              !o || typeof o !== 'object' || prof < 0 ? []
+                : Object.entries(o).flatMap(([k, v]) => [k, ...llaves(v, prof - 1)]);
+            sinMonto.set(key, `respondió sin total. Campos: ${[...new Set(llaves(r))].slice(0, 25).join(', ')}`);
+          }
+        } catch (e: any) {
+          sinMonto.set(key, e?.message ?? 'error sin detalle');
+        }
+      });
+      await Promise.race([
+        Promise.allSettled(pedir),
+        new Promise(res => setTimeout(res, PLAZO_MONTOS_MS)),
+      ]);
+    }
+
+    const tipoDeClave = (k: string) => k.length === 50 ? k.slice(29, 31) : '';
+    const salida = filtrados.map((d: any) => {
+      const key = String(d?.key ?? '');
+      return {
+        clave: key,
+        fecha: d?.date ?? null,
+        tipo: tipoDeClave(key),
+        consecutivo: key.length === 50 ? key.slice(31, 41) : null,
+        receptor: d?.receptor?.name ?? null,
+        emisor: d?.sender?.name ?? null,
+        en_base: presentes.has(key),
+        total: montos.get(key)?.total ?? null,
+        iva: montos.get(key)?.iva ?? null,
+        estado_hacienda: montos.get(key)?.estado ?? null,
+        motivo_sin_monto: montos.has(key) ? null : (sinMonto.get(key) ?? null),
+        notas_credito: (d?.creditNotes ?? []).map((n: any) => n?.key).filter(Boolean),
+        notas_debito: (d?.debitNotes ?? []).map((n: any) => n?.key).filter(Boolean),
+      };
+    }).sort((a, b) => String(a.consecutivo).localeCompare(String(b.consecutivo)));
+
+    return ok(c, {
+      cedula, tipo, env,
+      // Con qué se preguntó: sin esto, un resultado vacío no dice si la consulta
+      // fue a la cuenta correcta o simplemente no hay comprobantes.
+      consultado_con: {
+        cuenta: tenantId ? `cuenta propia del negocio ${tenantId}` : 'cuenta general',
+        empresa: usoEmpresa ? companyId : '(sin idCompany — empresa principal)',
+      },
+      // Si se cortó por tiempo, hay que decirlo: una lista incompleta que
+      // parece completa haría creer que un comprobante no existe.
+      completo,
+      aviso: completo ? null
+        : 'La lista quedó INCOMPLETA: Alanube tardó demasiado. Achicá el rango de fechas y repetí.',
+      encontrados: salida.length,
+      faltan_en_base: salida.filter(x => !x.en_base).length,
+      documentos: salida,
+    });
+  } catch (err: any) {
+    const st = err instanceof AlanubeError ? err.status : 500;
+    return fail(c, err.message, st);
+  }
+});
+
+/**
  * GET /alanube/reports/emissions/:companyId — total emitido por UNA empresa.
  *
  * El reporte general consulta todas las cuentas y a veces no cabe en el tiempo
@@ -4051,7 +4478,10 @@ admin.get('/alanube/reports/emissions', async (c) => {
         for (const row of rows) {
           const id = String(row.idCompany ?? row.id ?? '');
           if (id && present.has(id)) continue;
-          perC.push({ ...row, _ownAccount: true });
+          // Se guarda A QUÉ NEGOCIO pertenece la cuenta: sin esto, el detalle
+          // por empresa se consultaba con el token global y no encontraba nada,
+          // porque esta empresa vive en la cuenta propia del negocio.
+          perC.push({ ...row, _ownAccount: true, _tenantId: tenants?.[0] ?? null });
         }
       }
       extraDiag.push({ tenants, ok: true, rows: Array.isArray(rows) ? rows.length : 0 });

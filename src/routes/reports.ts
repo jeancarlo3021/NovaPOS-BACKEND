@@ -310,6 +310,36 @@ reports.get('/taxes/breakdown', async (c) => {
       a.iva[rate]  = (a.iva[rate] ?? 0) + Math.round(base * (rate / 100) * 100) / 100;
       acc.set(it.invoice_id, a);
     }
+    /**
+     * Facturas SIN líneas: se usa el impuesto de la propia factura.
+     *
+     * Una venta importada —emitida fuera del sistema y recuperada después— puede
+     * no tener detalle de productos, porque el proveedor no lo entrega a partir
+     * de la clave. Sin esto aportaba CERO a todas las tarifas aunque su impuesto
+     * estuviera guardado: la venta contaba en el total y desaparecía del
+     * desglose, que es justo lo que se declara.
+     *
+     * La tarifa se deduce de la relación impuesto/base y se ajusta a la tarifa
+     * legal más cercana (13, 4, 2, 1 o exento). No es tan exacto como el detalle
+     * real, pero declarar la venta en su tarifa aproximada es mucho mejor que no
+     * declararla.
+     */
+    const LEGALES = [0, 1, 2, 4, 13];
+    for (const r of rows) {
+      if (acc.has(r.id)) continue;
+      const impuesto = Number(r.tax_amount ?? 0);
+      const base = Number(r.subtotal ?? 0) > 0
+        ? Number(r.subtotal)
+        : Math.max(0, Number(r.total ?? 0) - impuesto);
+      if (base <= 0 && impuesto <= 0) continue;
+
+      const pct = base > 0 ? (impuesto / base) * 100 : 0;
+      const rate = LEGALES.reduce((mejor, x) =>
+        Math.abs(x - pct) < Math.abs(mejor - pct) ? x : mejor, 13);
+      seen.add(rate);
+      acc.set(r.id, { base: { [rate]: base }, iva: { [rate]: impuesto } });
+    }
+
     const rates = [...new Set([0, 1, 2, 4, 13, ...seen])].sort((a, b) => a - b);
 
     const out = rows.map(r => {
@@ -581,7 +611,7 @@ reports.get('/profit', async (c) => {
     const from = c.req.query('from');
     const to   = endOfDay(c.req.query('to'));
 
-    let salesQ = db.from('invoices').select('total, payment_method').eq('tenant_id', tenantId).neq('status', 'cancelled');
+    let salesQ = db.from('invoices').select('id, total, payment_method, issued_at').eq('tenant_id', tenantId).neq('status', 'cancelled');
     if (from) salesQ = salesQ.gte('issued_at', from);
     if (to)   salesQ = salesQ.lte('issued_at', to);
 
@@ -595,7 +625,70 @@ reports.get('/profit', async (c) => {
 
     const revenue  = sales?.reduce((s, r) => s + Number(r.total ?? 0), 0) ?? 0;
     const expenses = exps?.reduce((s, r) => s + Number(r.amount ?? 0), 0) ?? 0;
-    const profit   = revenue - expenses;
+
+    /**
+     * COSTO DE LO VENDIDO: lo que costó la mercadería que salió, no lo que se compró.
+     *
+     * Antes la ganancia era ingresos − gastos, sin costo de mercadería, así que
+     * un negocio que revende veía como ganancia casi todo lo que facturaba. Y el
+     * costo de COMPRAS tampoco sirve: comprar no es vender —una compra grande de
+     * fin de mes hundía la ganancia de ese mes y la inflaba en el siguiente—.
+     *
+     * Se toma el costo del producto por la cantidad vendida en cada línea. Los
+     * productos sin costo cargado quedan en cero y se informan aparte: si no, un
+     * catálogo a medio configurar muestra una ganancia mejor de la real.
+     */
+    const invIds = (sales ?? []).map((r: any) => r.id).filter(Boolean);
+    const lineas: any[] = [];
+    for (let i = 0; i < invIds.length; i += 200) {
+      const chunk = invIds.slice(i, i + 200);
+      const { data } = await fetchAllRows((a, b) => db.from('invoice_items')
+        .select('invoice_id, product_id, quantity').in('invoice_id', chunk)
+        .order('invoice_id', { ascending: true }).range(a, b));
+      lineas.push(...(data ?? []));
+    }
+    const prodIds = [...new Set(lineas.map(l => l.product_id).filter(Boolean))];
+    const costoDe = new Map<string, number>();
+    for (let i = 0; i < prodIds.length; i += 200) {
+      const { data } = await db.from('products')
+        .select('id, cost_price').in('id', prodIds.slice(i, i + 200) as string[]);
+      for (const p of (data ?? []) as any[]) costoDe.set(p.id, Number(p.cost_price ?? 0));
+    }
+
+    const costoPorFactura = new Map<string, number>();
+    let sinCosto = 0;
+    for (const l of lineas) {
+      const costo = l.product_id ? (costoDe.get(l.product_id) ?? 0) : 0;
+      if (!(costo > 0)) sinCosto++;
+      const monto = costo * Number(l.quantity ?? 0);
+      costoPorFactura.set(l.invoice_id, (costoPorFactura.get(l.invoice_id) ?? 0) + monto);
+    }
+    const cogs = [...costoPorFactura.values()].reduce((s, v) => s + v, 0);
+
+    const gross  = revenue - cogs;          // ganancia bruta: venta − costo
+    const profit = gross - expenses;        // neta: bruta − gastos
+
+    // Día por día, para la gráfica y la tabla del detalle.
+    const dias = new Map<string, { date: string; revenue: number; cogs: number; expenses: number }>();
+    const dia = (v: any) => String(v ?? '').slice(0, 10);
+    const tocar = (d: string) => {
+      if (!dias.has(d)) dias.set(d, { date: d, revenue: 0, cogs: 0, expenses: 0 });
+      return dias.get(d)!;
+    };
+    for (const r of (sales ?? []) as any[]) {
+      const d = dia(r.issued_at);
+      if (!d) continue;
+      const x = tocar(d);
+      x.revenue += Number(r.total ?? 0);
+      x.cogs    += costoPorFactura.get(r.id) ?? 0;
+    }
+    for (const e of (exps ?? []) as any[]) {
+      const d = dia((e as any).date);
+      if (d) tocar(d).expenses += Number((e as any).amount ?? 0);
+    }
+    const byDay = [...dias.values()]
+      .sort((a, b) => a.date.localeCompare(b.date))
+      .map(d => ({ ...d, gross: d.revenue - d.cogs, net: d.revenue - d.cogs - d.expenses, activePromos: [] }));
 
     // Revenue by payment method
     const methodMap: Record<string, { label: string; total: number; color: string }> = {
@@ -620,8 +713,15 @@ reports.get('/profit', async (c) => {
     return ok(c, {
       total_revenue: revenue,
       total_expenses: expenses,
+      cogs,
+      gross_profit: gross,
       profit,
       profit_margin: revenue > 0 ? (profit / revenue) * 100 : 0,
+      invoice_count: (sales ?? []).length,
+      // Cuántas líneas se vendieron sin costo cargado: es lo que explica una
+      // ganancia demasiado buena, y sin decirlo nadie lo descubre.
+      lineas_sin_costo: sinCosto,
+      byDay,
       revenueByMethod
     });
   } catch (err: any) { return fail(c, err.message, 500); }

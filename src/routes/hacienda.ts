@@ -823,7 +823,52 @@ export async function emitInvoiceCore(
       return fail(c, msg, 422);
     };
 
-    if (lines.length === 0) return await failFE('La factura no tiene líneas de detalle para emitir.');
+    /**
+     * Sin líneas no se puede emitir — pero el porqué cambia qué hay que hacer.
+     *
+     * «No tiene líneas» tapaba tres situaciones muy distintas: una factura que
+     * quedó sin detalle guardado (no se arregla desde la pantalla, hay que
+     * rehacer la venta), todos los productos marcados «no enviar a Hacienda», o
+     * todo a precio cero. Sin distinguirlas, el usuario reintentaba para siempre.
+     */
+    if (lines.length === 0) {
+      if (allItems.length === 0) {
+        return await failFE(
+          'Esta factura quedó guardada SIN líneas de detalle, así que no hay qué emitir. '
+          + 'No se arregla reintentando: hay que anularla y volver a hacer la venta.');
+      }
+      const excluidos = allItems.filter((it: any) => prodMap.get(it.product_id)?.exclude_from_fe).length;
+      if (excluidos === allItems.length) {
+        return await failFE(
+          `Los ${excluidos} producto(s) de esta factura están marcados «no enviar a Hacienda», `
+          + 'así que no queda ninguna línea para el comprobante. Quitá esa marca en el producto '
+          + 'si sí se debe declarar.');
+      }
+      if (sinPrecio.length > 0) {
+        return await failFE(
+          `Todas las líneas quedaron en precio cero y no se pueden declarar: ${sinPrecio.slice(0, 5).join(', ')}`
+          + `${sinPrecio.length > 5 ? ` y ${sinPrecio.length - 5} más` : ''}.`);
+      }
+      /**
+       * Las líneas ESTÁN guardadas pero ninguna sobrevivió a los filtros.
+       *
+       * Un mensaje genérico acá no sirve: la factura se ve completa en el PDF y
+       * en el tiquete, así que decir «no tiene líneas» parece falso y no deja
+       * nada que corregir. Se muestra el conteo de cada filtro y las primeras
+       * líneas con sus valores, que es lo que dice cuál es el problema.
+       */
+      const conCantidadCero = allItems.filter((it: any) => !(Number(it.quantity) > 0));
+      const muestra = allItems.slice(0, 3).map((it: any) => {
+        const p = prodMap.get(it.product_id) ?? {};
+        return `«${p.name ?? it.product_name ?? '?'}» cant=${it.quantity} precio=${it.unit_price} subtotal=${it.subtotal}`;
+      }).join(' · ');
+      return await failFE(
+        `La factura tiene ${allItems.length} línea(s) guardadas, pero ninguna se puede declarar.\n\n`
+        + `• Con cantidad 0 o inválida: ${conCantidadCero.length}\n`
+        + `• Marcadas «no enviar a Hacienda»: ${excluidos}\n`
+        + `• Sin precio: ${sinPrecio.length}\n\n`
+        + `Primeras líneas: ${muestra}`);
+    }
 
     // Hacienda exige CodigoCABYS en cada línea. Avisar con nombre del producto.
     const sinCabys = lines.filter((l: FELine) => !l.cabys_code);
@@ -1276,7 +1321,19 @@ hacienda.get('/invoices', async (c) => {
       let q = db.from('invoices').select(cols, { count: 'exact' })
         .eq('tenant_id', tenantId)
         .or('document_type.eq.tiquete_electronico,document_type.eq.factura_electronica,fe_clave.not.is.null');
-      if (status) q = q.eq('fe_status', status);
+      /**
+       * `pending` = PENDIENTES DE EMITIR, que no es un valor de `fe_status`.
+       *
+       * Son las ventas marcadas como electrónicas que nunca llegaron a Hacienda:
+       * no tienen clave ni error, así que no aparecían en ningún filtro y solo se
+       * las encontraba revisando la lista entera a ojo. Es justo lo que hay que
+       * vigilar, porque cada una es una venta sin declarar.
+       */
+      if (status === 'pending') {
+        q = q.is('fe_clave', null).is('fe_status', null);
+      } else if (status) {
+        q = q.eq('fe_status', status);
+      }
       if (from) q = q.gte('issued_at', from);
       if (to)   q = q.lte('issued_at', endOfDay(to));
       // Desempate por id: al paginar sin un orden único, las páginas se pisan y
@@ -3000,7 +3057,29 @@ hacienda.post('/emit-direct', async (c) => {
       const stripped = itemRowsFe.map(({ product_name, ...r }: any) => r);
       ({ error: feItemErr } = await db.from('invoice_items').insert(stripped));
     }
-    if (feItemErr) console.warn('[emit-direct] no se pudieron guardar los invoice_items:', feItemErr.message);
+    /**
+     * Sin líneas guardadas NO se emite.
+     *
+     * Antes esto era solo una advertencia en el log: el comprobante salía a
+     * Hacienda con sus líneas —que se arman del carrito, no de la base— pero en
+     * la base quedaba una factura sin detalle. Esa factura no se puede re-emitir
+     * («no tiene líneas de detalle»), no se puede reimprimir completa y no hay
+     * con qué probar qué se vendió. Es preferible cortar acá, borrar la factura
+     * a medias y que el cajero la vuelva a cobrar.
+     */
+    if (feItemErr) {
+      if (inv?.id) {
+        await db.from('invoice_items').delete().eq('invoice_id', inv.id);
+        await db.from('invoices').delete().eq('id', inv.id).eq('tenant_id', tenantId);
+      }
+      return fail(c,
+        'No se pudieron guardar las líneas de la factura, así que no se emitió nada '
+        + `y la factura se deshizo. Volvé a cobrarla.\n\nDetalle: ${feItemErr.message}`, 500);
+    }
+    if (!preview && itemRowsFe.length === 0) {
+      if (inv?.id) await db.from('invoices').delete().eq('id', inv.id).eq('tenant_id', tenantId);
+      return fail(c, 'Ninguna línea del carrito tiene cantidad válida: no hay nada que facturar.', 422);
+    }
 
     // Emitir a Hacienda.
     const emisor = {
