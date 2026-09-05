@@ -232,6 +232,10 @@ async function processXml(
 export interface ReceiveSummary {
   scanned: number; processed: number; duplicates: number;
   noTenant: number; skipped: number; errors: number;
+  /** Se acabó el tiempo antes de recorrer todo el buzón. */
+  cortado_por_tiempo?: boolean;
+  /** Correos de la ventana que quedaron sin mirar en esta corrida. */
+  restantes?: number;
   debug?: any[];
 }
 
@@ -273,8 +277,31 @@ export async function fetchAndProcessReceivedEmails(opts?: { debug?: boolean }):
       // con RECEPTION_DAYS (por defecto 15 días).
       const days = Math.max(1, Number(process.env.RECEPTION_DAYS || 15));
       const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
-      const uids = await client.search({ since }, { uid: true });
-      for (const uid of (uids || [])) {
+      const encontrados = (await client.search({ since }, { uid: true })) || [];
+
+      /**
+       * Del MÁS NUEVO al más viejo, y con tiempo límite.
+       *
+       * El servidor corta la ejecución a los 30 segundos. Este proceso recorría
+       * la ventana entera —quince días de correos— en cada corrida, así que al
+       * crecer el buzón empezó a morir por tiempo agotado: se caía a mitad y no
+       * quedaba constancia de qué había alcanzado a procesar.
+       *
+       * Empezar por los más nuevos hace que cada corrida procese lo que llegó
+       * desde la anterior, que es lo urgente; los viejos ya se procesaron en
+       * corridas pasadas y la deduplicación por clave impide duplicarlos. Con el
+       * plazo, el proceso termina bien y dice cuántos quedaron sin mirar.
+       */
+      const LIMITE_MS = Math.max(5_000, Number(process.env.RECEPTION_BUDGET_MS || 22_000));
+      const arranque = Date.now();
+      const uids = [...encontrados].reverse();
+
+      for (const uid of uids) {
+        if (Date.now() - arranque > LIMITE_MS) {
+          summary.cortado_por_tiempo = true;
+          summary.restantes = uids.length - summary.scanned;
+          break;
+        }
         summary.scanned++;
         try {
           const msg = await client.fetchOne(String(uid), { source: true }, { uid: true });
