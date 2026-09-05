@@ -57,11 +57,27 @@ settings.put('/:type', async (c) => {
         .eq('tenant_id', tenantId).eq('type', type).maybeSingle();
       const guardado: Record<string, any> = { ...((prev?.config as any) ?? {}) };
 
+      /**
+       * Lo que el negocio SÍ conoce y le cambia solo.
+       *
+       * La ubicación y las actividades económicas son datos del contribuyente
+       * que el negocio maneja mejor que nadie —se mudó, abrió una actividad
+       * nueva— y hasta ahora tenía que pedirlos por soporte para algo que sabe
+       * de memoria. Si pone algo que no le corresponde, Hacienda rechaza el
+       * comprobante y el error se ve de inmediato.
+       *
+       * Fuera de la lista queda lo que NO puede cambiar sin romper la emisión:
+       * cédula y razón social (identifican al contribuyente y tienen que
+       * coincidir con el certificado), el certificado y su clave, el token de la
+       * cuenta, las credenciales de ATV y el ambiente.
+       */
       const EDITABLES = [
         'emisor_commercial_name',   // nombre comercial (rótulo, no la razón social)
         'emisor_phone', 'emisor_phones',
         'emisor_address',           // otras señas / dirección exacta
         'emisor_email', 'emisor_emails',
+        'emisor_province_code', 'emisor_canton_code', 'emisor_district_code',
+        'economic_activity_code', 'economic_activities',
         'default_document_type',    // qué comprobante sale por defecto en el POS
       ];
       for (const k of EDITABLES) {
