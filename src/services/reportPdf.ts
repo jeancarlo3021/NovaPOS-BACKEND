@@ -1,12 +1,17 @@
-import PDFDocument from 'pdfkit';
-
 export interface ReportSection { heading?: string; rows: Array<[string, string]>; }
 
-/** Genera un PDF con apariencia de TICKET de cierre y lo devuelve en base64. */
-export function reportPdfBase64(
+/**
+ * Genera un PDF con apariencia de TICKET de cierre y lo devuelve en base64.
+ *
+ * `pdfkit` se carga ACÁ y no arriba: con sus tipografías pesa unos 200 ms de
+ * arranque, y el servidor lo pagaba en cada arranque en frío aunque la petición
+ * no tuviera nada que ver con generar un PDF.
+ */
+export async function reportPdfBase64(
   title: string, subtitle: string, sections: ReportSection[],
 ): Promise<string> {
-  return new Promise((resolve, reject) => {
+  const { default: PDFDocument } = await import('pdfkit');
+  return new Promise<string>((resolve, reject) => {
     // Ancho tipo ticket (~80mm ≈ 226pt). La altura pagina sola si es largo.
     const W = 240;
     const M = 14;

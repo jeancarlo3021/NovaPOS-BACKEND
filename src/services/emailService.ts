@@ -1,14 +1,29 @@
-import { Resend } from 'resend';
+type ResendType = Awaited<ReturnType<typeof importarResend>>;
+const importarResend = async () => (await import('resend')).Resend;
 
-// Cliente Resend. La API key vive solo en el backend (RESEND_API_KEY).
-// Sin key configurada, el servicio queda "deshabilitado" y las llamadas
-// devuelven un error claro en vez de romper.
+// La API key vive solo en el backend (RESEND_API_KEY). Sin key configurada, el
+// servicio queda "deshabilitado" y las llamadas devuelven un error claro.
 const apiKey = process.env.RESEND_API_KEY ?? '';
 const FROM = process.env.EMAIL_FROM || 'ColonClick <onboarding@resend.dev>';
 
-const resend = apiKey ? new Resend(apiKey) : null;
+/**
+ * El cliente se construye al ENVIAR el primer correo, no al arrancar.
+ *
+ * La mayoría de las peticiones no manda correos, y cargar la librería en cada
+ * arranque en frío del servidor era tiempo que pagaban todas por igual.
+ */
+let resend: InstanceType<ResendType> | null = null;
+async function cliente(): Promise<InstanceType<ResendType> | null> {
+  if (!apiKey) return null;
+  if (!resend) {
+    const Resend = await importarResend();
+    resend = new Resend(apiKey);
+  }
+  return resend;
+}
 
-export const emailEnabled = () => !!resend;
+/** ¿Hay correo configurado? No carga la librería: solo mira la key. */
+export const emailEnabled = () => !!apiKey;
 
 export interface SendEmailInput {
   to: string | string[];
@@ -19,7 +34,8 @@ export interface SendEmailInput {
 }
 
 export async function sendEmail(input: SendEmailInput): Promise<{ id: string }> {
-  if (!resend) {
+  const api = await cliente();
+  if (!api) {
     throw new Error('Email no configurado: falta RESEND_API_KEY en el servidor.');
   }
   // Resend adjunta de forma confiable con Buffer; nuestro `content` viene en
@@ -28,7 +44,7 @@ export async function sendEmail(input: SendEmailInput): Promise<{ id: string }> 
     filename: a.filename,
     content: Buffer.from(a.content, 'base64'),
   }));
-  const { data, error } = await resend.emails.send({
+  const { data, error } = await api.emails.send({
     from: FROM,
     to: input.to,
     subject: input.subject,

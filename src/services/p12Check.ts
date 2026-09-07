@@ -1,4 +1,17 @@
-import forge from 'node-forge';
+import type * as Forge from 'node-forge';
+
+/**
+ * `node-forge` se carga solo cuando hay un certificado que revisar.
+ *
+ * Es la única parte del sistema que lee PKCS#12, y revisar un .p12 pasa unas
+ * pocas veces en la vida de un negocio: no hay razón para que pese en el
+ * arranque de todas las peticiones.
+ */
+let forge: typeof Forge;
+async function cargarForge() {
+  if (!forge) forge = (await import('node-forge')).default as any;
+  return forge;
+}
 
 export type P12Check = {
   abre: boolean;              // ¿la clave guardada abre el archivo?
@@ -31,8 +44,9 @@ function cedulaDelSujeto(sujeto: any): string {
  * ellos. Esto lo resuelve sin intermediarios: si el archivo no abre con la clave
  * guardada, o venció, o es de otra cédula, el problema es acá y se dice cuál es.
  */
-export function revisarP12(p12Base64: string, clave: string, cedulaEmisor = ''): P12Check {
-  let p12: forge.pkcs12.Pkcs12Pfx;
+export async function revisarP12(p12Base64: string, clave: string, cedulaEmisor = ''): Promise<P12Check> {
+  const forge = await cargarForge();
+  let p12: Forge.pkcs12.Pkcs12Pfx;
   try {
     const der = forge.util.decode64(p12Base64);
     const asn1 = forge.asn1.fromDer(der);
@@ -51,7 +65,7 @@ export function revisarP12(p12Base64: string, clave: string, cedulaEmisor = ''):
 
   // Primer certificado con datos de vigencia: es el del titular.
   const bags = p12.getBags({ bagType: forge.pki.oids.certBag });
-  const cert = (bags[forge.pki.oids.certBag] ?? []).map(b => b.cert).find(Boolean);
+  const cert = (bags[forge.pki.oids.certBag] ?? []).map((b: any) => b.cert).find(Boolean);
   if (!cert) return { abre: true, motivo: 'Abre con la clave, pero no trae ningún certificado adentro.' };
 
   const desde = cert.validity.notBefore;

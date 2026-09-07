@@ -1485,7 +1485,7 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
     // El .p12 se revisa ACÁ, sin depender de Alanube: si está vencido, la clave
     // no lo abre o es de otra cédula, el error genérico de ellos ya queda explicado.
     try {
-      certChequeo = resumenP12(revisarP12(
+      certChequeo = resumenP12(await revisarP12(
         p12Base64,
         String(payload.certificate?.password ?? ''),
         String(cfg.emisor_identification ?? ''),

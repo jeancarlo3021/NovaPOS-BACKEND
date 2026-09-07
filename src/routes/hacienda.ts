@@ -6,7 +6,8 @@ import { alanube, AlanubeError, tenantAlanubeToken } from '../services/alanube.j
 import { buildAlanubeDocument, DISCOUNT_SHAPES, isDiscountShapeError } from '../services/alanubeDocument.js';
 import { endOfDay } from '../utils/dateRange.js';
 import { sendEmail } from '../services/emailService.js';
-import { parseHaciendaXml } from '../services/receivedEmails.js';
+// Del módulo LIVIANO: el otro arrastra el cliente IMAP y el parser de correo.
+import { parseHaciendaXml } from '../services/haciendaXml.js';
 import { notifyFeError, notifyQuotaLow } from '../services/whatsappNotify.js';
 
 // Próximo consecutivo de orden de compra (mismo formato que el POS: PO-XXXX).
