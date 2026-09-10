@@ -581,7 +581,9 @@ export async function refreshInvoiceStatus(tenantId: string, invoiceId: string):
     const { fe_response, fe_request, ...rest } = patch;   // migración 55 sin correr
     upd = await db.from('invoices').update(rest).eq('id', invoiceId).eq('tenant_id', tenantId);
   }
-  if (fe_status === 'accepted') autoSendComprobanteToCustomer(tenantId, invoiceId);
+  // Con await: en Vercel la función se congela al responder, y un envío
+  // lanzado sin esperar quedaba a medias (sin correo y sin marcar).
+  if (fe_status === 'accepted') await autoSendComprobanteToCustomer(tenantId, invoiceId);
   let consecutivo_bumped: number | null = null;
   if (fe_status === 'rejected' || fe_status === 'error') {
     const docLabel = `#${(inv as any)?.invoice_number ?? invoiceId}`;
@@ -681,6 +683,9 @@ hacienda.post('/refresh-pending', async (c) => {
       .order('issued_at', { ascending: false }).limit(60);
 
     let updated = 0;
+    // Los envíos corren en paralelo con la consulta y se esperan al final: en
+    // Vercel, lo que no termine antes de responder se pierde.
+    const sends: Promise<void>[] = [];
     for (const inv of (pend ?? []) as any[]) {
       try {
         let fe_status = 'sent';
@@ -699,10 +704,11 @@ hacienda.post('/refresh-pending', async (c) => {
           await db.from('invoices').update(patch).eq('id', inv.id).eq('tenant_id', tenantId);
           updated++;
           // Al ACEPTARSE, enviar el comprobante completo al cliente.
-          if (fe_status === 'accepted') autoSendComprobanteToCustomer(tenantId, inv.id);
+          if (fe_status === 'accepted') sends.push(autoSendComprobanteToCustomer(tenantId, inv.id));
         }
       } catch { /* seguir con los demás */ }
     }
+    await Promise.allSettled(sends);
     return ok(c, { updated });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
@@ -2233,10 +2239,11 @@ async function fetchToBase64(url: string): Promise<string | null> {
 }
 
 // Convierte un valor del comprobante a base64: URL → se descarga; XML crudo →
-// base64; ya-base64 → tal cual.
+// base64; ya-base64 → tal cual. El BOM se quita: un XML que empieza con él se
+// tomaba por base64 y el adjunto llegaba corrupto.
 async function toB64(v: any): Promise<string | null> {
   if (!v || typeof v !== 'string') return null;
-  const s = v.trim();
+  const s = v.replace(/^﻿/, '').trim();
   if (!s) return null;
   if (/^https?:\/\//i.test(s)) return await fetchToBase64(s);
   return s.startsWith('<') ? Buffer.from(s, 'utf8').toString('base64') : s;
@@ -2304,11 +2311,17 @@ async function alanubeAttachments(cfg: any, docId: string | null | undefined, ki
   return out;
 }
 
-/** Arma y envía el correo del comprobante electrónico con XML/PDF adjuntos. */
+/**
+ * Arma y envía el correo del comprobante electrónico con XML/PDF adjuntos.
+ *
+ * Devuelve si el correo llevó XML. Sin él no es un comprobante entregado, y
+ * quien llama no debe marcarlo como enviado: si lo marca, la bitácora dice que
+ * el cliente ya lo tiene y nadie lo vuelve a mandar.
+ */
 async function sendComprobanteEmail(to: string, i: {
   invoice_number: string; fe_clave: string; fe_consecutivo?: string | null;
   fe_status?: string | null; total?: number | null; customer_name?: string | null; fe_xml?: string | null;
-}, attachments?: Array<{ filename: string; content: string }>): Promise<void> {
+}, attachments?: Array<{ filename: string; content: string }>): Promise<{ hasXml: boolean }> {
   const estado = i.fe_status === 'accepted' ? 'Aceptado' : i.fe_status === 'rejected' ? 'Rechazado' : 'En proceso';
   const html = `
     <div style="font-family:sans-serif;font-size:14px;color:#222">
@@ -2323,14 +2336,56 @@ async function sendComprobanteEmail(to: string, i: {
   // adjunta el `fe_xml` guardado: al cliente le sirve igual y es el que Hacienda
   // reconoce. Un correo con solo el PDF no es un comprobante entregado.
   const atts = [...(attachments ?? [])];
-  const hasXml = atts.some(a => a.filename.toLowerCase().endsWith('.xml'));
-  if (!hasXml && i.fe_xml) {
-    atts.push({
-      filename: `${i.fe_clave}.xml`,
-      content: Buffer.from(String(i.fe_xml), 'utf8').toString('base64'),
-    });
+  if (!atts.some(a => a.filename.toLowerCase().endsWith('.xml'))) {
+    // `fe_xml` puede estar en XML plano o, en filas viejas, en base64.
+    const saved = await toB64(i.fe_xml);
+    if (saved) atts.push({ filename: `${i.fe_clave}.xml`, content: saved });
   }
   await sendEmail({ to, subject: `Comprobante electrónico ${i.invoice_number}`, html, attachments: atts.length ? atts : undefined });
+  return { hasXml: atts.some(a => a.filename.toLowerCase().endsWith('.xml')) };
+}
+
+/**
+ * Guarda en la factura el XML firmado que entregó Alanube, si aún no estaba.
+ *
+ * `fe_xml` es el respaldo del correo cuando Alanube no responde, pero solo se
+ * llenaba al descargar el XML desde la bitácora: en el primer envío casi nunca
+ * estaba. Ahora se guarda la primera vez que se baja para mandarlo.
+ */
+async function saveFeXml(
+  tenantId: string, invoiceId: string, clave: string,
+  attachments: Array<{ filename: string; content: string }> | undefined, current: string | null | undefined,
+): Promise<void> {
+  if (current) return;
+  const a = attachments?.find(x => x.filename === `${clave}.xml`);
+  if (!a) return;
+  const plain = Buffer.from(a.content, 'base64').toString('utf8');
+  if (!plain.replace(/^﻿/, '').trimStart().startsWith('<')) return;
+  await db.from('invoices').update({ fe_xml: plain })
+    .eq('id', invoiceId).eq('tenant_id', tenantId).then(() => {}, () => {});
+}
+
+/**
+ * Correo de destino del comprobante: primero el de la factura, luego el de la
+ * ficha del cliente. null si no hay o está mal escrito.
+ *
+ * Al cobrar se le pide el correo a quien no está registrado —el que llega una
+ * vez y pide factura— y ese dato queda en la factura, no en una ficha. Manda el
+ * de la factura: es el que dio para ESTA compra.
+ */
+async function customerEmailOf(inv: { customer_email?: string | null; customer_id?: string | null; invoice_number?: string | null }): Promise<string | null> {
+  let email: string | null = String(inv.customer_email ?? '').trim() || null;
+  if (!email && inv.customer_id) {
+    const { data: cust } = await db.from('customers').select('email').eq('id', inv.customer_id).maybeSingle();
+    email = String((cust as any)?.email ?? '').trim() || null;
+  }
+  // Correo mal escrito: mejor no intentarlo y dejarlo dicho, porque el envío
+  // fallido se pierde en el log y nadie se entera de que el cliente no recibió.
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    console.warn(`[FE email] correo inválido en la factura ${inv.invoice_number}: ${email}`);
+    return null;
+  }
+  return email;
 }
 
 // Envía AUTOMÁTICAMENTE el comprobante COMPLETO (XML + respuesta de Hacienda +
@@ -2344,36 +2399,22 @@ export async function autoSendComprobanteToCustomer(tenantId: string, invoiceId:
       .eq('id', invoiceId).eq('tenant_id', tenantId).maybeSingle();
     if (!inv || (inv as any).fe_emailed) return;   // ya se envió
 
-    /**
-     * El correo puede venir de dos lados, y hay que mirar los DOS.
-     *
-     * Antes solo se leía la ficha del cliente. Pero al cobrar se le pide el
-     * correo a quien no está registrado —el que llega una vez y pide factura— y
-     * ese dato queda en la factura, no en una ficha. A esa gente el comprobante
-     * nunca le llegaba, aunque lo hubiera dictado en el mostrador.
-     *
-     * Manda el de la factura: es el que dio para ESTA compra.
-     */
-    let email: string | null = String((inv as any).customer_email ?? '').trim() || null;
-    if (!email && (inv as any).customer_id) {
-      const { data: cust } = await db.from('customers').select('email').eq('id', (inv as any).customer_id).maybeSingle();
-      email = String((cust as any)?.email ?? '').trim() || null;
-    }
-    // Correo mal escrito: mejor no intentarlo y dejarlo dicho, porque el envío
-    // fallido se pierde en el log y nadie se entera de que el cliente no recibió.
-    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      console.warn(`[FE email] correo inválido en la factura ${(inv as any).invoice_number}: ${email}`);
-      email = null;
-    }
+    const email = await customerEmailOf(inv as any);
     if (!email) {
       console.log(`[FE email] la factura ${(inv as any).invoice_number} no tiene correo de destino`);
       return;
     }
     const atts = cfg.fe_provider === 'alanube'
-      ? await alanubeAttachments(cfg, (inv as any).fe_consecutivo, feKindOf((inv as any).document_type), (inv as any).fe_clave,
-          (String(cfg.environment ?? 'production') === 'sandbox' ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id)
+      ? await alanubeAttachments(cfg, (inv as any).fe_consecutivo, feKindOf((inv as any).document_type), (inv as any).fe_clave, feCompanyId(cfg))
       : undefined;
-    await sendComprobanteEmail(email, inv as any, atts);
+    await saveFeXml(tenantId, invoiceId, (inv as any).fe_clave, atts, (inv as any).fe_xml);
+    const { hasXml } = await sendComprobanteEmail(email, inv as any, atts);
+    if (!hasXml) {
+      // Sale lo que hay (el PDF), pero sin marcarla: en la bitácora queda como
+      // no enviada para que se reenvíe cuando Alanube publique el XML.
+      console.warn(`[FE email] la factura ${(inv as any).invoice_number} se envió SIN XML: no se marca como enviada`);
+      return;
+    }
     await db.from('invoices').update({ fe_emailed: true }).eq('id', invoiceId).eq('tenant_id', tenantId).then(() => {}, () => {});
   } catch (e: any) { console.warn('[FE email auto-accept] no se pudo enviar:', e?.message); }
 }
@@ -2387,7 +2428,7 @@ export async function autoSendComprobanteToCustomer(tenantId: string, invoiceId:
  */
 export async function sendComprobanteToCustomer(
   tenantId: string, invoiceId: string, to: string,
-): Promise<void> {
+): Promise<{ hasXml: boolean }> {
   const { data: inv } = await db.from('invoices')
     .select('invoice_number, fe_clave, fe_consecutivo, fe_status, fe_xml, total, customer_name, document_type')
     .eq('id', invoiceId).eq('tenant_id', tenantId).maybeSingle();
@@ -2396,14 +2437,16 @@ export async function sendComprobanteToCustomer(
 
   const cfg = await loadFEConfig(tenantId);
   const attachments = cfg.fe_provider === 'alanube'
-    ? await alanubeAttachments(cfg, i.fe_consecutivo, feKindOf(i.document_type), i.fe_clave,
-        (String(cfg.environment ?? 'production') === 'sandbox'
-          ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id)
+    ? await alanubeAttachments(cfg, i.fe_consecutivo, feKindOf(i.document_type), i.fe_clave, feCompanyId(cfg))
     : undefined;
 
-  await sendComprobanteEmail(to, i, attachments);
-  await db.from('invoices').update({ fe_emailed: true })
-    .eq('id', invoiceId).eq('tenant_id', tenantId).then(() => {}, () => {});
+  await saveFeXml(tenantId, invoiceId, i.fe_clave, attachments, i.fe_xml);
+  const { hasXml } = await sendComprobanteEmail(to, i, attachments);
+  if (hasXml) {
+    await db.from('invoices').update({ fe_emailed: true })
+      .eq('id', invoiceId).eq('tenant_id', tenantId).then(() => {}, () => {});
+  }
+  return { hasXml };
 }
 
 // POST /resend-email — reenvía un comprobante por correo.
@@ -2435,7 +2478,7 @@ export async function autoSendNotaToCustomer(
     const sentCol  = kind === 'nc' ? 'fe_nc_emailed' : 'fe_nd_emailed';
 
     const { data: inv } = await db.from('invoices')
-      .select(`invoice_number, total, customer_name, customer_id, document_type, ${claveCol}, ${docCol}`)
+      .select(`invoice_number, total, customer_name, customer_id, customer_email, document_type, ${claveCol}, ${docCol}`)
       .eq('id', invoiceId).eq('tenant_id', tenantId).maybeSingle();
     const i = inv as any;
     if (!i?.[claveCol]) return;
@@ -2446,25 +2489,29 @@ export async function autoSendNotaToCustomer(
       if ((sent as any)?.[sentCol]) return;
     } catch { /* la columna no existe: se envía igual */ }
 
-    if (!i.customer_id) return;
-    const { data: cust } = await db.from('customers').select('email').eq('id', i.customer_id).maybeSingle();
-    const email = (cust as any)?.email ?? null;
+    // Mismo criterio que la factura: el correo que dio en la compra, y si no,
+    // el de su ficha. Antes solo se miraba la ficha, así que al cliente de paso
+    // nunca le llegaba la nota.
+    const email = await customerEmailOf(i);
     if (!email) return;   // sin correo del cliente no hay a dónde mandarlo
 
     const cfg = await loadFEConfig(tenantId);
     const label = kind === 'nc' ? 'Nota de crédito' : 'Nota de débito';
     const atts = cfg.fe_provider === 'alanube'
       ? await alanubeAttachments(cfg, i[docCol] ?? i[claveCol],
-          (kind === 'nc' ? 'credit-note' : 'debit-note') as any, i[claveCol],
-          (String(cfg.environment ?? 'production') === 'sandbox' ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id)
+          (kind === 'nc' ? 'credit-note' : 'debit-note') as any, i[claveCol], feCompanyId(cfg))
       : undefined;
 
-    await sendComprobanteEmail(email, {
+    const { hasXml } = await sendComprobanteEmail(email, {
       ...i,
       fe_clave: i[claveCol],
       invoice_number: `${label} · ${i.invoice_number}`,
       fe_xml: null,   // el XML guardado es el de la factura, no el de la nota
     } as any, atts);
+    if (!hasXml) {
+      console.warn(`[FE email nota] ${label} de ${i.invoice_number} se envió SIN XML: no se marca como enviada`);
+      return;
+    }
 
     await db.from('invoices').update({ [sentCol]: true })
       .eq('id', invoiceId).eq('tenant_id', tenantId).then(() => {}, () => {});
@@ -2504,14 +2551,14 @@ hacienda.post('/resend-email', async (c) => {
     // Con Alanube, bajamos XML + respuesta de Hacienda + PDF para adjuntar.
     const cfg = await loadFEConfig(tenantId);
     const attachments = cfg.fe_provider === 'alanube'
-      ? await alanubeAttachments(cfg, doc.docId, doc.kind as any, doc.clave,
-          (String(cfg.environment ?? 'production') === 'sandbox' ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id)
+      ? await alanubeAttachments(cfg, doc.docId, doc.kind as any, doc.clave, feCompanyId(cfg))
       : undefined;
+    if (which === 'invoice') await saveFeXml(tenantId, invoice_id, doc.clave, attachments, i.fe_xml);
 
     // El correo se arma con la clave y el número del documento que se manda: si
     // fuera con los de la factura, el cliente recibiría una nota de crédito
     // rotulada como factura y no sabría qué guardar.
-    await sendComprobanteEmail(email, {
+    const { hasXml } = await sendComprobanteEmail(email, {
       ...i,
       fe_clave: doc.clave,
       invoice_number: doc.label ? `${doc.label} · ${i.invoice_number}` : i.invoice_number,
@@ -2520,16 +2567,19 @@ hacienda.post('/resend-email', async (c) => {
     }, attachments);
 
     // Solo la factura marca `fe_emailed`: ese check de la bitácora significa
-    // «el comprobante de venta ya se envió», y una nota no lo reemplaza.
-    if (which === 'invoice') {
+    // «el comprobante de venta ya se envió», y una nota no lo reemplaza. Y solo
+    // si llevó el XML: sin él no es un comprobante entregado.
+    if (which === 'invoice' && hasXml) {
       await db.from('invoices').update({ fe_emailed: true }).eq('id', invoice_id).eq('tenant_id', tenantId).then(() => {}, () => {});
     }
     const hasPdf = (attachments ?? []).some(a => a.filename.toLowerCase().endsWith('.pdf'));
     return ok(c, {
-      ok: true, kind: which, attachments: attachments?.length ?? 0, pdf: hasPdf,
-      // Se avisa en vez de fallar: el correo con los XML ya es un comprobante
-      // entregado, y el PDF es solo su representación gráfica.
-      warning: hasPdf ? null : 'Se envió sin PDF: Alanube no lo devolvió para este documento.',
+      ok: true, kind: which, attachments: attachments?.length ?? 0, pdf: hasPdf, xml: hasXml,
+      // Se avisa en vez de fallar: el correo ya salió con lo que había. Sin PDF
+      // sigue siendo un comprobante; sin XML no, y hay que reenviarlo después.
+      warning: !hasXml
+        ? 'Se envió SIN XML: Alanube no lo devolvió todavía. Reenviá el comprobante más tarde.'
+        : hasPdf ? null : 'Se envió sin PDF: Alanube no lo devolvió para este documento.',
     });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
@@ -2558,8 +2608,8 @@ hacienda.get('/fe-xml/:id', async (c) => {
       ({ xml, xmlHacienda } = await alanubeXmlFiles(
         cfg, String(i.fe_consecutivo), feKindOf(i.document_type), companyId));
     }
-    // Si Alanube todavía no lo publica, sirve el XML guardado.
-    if (!xml && i.fe_xml) xml = Buffer.from(String(i.fe_xml), 'utf8').toString('base64');
+    // Si Alanube todavía no lo publica, sirve el XML guardado (plano o base64).
+    if (!xml && i.fe_xml) xml = await toB64(i.fe_xml);
     else if (xml && !i.fe_xml) {
       // Se guarda la primera vez que se baja: así el comprobante sigue
       // descargable aunque después Alanube no responda.

@@ -149,8 +149,11 @@ email.post('/invoice/:id', async (c) => {
      */
     if ((inv as any).fe_clave) {
       const { sendComprobanteToCustomer } = await import('./hacienda.js');
-      await sendComprobanteToCustomer(tenantId, id, recipient);
-      return ok(c, { to: recipient, comprobante: true });
+      const { hasXml } = await sendComprobanteToCustomer(tenantId, id, recipient);
+      return ok(c, {
+        to: recipient, comprobante: true, xml: hasXml,
+        warning: hasXml ? null : 'Se envió SIN XML: Alanube no lo devolvió todavía. Reenviá el comprobante más tarde.',
+      });
     }
 
     // Nombres de producto

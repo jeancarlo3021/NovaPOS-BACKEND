@@ -99,11 +99,11 @@ webhooks.post('/alanube', async (c) => {
           // Al ACEPTARSE, la nota también se le manda al cliente. Antes solo se
           // enviaba la factura, así que a quien se le anulaba una compra nunca
           // le llegaba el comprobante que la respalda.
+          // Con await: en Vercel la función se congela al responder y el envío
+          // lanzado sin esperar quedaba a medias.
           if (feStatus === 'accepted') {
             const kind = claveCol === 'fe_nc_clave' ? 'nc' : 'nd';
-            for (const n of notes as any[]) {
-              void autoSendNotaToCustomer(n.tenant_id, n.id, kind).catch(() => {});
-            }
+            await Promise.allSettled((notes as any[]).map(n => autoSendNotaToCustomer(n.tenant_id, n.id, kind)));
           }
           if (feStatus === 'rejected' || feStatus === 'error') {
             const govErr = d?.governmentResponse ?? d?.errorMessage
@@ -129,8 +129,10 @@ webhooks.post('/alanube', async (c) => {
         }
         if (res.data && res.data.length) {
           // Al ACEPTARSE, enviar automáticamente el comprobante completo al cliente.
+          // Se espera: sin await, Vercel congelaba la función al responder y el
+          // correo no salía.
           if (feStatus === 'accepted') {
-            for (const row of res.data as any[]) autoSendComprobanteToCustomer(row.tenant_id, row.id);
+            await Promise.allSettled((res.data as any[]).map(row => autoSendComprobanteToCustomer(row.tenant_id, row.id)));
           }
           // RECHAZO por consecutivo ya usado (-99): subir el piso configurado para
           // que la próxima emisión no vuelva a chocar. El estado suele llegar por
