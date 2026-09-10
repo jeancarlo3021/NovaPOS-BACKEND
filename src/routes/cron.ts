@@ -45,4 +45,19 @@ const purgeHandler = async (c: any) => {
 cron.get('/purge-demos', purgeHandler);
 cron.post('/purge-demos', purgeHandler);
 
+// Reintento de correos de comprobantes aceptados que no salieron al primer
+// intento. Pensado para correr cada 15-30 minutos junto a los demás.
+const reintentoCorreosHandler = async (c: any) => {
+  if (!authorized(c)) return fail(c, 'No autorizado', 401);
+  try {
+    const { reintentarCorreosPendientes } = await import('./hacienda.js');
+    const res = await reintentarCorreosPendientes({ limite: 25, presupuestoMs: 22_000 });
+    return ok(c, { ok: true, ...res });
+  } catch (err: any) {
+    return fail(c, err?.message ?? 'Error al reintentar correos', 500);
+  }
+};
+cron.get('/retry-fe-emails', reintentoCorreosHandler);
+cron.post('/retry-fe-emails', reintentoCorreosHandler);
+
 export default cron;

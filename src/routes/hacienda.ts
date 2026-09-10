@@ -671,6 +671,7 @@ hacienda.post('/refresh-status', async (c) => {
 // (fe_status='sent') y actualiza su estado. Para que FE Facturas no se quede en
 // "pendiente" sin que nadie consulte uno por uno.
 hacienda.post('/refresh-pending', async (c) => {
+  const inicio = Date.now();
   try {
     const tenantId = c.get('tenantId');
     const cfg = await loadFEConfig(tenantId);
@@ -685,7 +686,7 @@ hacienda.post('/refresh-pending', async (c) => {
     let updated = 0;
     // Los envíos corren en paralelo con la consulta y se esperan al final: en
     // Vercel, lo que no termine antes de responder se pierde.
-    const sends: Promise<void>[] = [];
+    const sends: Promise<unknown>[] = [];
     for (const inv of (pend ?? []) as any[]) {
       try {
         let fe_status = 'sent';
@@ -709,7 +710,22 @@ hacienda.post('/refresh-pending', async (c) => {
       } catch { /* seguir con los demás */ }
     }
     await Promise.allSettled(sends);
-    return ok(c, { updated });
+
+    /**
+     * De paso, los correos que no salieron al primer intento.
+     *
+     * Es la pantalla donde se mira si un comprobante llegó: tiene sentido que
+     * al actualizarla se reintente lo que quedó pendiente, sin esperar al cron.
+     * Solo con el tiempo que sobre —el servidor corta a los 30 s—.
+     */
+    let correos: Awaited<ReturnType<typeof reintentarCorreosPendientes>> | null = null;
+    const restante = 24_000 - (Date.now() - inicio);
+    if (restante > 4_000) {
+      try {
+        correos = await reintentarCorreosPendientes({ tenantId, limite: 10, presupuestoMs: Math.min(10_000, restante) });
+      } catch (e: any) { console.warn('[refresh-pending] reintento de correos:', e?.message); }
+    }
+    return ok(c, { updated, correos });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
@@ -1020,6 +1036,15 @@ export async function emitInvoiceCore(
 
       // El correo al cliente se envía AUTOMÁTICAMENTE al ACEPTARSE (con los dos
       // XML + PDF), no al emitir — la respuesta de Hacienda aún no existe acá.
+
+      /**
+       * El XML firmado SÍ existe desde ya: se guarda en el momento de la venta.
+       *
+       * Plazo corto a propósito: el cajero está esperando esta respuesta para
+       * seguir cobrando. Si Alanube tarda, se sigue sin él y se guarda al
+       * aceptarse el comprobante.
+       */
+      await guardarXmlDelComprobante(tenantId, invoice_id, { plazoMs: 3_500 });
 
       void maybeNotifyQuotaLow(tenantId);
       return ok(c, {
@@ -2391,18 +2416,63 @@ async function customerEmailOf(inv: { customer_email?: string | null; customer_i
 // Envía AUTOMÁTICAMENTE el comprobante COMPLETO (XML + respuesta de Hacienda +
 // PDF) al correo del cliente. Se llama al ACEPTARSE la factura. Marca la factura
 // para no reenviar (fe_emailed) en cada refresco.
-export async function autoSendComprobanteToCustomer(tenantId: string, invoiceId: string): Promise<void> {
+/**
+ * Guarda el XML firmado del comprobante en la factura, SIN depender del correo.
+ *
+ * Antes el XML solo se guardaba como efecto de mandar el correo al cliente. Si
+ * el cliente no tenía correo —el caso de casi todos los tiquetes—, el envío se
+ * cortaba antes y el XML nunca quedaba guardado: el negocio no tenía copia del
+ * documento que vale ante Hacienda, y dependía de que Alanube lo conservara.
+ *
+ * Solo pide el XML (no el PDF, que es lento y no hace falta guardar). Nunca
+ * rompe a quien la llama: devuelve si quedó guardado.
+ */
+export async function guardarXmlDelComprobante(
+  tenantId: string, invoiceId: string, opts: { plazoMs?: number } = {},
+): Promise<boolean> {
+  try {
+    const { data: inv } = await db.from('invoices')
+      .select('fe_clave, fe_consecutivo, fe_xml, document_type')
+      .eq('id', invoiceId).eq('tenant_id', tenantId).maybeSingle();
+    const i = inv as any;
+    if (!i) return false;
+    if (i.fe_xml) return true;                      // ya estaba guardado
+    if (!i.fe_consecutivo || !i.fe_clave) return false;
+
+    const cfg = await loadFEConfig(tenantId);
+    const plazo = Math.max(1_000, opts.plazoMs ?? 12_000);
+    const archivos = await Promise.race([
+      alanubeXmlFiles(cfg, String(i.fe_consecutivo), feKindOf(i.document_type), feCompanyId(cfg)),
+      new Promise<null>(res => setTimeout(() => res(null), plazo)),
+    ]);
+    if (!archivos?.xml) return false;               // todavía no está publicado
+
+    await saveFeXml(tenantId, invoiceId, String(i.fe_clave),
+      [{ filename: `${i.fe_clave}.xml`, content: archivos.xml }], null);
+    return true;
+  } catch (e: any) {
+    console.warn('[FE xml] no se pudo guardar:', e?.message);
+    return false;
+  }
+}
+
+/** Qué pasó con un envío automático: lo usa el barrido de reintentos. */
+export type ResultadoEnvio = 'enviado' | 'ya_enviado' | 'sin_correo' | 'sin_xml' | 'error';
+
+export async function autoSendComprobanteToCustomer(tenantId: string, invoiceId: string): Promise<ResultadoEnvio> {
   try {
     const cfg = await loadFEConfig(tenantId);
     const { data: inv } = await db.from('invoices')
       .select('invoice_number, fe_clave, fe_consecutivo, fe_status, fe_xml, total, customer_name, customer_id, customer_email, document_type, fe_emailed')
       .eq('id', invoiceId).eq('tenant_id', tenantId).maybeSingle();
-    if (!inv || (inv as any).fe_emailed) return;   // ya se envió
+    if (!inv || (inv as any).fe_emailed) return 'ya_enviado';
 
     const email = await customerEmailOf(inv as any);
     if (!email) {
       console.log(`[FE email] la factura ${(inv as any).invoice_number} no tiene correo de destino`);
-      return;
+      // Que no haya a quién mandarlo no quiere decir que no haya que guardarlo.
+      await guardarXmlDelComprobante(tenantId, invoiceId);
+      return 'sin_correo';
     }
     const atts = cfg.fe_provider === 'alanube'
       ? await alanubeAttachments(cfg, (inv as any).fe_consecutivo, feKindOf((inv as any).document_type), (inv as any).fe_clave, feCompanyId(cfg))
@@ -2413,10 +2483,93 @@ export async function autoSendComprobanteToCustomer(tenantId: string, invoiceId:
       // Sale lo que hay (el PDF), pero sin marcarla: en la bitácora queda como
       // no enviada para que se reenvíe cuando Alanube publique el XML.
       console.warn(`[FE email] la factura ${(inv as any).invoice_number} se envió SIN XML: no se marca como enviada`);
-      return;
+      return 'sin_xml';
     }
     await db.from('invoices').update({ fe_emailed: true }).eq('id', invoiceId).eq('tenant_id', tenantId).then(() => {}, () => {});
-  } catch (e: any) { console.warn('[FE email auto-accept] no se pudo enviar:', e?.message); }
+    return 'enviado';
+  } catch (e: any) {
+    console.warn('[FE email auto-accept] no se pudo enviar:', e?.message);
+    return 'error';
+  }
+}
+
+/**
+ * REINTENTA los correos de comprobantes aceptados que nunca salieron.
+ *
+ * El envío automático ocurre una sola vez, al aceptarse. Si falló —el XML
+ * todavía no estaba, el correo no respondió— nada lo volvía a intentar y el
+ * cliente se quedaba sin su comprobante sin que nadie lo supiera.
+ *
+ * Reglas para no martillar:
+ *   · Solo los de los últimos 10 días: más atrás ya no es un fallo pasajero.
+ *   · Máximo 6 intentos por comprobante, con 20 minutos entre uno y otro.
+ *   · Primero los que nunca se reintentaron; así uno que falla siempre no
+ *     tapa a los demás.
+ *   · Con tiempo límite: termina bien aunque queden pendientes.
+ *
+ * Funciona aunque la migración 111 no se haya corrido: sin las columnas de
+ * intentos, reintenta igual, solo que sin tope.
+ */
+export async function reintentarCorreosPendientes(opts: {
+  tenantId?: string; limite?: number; presupuestoMs?: number;
+} = {}): Promise<{ revisados: number; enviados: number; sin_correo: number; sin_xml: number; errores: number; cortado_por_tiempo: boolean }> {
+  const limite = Math.max(1, Math.min(50, opts.limite ?? 20));
+  const presupuesto = Math.max(2_000, opts.presupuestoMs ?? 20_000);
+  const arranque = Date.now();
+  const res = { revisados: 0, enviados: 0, sin_correo: 0, sin_xml: 0, errores: 0, cortado_por_tiempo: false };
+
+  const desde = new Date(Date.now() - 10 * 86400000).toISOString();
+  const esperaAntes = new Date(Date.now() - 20 * 60000).toISOString();
+
+  const armar = (conIntentos: boolean) => {
+    let q = db.from('invoices')
+      .select('id, tenant_id')
+      .eq('fe_status', 'accepted')
+      .not('fe_clave', 'is', null)
+      // Nulo en las filas anteriores a la columna: también cuenta como no enviado.
+      .or('fe_emailed.is.null,fe_emailed.eq.false')
+      .gte('issued_at', desde);
+    if (opts.tenantId) q = q.eq('tenant_id', opts.tenantId);
+    if (conIntentos) {
+      q = q.lt('fe_email_attempts', 6)
+        .or(`fe_email_last_attempt.is.null,fe_email_last_attempt.lt.${esperaAntes}`)
+        .order('fe_email_last_attempt', { ascending: true, nullsFirst: true });
+    } else {
+      q = q.order('issued_at', { ascending: false });
+    }
+    return q.limit(limite);
+  };
+
+  let conIntentos = true;
+  let { data, error } = await armar(true);
+  if (error && /fe_email_attempts|fe_email_last_attempt/.test(error.message)) {
+    conIntentos = false;                                // migración 111 sin correr
+    ({ data, error } = await armar(false));
+  }
+  if (error) throw new Error(error.message);
+
+  for (const row of (data ?? []) as any[]) {
+    if (Date.now() - arranque > presupuesto) { res.cortado_por_tiempo = true; break; }
+    res.revisados++;
+
+    // El intento se anota ANTES de enviar: si la función muere a mitad, el
+    // próximo barrido igual respeta la espera y no lo repite de inmediato.
+    if (conIntentos) {
+      const { data: actual } = await db.from('invoices')
+        .select('fe_email_attempts').eq('id', row.id).maybeSingle();
+      await db.from('invoices').update({
+        fe_email_attempts: Number((actual as any)?.fe_email_attempts ?? 0) + 1,
+        fe_email_last_attempt: new Date().toISOString(),
+      }).eq('id', row.id).then(() => {}, () => {});
+    }
+
+    const r = await autoSendComprobanteToCustomer(row.tenant_id, row.id);
+    if (r === 'enviado') res.enviados++;
+    else if (r === 'sin_correo') res.sin_correo++;
+    else if (r === 'sin_xml') res.sin_xml++;
+    else if (r === 'error') res.errores++;
+  }
+  return res;
 }
 
 /**
@@ -3190,6 +3343,8 @@ hacienda.post('/emit-direct', async (c) => {
         const claveDig = String(clave ?? '').replace(/\D/g, '');
         const consecutivo = claveDig.length === 50 ? claveDig.slice(21, 41) : null;
         // El correo al cliente sale automáticamente al ACEPTARSE (dos XML + PDF).
+        // El XML firmado se guarda ya, con plazo corto: el cajero espera esto.
+        await guardarXmlDelComprobante(tenantId, inv.id, { plazoMs: 3_500 });
         return ok(c, { ok: true, provider: 'alanube', invoice_id: inv.id, invoice_number: inv.invoice_number, clave, consecutivo, alanube_doc_id: docId, alanube_status: alanubeStatus, tipo: tipoDoc });
       } catch (emitErr: any) {
         const msg = emitErr instanceof AlanubeError ? friendlyAlanubeError(emitErr.message) : (emitErr?.message ?? 'Error emitiendo con Alanube');
