@@ -1184,6 +1184,36 @@ admin.get('/tenants/:id/fe-test', async (c) => {
 const provDigit = (s: any) => (String(s ?? '').replace(/\D/g, '').replace(/^0+/, '') || '').slice(0, 1);
 const pad2Code = (s: any) => { const d = String(s ?? '').replace(/\D/g, ''); return d ? d.padStart(2, '0').slice(-2) : ''; };
 
+/**
+ * Deja el código de actividad en el ÚNICO formato que acepta el catálogo.
+ *
+ * El catálogo son cuatro dígitos, un punto y uno más: «4752.1». Pero el ATV lo
+ * muestra de varias maneras y la gente lo copia como puede — con el nombre de la
+ * actividad pegado, con guiones, o en seis dígitos seguidos («475201»). Cualquiera
+ * de esas se rechaza, y el error que devuelve el proveedor es la lista completa
+ * de trescientos códigos: ilegible, y sin decir cuál de los que mandamos falló.
+ *
+ * Se limpia lo que se pueda arreglar sin adivinar; lo que no, se devuelve vacío
+ * para que la validación lo señale por nombre.
+ */
+export function normalizarActividad(valor: any): string {
+  const texto = String(valor ?? '').trim();
+  if (!texto) return '';
+
+  // Ya viene bien.
+  if (/^\d{4}\.\d$/.test(texto)) return texto;
+
+  // Con el nombre pegado: «4752.1 - Venta de artículos de ferretería».
+  const conNombre = /^(\d{4})[.\-\s]?(\d)\b/.exec(texto);
+  if (conNombre) return `${conNombre[1]}.${conNombre[2]}`;
+
+  // Seis dígitos seguidos: clase (4) + subdivisión (2). «475201» → «4752.1».
+  const seis = /^(\d{4})(\d{2})$/.exec(texto.replace(/\D/g, ''));
+  if (seis) return `${seis[1]}.${Number(seis[2])}`;
+
+  return '';
+}
+
 export function buildAlanubeCompanyPayload(cfg: Record<string, any>, p12Base64: string, env: 'sandbox' | 'production' = 'production') {
   const others = String(cfg.emisor_address ?? '').trim();
   const activity = String(cfg.economic_activity_code ?? '').trim();
@@ -1247,7 +1277,7 @@ export function buildAlanubeCompanyPayload(cfg: Record<string, any>, p12Base64: 
   const actividades = [
     activity,
     ...(Array.isArray(cfg.economic_activities) ? cfg.economic_activities : []),
-  ].map((x: any) => String(x ?? '').trim())
+  ].map((x: any) => normalizarActividad(x))
     .filter(Boolean)
     .filter((v, i, a) => a.indexOf(v) === i);
   if (actividades.length) payload.economicActivities = actividades;
@@ -1426,7 +1456,29 @@ export function validateEmisorForAlanube(cfg: Record<string, any>, env: 'sandbox
   if (!distr || !/^\d{2}$/.test(String(distr))) p.push('Distrito: falta o inválido (2 dígitos).');
   if (!String(cfg.emisor_address ?? '').trim()) p.push('Otras señas (dirección exacta): vacío.');
 
-  if (!String(cfg.economic_activity_code ?? '').trim()) p.push('Actividad económica: vacía (código de Hacienda requerido).');
+  /**
+   * Las actividades se revisan UNA POR UNA y por su valor.
+   *
+   * Cuando el formato no sirve, el proveedor responde con la lista completa de
+   * trescientos códigos y un «economicActivities[0]» que no dice cuál es el
+   * valor ofensivo. Revisarlo acá permite nombrarlo y decir cómo se escribe.
+   */
+  const actividadPrincipal = String(cfg.economic_activity_code ?? '').trim();
+  if (!actividadPrincipal) {
+    p.push('Actividad económica: vacía (código de Hacienda requerido).');
+  }
+  const todasLasActividades = [
+    actividadPrincipal,
+    ...(Array.isArray(cfg.economic_activities) ? cfg.economic_activities : []),
+  ].map((x: any) => String(x ?? '').trim()).filter(Boolean);
+
+  for (const act of todasLasActividades) {
+    if (!normalizarActividad(act)) {
+      p.push(
+        `Actividad económica "${act}": formato no reconocido. Se escribe con cuatro dígitos, `
+        + `punto y uno más — por ejemplo 4752.1 — tal como aparece en el ATV.`);
+    }
+  }
 
   const email = String(cfg.emisor_email ?? '').trim();
   if (!email) p.push('Correo del emisor: vacío.');

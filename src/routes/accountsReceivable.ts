@@ -61,13 +61,28 @@ const ARSchema = z.object({
 
 const today = () => new Date().toISOString().slice(0, 10);
 
-// Marca como vencida (overdue) en la respuesta si pasó la fecha y no está pagada.
+/**
+ * Marca como vencida (overdue) si pasó la fecha y sigue debiéndose.
+ *
+ * Una cuenta ANULADA no se toca. Antes la condición era «distinta de pagada», y
+ * como una cuenta anulada tampoco está pagada, al pasar su fecha volvía a
+ * aparecer como vencida: la anulación se borraba en la lectura. El cliente
+ * quedaba debiendo una factura que ya se había anulado, y la única forma de
+ * notarlo era que el saldo no cuadrara.
+ */
+const CERRADAS = ['paid', 'cancelled'];
+
 function withDerivedStatus(row: any) {
-  if (row.status !== 'paid' && row.due_date && row.due_date < today()) {
+  if (!CERRADAS.includes(String(row.status)) && row.due_date && row.due_date < today()) {
     return { ...row, status: 'overdue' };
   }
   return row;
 }
+
+/** ¿Esta cuenta sigue debiéndose? Anulada y pagada NO cuentan. */
+const debeAlgo = (r: any) =>
+  !CERRADAS.includes(String(r.status))
+  && (Number(r.total_amount ?? 0) - Number(r.paid_amount ?? 0)) > 0;
 
 // Crea una cuenta por cobrar (reutilizable desde POS / distribución).
 export async function createReceivable(tenantId: string, r: {
@@ -205,13 +220,15 @@ accountsReceivable.get('/summary', async (c) => {
     const filterZone = (await getUserZone(c.get('userId'))) ?? c.req.query('zone') ?? null;
     if (filterZone) rows = rows.filter((r: any) => r.zone === filterZone);
 
-    const outstanding = rows.reduce((s: number, r: any) => s + (Number(r.total_amount) - Number(r.paid_amount)), 0);
+    // Las anuladas no suman al saldo: la deuda dejó de existir con la factura.
+    const outstanding = rows.filter(debeAlgo)
+      .reduce((s: number, r: any) => s + (Number(r.total_amount) - Number(r.paid_amount)), 0);
     const overdue = rows.filter((r: any) => r.status === 'overdue');
     const overdueAmount = overdue.reduce((s: number, r: any) => s + (Number(r.total_amount) - Number(r.paid_amount)), 0);
     const byCustomer: Record<string, { customer_id: string | null; customer_name: string; zone: string | null; balance: number; count: number }> = {};
     for (const r of rows) {
+      if (!debeAlgo(r)) continue;
       const bal = Number(r.total_amount) - Number(r.paid_amount);
-      if (bal <= 0) continue;
       const key = r.customer_id ?? r.customer_name ?? 'sin';
       if (!byCustomer[key]) byCustomer[key] = { customer_id: r.customer_id ?? null, customer_name: r.customer_name ?? 'Sin cliente', zone: r.zone ?? null, balance: 0, count: 0 };
       byCustomer[key].balance += bal;
@@ -219,7 +236,7 @@ accountsReceivable.get('/summary', async (c) => {
     }
     return ok(c, {
       outstanding, overdue_count: overdue.length, overdue_amount: overdueAmount,
-      pending_count: rows.filter((r: any) => r.status !== 'paid').length,
+      pending_count: rows.filter(debeAlgo).length,
       by_customer: Object.values(byCustomer).sort((a, b) => b.balance - a.balance),
     });
   } catch (err: any) { return fail(c, err.message, 500); }

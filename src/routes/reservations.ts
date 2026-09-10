@@ -50,22 +50,38 @@ async function nextNumber(tenantId: string): Promise<string> {
 }
 
 /**
- * Mueve el stock de los artículos apartados.
+ * Pone o saca mercadería del APARTADO ("standby").
  *
- * `signo` -1 al apartar (sale de la venta) y +1 al anular o vencer (vuelve).
- * Los productos que no llevan control de existencias se saltan.
+ * `signo` +1 al apartar y -1 al liberar (anulado, vencido o ya entregado).
+ *
+ * NO toca `stock_quantity`: la mercadería sigue en el local hasta que el cliente
+ * la retira. Antes se restaba del stock, y el inventario decía que el producto
+ * no estaba cuando estaba ahí, apartado — al contar la bodega nunca cuadraba y
+ * no había forma de explicar la diferencia. Lo que cambia es `reserved_quantity`,
+ * y lo vendible pasa a ser `stock_quantity - reserved_quantity`.
+ *
+ * Al ENTREGAR se libera el apartado y la venta descuenta el stock por el camino
+ * normal del POS, como cualquier otra.
  */
 async function moverStock(items: any[], signo: 1 | -1) {
   for (const it of items) {
     if (!it.product_id) continue;
     const { data: p } = await db.from('products')
-      .select('stock_quantity, tracks_stock').eq('id', it.product_id).maybeSingle();
+      .select('reserved_quantity, tracks_stock').eq('id', it.product_id).maybeSingle();
     if (!p || (p as any).tracks_stock === false) continue;
-    const actual = Number((p as any).stock_quantity ?? 0);
-    await db.from('products').update({
-      stock_quantity: Math.max(0, actual + signo * Number(it.quantity ?? 0)),
+    const apartado = Number((p as any).reserved_quantity ?? 0);
+    const { error } = await db.from('products').update({
+      // Nunca negativo: un apartado anulado dos veces no puede dejar la cuenta
+      // en rojo y hacer parecer que hay más disponible del que hay.
+      reserved_quantity: Math.max(0, apartado + signo * Number(it.quantity ?? 0)),
       updated_at: new Date().toISOString(),
     }).eq('id', it.product_id);
+    // Sin la columna (migración 110 sin correr) el apartado igual se registra:
+    // se pierde el "standby", no la venta.
+    if (error && /reserved_quantity/i.test(error.message)) {
+      console.warn('[apartados] falta la columna reserved_quantity: corré la migración 110');
+      return;
+    }
   }
 }
 
@@ -95,7 +111,7 @@ reservations.get('/', async (c) => {
     const vencidos = (data ?? []).filter((r: any) =>
       r.status === 'open' && r.expires_on && String(r.expires_on) < hoy);
     for (const r of vencidos as any[]) {
-      await moverStock(r.reservation_items ?? [], 1);
+      await moverStock(r.reservation_items ?? [], -1);
       await db.from('reservations')
         .update({ status: 'expired', updated_at: new Date().toISOString() })
         .eq('id', r.id).eq('tenant_id', tenantId);
@@ -165,7 +181,7 @@ reservations.post('/', async (c) => {
     }
 
     // La mercadería queda apartada: sale del inventario disponible.
-    await moverStock(items, -1);
+    await moverStock(items, 1);
 
     return ok(c, { ...(res as any), items }, 201);
   } catch (err: any) { return fail(c, err.message, 500); }
@@ -215,7 +231,7 @@ reservations.post('/:id/cancel', async (c) => {
     if (!r) return fail(c, 'Apartado no encontrado', 404);
     if ((r as any).status !== 'open') return fail(c, 'Este apartado ya no está vigente', 409);
 
-    await moverStock((r as any).reservation_items ?? [], 1);
+    await moverStock((r as any).reservation_items ?? [], -1);
     const { data, error } = await db.from('reservations').update({
       status: 'cancelled',
       notes: [(r as any).notes, c.req.query('reason')].filter(Boolean).join(' · ') || null,
@@ -272,7 +288,7 @@ reservations.post('/:id/deliver', async (c) => {
     const b = await c.req.json().catch(() => ({} as any));
 
     const { data: r } = await db.from('reservations')
-      .select('id, status').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+      .select('id, status, reservation_items(*)').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
     if (!r) return fail(c, 'Apartado no encontrado', 404);
     if ((r as any).status !== 'open') return fail(c, 'Este apartado ya no está vigente', 409);
 
@@ -282,8 +298,15 @@ reservations.post('/:id/deliver', async (c) => {
       updated_at: new Date().toISOString(),
     }).eq('id', id).eq('tenant_id', tenantId).select('*').single();
     if (error) throw new Error(error.message);
-    // El stock NO se toca: salió del inventario al apartarse. Descontarlo otra
-    // vez al facturar dejaría existencias negativas.
+
+    /**
+     * Entregado: deja de estar apartado.
+     *
+     * El descuento del inventario lo hace la VENTA, por el camino normal del
+     * POS. Si no se liberara acá, el producto quedaría contado como apartado
+     * para siempre y su disponible bajaría solo, sin que nadie lo apartara.
+     */
+    await moverStock((r as any).reservation_items ?? [], -1);
     return ok(c, data);
   } catch (err: any) { return fail(c, err.message, 500); }
 });

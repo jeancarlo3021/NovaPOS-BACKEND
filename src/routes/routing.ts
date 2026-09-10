@@ -638,6 +638,76 @@ routing.get('/:id/truck-stock', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+/**
+ * GET /:id/load-history — CON QUÉ se cargó el camión, no lo que queda.
+ *
+ * El stock del camión solo muestra el saldo del momento: a media ruta, un
+ * producto agotado simplemente no aparece, y no hay forma de saber si salió con
+ * veinte y se vendieron todos o si nunca se cargó. Al cerrar la ruta y cuadrar
+ * con el chofer esa diferencia es justamente lo que hay que revisar.
+ *
+ * Devuelve, por producto: cuánto se cargó, cuánto queda y la diferencia (lo que
+ * salió del camión: vendido, entregado o faltante).
+ */
+routing.get('/:id/load-history', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { id } = c.req.param();
+
+    const { data: route } = await db.from('routes')
+      .select('id, warehouse_id, route_date, status, loaded_summary')
+      .eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+    if (!route) return fail(c, 'Ruta no encontrada', 404);
+
+    const cargado: Record<string, number> = ((route as any).loaded_summary ?? {}) as any;
+    const ids = Object.keys(cargado);
+    if (ids.length === 0) {
+      return ok(c, { route_id: id, route_date: (route as any).route_date, items: [], sin_registro: true });
+    }
+
+    // Lo que queda HOY en el camión, para calcular la diferencia.
+    const { data: enCamion } = await db.from('warehouse_stock')
+      .select('product_id, quantity').eq('warehouse_id', (route as any).warehouse_id);
+    const queda = new Map<string, number>(
+      (enCamion ?? []).map((r: any) => [String(r.product_id), Number(r.quantity ?? 0)]));
+
+    // Nombres. Se piden por tandas: una ruta puede llevar cientos de productos.
+    const nombres = new Map<string, any>();
+    for (let i = 0; i < ids.length; i += 200) {
+      const { data: prods } = await db.from('products')
+        .select('id, name, sku, unit_price').in('id', ids.slice(i, i + 200));
+      for (const p of (prods ?? []) as any[]) nombres.set(String(p.id), p);
+    }
+
+    const items = ids.map(pid => {
+      const p = nombres.get(pid) ?? {};
+      const cant = Number(cargado[pid] ?? 0);
+      const resto = Number(queda.get(pid) ?? 0);
+      return {
+        product_id: pid,
+        // El producto pudo borrarse después de la carga: sin este respaldo la
+        // fila aparecería en blanco y no se sabría qué se cargó.
+        name: p.name ?? '(producto eliminado)',
+        sku: p.sku ?? null,
+        unit_price: Number(p.unit_price ?? 0),
+        loaded: cant,
+        remaining: resto,
+        moved: Math.max(0, cant - resto),   // vendido, entregado o faltante
+      };
+    }).sort((a, b) => a.name.localeCompare(b.name));
+
+    return ok(c, {
+      route_id: id,
+      route_date: (route as any).route_date,
+      status: (route as any).status,
+      items,
+      total_loaded: items.reduce((s, x) => s + x.loaded, 0),
+      total_remaining: items.reduce((s, x) => s + x.remaining, 0),
+      total_value: items.reduce((s, x) => s + x.loaded * x.unit_price, 0),
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // POST /:id/sale — AUTOVENTA: factura que descuenta del stock del CAMIÓN.
 // Valida que no se venda más de lo cargado (bloqueante). Sin caja chica.
 routing.post('/:id/sale', async (c) => {

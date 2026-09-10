@@ -71,6 +71,15 @@ export async function revisarP12(p12Base64: string, clave: string, cedulaEmisor 
   const desde = cert.validity.notBefore;
   const hasta = cert.validity.notAfter;
   const ahora = new Date();
+  /**
+   * Las cédulas se comparan SIN los ceros de relleno.
+   *
+   * Hacienda y los certificados escriben la misma cédula con distinto largo:
+   * «0801210116» y «801210116» son la misma persona. Comparándolas tal cual, el
+   * sistema avisaba de un certificado ajeno cuando era el correcto — y con eso
+   * mandaba a buscar un problema que no existía.
+   */
+  const sinRelleno = (v: any) => String(v ?? '').replace(/\D/g, '').replace(/^0+/, '');
   const cedula = cedulaDelSujeto(cert.subject);
   const mia = String(cedulaEmisor ?? '').replace(/\D/g, '');
 
@@ -81,7 +90,7 @@ export async function revisarP12(p12Base64: string, clave: string, cedulaEmisor 
     hasta: hasta.toISOString().slice(0, 10),
     sujeto: cert.subject.getField('CN')?.value ?? '',
     cedula,
-    coincide_cedula: !cedula || !mia ? undefined : cedula === mia,
+    coincide_cedula: !cedula || !mia ? undefined : sinRelleno(cedula) === sinRelleno(mia),
     cedula_emisor: mia,
   };
 }
