@@ -141,6 +141,17 @@ export async function loadFEConfig(tenantId: string): Promise<any> {
     ? (cfg.alanube_company_id_sandbox || cfg.alanube_company_id)
     : (cfg.alanube_company_id_production || cfg.alanube_company_id);
   cfg.alanube_company_id = companyByEnv ? String(companyByEnv).trim() : '';
+  /**
+   * El único proveedor es Alanube.
+   *
+   * La emisión ya lo daba por hecho, pero el envío por correo, la descarga del
+   * XML y la recepción de comprobantes preguntaban por `fe_provider`. Los
+   * negocios configurados después de quitar el selector no lo tienen guardado,
+   * y los que venían del proveedor anterior tienen otro valor: en ambos casos
+   * los correos salían SIN el XML ni el PDF y la descarga decía «XML no
+   * disponible». Normalizarlo acá arregla todos esos lugares a la vez.
+   */
+  cfg.fe_provider = 'alanube';
   return cfg;
 }
 
@@ -2288,7 +2299,10 @@ export async function alanubeXmlFiles(
   cfg: any, docId: string, kind: any, companyId?: string | null,
 ): Promise<{ xml: string | null; xmlHacienda: string | null }> {
   const client = alanube.forTenant(cfg);
-  for (const documents of ['xml,xmlHacienda', 'xml-xmlHacienda']) {
+  // GUIONES primero: es la forma que Alanube acepta. Con comas responde 400, y
+  // cada 400 hacía que se probaran los cuatro tipos de documento antes de pasar a
+  // la forma buena — segundos tirados que terminaban agotando el tiempo.
+  for (const documents of ['xml-xmlHacienda', 'xml,xmlHacienda']) {
     try {
       const resp: any = await client.getDocument(String(docId), {
         kind, documents, companyId: companyId ? String(companyId) : undefined,
@@ -2673,20 +2687,40 @@ export async function autoSendNotaToCustomer(
   }
 }
 
-hacienda.post('/resend-email', async (c) => {
-  try {
-    const tenantId = c.get('tenantId');
-    const { invoice_id, email, kind } = await c.req.json().catch(() => ({}));
-    if (!invoice_id || !email) return fail(c, 'Falta invoice_id o email', 422);
+/** Error con código HTTP, para que la ruta que llama responda con el correcto. */
+function conEstado(mensaje: string, status: number): Error {
+  return Object.assign(new Error(mensaje), { status });
+}
+
+/**
+ * Reenvía por correo un comprobante (factura, nota de crédito o de débito).
+ *
+ * Es la misma lógica para el negocio (FE Facturas) y para el panel admin
+ * (Bitácora FE). Tenerla en un solo lugar evita que las dos pantallas terminen
+ * mandando correos distintos para el mismo comprobante.
+ *
+ * `emailIndicado` vacío = el correo del cliente.
+ */
+export async function reenviarComprobante(
+  tenantId: string, invoice_id: string, emailIndicado: string | null | undefined,
+  kind?: string | null,
+) {
     const which: 'invoice' | 'nc' | 'nd' =
       kind === 'nc' || kind === 'nd' ? kind : 'invoice';
 
     const { data: inv } = await db.from('invoices')
-      .select('invoice_number, fe_clave, fe_consecutivo, fe_status, fe_xml, total, customer_name, document_type, '
+      .select('invoice_number, fe_clave, fe_consecutivo, fe_status, fe_xml, total, customer_name, customer_email, customer_id, document_type, '
         + 'fe_nc_clave, fe_nc_doc_id, fe_nd_clave, fe_nd_doc_id')
       .eq('id', invoice_id).eq('tenant_id', tenantId).maybeSingle();
-    if (!inv) return fail(c, 'Factura no encontrada', 404);
+    if (!inv) throw conEstado('Factura no encontrada', 404);
     const i = inv as any;
+
+    // Sin correo indicado se usa el del cliente: el de la compra, o el de su
+    // ficha. Desde la bitácora casi siempre se quiere reenviar al mismo cliente.
+    const email = String(emailIndicado ?? '').trim() || await customerEmailOf(i);
+    if (!email) {
+      throw conEstado('Este cliente no tiene correo registrado: escribí a qué correo mandarlo.', 422);
+    }
 
     // Documento a mandar: clave, id de Alanube y cómo llamarlo en el correo.
     const doc = which === 'nc'
@@ -2696,7 +2730,7 @@ hacienda.post('/resend-email', async (c) => {
         : { clave: i.fe_clave, docId: i.fe_consecutivo, kind: feKindOf(i.document_type), label: null as string | null };
 
     if (!doc.clave) {
-      return fail(c, which === 'invoice'
+      throw conEstado(which === 'invoice'
         ? 'La factura no fue emitida electrónicamente'
         : `Esta factura no tiene ${which === 'nc' ? 'nota de crédito' : 'nota de débito'} emitida.`, 422);
     }
@@ -2726,60 +2760,91 @@ hacienda.post('/resend-email', async (c) => {
       await db.from('invoices').update({ fe_emailed: true }).eq('id', invoice_id).eq('tenant_id', tenantId).then(() => {}, () => {});
     }
     const hasPdf = (attachments ?? []).some(a => a.filename.toLowerCase().endsWith('.pdf'));
-    return ok(c, {
+    return {
       ok: true, kind: which, attachments: attachments?.length ?? 0, pdf: hasPdf, xml: hasXml,
       // Se avisa en vez de fallar: el correo ya salió con lo que había. Sin PDF
       // sigue siendo un comprobante; sin XML no, y hay que reenviarlo después.
       warning: !hasXml
         ? 'Se envió SIN XML: Alanube no lo devolvió todavía. Reenviá el comprobante más tarde.'
         : hasPdf ? null : 'Se envió sin PDF: Alanube no lo devolvió para este documento.',
-    });
-  } catch (err: any) { return fail(c, err.message, 500); }
+    };
+}
+
+hacienda.post('/resend-email', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { invoice_id, email, kind } = await c.req.json().catch(() => ({}));
+    if (!invoice_id || !email) return fail(c, 'Falta invoice_id o email', 422);
+    return ok(c, await reenviarComprobante(tenantId, invoice_id, email, kind));
+  } catch (err: any) { return fail(c, err.message, err?.status ?? 500); }
 });
 
 // GET /fe-xml/:id — XML firmado y respuesta de Hacienda, en base64, para
 // descargarlos desde la bitácora. El XML es el comprobante de verdad: el
 // contribuyente tiene que poder guardarlo, no solo ver el PDF.
+/**
+ * XML firmado y respuesta de Hacienda de un comprobante, en base64.
+ *
+ * Compartida entre FE Facturas (el negocio) y la Bitácora FE (el panel), para
+ * que las dos descarguen exactamente lo mismo. Sirve también para las notas de
+ * crédito y débito, que tienen su propio documento en Alanube.
+ */
+export async function obtenerXmlDelComprobante(
+  tenantId: string, invoiceId: string, kind: 'invoice' | 'nc' | 'nd' = 'invoice',
+) {
+  const { data: inv } = await db.from('invoices')
+    .select('fe_consecutivo, fe_clave, fe_xml, document_type, fe_nc_clave, fe_nc_doc_id, fe_nd_clave, fe_nd_doc_id')
+    .eq('id', invoiceId).eq('tenant_id', tenantId).maybeSingle();
+  if (!inv) throw conEstado('Factura no encontrada', 404);
+  const i = inv as any;
+
+  const doc = kind === 'nc'
+    ? { clave: i.fe_nc_clave, docId: i.fe_nc_doc_id, tipo: 'credit-note', guardado: null as string | null }
+    : kind === 'nd'
+      ? { clave: i.fe_nd_clave, docId: i.fe_nd_doc_id, tipo: 'debit-note', guardado: null as string | null }
+      : { clave: i.fe_clave, docId: i.fe_consecutivo, tipo: feKindOf(i.document_type), guardado: i.fe_xml as string | null };
+  if (!doc.clave) throw conEstado('Este comprobante no fue emitido electrónicamente.', 422);
+  const base = String(doc.clave);
+
+  const cfg = await loadFEConfig(tenantId);
+  let xml: string | null = null;
+  let xmlHacienda: string | null = null;
+  if (doc.docId) {
+    ({ xml, xmlHacienda } = await alanubeXmlFiles(cfg, String(doc.docId), doc.tipo, feCompanyId(cfg)));
+  }
+
+  // Si Alanube no responde, sirve el XML guardado al emitir.
+  if (!xml && doc.guardado) xml = await toB64(doc.guardado);
+  else if (xml && kind === 'invoice' && !doc.guardado) {
+    // Se guarda la primera vez que se baja: así sigue descargable aunque
+    // después Alanube no responda.
+    const plain = Buffer.from(xml, 'base64').toString('utf8');
+    if (plain.trimStart().startsWith('<')) {
+      await db.from('invoices').update({ fe_xml: plain })
+        .eq('id', invoiceId).eq('tenant_id', tenantId).then(() => {}, () => {});
+    }
+  }
+
+  if (!xml && !xmlHacienda) {
+    throw conEstado(!doc.docId
+      ? 'Este comprobante no tiene el id de Alanube guardado, así que no se puede pedir su XML. '
+        + 'Si se importó por clave, cargá el «Consecutivo de Alanube» del correo.'
+      : 'Alanube todavía no publica el XML de este comprobante. Probá de nuevo en unos minutos.', 404);
+  }
+  return {
+    xml, xmlHacienda,
+    filename: `${base}.xml`,
+    filename_hacienda: `${base}-respuesta-hacienda.xml`,
+  };
+}
+
 hacienda.get('/fe-xml/:id', async (c) => {
   try {
-    const tenantId = c.get('tenantId');
-    const { id } = c.req.param();
-    const { data: inv } = await db.from('invoices')
-      .select('fe_consecutivo, fe_clave, fe_xml, document_type')
-      .eq('id', id).eq('tenant_id', tenantId).maybeSingle();
-    if (!inv) return fail(c, 'Factura no encontrada', 404);
-    const i = inv as any;
-    const base = String(i.fe_clave || id);
-
-    const cfg = await loadFEConfig(tenantId);
-    let xml: string | null = null;
-    let xmlHacienda: string | null = null;
-
-    if (cfg.fe_provider === 'alanube' && i.fe_consecutivo) {
-      const companyId = (String(cfg.environment ?? 'production') === 'sandbox'
-        ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id;
-      ({ xml, xmlHacienda } = await alanubeXmlFiles(
-        cfg, String(i.fe_consecutivo), feKindOf(i.document_type), companyId));
-    }
-    // Si Alanube todavía no lo publica, sirve el XML guardado (plano o base64).
-    if (!xml && i.fe_xml) xml = await toB64(i.fe_xml);
-    else if (xml && !i.fe_xml) {
-      // Se guarda la primera vez que se baja: así el comprobante sigue
-      // descargable aunque después Alanube no responda.
-      const plain = Buffer.from(xml, 'base64').toString('utf8');
-      if (plain.trimStart().startsWith('<')) {
-        await db.from('invoices').update({ fe_xml: plain })
-          .eq('id', id).eq('tenant_id', tenantId).then(() => {}, () => {});
-      }
-    }
-
-    if (!xml && !xmlHacienda) return fail(c, 'XML no disponible todavía', 404);
-    return ok(c, {
-      xml, xmlHacienda,
-      filename: `${base}.xml`,
-      filename_hacienda: `${base}-respuesta-hacienda.xml`,
-    });
-  } catch (err: any) { return fail(c, err.message, 500); }
+    const kind = c.req.query('kind');
+    return ok(c, await obtenerXmlDelComprobante(
+      c.get('tenantId'), c.req.param('id'),
+      kind === 'nc' || kind === 'nd' ? kind : 'invoice'));
+  } catch (err: any) { return fail(c, err.message, err?.status ?? 500); }
 });
 
 // GET /fe-pdf/:id — devuelve el PDF que genera ALANUBE (en base64) para abrirlo

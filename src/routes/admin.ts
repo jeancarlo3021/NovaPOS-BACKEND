@@ -4589,6 +4589,48 @@ admin.get('/alanube/reports/emissions', async (c) => {
 
 // POST /fe-refresh/:id — REINTENTO: re-consulta el estado de una factura en Hacienda
 // (para el botón de reintento en la bitácora). Resuelve el tenant de la factura.
+/**
+ * POST /fe-resend-email/:id — reenvía el correo de un comprobante desde la bitácora.
+ *
+ * El reenvío existía en FE Facturas, pero solo sirve para el negocio que lo
+ * pide. Desde el panel, cuando un cliente de un negocio reclama que no le llegó
+ * su factura, no había cómo mandársela sin entrar a la cuenta de ese negocio.
+ *
+ * body: { email? } — vacío = el correo del cliente.
+ * Acepta las filas de notas de la bitácora («<id>-nc» / «<id>-nd»).
+ */
+admin.post('/fe-resend-email/:id', async (c) => {
+  try {
+    const raw = c.req.param('id');
+    const kind = /-nc$/.test(raw) ? 'nc' : /-nd$/.test(raw) ? 'nd' : 'invoice';
+    const id = raw.replace(/-(nc|nd)$/, '');
+    const b = await c.req.json().catch(() => ({} as any));
+
+    const { data: inv } = await db.from('invoices').select('tenant_id').eq('id', id).maybeSingle();
+    if (!inv) return fail(c, 'Factura no encontrada', 404);
+
+    const { reenviarComprobante } = await import('./hacienda.js');
+    const r = await reenviarComprobante((inv as any).tenant_id, id, b?.email ?? null, kind);
+    return ok(c, r);
+  } catch (err: any) { return fail(c, err.message, err?.status ?? 500); }
+});
+
+/**
+ * GET /fe-xml/:id — descarga el XML de un comprobante desde la bitácora.
+ * Acepta las filas de notas («<id>-nc» / «<id>-nd»).
+ */
+admin.get('/fe-xml/:id', async (c) => {
+  try {
+    const raw = c.req.param('id');
+    const kind = /-nc$/.test(raw) ? 'nc' : /-nd$/.test(raw) ? 'nd' : 'invoice';
+    const id = raw.replace(/-(nc|nd)$/, '');
+    const { data: inv } = await db.from('invoices').select('tenant_id').eq('id', id).maybeSingle();
+    if (!inv) return fail(c, 'Factura no encontrada', 404);
+    const { obtenerXmlDelComprobante } = await import('./hacienda.js');
+    return ok(c, await obtenerXmlDelComprobante((inv as any).tenant_id, id, kind));
+  } catch (err: any) { return fail(c, err.message, err?.status ?? 500); }
+});
+
 admin.post('/fe-refresh/:id', async (c) => {
   try {
     const raw = c.req.param('id');

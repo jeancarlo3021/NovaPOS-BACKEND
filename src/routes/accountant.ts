@@ -135,10 +135,9 @@ export async function ensureAlanubeCompany(tenantId: string): Promise<{
     .eq('tenant_id', tenantId).eq('type', 'electronic-invoice').maybeSingle();
   const cfg: Record<string, any> = { ...((row as any)?.config ?? {}) };
 
-  // Alta de la empresa en Alanube.
-  if (cfg.fe_provider !== 'alanube') {
-    return { ok: false, message: 'El proveedor no es Alanube: no hay empresa que registrar.' };
-  }
+  // Alta de la empresa en Alanube. Antes se cortaba acá si la configuración no
+  // decía `fe_provider: 'alanube'`; como es el único proveedor, los negocios que
+  // no tenían ese valor guardado nunca se daban de alta solos.
 
   const env = String(cfg.environment ?? 'production') === 'sandbox' ? 'sandbox' : 'production';
   const problems = validateEmisorForAlanube(cfg, env);
