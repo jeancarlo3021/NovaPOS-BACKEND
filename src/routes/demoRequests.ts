@@ -13,8 +13,13 @@ import { ok, fail } from '../utils/response.js';
 const demoRequests = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
 const STATUSES = ['pendiente', 'aprobada', 'rechazada', 'entregada', 'convertida', 'vencida'] as const;
-/** Días que sobrevive una demo sin convertirse antes de borrarse sola. */
-export const DEMO_PURGE_DAYS = 30;
+/**
+ * Días que sobrevive una demo VENCIDA antes de borrarse sola.
+ *
+ * Al llegar a 0 la demo se bloquea (sin prórroga); estos días son el margen
+ * para convertirla en cliente sin perder lo que cargó. Pasado el plazo, se borra.
+ */
+export const DEMO_PURGE_DAYS = 4;
 const MANAGERS = new Set(['owner', 'admin', 'gerente']);
 
 const DemoSchema = z.object({
@@ -448,7 +453,7 @@ demoRequests.post('/:id/provision', async (c) => {
     }
 
     // 4) La solicitud queda entregada, con a dónde apunta y hasta cuándo dura.
-    // Se borra sola 30 días después de que venza la prueba, salvo que la
+    // Se borra sola DEMO_PURGE_DAYS después de que venza la prueba, salvo que la
     // conviertan a cliente. Sin esta fecha, las demos se acumulan para siempre.
     const purge = new Date(vence.getTime() + DEMO_PURGE_DAYS * 86400000);
 

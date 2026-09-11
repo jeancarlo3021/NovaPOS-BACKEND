@@ -59,6 +59,25 @@ export const enforceActiveTenant = createMiddleware<{ Variables: Variables }>(as
       .eq('id', tenantId)
       .maybeSingle();
     data = r.data; error = r.error;
+    /**
+     * ¿Es la demo de un PROSPECTO? Esas vencen; la demo compartida de ventas no.
+     *
+     * Se guarda en la misma memoria corta junto con su vencimiento, para no
+     * sumar dos consultas a cada petición de una demo.
+     */
+    if (!error && data?.is_demo) {
+      try {
+        const { data: sol } = await db.from('demo_requests')
+          .select('id').eq('demo_tenant_id', tenantId).is('converted_at', null).limit(1).maybeSingle();
+        data = { ...data, demo_prospecto: !!sol };
+        if (sol) {
+          const { data: sub } = await db.from('subscriptions')
+            .select('ends_at').eq('tenant_id', tenantId)
+            .order('created_at', { ascending: false }).limit(1).maybeSingle();
+          data.demo_vence = (sub as any)?.ends_at ?? null;
+        }
+      } catch { /* sin la tabla de solicitudes: se trata como demo compartida */ }
+    }
     if (!error && data) {
       if (tenantCache.size > 500) tenantCache.clear();
       tenantCache.set(tenantId, { at: Date.now(), row: data });
@@ -82,9 +101,30 @@ export const enforceActiveTenant = createMiddleware<{ Variables: Variables }>(as
     }, 403);
   }
 
+  /**
+   * DEMO DE PROSPECTO vencida: bloqueada, SIN prórroga.
+   *
+   * Antes toda demo pasaba por la regla de «demo eterna» de abajo y nunca se
+   * bloqueaba: el prospecto seguía usando el sistema días después de que se le
+   * terminara la prueba, sin incentivo para decidir. Al llegar a 0 se corta del
+   * todo —no solo lectura, como un cliente moroso—: no hay pago que regularizar,
+   * hay una decisión que tomar. A los 4 días se borra (ver demoCleanup).
+   */
+  if ((data as any)?.is_demo && (data as any)?.demo_prospecto) {
+    const vence = (data as any).demo_vence;
+    if (vence && new Date(vence).getTime() < Date.now()) {
+      return c.json({
+        data: null,
+        error: 'La prueba gratuita terminó. Contactanos para activar tu cuenta.',
+        code: 'tenant_suspended',
+        status: 'demo_expired',
+      }, 403);
+    }
+  }
+
   // ── DEMO ETERNO ───────────────────────────────────────────────────────────
-  // La cuenta demo nunca vence; en cambio, sus datos (productos y movimientos)
-  // se limpian cada 8 días. El reseteo se dispara perezosamente al acceder.
+  // La demo compartida de ventas nunca vence; en cambio, sus datos (productos y
+  // movimientos) se limpian cada 8 días. El reseteo se dispara perezosamente.
   if ((data as any)?.is_demo) {
     try { await maybeResetDemo(tenantId, (data as any).demo_reset_at ?? null); }
     catch (e: any) { console.warn('[demo-reset] middleware:', e?.message); }

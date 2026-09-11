@@ -9,19 +9,40 @@ import { db } from '../db/client.js';
  */
 export async function purgeExpiredDemos(opts: { dryRun?: boolean } = {}) {
   const hoy = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Costa_Rica' });
+  const { DEMO_PURGE_DAYS } = await import('../routes/demoRequests.js');
+  const plazoMs = DEMO_PURGE_DAYS * 86400000;
 
+  // Todas las demos sin convertir: el plazo se decide abajo, una por una.
   const { data: vencidas, error } = await db.from('demo_requests')
-    .select('id, number, business_name, demo_tenant_id, purge_on, converted_at')
+    .select('id, number, business_name, demo_tenant_id, purge_on, expires_on, converted_at')
     .not('demo_tenant_id', 'is', null)
     .is('converted_at', null)
-    .lte('purge_on', hoy)
-    .limit(200);
+    .limit(500);
   if (error) throw new Error(error.message);
 
   const borradas: string[] = [];
   const saltadas: Array<{ demo: string; motivo: string }> = [];
 
   for (const r of (vencidas ?? []) as any[]) {
+    /**
+     * El plazo se cuenta desde el vencimiento REAL de su suscripción.
+     *
+     * La fecha de borrado que se guardó al crear la demo queda vieja si después
+     * se le extendió la prueba desde «Renovar»: contar desde ahí borraría una
+     * demo que alguien decidió alargar. El vencimiento de la suscripción es el
+     * mismo contador que el negocio ve llegar a 0.
+     */
+    const { data: sub } = await db.from('subscriptions')
+      .select('ends_at').eq('tenant_id', r.demo_tenant_id)
+      .order('created_at', { ascending: false }).limit(1).maybeSingle();
+    const vence = (sub as any)?.ends_at
+      ? new Date((sub as any).ends_at).getTime()
+      : r.expires_on ? new Date(`${r.expires_on}T23:59:59`).getTime() : null;
+    const toca = vence != null
+      ? vence + plazoMs <= Date.now()
+      : !!(r.purge_on && String(r.purge_on) <= hoy);   // demos viejas sin fechas
+    if (!toca) continue;
+
     // Segunda verificación contra el negocio: si dejó de ser demo (lo pasaron a
     // cliente por otro lado), NO se toca.
     const { data: t } = await db.from('tenants')

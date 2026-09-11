@@ -6,6 +6,7 @@ import { alanube, AlanubeError, tenantAlanubeToken } from '../services/alanube.j
 import { buildAlanubeDocument, DISCOUNT_SHAPES, isDiscountShapeError } from '../services/alanubeDocument.js';
 import { endOfDay } from '../utils/dateRange.js';
 import { sendEmail } from '../services/emailService.js';
+import { comprobanteEmailHtml, comprobanteEmailAsunto, type DatosCorreoComprobante } from '../services/comprobanteEmail.js';
 // Del módulo LIVIANO: el otro arrastra el cliente IMAP y el parser de correo.
 import { parseHaciendaXml } from '../services/haciendaXml.js';
 import { notifyFeError, notifyQuotaLow } from '../services/whatsappNotify.js';
@@ -2357,30 +2358,103 @@ async function alanubeAttachments(cfg: any, docId: string | null | undefined, ki
  * quien llama no debe marcarlo como enviado: si lo marca, la bitácora dice que
  * el cliente ya lo tiene y nadie lo vuelve a mandar.
  */
+/**
+ * Datos del negocio y de la venta para armar el correo del comprobante.
+ *
+ * Nunca rompe el envío: si algo no se puede leer (un logo que no está, líneas
+ * de una factura importada sin detalle), el correo sale con lo que haya.
+ */
+async function datosParaCorreo(tenantId: string, invoiceId: string): Promise<{
+  negocio: DatosCorreoComprobante['negocio'];
+  fecha: string | null; subtotal: number | null; impuesto: number | null;
+  lineas: DatosCorreoComprobante['lineas'];
+}> {
+  const vacio = { negocio: { nombre: 'Comprobante electrónico' }, fecha: null, subtotal: null, impuesto: null, lineas: [] };
+  try {
+    const [cfg, recibo, general, venta] = await Promise.all([
+      loadFEConfig(tenantId),
+      db.from('settings').select('config').eq('tenant_id', tenantId).eq('type', 'receipt').maybeSingle(),
+      db.from('settings').select('config').eq('tenant_id', tenantId).eq('type', 'general').maybeSingle(),
+      db.from('invoices').select('issued_at, created_at, subtotal, tax_amount, invoice_items(*)')
+        .eq('id', invoiceId).eq('tenant_id', tenantId).maybeSingle(),
+    ]);
+    const rc = ((recibo as any)?.data?.config ?? {}) as any;
+    const gc = ((general as any)?.data?.config ?? {}) as any;
+    const v = ((venta as any)?.data ?? {}) as any;
+
+    const razonSocial = String(cfg.emisor_name ?? '').trim() || null;
+    const comercial = String(cfg.emisor_commercial_name ?? '').trim() || null;
+    return {
+      negocio: {
+        nombre: comercial || razonSocial || String(gc.businessName ?? '').trim() || 'Comprobante electrónico',
+        razonSocial,
+        cedula: String(cfg.emisor_identification ?? '').trim() || null,
+        telefono: String(cfg.emisor_phone ?? gc.phone ?? '').trim() || null,
+        correo: String(cfg.emisor_email ?? gc.email ?? '').trim() || null,
+        direccion: String(cfg.emisor_address ?? gc.address ?? '').trim() || null,
+        logoUrl: String(rc.logoUrl ?? '').trim() || null,
+      },
+      fecha: v.issued_at ?? v.created_at ?? null,
+      subtotal: v.subtotal != null ? Number(v.subtotal) : null,
+      impuesto: v.tax_amount != null ? Number(v.tax_amount) : null,
+      lineas: ((v.invoice_items ?? []) as any[]).map(it => ({
+        nombre: String(it.product_name ?? 'Producto'),
+        cantidad: Number(it.quantity ?? 0),
+        precio: Number(it.unit_price ?? 0),
+        importe: Number(it.subtotal ?? 0),
+      })),
+    };
+  } catch (e: any) {
+    console.warn('[FE email] datos del correo:', e?.message);
+    return vacio;
+  }
+}
+
 async function sendComprobanteEmail(to: string, i: {
   invoice_number: string; fe_clave: string; fe_consecutivo?: string | null;
   fe_status?: string | null; total?: number | null; customer_name?: string | null; fe_xml?: string | null;
-}, attachments?: Array<{ filename: string; content: string }>): Promise<{ hasXml: boolean }> {
-  const estado = i.fe_status === 'accepted' ? 'Aceptado' : i.fe_status === 'rejected' ? 'Rechazado' : 'En proceso';
-  const html = `
-    <div style="font-family:sans-serif;font-size:14px;color:#222">
-      <h2>Comprobante electrónico ${i.invoice_number}</h2>
-      <p><b>Cliente:</b> ${i.customer_name ?? '—'}</p>
-      <p><b>Estado Hacienda:</b> ${estado}</p>
-      <p><b>Consecutivo:</b> ${i.fe_consecutivo ?? '—'}</p>
-      <p><b>Clave:</b> ${i.fe_clave}</p>
-      <p><b>Total:</b> ₡${Number(i.total ?? 0).toLocaleString('es-CR')}</p>
-    </div>`;
-  // Adjuntos de Alanube. Si el XML no vino (o el proveedor no es Alanube), se
-  // adjunta el `fe_xml` guardado: al cliente le sirve igual y es el que Hacienda
-  // reconoce. Un correo con solo el PDF no es un comprobante entregado.
+}, attachments?: Array<{ filename: string; content: string }>,
+  ctx?: { tenantId: string; invoiceId: string }): Promise<{ hasXml: boolean }> {
+  // Adjuntos de Alanube. Si el XML no vino, se adjunta el `fe_xml` guardado:
+  // al cliente le sirve igual y es el que Hacienda reconoce. Un correo con solo
+  // el PDF no es un comprobante entregado.
   const atts = [...(attachments ?? [])];
   if (!atts.some(a => a.filename.toLowerCase().endsWith('.xml'))) {
     // `fe_xml` puede estar en XML plano o, en filas viejas, en base64.
     const saved = await toB64(i.fe_xml);
     if (saved) atts.push({ filename: `${i.fe_clave}.xml`, content: saved });
   }
-  await sendEmail({ to, subject: `Comprobante electrónico ${i.invoice_number}`, html, attachments: atts.length ? atts : undefined });
+  const nombres = atts.map(a => a.filename.toLowerCase());
+  const extra = ctx ? await datosParaCorreo(ctx.tenantId, ctx.invoiceId)
+    : { negocio: { nombre: 'Comprobante electrónico' }, fecha: null, subtotal: null, impuesto: null, lineas: [] };
+
+  const datos: DatosCorreoComprobante = {
+    negocio: extra.negocio,
+    numero: i.invoice_number,
+    clave: i.fe_clave,
+    estado: i.fe_status ?? null,
+    cliente: i.customer_name ?? null,
+    fecha: extra.fecha,
+    subtotal: extra.subtotal,
+    impuesto: extra.impuesto,
+    total: Number(i.total ?? 0),
+    lineas: extra.lineas,
+    adjuntos: {
+      xml: nombres.some(f => f.endsWith('.xml') && !f.includes('respuesta')),
+      respuesta: nombres.some(f => f.includes('respuesta') && f.endsWith('.xml')),
+      pdf: nombres.some(f => f.endsWith('.pdf')),
+    },
+  };
+
+  await sendEmail({
+    to,
+    subject: comprobanteEmailAsunto(datos),
+    html: comprobanteEmailHtml(datos),
+    // Si el cliente responde, que le llegue al negocio y no a la cuenta del sistema.
+    replyTo: datos.negocio.correo && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(datos.negocio.correo)
+      ? datos.negocio.correo : undefined,
+    attachments: atts.length ? atts : undefined,
+  });
   return { hasXml: atts.some(a => a.filename.toLowerCase().endsWith('.xml')) };
 }
 
@@ -2492,7 +2566,7 @@ export async function autoSendComprobanteToCustomer(tenantId: string, invoiceId:
       ? await alanubeAttachments(cfg, (inv as any).fe_consecutivo, feKindOf((inv as any).document_type), (inv as any).fe_clave, feCompanyId(cfg))
       : undefined;
     await saveFeXml(tenantId, invoiceId, (inv as any).fe_clave, atts, (inv as any).fe_xml);
-    const { hasXml } = await sendComprobanteEmail(email, inv as any, atts);
+    const { hasXml } = await sendComprobanteEmail(email, inv as any, atts, { tenantId, invoiceId });
     if (!hasXml) {
       // Sale lo que hay (el PDF), pero sin marcarla: en la bitácora queda como
       // no enviada para que se reenvíe cuando Alanube publique el XML.
@@ -2608,7 +2682,7 @@ export async function sendComprobanteToCustomer(
     : undefined;
 
   await saveFeXml(tenantId, invoiceId, i.fe_clave, attachments, i.fe_xml);
-  const { hasXml } = await sendComprobanteEmail(to, i, attachments);
+  const { hasXml } = await sendComprobanteEmail(to, i, attachments, { tenantId, invoiceId });
   if (hasXml) {
     await db.from('invoices').update({ fe_emailed: true })
       .eq('id', invoiceId).eq('tenant_id', tenantId).then(() => {}, () => {});
@@ -2674,7 +2748,7 @@ export async function autoSendNotaToCustomer(
       fe_clave: i[claveCol],
       invoice_number: `${label} · ${i.invoice_number}`,
       fe_xml: null,   // el XML guardado es el de la factura, no el de la nota
-    } as any, atts);
+    } as any, atts, { tenantId, invoiceId });
     if (!hasXml) {
       console.warn(`[FE email nota] ${label} de ${i.invoice_number} se envió SIN XML: no se marca como enviada`);
       return;
@@ -2751,7 +2825,7 @@ export async function reenviarComprobante(
       invoice_number: doc.label ? `${doc.label} · ${i.invoice_number}` : i.invoice_number,
       // El XML guardado es el de la FACTURA: no sirve para la nota.
       fe_xml: which === 'invoice' ? i.fe_xml : null,
-    }, attachments);
+    }, attachments, { tenantId, invoiceId: invoice_id });
 
     // Solo la factura marca `fe_emailed`: ese check de la bitácora significa
     // «el comprobante de venta ya se envió», y una nota no lo reemplaza. Y solo
