@@ -48,12 +48,41 @@ let supabaseAuth = null;   // { state, saveCreds, clear } cuando se usa Supabase
 
 const log = pino({ level: process.env.LOG_LEVEL || 'info' });
 
+/**
+ * Versión del worker, visible en /status.
+ *
+ * El worker se despliega aparte del backend, así que desde el panel no había
+ * forma de saber si el que está corriendo ya tiene un arreglo o es el de antes.
+ * Subila cuando cambies algo que se deba verificar desde afuera.
+ */
+const WORKER_BUILD = '2026-09-14-reenvio';
+
 // ── Estado en memoria de la sesión ──────────────────────────────────────────
 let sock = null;
 let connState = 'connecting';     // 'connecting' | 'qr' | 'open' | 'close'
 let currentQrDataUrl = null;      // data:image/png;base64,... (mientras haya QR)
 let meInfo = null;                // { id, name } cuando está conectado
 let starting = false;
+
+/**
+ * Últimos mensajes enviados, para poder REENVIARLOS si hace falta.
+ *
+ * Cuando el teléfono del destinatario no logra descifrar un mensaje, WhatsApp le
+ * pide al emisor que lo mande de nuevo. Baileys responde a ese pedido llamando a
+ * `getMessage`; sin eso, al destinatario le queda para siempre el aviso
+ * «Esperando el mensaje. Esto puede demorar un poco».
+ *
+ * Se guardan en memoria y acotados: solo sirven para el reintento inmediato.
+ */
+const enviados = new Map();
+const MAX_ENVIADOS = 300;
+
+function recordarEnviado(id, contenido) {
+  if (!id) return;
+  enviados.set(id, contenido);
+  // Se descarta el más viejo: un worker que vive semanas no puede crecer sin fin.
+  if (enviados.size > MAX_ENVIADOS) enviados.delete(enviados.keys().next().value);
+}
 
 /** Normaliza un teléfono a JID de WhatsApp. CR: 8 dígitos → 506XXXXXXXX. */
 function toJid(raw) {
@@ -80,6 +109,20 @@ async function startSock() {
     }
     const { version } = await fetchLatestBaileysVersion();
 
+    /**
+     * Se cierra el socket ANTERIOR antes de abrir uno nuevo.
+     *
+     * Al reconectar se creaba otro sin soltar el viejo: quedaban dos sesiones
+     * vivas con las mismas credenciales, cada una girando sus propias claves de
+     * cifrado y pisando las de la otra. El resultado en el teléfono del
+     * destinatario es «Esperando el mensaje», porque las claves ya no cuadran.
+     */
+    if (sock) {
+      try { sock.ev.removeAllListeners(); } catch { /* ya estaba suelto */ }
+      try { sock.end(undefined); } catch { /* ya estaba cerrado */ }
+      sock = null;
+    }
+
     sock = makeWASocket({
       version,
       auth: state,
@@ -88,6 +131,8 @@ async function startSock() {
       logger: pino({ level: 'silent' }),
       syncFullHistory: false,
       markOnlineOnConnect: false,
+      // Responde los pedidos de reenvío: es lo que destraba «Esperando el mensaje».
+      getMessage: async (key) => enviados.get(key?.id) ?? undefined,
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -157,6 +202,9 @@ app.get('/status', (c) => c.json({
   connected: connState === 'open',
   qr: connState === 'qr' ? currentQrDataUrl : null,
   me: meInfo,
+  build: WORKER_BUILD,
+  // Qué trae esta versión, para confirmar desde el panel que el arreglo está.
+  features: { reenvio: true, socketUnico: true },
 }));
 
 app.post('/send', async (c) => {
@@ -172,7 +220,10 @@ app.post('/send', async (c) => {
     // Verifica que el número tenga WhatsApp antes de enviar.
     const [exists] = await sock.onWhatsApp(jid.replace('@s.whatsapp.net', ''));
     if (!exists?.exists) return c.json({ ok: false, error: 'no_whatsapp' }, 422);
-    const res = await sock.sendMessage(exists.jid, { text });
+    const contenido = { text };
+    const res = await sock.sendMessage(exists.jid, contenido);
+    // Se guarda por si el destinatario pide que se lo reenvíen.
+    recordarEnviado(res?.key?.id, { conversation: text });
     return c.json({ ok: true, id: res?.key?.id ?? null });
   } catch (e) {
     log.error({ err: String(e) }, 'Error al enviar');

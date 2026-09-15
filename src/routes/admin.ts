@@ -341,7 +341,34 @@ admin.post('/renew', async (c) => {
     if (data?.subscription_id) {
       await db.from('tenants').update({ subscription_id: data.subscription_id }).eq('id', p_tenant_id);
     }
-    return ok(c, data);
+
+    /**
+     * La fecha que quedó guardada tiene que ser la que se pidió.
+     *
+     * El panel manda la fecha FINAL ya calculada. La función de la base le
+     * sumaba además su propio plazo, así que renovar «1 mes» dejaba la
+     * suscripción vencida dos meses después. Acá se comprueba y se corrige: así
+     * queda bien aunque la base todavía tenga la versión vieja de la función
+     * (migración 112 sin correr).
+     */
+    let corregido = false;
+    const pedida = String(p_ends_at ?? '').slice(0, 10);
+    const subId = (data as any)?.subscription_id;
+    if (subId && /^\d{4}-\d{2}-\d{2}$/.test(pedida)) {
+      const { data: sub } = await db.from('subscriptions')
+        .select('ends_at').eq('id', subId).maybeSingle();
+      const guardada = String((sub as any)?.ends_at ?? '').slice(0, 10);
+      if (guardada && guardada !== pedida) {
+        // Fin de ESE día: «vence el 13» significa que el 13 todavía se trabaja.
+        const finDelDia = `${pedida}T23:59:59`;
+        await db.from('subscriptions').update({ ends_at: finDelDia }).eq('id', subId);
+        corregido = true;
+        console.warn(`[renew] la base guardó ${guardada} en vez de ${pedida}: corregido. `
+          + 'Corré la migración 112 para arreglarlo en el origen.');
+      }
+    }
+
+    return ok(c, { ...(data as any), ends_at_pedida: pedida, corregido });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
@@ -5168,6 +5195,124 @@ admin.post('/clean-product-names', async (c) => {
     }
     return ok(c, { cleaned, scanned });
   } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/**
+ * GET /whatsapp/diagnostico — POR QUÉ no llegan los mensajes.
+ *
+ * El envío pasa por cuatro cosas que pueden fallar y que, desde afuera, se ven
+ * todas igual («no llega nada»): que haya un canal configurado, que el worker
+ * esté conectado, que el NEGOCIO tenga teléfono y que el mensaje se acepte.
+ * Los avisos se disparan sin esperar respuesta para no frenar una venta, así que
+ * ningún error llegaba nunca a una pantalla.
+ *
+ * ?tenant=<id>   revisa además el teléfono de ese negocio.
+ * ?enviar=1      manda un mensaje de prueba REAL por el mismo camino que los avisos.
+ */
+admin.get('/whatsapp/diagnostico', async (c) => {
+  try {
+    const tenantId = String(c.req.query('tenant') ?? '').trim();
+    const pasos: Array<{ paso: string; ok: boolean; detalle: string }> = [];
+
+    const conWorker = !!waWorkerBase();
+    const conCloud = whatsappEnabled();
+    pasos.push({
+      paso: 'Canal configurado',
+      ok: conWorker || conCloud,
+      detalle: conWorker ? 'Worker propio (número vinculado por QR)'
+        : conCloud ? 'Cloud API de Meta — los avisos necesitan plantillas aprobadas'
+        : 'Ninguno: al servidor le falta WHATSAPP_WORKER_URL o WHATSAPP_TOKEN',
+    });
+
+    /**
+     * Con la Cloud API se comprueba el token ANTES de intentar enviar.
+     *
+     * Es la causa más común de que «no llegue nada»: los tokens de prueba de
+     * Meta duran 24 horas y, al vencer, contesta «authentication error» sin
+     * decir qué hay que renovar.
+     */
+    if (!conWorker && conCloud) {
+      const { verificarTokenMeta } = await import('../services/whatsapp.js');
+      const t = await verificarTokenMeta();
+      pasos.push({ paso: 'Token de Meta', ok: t.ok, detalle: t.detalle });
+      pasos.push({
+        paso: 'Plantillas aprobadas',
+        ok: true,
+        detalle: 'Por la Cloud API los avisos usan plantillas: recordatorio_pago, '
+          + 'documentos_por_acabarse y error_facturacion. Tienen que estar APROBADAS en '
+          + 'WhatsApp Manager con esos nombres exactos. Con el worker por QR no hacen falta.',
+      });
+    }
+
+    if (conWorker) {
+      try {
+        const r = await callWorker('/status');
+        const crudo = await r.text();
+        let d: any = {};
+        try { d = JSON.parse(crudo); } catch { /* el worker no devolvió JSON */ }
+        pasos.push({
+          paso: 'Worker conectado',
+          ok: !!d?.connected,
+          // El texto CRUDO va incluido: cuando el error no es uno de los
+          // nuestros, es lo único que dice quién lo está produciendo.
+          detalle: r.status === 401
+            ? 'El worker rechazó el secreto: WHATSAPP_WORKER_SECRET no coincide con el del worker'
+            : !r.ok ? `worker: HTTP ${r.status} — ${crudo.slice(0, 200)}`
+            : d?.connected
+              ? `Vinculado${d?.me?.id ? ` como ${d.me.id}` : ''}`
+                // La versión dice si el worker desplegado trae el arreglo de
+                // reenvío («Esperando el mensaje») o si quedó el anterior.
+                + ` · versión ${d?.build ?? 'anterior (sin marca) — volvé a desplegar el worker'}`
+                + (d?.features?.reenvio ? '' : ' · SIN el arreglo de reenvío')
+            : `Sin vincular (estado: ${d?.state ?? '?'}${d?.error ? ` · ${d.error}` : ''}). `
+              + 'Escaneá el QR de esta pantalla.',
+        });
+      } catch (e: any) {
+        pasos.push({ paso: 'Worker conectado', ok: false,
+          detalle: `No se pudo conectar al worker (${e?.message}). ¿Está encendido?` });
+      }
+    }
+
+    if (tenantId) {
+      try {
+        const { phone, name } = await businessContact(tenantId);
+        pasos.push({
+          paso: 'Teléfono del negocio',
+          ok: !!phone,
+          detalle: phone ? `${name || 'Negocio'} · ${phone}`
+            : 'Sin teléfono. Se toma de «Número de avisos» o del teléfono del emisor en Datos de FE.',
+        });
+      } catch (e: any) {
+        // Leer la configuración va contra la base: si falla, el error es de la
+        // base y no de WhatsApp. Decirlo evita buscar del lado equivocado.
+        pasos.push({ paso: 'Teléfono del negocio', ok: false,
+          detalle: `base de datos: ${e?.message ?? 'error'} — ¿el id del negocio existe?` });
+      }
+
+      if (c.req.query('enviar') === '1') {
+        const { notifyFeError } = await import('../services/whatsappNotify.js');
+        const r = await notifyFeError(tenantId, 'PRUEBA', 'Mensaje de prueba del diagnóstico de WhatsApp.');
+        // De quién es el mensaje de error: el worker y Meta contestan cosas
+        // distintas, y sin saber cuál habló no se sabe dónde corregir.
+        const quien = waWorkerBase() ? 'worker' : 'Meta (Cloud API)';
+        pasos.push({
+          paso: 'Envío de prueba',
+          ok: !!r.ok,
+          detalle: r.ok ? 'Enviado: revisá el WhatsApp del negocio'
+            : `${quien} respondió: ${r.error ?? 'sin detalle'}`,
+        });
+      }
+    }
+
+    return ok(c, { pasos, listo: pasos.every(p => p.ok) });
+  } catch (err: any) {
+    // Incluso si el diagnóstico se cae, se devuelve como un paso fallido: un
+    // error suelto en pantalla no dice en qué parte de la cadena ocurrió.
+    return ok(c, {
+      listo: false,
+      pasos: [{ paso: 'Diagnóstico', ok: false, detalle: `servidor: ${err?.message ?? 'error'}` }],
+    });
+  }
 });
 
 // GET /whatsapp/status — ¿está configurado el envío por WhatsApp?

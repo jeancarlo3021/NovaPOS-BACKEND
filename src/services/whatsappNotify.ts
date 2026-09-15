@@ -16,6 +16,22 @@ import { sendViaWorker, workerEnabled } from './whatsappWorker.js';
 
 export interface BizContact { phone: string; name: string }
 
+/**
+ * Deja constancia de los avisos que NO salieron.
+ *
+ * Quien llama a estas funciones lo hace con `void … .catch(() => {})` para no
+ * frenar una venta por un aviso. El costo era que un aviso que no se mandaba
+ * —sin teléfono, worker caído, plantilla sin aprobar— no dejaba rastro en
+ * ningún lado, y desde afuera parecía que WhatsApp «no funciona» sin más.
+ */
+function registrar(caso: string, tenantId: string, r: WaResult): WaResult {
+  if (!r.ok) {
+    console.warn(`[wa ${caso}] negocio ${tenantId}: `
+      + `${r.skipped ? 'OMITIDO' : 'FALLÓ'} — ${r.error ?? 'sin detalle'}`);
+  }
+  return r;
+}
+
 /** Teléfono + nombre del negocio (para dirigir los avisos al dueño). */
 export async function businessContact(tenantId: string): Promise<BizContact> {
   let phone = '';
@@ -75,28 +91,31 @@ async function deliver(phone: string, workerText: string, template: () => WaResu
 /** 1. Recordatorio de pago de la suscripción. */
 export async function notifyPaymentDue(tenantId: string, days: number): Promise<WaResult> {
   const { phone, name } = await businessContact(tenantId);
-  if (!phone) return { ok: false, skipped: true, error: 'Sin teléfono' };
+  if (!phone) return registrar('recordatorio_pago', tenantId, { ok: false, skipped: true, error: 'el negocio no tiene teléfono configurado' });
   const cuando = days <= 0 ? 'hoy' : days === 1 ? 'mañana' : `en ${days} días`;
   const text = `⏰ *ColónClick*\n\nHola ${name}, tu suscripción vence ${cuando}. `
     + `Renová a tiempo para no perder el servicio (POS, facturación, etc.).\n\n¡Gracias por confiar en ColónClick!`;
-  return deliver(phone, text, () => sendTemplate(phone, 'recordatorio_pago', [name, days]));
+  return registrar('recordatorio_pago', tenantId,
+    await deliver(phone, text, () => sendTemplate(phone, 'recordatorio_pago', [name, days])));
 }
 
 /** 2. Aviso de comprobantes por acabarse. */
 export async function notifyQuotaLow(tenantId: string, remaining: number, included: number): Promise<WaResult> {
   const { phone, name } = await businessContact(tenantId);
-  if (!phone) return { ok: false, skipped: true, error: 'Sin teléfono' };
+  if (!phone) return registrar('cuota_baja', tenantId, { ok: false, skipped: true, error: 'el negocio no tiene teléfono configurado' });
   const text = `📄 *ColónClick — Comprobantes electrónicos*\n\n${name}: te quedan *${remaining}* de ${included} comprobantes de tu plan. `
     + `Cuando se acaben no podrás emitir facturas/tiquetes electrónicos. Considerá ampliar tu plan.`;
-  return deliver(phone, text, () => sendTemplate(phone, 'documentos_por_acabarse', [name, remaining, included]));
+  return registrar('cuota_baja', tenantId,
+    await deliver(phone, text, () => sendTemplate(phone, 'documentos_por_acabarse', [name, remaining, included])));
 }
 
 /** 3. Aviso de error en la facturación electrónica. */
 export async function notifyFeError(tenantId: string, docLabel: string, reason: string): Promise<WaResult> {
   const { phone, name } = await businessContact(tenantId);
-  if (!phone) return { ok: false, skipped: true, error: 'Sin teléfono' };
+  if (!phone) return registrar('error_fe', tenantId, { ok: false, skipped: true, error: 'el negocio no tiene teléfono configurado' });
   const motivo = String(reason || 'Error desconocido').slice(0, 400);
   const text = `⚠️ *ColónClick — Facturación electrónica*\n\n${name}: falló la emisión de *${docLabel || 'un comprobante'}*.\n\n`
     + `Motivo: ${motivo}\n\nRevisá los datos e intentá de nuevo. Si persiste, contactá a soporte.`;
-  return deliver(phone, text, () => sendTemplate(phone, 'error_facturacion', [name, docLabel || 'comprobante', motivo]));
+  return registrar('error_fe', tenantId,
+    await deliver(phone, text, () => sendTemplate(phone, 'error_facturacion', [name, docLabel || 'comprobante', motivo])));
 }

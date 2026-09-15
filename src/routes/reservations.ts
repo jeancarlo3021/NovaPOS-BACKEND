@@ -39,6 +39,51 @@ const CreateSchema = z.object({
 
 const round2 = (n: number) => Math.round(Number(n || 0) * 100) / 100;
 
+/**
+ * IVA del apartado.
+ *
+ * El total tiene que ser lo que el cliente va a PAGAR al retirarlo. Los precios
+ * se guardan sin impuesto, así que un apartado de «₡10.000» terminaba cobrando
+ * ₡11.300 en la caja: el abono quedaba aplicado contra un monto que no existía y
+ * el saldo que se le decía al cliente era menor que el real.
+ *
+ * Se usa la tarifa de cada producto —un apartado puede mezclar tarifas— y la del
+ * negocio para lo que no la tenga. Si el negocio no cobra impuesto, es 0.
+ */
+async function calcularIva(
+  tenantId: string,
+  items: Array<{ product_id?: string | null; subtotal: number }>,
+): Promise<number> {
+  try {
+    const { data: cfg } = await db.from('settings').select('config')
+      .eq('tenant_id', tenantId).eq('type', 'general').maybeSingle();
+    const g = ((cfg as any)?.config ?? {}) as any;
+    if (g.taxEnabled === false) return 0;
+    const global = typeof g.taxPercentage === 'number' && g.taxPercentage >= 0 ? g.taxPercentage : 13;
+
+    const ids = [...new Set(items.map(i => i.product_id).filter(Boolean))] as string[];
+    const tarifa = new Map<string, number>();
+    for (let i = 0; i < ids.length; i += 200) {
+      const { data: prods } = await db.from('products')
+        .select('id, iva_rate').in('id', ids.slice(i, i + 200));
+      for (const p of (prods ?? []) as any[]) {
+        if (p.iva_rate != null && p.iva_rate !== '') tarifa.set(String(p.id), Number(p.iva_rate));
+      }
+    }
+    let iva = 0;
+    for (const it of items) {
+      const pct = (it.product_id && tarifa.has(String(it.product_id)))
+        ? tarifa.get(String(it.product_id))! : global;
+      iva += round2(it.subtotal * (pct / 100));
+    }
+    return round2(iva);
+  } catch (e: any) {
+    // Sin la configuración no se inventa un impuesto: quedaría un total falso.
+    console.warn('[apartados] no se pudo calcular el IVA:', e?.message);
+    return 0;
+  }
+}
+
 /** Consecutivo simple del apartado: AP-000001 por negocio. */
 async function nextNumber(tenantId: string): Promise<string> {
   const { data } = await db.from('reservations')
@@ -63,7 +108,7 @@ async function nextNumber(tenantId: string): Promise<string> {
  * Al ENTREGAR se libera el apartado y la venta descuenta el stock por el camino
  * normal del POS, como cualquier otra.
  */
-async function moverStock(items: any[], signo: 1 | -1) {
+async function moverStock(items: any[], signo: 1 | -1): Promise<{ ok: boolean; motivo?: string }> {
   for (const it of items) {
     if (!it.product_id) continue;
     const { data: p } = await db.from('products')
@@ -79,10 +124,19 @@ async function moverStock(items: any[], signo: 1 | -1) {
     // Sin la columna (migración 110 sin correr) el apartado igual se registra:
     // se pierde el "standby", no la venta.
     if (error && /reserved_quantity/i.test(error.message)) {
+      /**
+       * Sin la columna, el apartado se registra pero NO reserva mercadería.
+       *
+       * Antes solo quedaba anotado en el registro del servidor, donde nadie lo
+       * mira: el vendedor creía que la mercadería estaba separada y el cajero la
+       * vendía igual. Ahora se devuelve para poder avisarlo en pantalla.
+       */
       console.warn('[apartados] falta la columna reserved_quantity: corré la migración 110');
-      return;
+      return { ok: false, motivo: 'No se pudo apartar del inventario: falta correr la migración 110.' };
     }
+    if (error) return { ok: false, motivo: error.message };
   }
+  return { ok: true };
 }
 
 // GET / — lista de apartados. ?status=open|delivered|cancelled|expired|all
@@ -149,7 +203,10 @@ reservations.post('/', async (c) => {
     const items = b.items.map(it => ({
       ...it, subtotal: round2(it.quantity * it.unit_price),
     }));
-    const total = round2(items.reduce((s, it) => s + it.subtotal, 0));
+    const base = round2(items.reduce((s, it) => s + it.subtotal, 0));
+    // El total es lo que se va a pagar al retirar: base + IVA.
+    const impuesto = await calcularIva(tenantId, items);
+    const total = round2(base + impuesto);
     const deposit = round2(b.deposit ?? 0);
     if (deposit > total) return fail(c, 'El abono no puede ser mayor que el total del apartado', 422);
 
@@ -181,9 +238,9 @@ reservations.post('/', async (c) => {
     }
 
     // La mercadería queda apartada: sale del inventario disponible.
-    await moverStock(items, 1);
+    const inventario = await moverStock(items, 1);
 
-    return ok(c, { ...(res as any), items }, 201);
+    return ok(c, { ...(res as any), items, inventario }, 201);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
