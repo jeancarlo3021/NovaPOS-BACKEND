@@ -53,9 +53,12 @@ const log = pino({ level: process.env.LOG_LEVEL || 'info' });
  *
  * El worker se despliega aparte del backend, así que desde el panel no había
  * forma de saber si el que está corriendo ya tiene un arreglo o es el de antes.
- * Subila cuando cambies algo que se deba verificar desde afuera.
+ * Subila EN CADA arreglo que se deba verificar desde afuera. Si no cambia, un
+ * despliegue viejo y uno nuevo se ven iguales desde el panel — que fue justo lo
+ * que pasó: la marca quedó igual entre dos arreglos y no se podía saber cuál
+ * estaba corriendo.
  */
-const WORKER_BUILD = '2026-09-14-reenvio';
+const WORKER_BUILD = '2026-09-14c-auth';
 
 // ── Estado en memoria de la sesión ──────────────────────────────────────────
 let sock = null;
