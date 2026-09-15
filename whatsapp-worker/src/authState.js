@@ -6,9 +6,32 @@
  * BufferJSON (maneja los Buffers de las llaves de señal). Patrón estándar de
  * Baileys (initAuthCreds / BufferJSON / proto).
  */
-import baileys from '@whiskeysockets/baileys';
+import * as baileys from '@whiskeysockets/baileys';
 
-const { initAuthCreds, BufferJSON, proto } = baileys;
+/**
+ * Baileys se importa como ESPACIO DE NOMBRES completo.
+ *
+ * `initAuthCreds`, `BufferJSON` y `proto` son exports CON NOMBRE, pero acá se
+ * sacaban del export por defecto —que es `makeWASocket`, una función— y quedaban
+ * en `undefined`. El worker moría con «initAuthCreds is not a function», y solo
+ * por el camino de Supabase: con la sesión en disco nunca se tocaba este archivo.
+ *
+ * Se leen de los dos lados porque el empaquetado cambia entre versiones.
+ */
+const api = {
+  ...(baileys.default && typeof baileys.default !== 'undefined' ? baileys.default : {}),
+  ...baileys,
+};
+const initAuthCreds = api.initAuthCreds;
+const BufferJSON = api.BufferJSON;
+const proto = api.proto;
+
+if (typeof initAuthCreds !== 'function') {
+  throw new Error(
+    'No se encontró initAuthCreds en @whiskeysockets/baileys. '
+    + 'Revisá la versión instalada del paquete en whatsapp-worker.',
+  );
+}
 
 export async function useSupabaseAuthState(supabase, sessionId = 'colonclick', table = 'wa_sessions') {
   const loadRaw = async () => {
