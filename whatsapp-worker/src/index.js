@@ -60,6 +60,13 @@ const WORKER_BUILD = '2026-09-14-reenvio';
 // ── Estado en memoria de la sesión ──────────────────────────────────────────
 let sock = null;
 let connState = 'connecting';     // 'connecting' | 'qr' | 'open' | 'close'
+let estadoDesde = Date.now();     // cuándo entró al estado actual
+let ultimoError = null;           // por qué falló el último intento
+
+/** Cambia de estado anotando CUÁNDO: sin eso no se sabe si lleva 2 s o 5 min. */
+function setEstado(nuevo) {
+  if (nuevo !== connState) { connState = nuevo; estadoDesde = Date.now(); }
+}
 let currentQrDataUrl = null;      // data:image/png;base64,... (mientras haya QR)
 let meInfo = null;                // { id, name } cuando está conectado
 let starting = false;
@@ -107,7 +114,24 @@ async function startSock() {
       state = mf.state;
       saveCreds = mf.saveCreds;
     }
-    const { version } = await fetchLatestBaileysVersion();
+    /**
+     * La versión del protocolo se consulta CON PLAZO.
+     *
+     * `fetchLatestBaileysVersion()` sale a internet, y se esperaba sin límite:
+     * si el endpoint tardaba o estaba bloqueado, el worker se quedaba en
+     * «conectando» para siempre y ni siquiera llegaba a mostrar el QR. Si no
+     * responde a tiempo se usa la versión que trae la librería, que funciona.
+     */
+    let version;
+    try {
+      const r = await Promise.race([
+        fetchLatestBaileysVersion(),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('tardó más de 6 s')), 6000)),
+      ]);
+      version = r?.version;
+    } catch (e) {
+      log.warn({ err: String(e) }, 'No se pudo consultar la versión del protocolo: se usa la incluida');
+    }
 
     /**
      * Se cierra el socket ANTERIOR antes de abrir uno nuevo.
@@ -124,7 +148,8 @@ async function startSock() {
     }
 
     sock = makeWASocket({
-      version,
+      // `undefined` = la que trae la librería (cuando la consulta no respondió).
+      ...(version ? { version } : {}),
       auth: state,
       printQRInTerminal: false,
       browser: ['ColónClick', 'Chrome', '1.0.0'],
@@ -133,7 +158,26 @@ async function startSock() {
       markOnlineOnConnect: false,
       // Responde los pedidos de reenvío: es lo que destraba «Esperando el mensaje».
       getMessage: async (key) => enviados.get(key?.id) ?? undefined,
+      // Sin estos topes, un intento que no avanza se queda colgado sin reintentar.
+      connectTimeoutMs: 30_000,
+      qrTimeout: 60_000,
+      keepAliveIntervalMs: 25_000,
     });
+
+    /**
+     * Si se queda en «conectando» sin llegar a QR ni a vincularse, se reinicia.
+     *
+     * Pasaba con un arranque a medias: el estado no avanzaba nunca y desde el
+     * panel solo se veía «Conectando con WhatsApp…» sin más información.
+     */
+    setTimeout(() => {
+      if (connState === 'connecting') {
+        log.warn('Sigue en «conectando» tras 45 s: se reinicia el socket');
+        ultimoError = 'El intento anterior no avanzó en 45 s y se reinició.';
+        starting = false;
+        startSock().catch(() => {});
+      }
+    }, 45_000);
 
     sock.ev.on('creds.update', saveCreds);
 
@@ -141,23 +185,26 @@ async function startSock() {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
-        connState = 'qr';
+        setEstado('qr');
         try { currentQrDataUrl = await qrcode.toDataURL(qr, { margin: 1, width: 320 }); }
         catch { currentQrDataUrl = null; }
         log.info('QR nuevo generado — escanealo desde el panel admin');
       }
 
       if (connection === 'open') {
-        connState = 'open';
+        setEstado('open');
         currentQrDataUrl = null;
         meInfo = { id: sock?.user?.id ?? null, name: sock?.user?.name ?? null };
         log.info({ me: meInfo }, 'WhatsApp conectado');
       }
 
       if (connection === 'close') {
-        connState = 'close';
+        setEstado('close');
         const code = lastDisconnect?.error?.output?.statusCode;
         const loggedOut = code === DisconnectReason.loggedOut;
+        ultimoError = loggedOut
+          ? 'La sesión se cerró desde el teléfono: hay que volver a escanear el QR.'
+          : `Conexión cerrada (código ${code ?? '?'}): reintentando.`;
         log.warn({ code, loggedOut }, 'Conexión cerrada');
         starting = false;
         if (loggedOut) {
@@ -174,6 +221,7 @@ async function startSock() {
       }
     });
   } catch (e) {
+    ultimoError = `No se pudo iniciar: ${String(e)}`;
     log.error({ err: String(e) }, 'Fallo al iniciar el socket');
     setTimeout(() => { starting = false; startSock().catch(() => {}); }, 5000);
     return;
@@ -203,6 +251,10 @@ app.get('/status', (c) => c.json({
   qr: connState === 'qr' ? currentQrDataUrl : null,
   me: meInfo,
   build: WORKER_BUILD,
+  // Cuánto lleva en este estado y el último motivo de corte: sin esto, «conectando»
+  // se ve igual a los 2 segundos que a los 5 minutos.
+  segundos_en_estado: Math.round((Date.now() - estadoDesde) / 1000),
+  ultimo_error: ultimoError,
   // Qué trae esta versión, para confirmar desde el panel que el arreglo está.
   features: { reenvio: true, socketUnico: true },
 }));
@@ -234,7 +286,7 @@ app.post('/send', async (c) => {
 app.post('/logout', async (c) => {
   try { await sock?.logout(); } catch { /* ignore */ }
   if (supabaseAuth) { try { await supabaseAuth.clear(); } catch { /* ignore */ } }
-  connState = 'close';
+  setEstado('close');
   meInfo = null;
   currentQrDataUrl = null;
   // Reinicia para generar un QR nuevo.
