@@ -20,6 +20,22 @@ const STATUSES = ['pendiente', 'aprobada', 'rechazada', 'entregada', 'convertida
  * para convertirla en cliente sin perder lo que cargó. Pasado el plazo, se borra.
  */
 export const DEMO_PURGE_DAYS = 4;
+
+/**
+ * Hasta cuándo dura una suscripción según el ciclo del plan.
+ *
+ * `lifetime` (Vitalicio) devuelve null: sin fecha de fin, que es como el sistema
+ * representa «no vence» —el control de acceso deja pasar cualquier suscripción
+ * sin `ends_at`—. Antes esa opción existía en la pantalla de planes pero nadie
+ * la miraba: el cálculo era «anual → 365 días, lo demás → 30», así que un plan
+ * vitalicio vencía al mes igual que uno mensual.
+ */
+export function finSegunCiclo(cycle: any): Date | null {
+  const c = String(cycle ?? 'monthly').toLowerCase();
+  if (c === 'lifetime') return null;
+  const dias = c === 'yearly' ? 365 : 30;
+  return new Date(Date.now() + dias * 86400000);
+}
 const MANAGERS = new Set(['owner', 'admin', 'gerente']);
 
 const DemoSchema = z.object({
@@ -246,7 +262,7 @@ async function createTenantForRequest(req: any, opts: {
   const tenantId = (created as any).id as string;
 
   let planId = opts.planId ?? null;
-  let endsAt: Date;
+  let endsAt: Date | null;   // null = vitalicio (sin vencimiento)
 
   if (opts.demo) {
     // Plan propio de esta demo con EXACTAMENTE los módulos pedidos. Tocar uno
@@ -262,15 +278,14 @@ async function createTenantForRequest(req: any, opts: {
   } else {
     const { data: plan } = await db.from('subscription_plans')
       .select('billing_cycle').eq('id', planId ?? '').maybeSingle();
-    const cycleDays = String((plan as any)?.billing_cycle ?? 'monthly').toLowerCase() === 'yearly' ? 365 : 30;
-    endsAt = new Date(Date.now() + cycleDays * 86400000);
+    endsAt = finSegunCiclo((plan as any)?.billing_cycle);
   }
 
   if (planId) {
     await db.from('tenants').update({ plan_id: planId }).eq('id', tenantId);
     const { data: sub } = await db.from('subscriptions').insert({
       tenant_id: tenantId, plan_id: planId, status: 'active',
-      auto_renew: !opts.demo, ends_at: endsAt.toISOString(),
+      auto_renew: !opts.demo, ends_at: endsAt ? endsAt.toISOString() : null,
     }).select('id').single();
     if ((sub as any)?.id) {
       await db.from('tenants').update({ subscription_id: (sub as any).id }).eq('id', tenantId);
@@ -617,10 +632,11 @@ demoRequests.post('/:id/convert', async (c) => {
       .update({ status: 'cancelled', auto_renew: false, updated_at: new Date().toISOString() })
       .eq('tenant_id', demoTenant).eq('status', 'active');
 
-    const cycleDays = String((plan as any).billing_cycle ?? 'monthly').toLowerCase() === 'yearly' ? 365 : 30;
+    const fin = finSegunCiclo((plan as any).billing_cycle);
     const { data: sub } = await db.from('subscriptions').insert({
       tenant_id: demoTenant, plan_id: planId, status: 'active', auto_renew: true,
-      ends_at: new Date(Date.now() + cycleDays * 86400000).toISOString(),
+      // Vitalicio → sin fecha de fin.
+      ends_at: fin ? fin.toISOString() : null,
     }).select('id').single();
     if ((sub as any)?.id) {
       await db.from('tenants').update({ subscription_id: (sub as any).id }).eq('id', demoTenant);

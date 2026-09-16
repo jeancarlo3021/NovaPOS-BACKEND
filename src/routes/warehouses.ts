@@ -70,13 +70,72 @@ warehouses.put('/:id', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+/**
+ * Borra una bodega, o explica POR QUÉ no se puede.
+ *
+ * Antes se intentaba el borrado a secas y, cuando algo la referenciaba, salía en
+ * pantalla el error crudo de la base: «violates foreign key constraint
+ * transfers_from_warehouse_fkey». Eso no dice qué hay que hacer, y encima
+ * esconde algo importante: los traslados son HISTORIAL y no se deben borrar.
+ */
 warehouses.delete('/:id', async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const { id } = c.req.param();
+
+    const { data: wh } = await db.from('warehouses')
+      .select('id, name').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+    if (!wh) return fail(c, 'Bodega no encontrada', 404);
+    const nombre = (wh as any).name ?? 'la bodega';
+
+    const impedimentos: string[] = [];
+
+    // 1) Traslados: son historial de movimientos de mercadería.
+    try {
+      const { count } = await db.from('transfers')
+        .select('id', { count: 'exact', head: true })
+        .or(`from_warehouse.eq.${id},to_warehouse.eq.${id}`);
+      if (count) {
+        impedimentos.push(`tiene ${count} traslado(s) en el historial`);
+      }
+    } catch { /* sin la tabla: no bloquea */ }
+
+    // 2) Existencias: borrarla haría desaparecer mercadería del inventario.
+    try {
+      const { data: st } = await db.from('warehouse_stock')
+        .select('quantity').eq('warehouse_id', id);
+      const conSaldo = (st ?? []).filter((r: any) => Number(r.quantity ?? 0) !== 0).length;
+      if (conSaldo) impedimentos.push(`todavía tiene existencias de ${conSaldo} producto(s)`);
+    } catch { /* ignore */ }
+
+    // 3) Rutas: si es un camión, borrarlo se llevaría sus rutas y sus ventas.
+    try {
+      const { count } = await db.from('routes')
+        .select('id', { count: 'exact', head: true }).eq('warehouse_id', id);
+      if (count) impedimentos.push(`es el camión de ${count} ruta(s)`);
+    } catch { /* ignore */ }
+
+    if (impedimentos.length) {
+      return fail(c,
+        `No se puede borrar «${nombre}»: ${impedimentos.join(', ')}.\n\n`
+        + 'Ese historial tiene que conservarse: los traslados y las rutas respaldan movimientos '
+        + 'de mercadería que ya ocurrieron. Si la bodega dejó de usarse, pasá sus existencias a '
+        + 'otra con un traslado y dejala vacía, sin borrarla.', 409);
+    }
+
     const { error } = await db.from('warehouses')
       .delete().eq('id', id).eq('tenant_id', tenantId);
-    if (error) throw new Error(error.message);
+    if (error) {
+      // Quedó algo que no previmos: se traduce en vez de mostrar el texto de la base.
+      if (/foreign key|violates/i.test(error.message)) {
+        const tabla = /on table "([^"]+)"/.exec(error.message)?.[1]
+          ?? /constraint "([a-z_]+)_/.exec(error.message)?.[1];
+        return fail(c,
+          `No se puede borrar «${nombre}»: todavía hay registros que la usan`
+          + `${tabla ? ` (en ${tabla})` : ''}. Vaciala y dejala sin uso en vez de borrarla.`, 409);
+      }
+      throw new Error(error.message);
+    }
     return ok(c, { deleted: true });
   } catch (err: any) { return fail(c, err.message, 500); }
 });

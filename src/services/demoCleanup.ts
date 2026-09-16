@@ -22,6 +22,14 @@ export async function purgeExpiredDemos(opts: { dryRun?: boolean } = {}) {
 
   const borradas: string[] = [];
   const saltadas: Array<{ demo: string; motivo: string }> = [];
+  /**
+   * Las que TODAVÍA no toca borrar, con la fecha en que les toca.
+   *
+   * Sin esto, «no se borra ninguna» y «no le toca a ninguna» se veían igual: una
+   * lista vacía. Saber cuándo le toca a cada una es lo que permite distinguir un
+   * proceso que no corre de uno que corre y no tiene nada que hacer.
+   */
+  const pendientes: Array<{ demo: string; negocio: string; borra_el: string }> = [];
 
   for (const r of (vencidas ?? []) as any[]) {
     /**
@@ -38,10 +46,17 @@ export async function purgeExpiredDemos(opts: { dryRun?: boolean } = {}) {
     const vence = (sub as any)?.ends_at
       ? new Date((sub as any).ends_at).getTime()
       : r.expires_on ? new Date(`${r.expires_on}T23:59:59`).getTime() : null;
-    const toca = vence != null
-      ? vence + plazoMs <= Date.now()
-      : !!(r.purge_on && String(r.purge_on) <= hoy);   // demos viejas sin fechas
-    if (!toca) continue;
+    const borraEl = vence != null ? vence + plazoMs
+      : r.purge_on ? new Date(`${r.purge_on}T00:00:00`).getTime() : null;
+    const toca = borraEl != null && borraEl <= Date.now();
+    if (!toca) {
+      pendientes.push({
+        demo: r.number ?? r.id,
+        negocio: r.business_name ?? '',
+        borra_el: borraEl != null ? new Date(borraEl).toISOString().slice(0, 10) : 'sin fecha definida',
+      });
+      continue;
+    }
 
     // Segunda verificación contra el negocio: si dejó de ser demo (lo pasaron a
     // cliente por otro lado), NO se toca.
@@ -87,5 +102,5 @@ export async function purgeExpiredDemos(opts: { dryRun?: boolean } = {}) {
     borradas.push(r.number ?? r.id);
   }
 
-  return { revisadas: (vencidas ?? []).length, borradas, saltadas };
+  return { revisadas: (vencidas ?? []).length, borradas, saltadas, pendientes };
 }

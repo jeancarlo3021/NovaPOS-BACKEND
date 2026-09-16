@@ -706,6 +706,122 @@ groups.put('/:id/branches/:tenantId/fe-plan', async (c) => {
 });
 
 // ── GET /fe-plans — catálogo de planes FE disponibles ─────────────────────
+/**
+ * POST /:id/copy-products — copia el catálogo de una sucursal a otra.
+ *
+ * Cada sucursal del grupo es un negocio aparte, con sus propios productos: una
+ * nueva abría con el catálogo vacío y había que cargarlo de cero o por Excel.
+ *
+ * No es copiar filas. Las categorías, unidades y proveedores son de cada
+ * negocio: si se copiaran los identificadores tal cual, los productos quedarían
+ * apuntando a categorías de OTRO negocio. Se emparejan POR NOMBRE y se crean las
+ * que falten en el destino.
+ *
+ * El stock NO se copia: la sucursal nueva no tiene esa mercadería. Se copia el
+ * catálogo (precios, códigos, CABYS, impuestos), que es lo que se comparte.
+ *
+ * body: { from_tenant, to_tenant }
+ */
+groups.post('/:id/copy-products', async (c) => {
+  try {
+    const groupId = c.req.param('id');
+    const b = await c.req.json().catch(() => ({} as any));
+    const origen = String(b?.from_tenant ?? '').trim();
+    const destino = String(b?.to_tenant ?? '').trim();
+    if (!origen || !destino) return fail(c, 'Indicá desde qué sucursal y hacia cuál copiar.', 422);
+    if (origen === destino) return fail(c, 'El origen y el destino son la misma sucursal.', 422);
+
+    // Las dos tienen que ser del MISMO grupo: si no, se estarían copiando
+    // productos entre negocios que no tienen relación.
+    const { data: miembros } = await db.from('tenants')
+      .select('id, name').eq('group_id', groupId).in('id', [origen, destino]);
+    if ((miembros ?? []).length !== 2) {
+      return fail(c, 'Las dos sucursales tienen que pertenecer a este grupo.', 422);
+    }
+
+    /** Empareja un catálogo auxiliar por NOMBRE y devuelve viejo id → nuevo id. */
+    const mapearPorNombre = async (tabla: string): Promise<Map<string, string>> => {
+      const mapa = new Map<string, string>();
+      try {
+        const { data: deOrigen } = await db.from(tabla).select('*').eq('tenant_id', origen);
+        if (!deOrigen?.length) return mapa;
+        const { data: deDestino } = await db.from(tabla).select('*').eq('tenant_id', destino);
+        const porNombre = new Map<string, any>(
+          (deDestino ?? []).map((r: any) => [String(r.name ?? '').trim().toLowerCase(), r]));
+
+        for (const fila of deOrigen as any[]) {
+          const clave = String(fila.name ?? '').trim().toLowerCase();
+          const ya = porNombre.get(clave);
+          if (ya) { mapa.set(String(fila.id), String(ya.id)); continue; }
+          const { id, tenant_id, created_at, updated_at, ...resto } = fila;
+          const { data: creada } = await db.from(tabla)
+            .insert({ ...resto, tenant_id: destino }).select('id').maybeSingle();
+          if ((creada as any)?.id) {
+            mapa.set(String(fila.id), String((creada as any).id));
+            porNombre.set(clave, creada);
+          }
+        }
+      } catch (e: any) {
+        console.warn(`[copiar catálogo] ${tabla}:`, e?.message);
+      }
+      return mapa;
+    };
+
+    const categorias = await mapearPorNombre('categories');
+    const unidades = await mapearPorNombre('unit_types');
+
+    const { data: productos } = await db.from('products').select('*').eq('tenant_id', origen);
+    if (!productos?.length) return ok(c, { copiados: 0, omitidos: 0, motivo: 'La sucursal de origen no tiene productos.' });
+
+    // Lo que YA está en el destino no se duplica: por código, o por nombre
+    // cuando el producto no tiene código.
+    const { data: yaHay } = await db.from('products').select('sku, name').eq('tenant_id', destino);
+    const skus = new Set((yaHay ?? []).map((p: any) => String(p.sku ?? '').trim().toLowerCase()).filter(Boolean));
+    const nombres = new Set((yaHay ?? []).map((p: any) => String(p.name ?? '').trim().toLowerCase()));
+
+    const filas: any[] = [];
+    let omitidos = 0;
+    for (const p of productos as any[]) {
+      const sku = String(p.sku ?? '').trim().toLowerCase();
+      const nombre = String(p.name ?? '').trim().toLowerCase();
+      if ((sku && skus.has(sku)) || (!sku && nombres.has(nombre))) { omitidos++; continue; }
+
+      const { id, tenant_id, created_at, updated_at, ...resto } = p;
+      filas.push({
+        ...resto,
+        tenant_id: destino,
+        category_id: p.category_id ? (categorias.get(String(p.category_id)) ?? null) : null,
+        unit_type_id: p.unit_type_id ? (unidades.get(String(p.unit_type_id)) ?? null) : null,
+        // El proveedor es del otro negocio: dejarlo apuntaría a una ficha ajena.
+        supplier_id: null,
+        // Catálogo, no mercadería: la sucursal nueva arranca sin existencias.
+        stock_quantity: 0,
+        reserved_quantity: 0,
+      });
+      if (sku) skus.add(sku); else nombres.add(nombre);
+    }
+
+    let copiados = 0;
+    for (let i = 0; i < filas.length; i += 200) {
+      const tanda = filas.slice(i, i + 200);
+      let { error } = await db.from('products').insert(tanda);
+      // `reserved_quantity` puede no existir (migración 110 sin correr).
+      if (error && /reserved_quantity/i.test(error.message)) {
+        ({ error } = await db.from('products')
+          .insert(tanda.map(({ reserved_quantity, ...r }: any) => r)));
+      }
+      if (error) return fail(c, `Se copiaron ${copiados}; falló el resto: ${error.message}`, 500);
+      copiados += tanda.length;
+    }
+
+    return ok(c, {
+      copiados, omitidos,
+      categorias_creadas: categorias.size,
+      unidades_creadas: unidades.size,
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 groups.get('/fe-plans/catalog', async (c) => {
   try {
     const { data, error } = await db.from('fe_plans')

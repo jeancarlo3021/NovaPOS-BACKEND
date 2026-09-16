@@ -21,7 +21,37 @@ const handler = async (c: any) => {
   try {
     const debug = c.req.query('debug') === '1';
     const summary = await fetchAndProcessReceivedEmails({ debug });
-    return ok(c, { ok: true, ...summary });
+
+    /**
+     * De paso se limpian las demos vencidas.
+     *
+     * El borrado tenía su propio trabajo programado (`/cron/purge-demos`), y si
+     * ese no se configura NUNCA se ejecuta: las demos quedaban vivas para
+     * siempre sin que nada lo avisara. Colgarlo del que sí corre lo vuelve
+     * independiente de esa configuración. Nunca rompe la lectura de correos.
+     */
+    let demos: any = null;
+    try {
+      const { purgeExpiredDemos } = await import('../services/demoCleanup.js');
+      demos = await purgeExpiredDemos();
+    } catch (e: any) {
+      console.warn('[cron] limpieza de demos:', e?.message);
+    }
+    /**
+     * Avisos de cobro (7, 4, 2 y 1 días antes del vencimiento).
+     *
+     * Van acá por lo mismo que la limpieza de demos: este es el trabajo
+     * programado que sí está corriendo. La tabla de avisos enviados impide que
+     * se repitan, así que ejecutarlo cada pocos minutos es inofensivo.
+     */
+    let cobros: any = null;
+    try {
+      const { enviarAvisosDeCobro } = await import('../services/paymentReminders.js');
+      cobros = await enviarAvisosDeCobro();
+    } catch (e: any) {
+      console.warn('[cron] avisos de cobro:', e?.message);
+    }
+    return ok(c, { ok: true, ...summary, demos, cobros });
   } catch (err: any) {
     return fail(c, err?.message ?? 'Error al procesar correos', 500);
   }
@@ -59,5 +89,20 @@ const reintentoCorreosHandler = async (c: any) => {
 };
 cron.get('/retry-fe-emails', reintentoCorreosHandler);
 cron.post('/retry-fe-emails', reintentoCorreosHandler);
+
+// Avisos de cobro por WhatsApp a los 7, 4, 2 y 1 días. `?debug=1` solo informa
+// a quién le tocaría, sin mandar nada.
+const cobrosHandler = async (c: any) => {
+  if (!authorized(c)) return fail(c, 'No autorizado', 401);
+  try {
+    const { enviarAvisosDeCobro } = await import('../services/paymentReminders.js');
+    const res = await enviarAvisosDeCobro({ dryRun: c.req.query('debug') === '1' });
+    return ok(c, { ok: true, simulacion: c.req.query('debug') === '1', ...res });
+  } catch (err: any) {
+    return fail(c, err?.message ?? 'Error al enviar los avisos de cobro', 500);
+  }
+};
+cron.get('/payment-reminders', cobrosHandler);
+cron.post('/payment-reminders', cobrosHandler);
 
 export default cron;

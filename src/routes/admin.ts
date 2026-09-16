@@ -41,15 +41,32 @@ async function esAdminDelSaas(userId: string): Promise<boolean> {
   if (hit && Date.now() - hit.at < ADMIN_TTL_MS) return hit.ok;
   let permitido = false;
   try {
+    /**
+     * Se miran TODOS los negocios del usuario, no solo su negocio «principal».
+     *
+     * Antes se leía únicamente `users.tenant_id`. A quien se agrega al negocio
+     * administrador el vínculo le queda en `user_tenants`, y su `tenant_id`
+     * apunta a otro lado o está vacío: el menú le mostraba el Panel Admin
+     * —porque el plan del negocio activo sí lo trae— y el servidor le respondía
+     * 403. Alcanza con que UNO de sus negocios tenga el panel habilitado.
+     */
+    const tenantIds = new Set<string>();
     const { data: u } = await db.from('users').select('tenant_id').eq('id', userId).maybeSingle();
     const tid = (u as any)?.tenant_id;
-    if (tid) {
-      const { data: t } = await db.from('tenants').select('plan_id').eq('id', tid).maybeSingle();
-      const planId = (t as any)?.plan_id;
-      if (planId) {
-        const { data: p } = await db.from('subscription_plans')
-          .select('features').eq('id', planId).maybeSingle();
-        permitido = ((p as any)?.features)?.admin_dashboard === true;
+    if (tid) tenantIds.add(String(tid));
+    try {
+      const { data: ut } = await db.from('user_tenants').select('tenant_id').eq('user_id', userId);
+      for (const r of (ut ?? []) as any[]) if (r.tenant_id) tenantIds.add(String(r.tenant_id));
+    } catch { /* sin la tabla: queda el tenant_id de siempre */ }
+
+    if (tenantIds.size > 0) {
+      const { data: ts } = await db.from('tenants')
+        .select('plan_id').in('id', [...tenantIds]);
+      const planIds = [...new Set((ts ?? []).map((t: any) => t.plan_id).filter(Boolean))] as string[];
+      if (planIds.length) {
+        const { data: ps } = await db.from('subscription_plans')
+          .select('features').in('id', planIds);
+        permitido = (ps ?? []).some((p: any) => (p?.features)?.admin_dashboard === true);
       }
     } else {
       // Sin negocio propio: es dueño de la plataforma solo si además figura como
@@ -334,6 +351,26 @@ admin.get('/invoices-monthly', async (c) => {
 admin.post('/renew', async (c) => {
   try {
     const { p_tenant_id, p_plan_id, p_ends_at } = await c.req.json();
+
+    /**
+     * SIN VENCIMIENTO: `ends_at` en null.
+     *
+     * Es como el sistema representa «no vence»: el control de acceso deja pasar
+     * cualquier suscripción sin fecha de fin. La función de la base exige una
+     * fecha, así que este caso se inserta directo.
+     */
+    if (!p_ends_at) {
+      const { data: sub, error: eSub } = await db.from('subscriptions').insert({
+        tenant_id: p_tenant_id, plan_id: p_plan_id ?? null, status: 'active',
+        auto_renew: false, ends_at: null,
+      }).select('id').single();
+      if (eSub) throw new Error(eSub.message);
+      await db.from('tenants')
+        .update({ subscription_id: (sub as any).id, updated_at: new Date().toISOString() })
+        .eq('id', p_tenant_id);
+      return ok(c, { subscription_id: (sub as any).id, ends_at: null, sin_vencimiento: true });
+    }
+
     const { data, error } = await db.rpc('admin_renew_subscription', { p_tenant_id, p_plan_id, p_ends_at });
     if (error) throw new Error(error.message);
 
@@ -5313,6 +5350,21 @@ admin.get('/whatsapp/diagnostico', async (c) => {
       pasos: [{ paso: 'Diagnóstico', ok: false, detalle: `servidor: ${err?.message ?? 'error'}` }],
     });
   }
+});
+
+/**
+ * POST /demos/purge — borra las demos vencidas AHORA, desde el panel.
+ *
+ * El borrado automático depende de un trabajo programado; esto permite
+ * ejecutarlo a mano y, sobre todo, VER por qué una demo sigue viva.
+ * `?debug=1` solo informa qué borraría, sin borrar nada.
+ */
+admin.post('/demos/purge', async (c) => {
+  try {
+    const { purgeExpiredDemos } = await import('../services/demoCleanup.js');
+    const res = await purgeExpiredDemos({ dryRun: c.req.query('debug') === '1' });
+    return ok(c, { ...res, simulacion: c.req.query('debug') === '1' });
+  } catch (err: any) { return fail(c, err.message, 500); }
 });
 
 // GET /whatsapp/status — ¿está configurado el envío por WhatsApp?
