@@ -439,6 +439,134 @@ const UserPermissionsSchema = z.record(
   })
 );
 
+/**
+ * Tiendas o sucursales que un usuario puede ver.
+ *
+ * El acceso ya existía —es `user_tenants`, lo que llena el selector de empresa—
+ * pero solo se podía dar al crear el usuario (en UNA sucursal) o desde el panel
+ * de grupos. Un cajero que cubre turnos en dos tiendas, o un gerente que tiene
+ * que ver todas, obligaba a crear un usuario por tienda.
+ *
+ * Solo se tocan las tiendas que MANEJA quien edita: las que tiene como dueño (o
+ * todas las suyas, si es super-admin). Lo que el usuario tenga en otras tiendas
+ * no se ve ni se modifica desde acá.
+ */
+async function tiendasQueManeja(editorId: string): Promise<Array<{ id: string; name: string }>> {
+  const { data: ut } = await db.from('user_tenants')
+    .select('tenant_id, role, tenant:tenants!user_tenants_tenant_id_fkey(id, name, owner_id)')
+    .eq('user_id', editorId);
+  let superAdmin = false;
+  try {
+    const { data: u } = await db.from('users').select('tenant_id').eq('id', editorId).maybeSingle();
+    const { data: t } = await db.from('tenants').select('plan_id').eq('id', (u as any)?.tenant_id ?? '').maybeSingle();
+    const { data: p } = await db.from('subscription_plans').select('features').eq('id', (t as any)?.plan_id ?? '').maybeSingle();
+    superAdmin = (p as any)?.features?.admin_dashboard === true;
+  } catch { /* sin plan: no es super-admin */ }
+
+  const tiendas = new Map<string, string>();
+  for (const r of (ut ?? []) as any[]) {
+    const esDueño = r.role === 'owner' || r.tenant?.owner_id === editorId;
+    if (superAdmin || esDueño) tiendas.set(String(r.tenant_id), String(r.tenant?.name ?? 'Negocio'));
+  }
+  // Negocios de los que es dueño aunque le falte la fila de acceso.
+  const { data: propios } = await db.from('tenants').select('id, name').eq('owner_id', editorId);
+  for (const t of (propios ?? []) as any[]) tiendas.set(String(t.id), String(t.name ?? 'Negocio'));
+  return [...tiendas].map(([id, name]) => ({ id, name })).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// GET /managed-tenants — tiendas que maneja quien edita (para elegir al crear un usuario)
+users.get('/managed-tenants', async (c) => {
+  try { return ok(c, await tiendasQueManeja(c.get('userId'))); }
+  catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// GET /:id/tenants — tiendas que maneja quien edita, marcando a cuáles entra el usuario
+users.get('/:id/tenants', async (c) => {
+  try {
+    const { id } = c.req.param();
+    const tiendas = await tiendasQueManeja(c.get('userId'));
+    const ids = tiendas.map(t => t.id);
+
+    const { data: usuario } = await db.from('users').select('id, tenant_id').eq('id', id).maybeSingle();
+    if (!usuario) return fail(c, 'Usuario no encontrado', 404);
+    const { data: accesos } = await db.from('user_tenants').select('tenant_id').eq('user_id', id);
+    const conAcceso = new Set(((accesos ?? []) as any[]).map(a => String(a.tenant_id)));
+    // Solo se puede administrar a alguien que está en alguna de las tiendas propias.
+    const esDeMisTiendas = ids.includes(String((usuario as any).tenant_id)) || ids.some(t => conAcceso.has(t));
+    if (!esDeMisTiendas) return fail(c, 'Usuario no encontrado', 404);
+
+    return ok(c, {
+      tiendas: tiendas.map(t => ({
+        tenant_id: t.id, name: t.name,
+        acceso: conAcceso.has(t.id) || String((usuario as any).tenant_id) === t.id,
+        /** Donde está trabajando ahora: no se le puede quitar sin moverlo. */
+        actual: String((usuario as any).tenant_id) === t.id,
+      })),
+      /** Accesos en tiendas que quien edita no maneja (no se tocan). */
+      otras: [...conAcceso].filter(t => !ids.includes(t)).length,
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// PUT /:id/tenants — { tenant_ids: [...] } tiendas (de las que maneja) a las que entra
+users.put('/:id/tenants', async (c) => {
+  try {
+    const { id } = c.req.param();
+    const body = await c.req.json().catch(() => ({} as any));
+    const pedidas = new Set<string>((Array.isArray(body?.tenant_ids) ? body.tenant_ids : []).map(String));
+
+    const tiendas = await tiendasQueManeja(c.get('userId'));
+    const ids = new Set(tiendas.map(t => t.id));
+    for (const t of pedidas) if (!ids.has(t)) return fail(c, 'No administrás una de las tiendas elegidas.', 403);
+
+    const { data: usuario } = await db.from('users').select('id, tenant_id, role').eq('id', id).maybeSingle();
+    if (!usuario) return fail(c, 'Usuario no encontrado', 404);
+    const { data: filas } = await db.from('user_tenants').select('tenant_id, role, is_default').eq('user_id', id);
+    const actuales = ((filas ?? []) as any[]);
+    const conAcceso = new Set(actuales.map(a => String(a.tenant_id)));
+    const actual = String((usuario as any).tenant_id ?? '');
+    if (!ids.has(actual) && ![...ids].some(t => conAcceso.has(t))) return fail(c, 'Usuario no encontrado', 404);
+
+    // Lo que tiene fuera de mis tiendas se conserva tal cual.
+    const quedan = new Set([...conAcceso].filter(t => !ids.has(t)));
+    for (const t of pedidas) quedan.add(t);
+    if (quedan.size === 0) return fail(c, 'El usuario tiene que poder entrar al menos a una tienda.', 422);
+
+    const agregar = [...pedidas].filter(t => !conAcceso.has(t));
+    const quitar = [...conAcceso].filter(t => ids.has(t) && !pedidas.has(t));
+
+    if (agregar.length) {
+      // El dueño sigue siendo dueño en las otras tiendas; el resto entra como personal.
+      const rol = (usuario as any).role === 'owner' ? 'owner' : 'staff';
+      const { error } = await db.from('user_tenants').upsert(
+        agregar.map(t => ({ user_id: id, tenant_id: t, role: rol, is_default: false })),
+        { onConflict: 'user_id,tenant_id' });
+      if (error) throw new Error(error.message);
+    }
+    if (quitar.length) {
+      const { error } = await db.from('user_tenants').delete().eq('user_id', id).in('tenant_id', quitar);
+      if (error) throw new Error(error.message);
+    }
+
+    /**
+     * Si le quitaron la tienda en la que está trabajando, se lo pasa a otra.
+     * El negocio activo de un usuario es `users.tenant_id`: sin moverlo, seguiría
+     * adentro de la tienda que ya no puede ver hasta que cambiara a mano.
+     */
+    let movidoA: string | null = null;
+    if (!quedan.has(actual)) {
+      const preferida = actuales.find(a => a.is_default && quedan.has(String(a.tenant_id)))?.tenant_id;
+      movidoA = String(preferida ?? [...pedidas][0] ?? [...quedan][0]);
+      const { error } = await db.from('users').update({ tenant_id: movidoA }).eq('id', id);
+      if (error) throw new Error(error.message);
+      await db.from('user_tenants').update({ is_default: true }).eq('user_id', id).eq('tenant_id', movidoA);
+    }
+    forgetCachedUser(id);
+
+    return ok(c, { agregadas: agregar.length, quitadas: quitar.length, movido_a: movidoA });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // GET /:id/permissions — get all permissions for a user
 users.get('/:id/permissions', async (c) => {
   try {

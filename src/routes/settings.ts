@@ -2,6 +2,8 @@ import { Hono } from 'hono';
 import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
 import { sincronizarEmpresaEnAlanube } from './admin.js';
+import { configEfectiva, guardarRepartido } from '../services/feCompartida.js';
+import { crearActividadesNuevas } from '../services/actividadesSucursal.js';
 
 const settings = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
@@ -13,6 +15,13 @@ settings.get('/:type', async (c) => {
     const { data, error } = await db.from('settings').select('*')
       .eq('tenant_id', tenantId).eq('type', type).maybeSingle();
     if (error) throw new Error(error.message);
+    if (type === 'electronic-invoice' && (data?.config as any)?.fe_shared_from) {
+      // Sucursal de actividad: se muestran los datos de la sociedad con los suyos.
+      const cfg = await configEfectiva(tenantId, data!.config as any);
+      const { data: t } = await db.from('tenants').select('name')
+        .eq('id', String((data!.config as any).fe_shared_from)).maybeSingle();
+      return ok(c, { ...cfg, fe_shared_from_name: (t as any)?.name ?? null });
+    }
     return ok(c, data?.config ?? {});
   } catch (err: any) { return fail(c, err.message, 500); }
 });
@@ -55,7 +64,9 @@ settings.put('/:type', async (c) => {
     if (type === 'electronic-invoice' && !(await isSuperAdmin(c.get('userId')))) {
       const { data: prev } = await db.from('settings').select('config')
         .eq('tenant_id', tenantId).eq('type', type).maybeSingle();
-      const guardado: Record<string, any> = { ...((prev?.config as any) ?? {}) };
+      // Sobre la config EFECTIVA: en una sucursal de actividad, lo guardado propio
+      // no trae los datos de la sociedad y el merge los daría por vacíos.
+      const guardado: Record<string, any> = { ...(await configEfectiva(tenantId, (prev?.config as any) ?? {})) };
 
       /**
        * Lo que el negocio SÍ conoce y le cambia solo.
@@ -86,12 +97,26 @@ settings.put('/:type', async (c) => {
       config = guardado;
     }
 
-    const { data, error } = await db.from('settings').upsert({
-      tenant_id: tenantId, type, config,
-      updated_at: new Date().toISOString(),
-    }, { onConflict: 'tenant_id,type' }).select().single();
-
-    if (error) throw new Error(error.message);
+    let data: any;
+    // Lo que había ANTES, para saber qué actividades se agregaron en este guardado.
+    let anterior: Record<string, any> = {};
+    if (type === 'electronic-invoice') {
+      const { data: prevRow } = await db.from('settings').select('config')
+        .eq('tenant_id', tenantId).eq('type', type).maybeSingle();
+      anterior = await configEfectiva(tenantId, (prevRow?.config as any) ?? {});
+    }
+    if (type === 'electronic-invoice') {
+      // Reparte: lo de la actividad en este negocio, lo de la sociedad en el principal.
+      const r = await guardarRepartido(tenantId, config);
+      data = { config: r.config };
+    } else {
+      const res = await db.from('settings').upsert({
+        tenant_id: tenantId, type, config,
+        updated_at: new Date().toISOString(),
+      }, { onConflict: 'tenant_id,type' }).select().single();
+      if (res.error) throw new Error(res.error.message);
+      data = res.data;
+    }
 
     /**
      * Los datos de contacto también se mandan a Alanube.
@@ -105,7 +130,15 @@ settings.put('/:type', async (c) => {
      * hasta que se sincronice el comprobante sigue saliendo con lo anterior.
      */
     let alanube: { ok: boolean; motivo?: string } | null = null;
+    let actividades: Awaited<ReturnType<typeof crearActividadesNuevas>> | null = null;
     if (type === 'electronic-invoice') {
+      /**
+       * Cada actividad nueva de la lista pasa a ser su propio negocio, ligado a
+       * este como principal. Va ANTES de actualizar Alanube: así la empresa
+       * recibe en una sola actualización todas las actividades.
+       */
+      try { actividades = await crearActividadesNuevas(tenantId, anterior, data?.config ?? config, c.get('userId')); }
+      catch (e: any) { actividades = { creadas: [], avisos: [e?.message ?? 'No se pudieron crear las actividades.'] }; }
       alanube = await sincronizarEmpresaEnAlanube(tenantId);
     }
 
@@ -113,6 +146,8 @@ settings.put('/:type', async (c) => {
       ...(data?.config ?? config),
       alanube_sync: alanube?.ok ?? null,
       alanube_motivo: alanube?.ok === false ? alanube.motivo : undefined,
+      actividades_creadas: actividades?.creadas ?? [],
+      actividades_avisos: actividades?.avisos ?? [],
     });
   } catch (err: any) { return fail(c, err.message, 500); }
 });

@@ -10,6 +10,7 @@ import { comprobanteEmailHtml, comprobanteEmailAsunto, type DatosCorreoComproban
 // Del módulo LIVIANO: el otro arrastra el cliente IMAP y el parser de correo.
 import { parseHaciendaXml } from '../services/haciendaXml.js';
 import { notifyFeError, notifyQuotaLow } from '../services/whatsappNotify.js';
+import { configEfectiva, razonSocialDe } from '../services/feCompartida.js';
 
 // Próximo consecutivo de orden de compra (mismo formato que el POS: PO-XXXX).
 async function nextPurchaseNumber(tenantId: string): Promise<string> {
@@ -134,7 +135,9 @@ function deepFind(obj: any, re: RegExp, minLen = 1): string | null {
 export async function loadFEConfig(tenantId: string): Promise<any> {
   const { data } = await db.from('settings').select('config')
     .eq('tenant_id', tenantId).eq('type', 'electronic-invoice').maybeSingle();
-  const cfg = (data as any)?.config ?? {};
+  // Una sucursal de actividad factura con los datos de la sociedad (principal)
+  // y su propia actividad, sucursal y consecutivos. Ver services/feCompartida.
+  const cfg = await configEfectiva(tenantId, (data as any)?.config ?? {});
   const env = cfg.environment === 'sandbox' ? 'sandbox' : 'production';
   // ID de empresa de Alanube SEGÚN AMBIENTE (con fallback al legacy), para que
   // todos los handlers usen el companyId correcto con `cfg.alanube_company_id`.
@@ -181,7 +184,13 @@ async function groupMainTenantId(tenantId: string): Promise<string | null> {
 }
 
 export async function computeFeQuota(tenantId: string) {
-  const cfg = await loadFEConfig(tenantId);
+  /**
+   * La bolsa es de la RAZÓN SOCIAL: se toma del titular y se gasta con los
+   * comprobantes de todos sus negocios (sucursales con la misma cédula y
+   * actividades). Ver `razonSocialDe`.
+   */
+  const { titular, miembros } = await razonSocialDe(tenantId);
+  const cfg = await loadFEConfig(titular);
   // Un solo contador: facturas, tiquetes Y notas de crédito cuentan juntos.
   let included = Number(cfg.fe_included_docs ?? 0);         // comprobantes por bolsa (0 = ilimitado)
   let extraFee = Number(cfg.fe_extra_fee ?? 0);             // ₡ por comprobante extra
@@ -190,8 +199,9 @@ export async function computeFeQuota(tenantId: string) {
   // si no existe, cae al inicio de la suscripción o creación del tenant.
   let startISO: string = cfg.fe_quota_start ?? '';
 
-  // Sucursal sin bolsa propia → hereda la del negocio principal del grupo.
-  if (!included) {
+  // Sucursal de OTRA razón social sin bolsa propia → sigue heredando el límite
+  // de la matriz, como antes (pero contando solo lo suyo, porque es otra cédula).
+  if (!included && titular === tenantId) {
     const mainId = await groupMainTenantId(tenantId);
     if (mainId) {
       const mcfg = await loadFEConfig(mainId);
@@ -206,7 +216,7 @@ export async function computeFeQuota(tenantId: string) {
   if (!startISO) {
     const { data: t } = await db.from('tenants')
       .select('created_at, subscription:subscriptions!tenants_subscription_id_fkey(started_at)')
-      .eq('id', tenantId).maybeSingle();
+      .eq('id', titular).maybeSingle();
     startISO = (t as any)?.subscription?.started_at ?? (t as any)?.created_at ?? new Date().toISOString();
   }
 
@@ -216,11 +226,11 @@ export async function computeFeQuota(tenantId: string) {
   const failed = (s: any) => s === 'rejected' || s === 'error';
   let feRows: any = await db.from('invoices')
     .select('fe_clave, fe_status, fe_nc_clave, fe_nc_status, fe_nd_clave, fe_nd_status')
-    .eq('tenant_id', tenantId).gte('created_at', startISO)
+    .in('tenant_id', miembros).gte('created_at', startISO)
     .or('fe_clave.not.is.null,fe_nc_clave.not.is.null,fe_nd_clave.not.is.null');
   if (feRows.error) {   // columnas NC/ND (o su status) sin migrar → intento mínimo
     feRows = await db.from('invoices').select('fe_clave, fe_status')
-      .eq('tenant_id', tenantId).gte('created_at', startISO).not('fe_clave', 'is', null);
+      .in('tenant_id', miembros).gte('created_at', startISO).not('fe_clave', 'is', null);
   }
   let usedDocs = 0, usedNc = 0, usedNd = 0;
   for (const r of (feRows.data ?? []) as any[]) {
@@ -254,6 +264,9 @@ export async function computeFeQuota(tenantId: string) {
     available,
     overage,
     extra_charge: extraFee * overage,
+    /** Negocio que guarda la bolsa y cuántos negocios la comparten. */
+    titular,
+    negocios_que_comparten: miembros.length,
   };
 }
 

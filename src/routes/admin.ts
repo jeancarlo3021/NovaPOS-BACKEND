@@ -11,6 +11,8 @@ import { notifyPaymentDue, businessContact } from '../services/whatsappNotify.js
 import { clearPermissionCache } from '../middleware/permissions.js';
 import { forgetCachedTenant } from '../middleware/tenantStatus.js';
 import { forgetCachedUser } from '../middleware/auth.js';
+import { configEfectiva, guardarRepartido, principalFiscal, actividadesDeLaSociedad, normalizarActividad, razonSocialDe } from '../services/feCompartida.js';
+import { crearActividadesNuevas } from '../services/actividadesSucursal.js';
 
 const admin = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
@@ -921,7 +923,7 @@ admin.get('/tenants/:id/fe-config', async (c) => {
     const { data: kioskRow } = await db.from('settings')
       .select('config').eq('tenant_id', id).eq('type', 'pos-kiosk').maybeSingle();
     return ok(c, {
-      fe:    feRow?.config ?? {},
+      fe:    await configEfectiva(id, (feRow?.config as any) ?? {}),
       kiosk: kioskRow?.config ?? {},
     });
   } catch (err: any) { return fail(c, err.message, 500); }
@@ -932,6 +934,7 @@ admin.put('/tenants/:id/fe-config', async (c) => {
     const { id } = c.req.param();
     const body = await c.req.json();
     const { fe, kiosk } = body ?? {};
+    let actividades: { creadas: any[]; avisos: string[] } = { creadas: [], avisos: [] };
 
     if (fe) {
       // MERGE con la config existente para no pisar campos administrados por
@@ -939,11 +942,13 @@ admin.put('/tenants/:id/fe-config', async (c) => {
       // Solo las claves presentes en `fe` sobreescriben; el resto se conserva.
       const { data: prev } = await db.from('settings').select('config')
         .eq('tenant_id', id).eq('type', 'electronic-invoice').maybeSingle();
-      const merged = { ...((prev?.config as any) ?? {}), ...fe };
-      await db.from('settings').upsert({
-        tenant_id: id, type: 'electronic-invoice', config: merged,
-        updated_at: new Date().toISOString(),
-      }, { onConflict: 'tenant_id,type' });
+      const antes = await configEfectiva(id, (prev?.config as any) ?? {});
+      const merged = { ...antes, ...fe };
+      // En una sucursal de actividad, los datos de la sociedad van al principal.
+      await guardarRepartido(id, merged);
+      // Cada actividad nueva de la lista pasa a ser su negocio, ligado a este.
+      try { actividades = await crearActividadesNuevas(id, antes, merged, c.get('userId')); }
+      catch (e: any) { actividades = { creadas: [], avisos: [e?.message ?? 'No se pudieron crear las actividades.'] }; }
     }
     if (kiosk) {
       await db.from('settings').upsert({
@@ -974,7 +979,10 @@ admin.put('/tenants/:id/fe-config', async (c) => {
       alanube_synced = r.ok;
       if (!r.ok) alanube_motivo = r.motivo;
     }
-    return ok(c, { ok: true, customer_synced, alanube_synced, alanube_motivo });
+    return ok(c, {
+      ok: true, customer_synced, alanube_synced, alanube_motivo,
+      actividades_creadas: actividades.creadas, actividades_avisos: actividades.avisos,
+    });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
@@ -1248,35 +1256,7 @@ admin.get('/tenants/:id/fe-test', async (c) => {
 const provDigit = (s: any) => (String(s ?? '').replace(/\D/g, '').replace(/^0+/, '') || '').slice(0, 1);
 const pad2Code = (s: any) => { const d = String(s ?? '').replace(/\D/g, ''); return d ? d.padStart(2, '0').slice(-2) : ''; };
 
-/**
- * Deja el código de actividad en el ÚNICO formato que acepta el catálogo.
- *
- * El catálogo son cuatro dígitos, un punto y uno más: «4752.1». Pero el ATV lo
- * muestra de varias maneras y la gente lo copia como puede — con el nombre de la
- * actividad pegado, con guiones, o en seis dígitos seguidos («475201»). Cualquiera
- * de esas se rechaza, y el error que devuelve el proveedor es la lista completa
- * de trescientos códigos: ilegible, y sin decir cuál de los que mandamos falló.
- *
- * Se limpia lo que se pueda arreglar sin adivinar; lo que no, se devuelve vacío
- * para que la validación lo señale por nombre.
- */
-export function normalizarActividad(valor: any): string {
-  const texto = String(valor ?? '').trim();
-  if (!texto) return '';
-
-  // Ya viene bien.
-  if (/^\d{4}\.\d$/.test(texto)) return texto;
-
-  // Con el nombre pegado: «4752.1 - Venta de artículos de ferretería».
-  const conNombre = /^(\d{4})[.\-\s]?(\d)\b/.exec(texto);
-  if (conNombre) return `${conNombre[1]}.${conNombre[2]}`;
-
-  // Seis dígitos seguidos: clase (4) + subdivisión (2). «475201» → «4752.1».
-  const seis = /^(\d{4})(\d{2})$/.exec(texto.replace(/\D/g, ''));
-  if (seis) return `${seis[1]}.${Number(seis[2])}`;
-
-  return '';
-}
+export { normalizarActividad } from '../services/feCompartida.js';
 
 export function buildAlanubeCompanyPayload(cfg: Record<string, any>, p12Base64: string, env: 'sandbox' | 'production' = 'production') {
   const others = String(cfg.emisor_address ?? '').trim();
@@ -1573,6 +1553,23 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
     const { data: row } = await db.from('settings').select('config')
       .eq('tenant_id', id).eq('type', 'electronic-invoice').maybeSingle();
     const cfg: Record<string, any> = { ...((row as any)?.config ?? {}) };
+    /**
+     * Una sucursal de actividad NO crea empresa: usa la de su principal. Crear
+     * otra con la misma cédula deja dos empresas en Alanube para un solo
+     * contribuyente, y cada una numera por su lado.
+     */
+    if (cfg.fe_shared_from) {
+      const { data: pr } = await db.from('tenants').select('name').eq('id', String(cfg.fe_shared_from)).maybeSingle();
+      return fail(c, `Este negocio es una actividad de «${(pr as any)?.name ?? 'otro negocio'}» y emite con su empresa de Alanube. `
+        + 'La empresa se crea (o se actualiza) desde el negocio principal.', 422);
+    }
+    // Con todas las actividades de la sociedad, incluidas las de sus sucursales.
+    // Solo para el alta: no se guarda en la config, que sigue siendo del principal.
+    const cfgAlta = {
+      ...cfg,
+      economic_activities: (await actividadesDeLaSociedad(id, normalizarActividad))
+        .filter(a => a !== normalizarActividad(cfg.economic_activity_code)),
+    };
 
     // Validación completa de los datos del emisor ANTES de llamar a Alanube.
     // Devuelve TODOS los problemas de una vez para que el usuario sepa exactamente
@@ -1594,7 +1591,7 @@ admin.post('/tenants/:id/alanube/company', async (c) => {
 
     // Ambiente del TENANT (producción o QA/sandbox según su config FE).
     const client = alanube.forTenant(cfg);
-    const payload = buildAlanubeCompanyPayload(cfg, p12Base64, client.env);
+    const payload = buildAlanubeCompanyPayload(cfgAlta, p12Base64, client.env);
 
     // Resumen de lo enviado, para poder mostrarlo si Alanube contesta genérico.
     // Solo se dice si los secretos venían o no, nunca su contenido.
@@ -2053,10 +2050,19 @@ export async function sincronizarEmpresaEnAlanube(tenantId: string): Promise<{
   ok: boolean; motivo?: string; company_id?: string;
 }> {
   try {
+    /**
+     * La empresa en Alanube es de la SOCIEDAD. Si el cambio vino de una sucursal
+     * de actividad, se actualiza con los datos del principal y con las
+     * actividades de todas: mandar solo las de quien guardó borraba de Alanube
+     * las otras, y desde ese momento sus comprobantes se rechazaban.
+     */
+    tenantId = await principalFiscal(tenantId);
     const { data: row } = await db.from('settings').select('config')
       .eq('tenant_id', tenantId).eq('type', 'electronic-invoice').maybeSingle();
     const cfg: Record<string, any> = { ...((row as any)?.config ?? {}) };
     const isSandbox = String(cfg.environment ?? 'production') === 'sandbox';
+    const todas = await actividadesDeLaSociedad(tenantId, normalizarActividad);
+    const payloadCfg = { ...cfg, economic_activities: todas.filter(a => a !== normalizarActividad(cfg.economic_activity_code)) };
 
     const companyId = (isSandbox ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production)
       ?? cfg.alanube_company_id;
@@ -2070,7 +2076,7 @@ export async function sincronizarEmpresaEnAlanube(tenantId: string): Promise<{
     if (dlErr || !file) return { ok: false, motivo: `No se pudo leer el certificado: ${dlErr?.message ?? 'vacío'}` };
 
     const client = alanube.forTenant(cfg);
-    const payload = buildAlanubeCompanyPayload(cfg, Buffer.from(await file.arrayBuffer()).toString('base64'), client.env);
+    const payload = buildAlanubeCompanyPayload(payloadCfg, Buffer.from(await file.arrayBuffer()).toString('base64'), client.env);
     // Al ACTUALIZAR, Alanube no acepta `type` (solo se define al crear).
     delete (payload as any).type;
     await client.updateCompany(String(companyId), payload);
@@ -2086,7 +2092,8 @@ export async function sincronizarEmpresaEnAlanube(tenantId: string): Promise<{
 }
 
 admin.put('/tenants/:id/alanube/company', async (c) => {
-  const { id } = c.req.param();
+  // Desde una sucursal de actividad se actualiza la empresa de la sociedad.
+  const id = await principalFiscal(c.req.param('id'));
   try {
     const { data: row } = await db.from('settings').select('config')
       .eq('tenant_id', id).eq('type', 'electronic-invoice').maybeSingle();
@@ -2110,7 +2117,11 @@ admin.put('/tenants/:id/alanube/company', async (c) => {
       if (isSandbox) cfg.alanube_company_id_sandbox = companyId; else cfg.alanube_company_id_production = companyId;
       cfg.alanube_company_id = companyId;
     }
-    const payload = buildAlanubeCompanyPayload(cfg, p12Base64, client.env);
+    const payload = buildAlanubeCompanyPayload({
+      ...cfg,
+      economic_activities: (await actividadesDeLaSociedad(id, normalizarActividad))
+        .filter(a => a !== normalizarActividad(cfg.economic_activity_code)),
+    }, p12Base64, client.env);
     // Al ACTUALIZAR, Alanube no acepta `type` (solo se define al crear).
     delete (payload as any).type;
     const result: any = await client.updateCompany(String(companyId), payload);
@@ -2993,7 +3004,9 @@ admin.post('/sync-customers', async (c) => {
 
 admin.post('/tenants/:id/fe-renew', async (c) => {
   try {
-    const { id } = c.req.param();
+    // La bolsa es de la razón social: renovar desde una sucursal o una actividad
+    // renueva la bolsa compartida, que vive en el titular.
+    const { titular: id } = await razonSocialDe(c.req.param('id'));
 
     // Lo que SOBRA de la bolsa vigente se arrastra a la nueva. Son comprobantes
     // ya pagados: hacerlos caducar al renovar sería cobrar dos veces por lo
@@ -3985,20 +3998,36 @@ admin.get('/fe-quotas', async (c) => {
       .select('tenant_id, config').eq('type', 'electronic-invoice');
     const YEAR_MS = 365 * 24 * 60 * 60 * 1000;
     const result: Record<string, any> = {};
+    /**
+     * La bolsa es de la razón social. Solo los negocios que están en un grupo o
+     * son actividades pueden compartirla: para el resto (la mayoría) no hace
+     * falta resolver nada y se cuenta como siempre.
+     */
+    const { data: agrupados } = await db.from('tenant_group_members').select('tenant_id');
+    const enGrupo = new Set(((agrupados ?? []) as any[]).map(x => String(x.tenant_id)));
+    const cfgPorNegocio = new Map(((rows ?? []) as any[]).map(x => [String(x.tenant_id), x.config ?? {}]));
     for (const r of (rows ?? []) as any[]) {
-      const cfg = r.config ?? {};
+      if (result[r.tenant_id]) continue;   // ya resuelto con su razón social
+      let miembros: string[] = [String(r.tenant_id)];
+      let titular = String(r.tenant_id);
+      if (enGrupo.has(titular) || r.config?.fe_shared_from) {
+        const rs = await razonSocialDe(titular);
+        titular = rs.titular; miembros = rs.miembros;
+      }
+      const cfg = cfgPorNegocio.get(titular) ?? r.config ?? {};
+      const compartida = miembros.length > 1 ? { titular, negocios_que_comparten: miembros.length } : {};
       const included = Number(cfg.fe_included_docs ?? 0);
       if (included <= 0) {
         // FE activa pero sin límite de bolsa → ilimitado. Si ni siquiera está
         // activa, no devolvemos nada (el panel muestra "Sin FE").
-        if (cfg.enabled) result[r.tenant_id] = { unlimited: true };
+        if (cfg.enabled) for (const m of miembros) result[m] = { unlimited: true, ...compartida };
         continue;
       }
       let start: string = cfg.fe_quota_start ?? '';
       if (!start) {
         const { data: t } = await db.from('tenants')
           .select('created_at, subscription:subscriptions!tenants_subscription_id_fkey(started_at)')
-          .eq('id', r.tenant_id).maybeSingle();
+          .eq('id', titular).maybeSingle();
         start = (t as any)?.subscription?.started_at ?? (t as any)?.created_at ?? new Date().toISOString();
       }
       // Traemos las filas con alguna clave de Hacienda y contamos cada comprobante
@@ -4010,11 +4039,11 @@ admin.get('/fe-quotas', async (c) => {
       const failed = (s: any) => s === 'rejected' || s === 'error';
       let sel: any = await db.from('invoices')
         .select('fe_consecutivo, fe_clave, fe_status, fe_nc_clave, fe_nc_status, fe_nd_clave, fe_nd_status')
-        .eq('tenant_id', r.tenant_id).gte('created_at', start)
+        .in('tenant_id', miembros).gte('created_at', start)
         .or('fe_clave.not.is.null,fe_nc_clave.not.is.null,fe_nd_clave.not.is.null');
       if (sel.error) {   // columnas NC/ND (o status) sin migrar → intento mínimo
         sel = await db.from('invoices').select('fe_consecutivo, fe_clave, fe_status')
-          .eq('tenant_id', r.tenant_id).gte('created_at', start).not('fe_clave', 'is', null);
+          .in('tenant_id', miembros).gte('created_at', start).not('fe_clave', 'is', null);
       }
       // `usedPrevio` cuenta los comprobantes que quedaron del proveedor anterior:
       // el negocio ya los emitió y siguen contando en su bolsa del período.
@@ -4033,13 +4062,15 @@ admin.get('/fe-quotas', async (c) => {
       const used = docs + ncs + nds;
       const extraFee = Number(cfg.fe_extra_fee ?? 0);          // ₡ por comprobante extra (del plan)
       const overage = Math.max(0, used - included);            // comprobantes sobre la bolsa
-      result[r.tenant_id] = {
+      const bolsa = {
+        ...compartida,
         included, used, available: included - used,
         used_alanube: usedAlanube, used_facturemos: usedPrevio,
         overage, extra_fee: extraFee, extra_charge: overage * extraFee,
         quota_start: start,
         expires_at: new Date(new Date(start).getTime() + YEAR_MS).toISOString(),
       };
+      for (const m of miembros) result[m] = bolsa;
     }
     return ok(c, result);
   } catch (err: any) { return fail(c, err.message, 500); }

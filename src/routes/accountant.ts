@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { db } from '../db/client.js';
+import { razonSocialDe, configEfectiva } from '../services/feCompartida.js';
 import { ok, fail } from '../utils/response.js';
 import { alanube, AlanubeError, tenantAlanubeToken } from '../services/alanube.js';
 import {
@@ -42,23 +43,26 @@ async function assertClient(userId: string, tenantId: string): Promise<boolean> 
 
 /** Bolsa de comprobantes FE de un negocio: incluidos, usados y disponibles. */
 async function quotaFor(tenantId: string, cfg: any) {
+  // La bolsa es de la razón social (ver razonSocialDe): se mide con la del titular.
+  const { titular, miembros } = await razonSocialDe(tenantId);
+  if (titular !== tenantId) cfg = await configEfectiva(titular);
   const included = Number(cfg?.fe_included_docs ?? 0);
   if (included <= 0) return cfg?.enabled ? { unlimited: true } : null;
 
   let start: string = cfg.fe_quota_start ?? '';
   if (!start) {
-    const { data: t } = await db.from('tenants').select('created_at').eq('id', tenantId).maybeSingle();
+    const { data: t } = await db.from('tenants').select('created_at').eq('id', titular).maybeSingle();
     start = (t as any)?.created_at ?? new Date().toISOString();
   }
   // Los RECHAZADOS no consumen bolsa: no existen ante Hacienda.
   const failed = (s: any) => s === 'rejected' || s === 'error';
   let sel: any = await db.from('invoices')
     .select('fe_clave, fe_status, fe_nc_clave, fe_nc_status, fe_nd_clave, fe_nd_status')
-    .eq('tenant_id', tenantId).gte('created_at', start)
+    .in('tenant_id', miembros).gte('created_at', start)
     .or('fe_clave.not.is.null,fe_nc_clave.not.is.null,fe_nd_clave.not.is.null');
   if (sel.error) {
     sel = await db.from('invoices').select('fe_clave, fe_status')
-      .eq('tenant_id', tenantId).gte('created_at', start).not('fe_clave', 'is', null);
+      .in('tenant_id', miembros).gte('created_at', start).not('fe_clave', 'is', null);
   }
   let used = 0;
   for (const r of (sel.data ?? []) as any[]) {

@@ -11,6 +11,7 @@
  * en WhatsApp Manager con esos nombres exactos.
  */
 import { db } from '../db/client.js';
+import { configEfectiva } from './feCompartida.js';
 import { sendTemplate, whatsappEnabled, normalizePhone, type WaResult } from './whatsapp.js';
 import { sendViaWorker, workerEnabled } from './whatsappWorker.js';
 
@@ -53,7 +54,7 @@ export async function businessContact(tenantId: string): Promise<BizContact> {
     try {
       const { data: fe } = await db.from('settings').select('config')
         .eq('tenant_id', tenantId).eq('type', 'electronic-invoice').maybeSingle();
-      const f: any = (fe as any)?.config ?? {};
+      const f: any = await configEfectiva(tenantId, (fe as any)?.config ?? {});
       if (!phone) phone = normalizePhone(f.notify_phone || f.emisor_phone);
       if (!name)  name  = String(f.emisor_commercial_name || f.emisor_name || '').trim();
     } catch { /* ignore */ }

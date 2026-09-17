@@ -3,6 +3,10 @@ import { z } from 'zod';
 import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
 import { endOfDay } from '../utils/dateRange.js';
+import { sincronizarEmpresaEnAlanube } from './admin.js';
+import { computeFeQuota } from './hacienda.js';
+import { configEfectiva } from '../services/feCompartida.js';
+import { crearNegocio, crearActividadComoSucursal, ErrorDeActividad, recordarActividadSinNegocio } from '../services/actividadesSucursal.js';
 
 /**
  * Endpoints para gestión de grupos de empresas (multi-empresa con sucursales
@@ -181,8 +185,8 @@ groups.get('/:id', async (c) => {
         tenant:tenants(
           id, name, is_demo, status, created_at,
           subscription:subscriptions!tenants_subscription_id_fkey(
-            id, status, started_at, ends_at,
-            plan:plan_id(id, name, price)
+            id, status, started_at, ends_at, custom_price,
+            plan:plan_id(id, name, price, billing_cycle)
           )
         )
       `)
@@ -200,13 +204,135 @@ groups.get('/:id', async (c) => {
       feByTenant = Object.fromEntries((feRows ?? []).map((r: any) => [r.tenant_id, r]));
     }
 
+    // Actividad económica y sucursal ante Hacienda de cada negocio, para que se
+    // vea cuál es el principal de la sociedad y qué actividad lleva cada uno.
+    const actividadPorNegocio: Record<string, any> = {};
+    if (tenantIds.length > 0) {
+      const { data: cfgs } = await db.from('settings').select('tenant_id, config')
+        .eq('type', 'electronic-invoice').in('tenant_id', tenantIds);
+      for (const r of (cfgs ?? []) as any[]) {
+        const cfg = r.config ?? {};
+        actividadPorNegocio[r.tenant_id] = {
+          economic_activity_code: cfg.economic_activity_code ?? null,
+          sucursal: cfg.sucursal ?? null,
+          shared_from: cfg.fe_shared_from ?? null,
+          tiene_cedula: !!String(cfg.emisor_identification ?? '').replace(/\D/g, ''),
+        };
+      }
+    }
+
+    /**
+     * Comprobantes restantes de cada negocio.
+     *
+     * Es la misma bolsa que ve el negocio en Mi Plan: la de su razón social, así
+     * que las sucursales con la misma cédula y las actividades muestran el mismo
+     * saldo. Se calcula una vez por titular. Si falla, la tabla sale igual.
+     */
+    const bolsaPorNegocio: Record<string, any> = {};
+    const porTitular = new Map<string, any>();
+    const cuotaPorTitular = new Map<string, { q: any; fe_plan_id: string | null }>();
+    const titularDe: Record<string, string> = {};
+    await Promise.all(tenantIds.map(async (tid: string) => {
+      try {
+        const cfg = await configEfectiva(tid);
+        const q: any = await computeFeQuota(tid);
+        let bolsa = porTitular.get(q.titular);
+        if (!bolsa) {
+          cuotaPorTitular.set(q.titular, { q, fe_plan_id: cfg.fe_plan_id ?? null });
+          bolsa = {
+            limitada: Number(q.included) > 0,
+            incluidos: Number(q.included) || 0,
+            usados: Number(q.used) || 0,
+            restantes: q.available,
+            desde: q.quota_start ?? null,
+            titular: q.titular,
+            compartida: Number(q.negocios_que_comparten ?? 1) > 1,
+          };
+          porTitular.set(q.titular, bolsa);
+        }
+        bolsaPorNegocio[tid] = { ...bolsa, fe_activa: !!cfg.enabled };
+        titularDe[tid] = q.titular;
+      } catch (e: any) {
+        console.warn('[tenant-groups] bolsa FE:', e?.message);
+      }
+    }));
+
     // Inyectar fe en cada member (el frontend espera m.fe directamente)
     const enriched = (members ?? []).map((m: any) => ({
       ...m,
       fe: m.tenant?.id ? feByTenant[m.tenant.id] ?? null : null,
+      actividad: m.tenant?.id ? actividadPorNegocio[m.tenant.id] ?? null : null,
+      bolsa: m.tenant?.id ? bolsaPorNegocio[m.tenant.id] ?? null : null,
     }));
 
-    return ok(c, { group, owner_info, members: enriched, fe_by_tenant: feByTenant });
+    /**
+     * Lo que hay que COBRAR, agrupado por razón social.
+     *
+     * Se cobra por razón social: el plan FE y el excedente de comprobantes van
+     * una sola vez por cédula, aunque la usen varias sucursales o actividades.
+     * El plan del sistema (SaaS) sí es de cada negocio que tenga uno asignado:
+     * con su precio personalizado si lo tiene. Las actividades se crean sin plan
+     * propio, así que no suman.
+     *
+     * Reemplaza el «total mensual» de `group_billing`, que multiplicaba un precio
+     * fijo por sucursal y leía una tabla de planes FE que ya no se usa.
+     */
+    let cobro: any = null;
+    try {
+      const planIds = [...new Set([...cuotaPorTitular.values()].map(x => x.fe_plan_id).filter(Boolean))] as string[];
+      const planFe = new Map<string, any>();
+      if (planIds.length) {
+        const { data: pls } = await db.from('fe_plan_catalog').select('id, name, price').in('id', planIds);
+        for (const p of (pls ?? []) as any[]) planFe.set(String(p.id), p);
+      }
+      const razones = new Map<string, any>();
+      for (const m of (members ?? []) as any[]) {
+        const t = m.tenant;
+        if (!t?.id) continue;
+        const titular = titularDe[t.id] ?? t.id;
+        let r = razones.get(titular);
+        if (!r) {
+          const cuota = cuotaPorTitular.get(titular);
+          const plan = cuota?.fe_plan_id ? planFe.get(String(cuota.fe_plan_id)) : null;
+          r = {
+            titular,
+            nombre: '',
+            negocios: [] as string[],
+            saas: 0,
+            fe_plan: plan ? { nombre: plan.name, precio: Number(plan.price ?? 0) } : null,
+            excedente: {
+              comprobantes: Number(cuota?.q?.overage ?? 0),
+              precio: Number(cuota?.q?.extra_fee ?? 0),
+              monto: Number(cuota?.q?.extra_charge ?? 0),
+            },
+          };
+          razones.set(titular, r);
+        }
+        if (t.id === titular) r.nombre = t.name;
+        r.negocios.push(t.name);
+        const sub = t.subscription;
+        if (sub) {
+          const precio = sub.custom_price != null ? Number(sub.custom_price) : Number(sub.plan?.price ?? 0);
+          r.saas += Number.isFinite(precio) ? precio : 0;
+        }
+      }
+      const filas = [...razones.values()].map(r => ({
+        ...r,
+        nombre: r.nombre || r.negocios[0] || '—',
+        total: r.saas + (r.fe_plan?.precio ?? 0) + r.excedente.monto,
+      }));
+      cobro = {
+        razones_sociales: filas,
+        saas: filas.reduce((a, r) => a + r.saas, 0),
+        fe: filas.reduce((a, r) => a + (r.fe_plan?.precio ?? 0), 0),
+        excedente: filas.reduce((a, r) => a + r.excedente.monto, 0),
+        total: filas.reduce((a, r) => a + r.total, 0),
+      };
+    } catch (e: any) {
+      console.warn('[tenant-groups] cobro:', e?.message);
+    }
+
+    return ok(c, { group, owner_info, members: enriched, fe_by_tenant: feByTenant, cobro });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
@@ -378,51 +504,7 @@ groups.post('/:id/branches', async (c) => {
 
     // Modo B: crear tenant nuevo
     if (!tenantId && parsed.data.new_tenant) {
-      const nt = parsed.data.new_tenant;
-      // schema_name es NOT NULL en tenants. Generamos uno único por tenant
-      // siguiendo el patrón del edge function admin-create-owner (`tenant_<uuid>`).
-      const tenantUuid = (globalThis.crypto as any)?.randomUUID?.()
-        ?? `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
-      const schemaName = `tenant_${String(tenantUuid).replace(/-/g, '_')}`;
-
-      const { data: created, error: tErr } = await db.from('tenants')
-        .insert({
-          name:        nt.name,
-          owner_id:    userId,
-          is_demo:     nt.is_demo ?? false,
-          plan_id:     nt.plan_id ?? null,
-          status:      'active',
-          schema_name: schemaName,
-        })
-        .select('id').single();
-      if (tErr) throw new Error(tErr.message);
-      tenantId = created.id;
-
-      // Si tiene plan, crear suscripción asociada para que aparezca con su
-      // fecha de vencimiento en /admin/owners.
-      if (nt.plan_id) {
-        try {
-          const { data: planRow } = await db.from('subscription_plans')
-            .select('billing_cycle').eq('id', nt.plan_id).maybeSingle();
-          const cycleDays = (planRow?.billing_cycle ?? 'monthly').toLowerCase() === 'yearly' ? 365 : 30;
-          const endsAt = new Date(Date.now() + cycleDays * 86400000).toISOString();
-
-          const { data: subData } = await db.from('subscriptions')
-            .insert({
-              tenant_id: tenantId,
-              plan_id:   nt.plan_id,
-              status:    'active',
-              ends_at:   endsAt,
-              auto_renew: true,
-            })
-            .select('id').single();
-          if (subData?.id) {
-            await db.from('tenants').update({ subscription_id: subData.id }).eq('id', tenantId);
-          }
-        } catch (e: any) {
-          console.warn('[branches] no se pudo crear suscripción:', e?.message);
-        }
-      }
+      tenantId = await crearNegocio(parsed.data.new_tenant, userId);
     }
 
     if (!tenantId) {
@@ -459,6 +541,69 @@ groups.post('/:id/branches', async (c) => {
 
     return ok(c, { tenant_id: tenantId, linked: true }, 201);
   } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/**
+ * POST /:id/activity-branches — otra ACTIVIDAD económica de la misma sociedad.
+ *
+ * Funciona como una sucursal: es un negocio del grupo con su inventario, sus
+ * cajas, sus reportes y sus cierres, y el dueño cambia entre uno y otro con el
+ * selector de empresa. La diferencia está en la facturación electrónica: NO
+ * tiene cédula, certificado ni empresa de Alanube propios, usa los de la
+ * sociedad (el negocio principal) y factura con:
+ *
+ *   · su actividad, que es la que declara cada comprobante;
+ *   · su propio número de sucursal ante Hacienda (002, 003…) y sus propios
+ *     consecutivos, para que las dos series no choquen.
+ *
+ * La actividad se agrega a la empresa en Alanube; sin eso, el primer
+ * comprobante se rechaza por declarar una actividad que la empresa no tiene.
+ *
+ * body: {
+ *   from_tenant,                 // negocio principal (el que tiene los datos de FE)
+ *   economic_activity_code,      // p. ej. «4752.1»
+ *   new_tenant?: { name, plan_id?, is_demo? } | tenant_id?,   // crear o usar uno existente
+ *   fe_plan_id?, copy_products?: boolean,
+ * }
+ */
+groups.post('/:id/activity-branches', async (c) => {
+  try {
+    const userId = c.get('userId');
+    const groupId = c.req.param('id');
+    if (!(await isGroupOwner(userId, groupId))) return fail(c, 'No autorizado', 403);
+
+    const b = await c.req.json().catch(() => ({} as any));
+    const r = await crearActividadComoSucursal({
+      groupId, userId,
+      principalId: String(b?.from_tenant ?? '').trim(),
+      actividad: b?.economic_activity_code,
+      tenantId: String(b?.tenant_id ?? '').trim() || null,
+      nuevo: b?.new_tenant ?? null,
+      fePlanId: b?.fe_plan_id ?? null,
+    });
+
+    // Catálogo: opcional. Las actividades suelen vender cosas distintas.
+    let catalogo: Record<string, any> | null = null;
+    if (b?.copy_products) {
+      try { catalogo = await copiarCatalogo(r.principalId, r.tenant_id); }
+      catch (e: any) { catalogo = { error: e?.message ?? 'no se pudo copiar' }; }
+    }
+
+    // La empresa en Alanube tiene que conocer la actividad nueva.
+    const alanube = await sincronizarEmpresaEnAlanube(r.principalId);
+
+    return ok(c, {
+      tenant_id: r.tenant_id,
+      creado: r.creado,
+      economic_activity_code: r.economic_activity_code,
+      sucursal: r.sucursal,
+      catalogo,
+      alanube_sync: alanube.ok,
+      alanube_motivo: alanube.ok ? undefined : alanube.motivo,
+    }, 201);
+  } catch (err: any) {
+    return fail(c, err.message, err instanceof ErrorDeActividad ? err.status : 500);
+  }
 });
 
 // ── POST /:id/clients — agregar un CLIENTE a la cartera del contador ──────
@@ -677,6 +822,9 @@ groups.delete('/:id/branches/:tenantId', async (c) => {
     const { error } = await db.from('tenant_group_members')
       .delete().eq('group_id', groupId).eq('tenant_id', tenantId);
     if (error) throw new Error(error.message);
+    // Si era una actividad, que el próximo guardado de FE no la vuelva a crear.
+    try { await recordarActividadSinNegocio(tenantId); }
+    catch (e: any) { console.warn('[grupos] actividad sin negocio:', e?.message); }
     return ok(c, { unlinked: true });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
@@ -722,9 +870,95 @@ groups.put('/:id/branches/:tenantId/fe-plan', async (c) => {
  *
  * body: { from_tenant, to_tenant }
  */
+/** Copia el catálogo de `origen` a `destino` (ver POST /:id/copy-products). */
+async function copiarCatalogo(origen: string, destino: string): Promise<Record<string, any>> {
+
+  /** Empareja un catálogo auxiliar por NOMBRE y devuelve viejo id → nuevo id. */
+  const mapearPorNombre = async (tabla: string): Promise<Map<string, string>> => {
+    const mapa = new Map<string, string>();
+    try {
+      const { data: deOrigen } = await db.from(tabla).select('*').eq('tenant_id', origen);
+      if (!deOrigen?.length) return mapa;
+      const { data: deDestino } = await db.from(tabla).select('*').eq('tenant_id', destino);
+      const porNombre = new Map<string, any>(
+        (deDestino ?? []).map((r: any) => [String(r.name ?? '').trim().toLowerCase(), r]));
+
+      for (const fila of deOrigen as any[]) {
+        const clave = String(fila.name ?? '').trim().toLowerCase();
+        const ya = porNombre.get(clave);
+        if (ya) { mapa.set(String(fila.id), String(ya.id)); continue; }
+        const { id, tenant_id, created_at, updated_at, ...resto } = fila;
+        const { data: creada } = await db.from(tabla)
+          .insert({ ...resto, tenant_id: destino }).select('id').maybeSingle();
+        if ((creada as any)?.id) {
+          mapa.set(String(fila.id), String((creada as any).id));
+          porNombre.set(clave, creada);
+        }
+      }
+    } catch (e: any) {
+      console.warn(`[copiar catálogo] ${tabla}:`, e?.message);
+    }
+    return mapa;
+  };
+
+  const categorias = await mapearPorNombre('categories');
+  const unidades = await mapearPorNombre('unit_types');
+
+  const { data: productos } = await db.from('products').select('*').eq('tenant_id', origen);
+  if (!productos?.length) return { copiados: 0, omitidos: 0, motivo: 'La sucursal de origen no tiene productos.' };
+
+  // Lo que YA está en el destino no se duplica: por código, o por nombre
+  // cuando el producto no tiene código.
+  const { data: yaHay } = await db.from('products').select('sku, name').eq('tenant_id', destino);
+  const skus = new Set((yaHay ?? []).map((p: any) => String(p.sku ?? '').trim().toLowerCase()).filter(Boolean));
+  const nombres = new Set((yaHay ?? []).map((p: any) => String(p.name ?? '').trim().toLowerCase()));
+
+  const filas: any[] = [];
+  let omitidos = 0;
+  for (const p of productos as any[]) {
+    const sku = String(p.sku ?? '').trim().toLowerCase();
+    const nombre = String(p.name ?? '').trim().toLowerCase();
+    if ((sku && skus.has(sku)) || (!sku && nombres.has(nombre))) { omitidos++; continue; }
+
+    const { id, tenant_id, created_at, updated_at, ...resto } = p;
+    filas.push({
+      ...resto,
+      tenant_id: destino,
+      category_id: p.category_id ? (categorias.get(String(p.category_id)) ?? null) : null,
+      unit_type_id: p.unit_type_id ? (unidades.get(String(p.unit_type_id)) ?? null) : null,
+      // El proveedor es del otro negocio: dejarlo apuntaría a una ficha ajena.
+      supplier_id: null,
+      // Catálogo, no mercadería: la sucursal nueva arranca sin existencias.
+      stock_quantity: 0,
+      reserved_quantity: 0,
+    });
+    if (sku) skus.add(sku); else nombres.add(nombre);
+  }
+
+  let copiados = 0;
+  for (let i = 0; i < filas.length; i += 200) {
+    const tanda = filas.slice(i, i + 200);
+    let { error } = await db.from('products').insert(tanda);
+    // `reserved_quantity` puede no existir (migración 110 sin correr).
+    if (error && /reserved_quantity/i.test(error.message)) {
+      ({ error } = await db.from('products')
+        .insert(tanda.map(({ reserved_quantity, ...r }: any) => r)));
+    }
+    if (error) throw new Error(`Se copiaron ${copiados}; falló el resto: ${error.message}`);
+    copiados += tanda.length;
+  }
+
+  return {
+    copiados, omitidos,
+    categorias_creadas: categorias.size,
+    unidades_creadas: unidades.size,
+  };
+}
+
 groups.post('/:id/copy-products', async (c) => {
   try {
     const groupId = c.req.param('id');
+    if (!(await isGroupOwner(c.get('userId'), groupId))) return fail(c, 'No autorizado', 403);
     const b = await c.req.json().catch(() => ({} as any));
     const origen = String(b?.from_tenant ?? '').trim();
     const destino = String(b?.to_tenant ?? '').trim();
@@ -732,93 +966,15 @@ groups.post('/:id/copy-products', async (c) => {
     if (origen === destino) return fail(c, 'El origen y el destino son la misma sucursal.', 422);
 
     // Las dos tienen que ser del MISMO grupo: si no, se estarían copiando
-    // productos entre negocios que no tienen relación.
-    const { data: miembros } = await db.from('tenants')
-      .select('id, name').eq('group_id', groupId).in('id', [origen, destino]);
+    // productos entre negocios que no tienen relación. La membresía está en
+    // `tenant_group_members` (`tenants` no tiene columna de grupo: la consulta
+    // anterior fallaba siempre y la copia nunca llegaba a hacerse).
+    const { data: miembros } = await db.from('tenant_group_members')
+      .select('tenant_id').eq('group_id', groupId).in('tenant_id', [origen, destino]);
     if ((miembros ?? []).length !== 2) {
       return fail(c, 'Las dos sucursales tienen que pertenecer a este grupo.', 422);
     }
-
-    /** Empareja un catálogo auxiliar por NOMBRE y devuelve viejo id → nuevo id. */
-    const mapearPorNombre = async (tabla: string): Promise<Map<string, string>> => {
-      const mapa = new Map<string, string>();
-      try {
-        const { data: deOrigen } = await db.from(tabla).select('*').eq('tenant_id', origen);
-        if (!deOrigen?.length) return mapa;
-        const { data: deDestino } = await db.from(tabla).select('*').eq('tenant_id', destino);
-        const porNombre = new Map<string, any>(
-          (deDestino ?? []).map((r: any) => [String(r.name ?? '').trim().toLowerCase(), r]));
-
-        for (const fila of deOrigen as any[]) {
-          const clave = String(fila.name ?? '').trim().toLowerCase();
-          const ya = porNombre.get(clave);
-          if (ya) { mapa.set(String(fila.id), String(ya.id)); continue; }
-          const { id, tenant_id, created_at, updated_at, ...resto } = fila;
-          const { data: creada } = await db.from(tabla)
-            .insert({ ...resto, tenant_id: destino }).select('id').maybeSingle();
-          if ((creada as any)?.id) {
-            mapa.set(String(fila.id), String((creada as any).id));
-            porNombre.set(clave, creada);
-          }
-        }
-      } catch (e: any) {
-        console.warn(`[copiar catálogo] ${tabla}:`, e?.message);
-      }
-      return mapa;
-    };
-
-    const categorias = await mapearPorNombre('categories');
-    const unidades = await mapearPorNombre('unit_types');
-
-    const { data: productos } = await db.from('products').select('*').eq('tenant_id', origen);
-    if (!productos?.length) return ok(c, { copiados: 0, omitidos: 0, motivo: 'La sucursal de origen no tiene productos.' });
-
-    // Lo que YA está en el destino no se duplica: por código, o por nombre
-    // cuando el producto no tiene código.
-    const { data: yaHay } = await db.from('products').select('sku, name').eq('tenant_id', destino);
-    const skus = new Set((yaHay ?? []).map((p: any) => String(p.sku ?? '').trim().toLowerCase()).filter(Boolean));
-    const nombres = new Set((yaHay ?? []).map((p: any) => String(p.name ?? '').trim().toLowerCase()));
-
-    const filas: any[] = [];
-    let omitidos = 0;
-    for (const p of productos as any[]) {
-      const sku = String(p.sku ?? '').trim().toLowerCase();
-      const nombre = String(p.name ?? '').trim().toLowerCase();
-      if ((sku && skus.has(sku)) || (!sku && nombres.has(nombre))) { omitidos++; continue; }
-
-      const { id, tenant_id, created_at, updated_at, ...resto } = p;
-      filas.push({
-        ...resto,
-        tenant_id: destino,
-        category_id: p.category_id ? (categorias.get(String(p.category_id)) ?? null) : null,
-        unit_type_id: p.unit_type_id ? (unidades.get(String(p.unit_type_id)) ?? null) : null,
-        // El proveedor es del otro negocio: dejarlo apuntaría a una ficha ajena.
-        supplier_id: null,
-        // Catálogo, no mercadería: la sucursal nueva arranca sin existencias.
-        stock_quantity: 0,
-        reserved_quantity: 0,
-      });
-      if (sku) skus.add(sku); else nombres.add(nombre);
-    }
-
-    let copiados = 0;
-    for (let i = 0; i < filas.length; i += 200) {
-      const tanda = filas.slice(i, i + 200);
-      let { error } = await db.from('products').insert(tanda);
-      // `reserved_quantity` puede no existir (migración 110 sin correr).
-      if (error && /reserved_quantity/i.test(error.message)) {
-        ({ error } = await db.from('products')
-          .insert(tanda.map(({ reserved_quantity, ...r }: any) => r)));
-      }
-      if (error) return fail(c, `Se copiaron ${copiados}; falló el resto: ${error.message}`, 500);
-      copiados += tanda.length;
-    }
-
-    return ok(c, {
-      copiados, omitidos,
-      categorias_creadas: categorias.size,
-      unidades_creadas: unidades.size,
-    });
+    return ok(c, await copiarCatalogo(origen, destino));
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
