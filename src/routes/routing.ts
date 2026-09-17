@@ -623,6 +623,80 @@ routing.post('/:id/clear-load', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+/**
+ * POST /:id/unload-product — baja UN producto del camión y lo devuelve al inventario.
+ *
+ * «Borrar carga» devuelve todo y solo sirve si la ruta no vendió nada. Para un
+ * producto que subió por error, o que el chofer devuelve a media ruta, había que
+ * borrar la carga entera y volver a armarla.
+ *
+ * body: { product_id, quantity? }  — sin cantidad, devuelve TODO lo que queda de
+ * ese producto en el camión. Nunca devuelve más de lo que hay arriba.
+ *
+ * También se descuenta de `loaded_summary` (con qué se cargó): si no, al cerrar
+ * la ruta esa mercadería aparecería como vendida o faltante.
+ */
+routing.post('/:id/unload-product', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { id } = c.req.param();
+    const b = await c.req.json().catch(() => ({} as any));
+    const productId = String(b?.product_id ?? '').trim();
+    if (!productId) return fail(c, 'Indicá el producto a bajar del camión.', 422);
+
+    const { data: route } = await db.from('routes')
+      .select('id, warehouse_id, status').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+    if (!route) return fail(c, 'Ruta no encontrada', 404);
+    if ((route as any).status === 'closed') return fail(c, 'La ruta está cerrada', 409);
+
+    const truckId = (route as any).warehouse_id;
+    const { data: fila } = await db.from('warehouse_stock')
+      .select('quantity').eq('warehouse_id', truckId).eq('product_id', productId).maybeSingle();
+    const enCamion = Number((fila as any)?.quantity ?? 0);
+    if (enCamion <= 0) return fail(c, 'Ese producto ya no está en el camión.', 409);
+
+    const pedida = Number(b?.quantity);
+    const cantidad = Number.isFinite(pedida) && pedida > 0 ? Math.min(pedida, enCamion) : enCamion;
+
+    const { data: prod } = await db.from('products')
+      .select('name, stock_quantity, tracks_stock').eq('id', productId).eq('tenant_id', tenantId).maybeSingle();
+    if (!prod) return fail(c, 'Producto no encontrado', 404);
+
+    // Primero al inventario y después se baja del camión: si algo falla en medio,
+    // es preferible que la mercadería aparezca de más en el sistema y no que
+    // desaparezca de los dos lados.
+    if ((prod as any).tracks_stock !== false) {
+      const { error } = await db.from('products').update({
+        stock_quantity: Number((prod as any).stock_quantity ?? 0) + cantidad,
+        updated_at: new Date().toISOString(),
+      }).eq('id', productId).eq('tenant_id', tenantId);
+      if (error) throw new Error(error.message);
+    }
+    const { error: wErr } = await db.from('warehouse_stock').upsert(
+      { warehouse_id: truckId, product_id: productId, quantity: Math.max(0, enCamion - cantidad) },
+      { onConflict: 'warehouse_id,product_id' });
+    if (wErr) throw new Error(wErr.message);
+
+    try {
+      const { data: r } = await db.from('routes').select('loaded_summary').eq('id', id).maybeSingle();
+      const acc: Record<string, number> = { ...((r as any)?.loaded_summary ?? {}) };
+      if (acc[productId] != null) {
+        const queda = Number(acc[productId]) - cantidad;
+        if (queda > 0) acc[productId] = queda; else delete acc[productId];
+        await db.from('routes').update({ loaded_summary: acc }).eq('id', id).eq('tenant_id', tenantId);
+      }
+    } catch { /* columna loaded_summary no existe todavía */ }
+
+    return ok(c, {
+      ok: true,
+      product_id: productId,
+      product_name: (prod as any).name ?? 'Producto',
+      devuelto: cantidad,
+      queda_en_camion: Math.max(0, enCamion - cantidad),
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // GET /:id/truck-stock — stock actual del camión de la ruta
 routing.get('/:id/truck-stock', async (c) => {
   try {
