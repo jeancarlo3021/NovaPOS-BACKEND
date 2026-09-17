@@ -853,6 +853,25 @@ groups.put('/:id/branches/:tenantId/fe-plan', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+/**
+ * Negocios a los que puede entrar un usuario: sus accesos (`user_tenants`) y los
+ * que tiene como dueño. El super-admin, todos.
+ */
+async function negociosAccesibles(userId: string): Promise<Set<string> | 'todos'> {
+  try {
+    const { data: u } = await db.from('users').select('tenant_id').eq('id', userId).maybeSingle();
+    const { data: t } = await db.from('tenants').select('plan_id').eq('id', (u as any)?.tenant_id ?? '').maybeSingle();
+    const { data: p } = await db.from('subscription_plans').select('features').eq('id', (t as any)?.plan_id ?? '').maybeSingle();
+    if ((p as any)?.features?.admin_dashboard === true) return 'todos';
+  } catch { /* sin plan: no es super-admin */ }
+  const ids = new Set<string>();
+  const { data: ut } = await db.from('user_tenants').select('tenant_id').eq('user_id', userId);
+  for (const r of (ut ?? []) as any[]) ids.add(String(r.tenant_id));
+  const { data: propios } = await db.from('tenants').select('id').eq('owner_id', userId);
+  for (const r of (propios ?? []) as any[]) ids.add(String(r.id));
+  return ids;
+}
+
 // ── GET /fe-plans — catálogo de planes FE disponibles ─────────────────────
 /**
  * POST /:id/copy-products — copia el catálogo de una sucursal a otra.
@@ -1126,8 +1145,20 @@ groups.get('/my/branches-stats', async (c) => {
     if (!(myGroupRow as any)?.group_id) return ok(c, []);
     const { data: memberRows } = await db.from('tenant_group_members')
       .select('tenant_id').eq('group_id', (myGroupRow as any).group_id);
-    const tenantIds = Array.from(new Set((memberRows ?? []).map((r: any) => r.tenant_id)));
-    if (tenantIds.length === 0) return ok(c, []);
+    /**
+     * Solo los negocios a los que el usuario TIENE ACCESO.
+     *
+     * Antes bastaba con que el negocio actual estuviera en el grupo para ver
+     * ventas, usuarios y facturas de todos los demás. En la cartera de un
+     * contador eso es grave: el usuario de un cliente veía los números de los
+     * otros clientes. El dueño del grupo (o el contador) tiene acceso a todos y
+     * los sigue viendo; cada cliente ve solo lo suyo.
+     */
+    const accesibles = await negociosAccesibles(userId);
+    const tenantIds = Array.from(new Set((memberRows ?? []).map((r: any) => String(r.tenant_id))))
+      .filter(t => accesibles === 'todos' || accesibles.has(t));
+    // Con uno solo no hay "sucursales" que comparar: el panel no se muestra.
+    if (tenantIds.length <= 1) return ok(c, []);
 
     // 2. Nombres
     const { data: tenants } = await db.from('tenants')

@@ -4,6 +4,7 @@ import { db } from '../db/client.js';
 import { forgetCachedUser } from '../middleware/auth.js';
 import { ok, fail } from '../utils/response.js';
 import { clearPermissionCache } from '../middleware/permissions.js';
+import { razonSocialDe } from '../services/feCompartida.js';
 
 const users = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
@@ -474,9 +475,45 @@ async function tiendasQueManeja(editorId: string): Promise<Array<{ id: string; n
   return [...tiendas].map(([id, name]) => ({ id, name })).sort((a, b) => a.name.localeCompare(b.name));
 }
 
+/**
+ * Separa a los clientes de un contador.
+ *
+ * El contador es dueño de todos los negocios de su cartera, así que "las tiendas
+ * que maneja" incluye a todos sus clientes. Sin este filtro, al darle acceso a
+ * otra tienda al usuario de un cliente podía marcar —por error o no— el negocio
+ * de OTRO cliente, y ese usuario pasaba a ver ventas y datos ajenos.
+ *
+ *   · Usuario de un cliente de la cartera: solo se le ofrecen los negocios de la
+ *     MISMA razón social (sus sucursales y actividades).
+ *   · Usuario de un negocio fuera de la cartera: nunca se le ofrecen clientes.
+ *
+ * Lo que ya tiene se sigue mostrando, para poder quitarlo.
+ */
+async function sinCruzarClientes<T extends { id: string }>(
+  tiendas: T[], base: string | null, yaConAcceso: Set<string>,
+): Promise<T[]> {
+  const { data: carteras, error } = await db.from('tenant_groups').select('id').eq('kind', 'accounting');
+  if (error || !carteras?.length) return tiendas;   // sin carteras (o sin la columna): nada que separar
+  const { data: miembros } = await db.from('tenant_group_members')
+    .select('tenant_id').in('group_id', (carteras as any[]).map(g => g.id));
+  const enCartera = new Set(((miembros ?? []) as any[]).map(m => String(m.tenant_id)));
+  if (!tiendas.some(t => enCartera.has(t.id))) return tiendas;
+
+  if (base && enCartera.has(base)) {
+    const mismaRazon = new Set((await razonSocialDe(base)).miembros);
+    mismaRazon.add(base);
+    return tiendas.filter(t => mismaRazon.has(t.id) || yaConAcceso.has(t.id));
+  }
+  return tiendas.filter(t => !enCartera.has(t.id) || yaConAcceso.has(t.id));
+}
+
 // GET /managed-tenants — tiendas que maneja quien edita (para elegir al crear un usuario)
 users.get('/managed-tenants', async (c) => {
-  try { return ok(c, await tiendasQueManeja(c.get('userId'))); }
+  // ?base= negocio donde se va a crear el usuario (por defecto, el actual).
+  try {
+    const base = c.req.query('base') || c.get('tenantId') || null;
+    return ok(c, await sinCruzarClientes(await tiendasQueManeja(c.get('userId')), base, new Set()));
+  }
   catch (err: any) { return fail(c, err.message, 500); }
 });
 
@@ -484,13 +521,14 @@ users.get('/managed-tenants', async (c) => {
 users.get('/:id/tenants', async (c) => {
   try {
     const { id } = c.req.param();
-    const tiendas = await tiendasQueManeja(c.get('userId'));
-    const ids = tiendas.map(t => t.id);
+    const todas = await tiendasQueManeja(c.get('userId'));
+    const ids = todas.map(t => t.id);
 
     const { data: usuario } = await db.from('users').select('id, tenant_id').eq('id', id).maybeSingle();
     if (!usuario) return fail(c, 'Usuario no encontrado', 404);
     const { data: accesos } = await db.from('user_tenants').select('tenant_id').eq('user_id', id);
     const conAcceso = new Set(((accesos ?? []) as any[]).map(a => String(a.tenant_id)));
+    const tiendas = await sinCruzarClientes(todas, String((usuario as any).tenant_id ?? '') || null, conAcceso);
     // Solo se puede administrar a alguien que está en alguna de las tiendas propias.
     const esDeMisTiendas = ids.includes(String((usuario as any).tenant_id)) || ids.some(t => conAcceso.has(t));
     if (!esDeMisTiendas) return fail(c, 'Usuario no encontrado', 404);
@@ -515,9 +553,8 @@ users.put('/:id/tenants', async (c) => {
     const body = await c.req.json().catch(() => ({} as any));
     const pedidas = new Set<string>((Array.isArray(body?.tenant_ids) ? body.tenant_ids : []).map(String));
 
-    const tiendas = await tiendasQueManeja(c.get('userId'));
-    const ids = new Set(tiendas.map(t => t.id));
-    for (const t of pedidas) if (!ids.has(t)) return fail(c, 'No administrás una de las tiendas elegidas.', 403);
+    const todas = await tiendasQueManeja(c.get('userId'));
+    const ids = new Set(todas.map(t => t.id));
 
     const { data: usuario } = await db.from('users').select('id, tenant_id, role').eq('id', id).maybeSingle();
     if (!usuario) return fail(c, 'Usuario no encontrado', 404);
@@ -525,6 +562,16 @@ users.put('/:id/tenants', async (c) => {
     const actuales = ((filas ?? []) as any[]);
     const conAcceso = new Set(actuales.map(a => String(a.tenant_id)));
     const actual = String((usuario as any).tenant_id ?? '');
+
+    for (const t of pedidas) if (!ids.has(t)) return fail(c, 'No administrás una de las tiendas elegidas.', 403);
+    // Nunca dar acceso al negocio de otro cliente de la cartera (ver sinCruzarClientes).
+    const permitidas = new Set((await sinCruzarClientes(todas, actual || null, conAcceso)).map(t => t.id));
+    const ajenas = [...pedidas].filter(t => !permitidas.has(t));
+    if (ajenas.length) {
+      const nombres = todas.filter(t => ajenas.includes(t.id)).map(t => t.name).join(', ');
+      return fail(c, `No se puede dar acceso a ${nombres}: es de otro cliente. `
+        + 'Cada cliente solo puede ver sus propios negocios.', 403);
+    }
     if (!ids.has(actual) && ![...ids].some(t => conAcceso.has(t))) return fail(c, 'Usuario no encontrado', 404);
 
     // Lo que tiene fuera de mis tiendas se conserva tal cual.
