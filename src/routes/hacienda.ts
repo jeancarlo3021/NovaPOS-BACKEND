@@ -3319,11 +3319,27 @@ hacienda.post('/emit-direct', async (c) => {
     const feRawLines = rawLines.filter((l: any) =>
       Number(l.unit_price) > 0 && !(l.product_id && excludedFe.has(l.product_id)));
 
+    /**
+     * Neto de la línea, ya con sus descuentos.
+     *
+     * El POS electrónico manda el `subtotal` que calculó con el descuento de la
+     * línea y su parte del descuento general. Se usa tal cual —igual que en el
+     * POS normal, donde el comprobante declara el precio efectivo— pero nunca
+     * por encima del bruto ni por debajo de cero: un monto fuera de rango no
+     * puede terminar en el comprobante. Sin `subtotal`, es cantidad × precio.
+     */
+    const netoDe = (l: any): number => {
+      const bruto = Math.round((Number(l.quantity) || 0) * (Number(l.unit_price) || 0) * 100) / 100;
+      const pedido = Number(l.subtotal);
+      if (l.subtotal == null || !Number.isFinite(pedido)) return bruto;
+      return Math.round(Math.min(bruto, Math.max(0, pedido)) * 100) / 100;
+    };
+
     // Normalizar líneas + totales.
     const lines: FELine[] = feRawLines.map((l: any) => {
       const qty = Number(l.quantity) || 0;
       const price = Number(l.unit_price) || 0;
-      const sub = Math.round(qty * price * 100) / 100;
+      const sub = netoDe(l);
       return {
         product_name: l.name ?? 'Producto',
         sku: l.sku ?? null,
@@ -3343,9 +3359,11 @@ hacienda.post('/emit-direct', async (c) => {
       return fail(c, `Estos productos no tienen código CABYS: ${nombres}. Asignáselo en el producto.`, 422);
     }
 
-    const subtotal = lines.reduce((s, l) => s + l.subtotal, 0);
+    const subtotal = Math.round(lines.reduce((s, l) => s + l.subtotal, 0) * 100) / 100;
     const taxAmount = lines.reduce((s, l) => s + Math.round(l.subtotal * (Number(l.iva_rate) / 100) * 100) / 100, 0);
     const total = Math.round((subtotal + taxAmount) * 100) / 100;
+    // Lo que se rebajó en total (bruto − neto de las líneas que van al comprobante).
+    const discountTotal = Math.round(lines.reduce((s, l) => s + (l.quantity * l.unit_price - l.subtotal), 0) * 100) / 100;
 
     // Receptor.
     const receptor = b.customer && (b.customer.identification || b.customer.name)
@@ -3380,7 +3398,7 @@ hacienda.post('/emit-direct', async (c) => {
         tenant_id: tenantId,
         cash_session_id: b.session_id ?? null,
         invoice_number: finalNumber,
-        subtotal, discount_amount: 0, tax_amount: taxAmount, total,
+        subtotal, discount_amount: Math.max(0, discountTotal), tax_amount: taxAmount, total,
         payment_method: payment,
         customer_id: b.customer?.id ?? null,
         customer_name: b.customer?.name ?? null,
@@ -3403,8 +3421,11 @@ hacienda.post('/emit-direct', async (c) => {
         invoice_id: inv.id, product_id: l.product_id ?? null,
         product_name: l.name ?? 'Producto',   // snapshot: sobrevive si se borra el producto
         quantity: Number(l.quantity),
-        unit_price: Number(l.unit_price) || 0, discount_percent: 0, discount_amount: 0,
-        subtotal: Math.round((Number(l.quantity) || 0) * (Number(l.unit_price) || 0) * 100) / 100,
+        unit_price: Number(l.unit_price) || 0,
+        discount_percent: Math.min(100, Math.max(0, Number(l.discount_percent) || 0)),
+        // Todo lo rebajado de la línea: su descuento y su parte del general.
+        discount_amount: Math.round(((Number(l.quantity) || 0) * (Number(l.unit_price) || 0) - netoDe(l)) * 100) / 100,
+        subtotal: netoDe(l),
       }));
     let { error: feItemErr } = preview
       ? { error: null } as any

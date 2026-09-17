@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
 import { sincronizarEmpresaEnAlanube } from './admin.js';
-import { configEfectiva, guardarRepartido } from '../services/feCompartida.js';
+import { configEfectiva, guardarRepartido, principalFiscal } from '../services/feCompartida.js';
 import { crearActividadesNuevas } from '../services/actividadesSucursal.js';
 
 const settings = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
@@ -21,6 +21,27 @@ settings.get('/:type', async (c) => {
       const { data: t } = await db.from('tenants').select('name')
         .eq('id', String((data!.config as any).fe_shared_from)).maybeSingle();
       return ok(c, { ...cfg, fe_shared_from_name: (t as any)?.name ?? null });
+    }
+    /**
+     * Una ACTIVIDAD sin configuración propia usa la de su negocio principal.
+     *
+     * Se crea con los valores por defecto de la base: sin personalización del
+     * ticket, sin datos generales, sin métodos de pago. Con eso el ticket salía con valores por defecto —sin el
+     * nombre del local, con el ancho equivocado— como si fuera otro negocio.
+     * Es la misma sociedad: arranca igual que el principal. En cuanto guarda un
+     * cambio propio, tiene su configuración y deja de heredar.
+     */
+    // Las filas que crea la base al dar de alta el negocio («Mi Negocio», ticket
+    // por navegador) nunca se guardaron: `updated_at` es igual a `created_at`.
+    // Esas no son una configuración elegida, así que también se heredan.
+    const sinTocar = !!data && String((data as any).updated_at ?? '') === String((data as any).created_at ?? '');
+    if ((!data || sinTocar) && type !== 'electronic-invoice') {
+      const principalId = await principalFiscal(tenantId);
+      if (principalId !== tenantId) {
+        const { data: delPrincipal } = await db.from('settings').select('config')
+          .eq('tenant_id', principalId).eq('type', type).maybeSingle();
+        if (delPrincipal) return ok(c, (delPrincipal as any).config ?? {});
+      }
     }
     return ok(c, data?.config ?? {});
   } catch (err: any) { return fail(c, err.message, 500); }

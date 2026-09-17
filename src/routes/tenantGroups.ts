@@ -5,7 +5,7 @@ import { ok, fail } from '../utils/response.js';
 import { endOfDay } from '../utils/dateRange.js';
 import { sincronizarEmpresaEnAlanube } from './admin.js';
 import { computeFeQuota } from './hacienda.js';
-import { configEfectiva } from '../services/feCompartida.js';
+import { configEfectiva, principalFiscal } from '../services/feCompartida.js';
 import { crearNegocio, crearActividadComoSucursal, ErrorDeActividad, recordarActividadSinNegocio } from '../services/actividadesSucursal.js';
 
 /**
@@ -1092,6 +1092,14 @@ groups.get('/my/tenant-plan/:tenantId', async (c) => {
 
     // 1) Suscripción propia de la sucursal.
     let sub = await activeSubOf(tenantId);
+
+    // 1b) Una ACTIVIDAD sin plan propio usa el de su negocio principal (la misma
+    //     sociedad), esté o no en el mismo grupo. Sin esto quedaba en «demo»:
+    //     sin facturación electrónica en el POS y sin los módulos del principal.
+    if (!sub?.subscription_plans) {
+      const principalId = await principalFiscal(tenantId);
+      if (principalId !== tenantId) sub = await activeSubOf(principalId);
+    }
 
     // 2) Si no tiene suscripción propia (sucursal enlazada/creada sin plan), HEREDA
     //    el plan del tenant principal del grupo.
