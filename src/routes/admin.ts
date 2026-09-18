@@ -2575,61 +2575,115 @@ async function syncTenantsToCustomers(myTenant: string, onlyTenant: string | nul
     const { data: tenants, error: tErr } = await q;
     if (tErr) throw new Error(tErr.message);
     const targets = (tenants ?? []).filter((t: any) => t.id !== myTenant);
-    if (targets.length === 0) return { created: 0, updated: 0, total: 0, errors: [] as string[] };
+    if (targets.length === 0) return { created: 0, updated: 0, total: 0, errors: [] as string[], incompletos: [] as any[] };
 
-    // Config FE de cada negocio (datos del emisor) — de ahí salen cédula/correo/dirección.
+    const ids = targets.map((t: any) => t.id);
+
+    // Datos de FE de cada negocio (cédula, nombre, correo, dirección…).
     const feByTenant: Record<string, any> = {};
     try {
       const { data: rows } = await db.from('settings')
-        .select('tenant_id, config').eq('type', 'electronic-invoice')
-        .in('tenant_id', targets.map((t: any) => t.id));
+        .select('tenant_id, config').eq('type', 'electronic-invoice').in('tenant_id', ids);
       for (const r of (rows ?? []) as any[]) feByTenant[r.tenant_id] = r.config ?? {};
     } catch (e: any) { console.warn('[sync-customers] fe config:', e?.message); }
 
-    // Correo del dueño como respaldo cuando la config FE no trae correo.
-    const emailByOwner: Record<string, string> = {};
+    /**
+     * Los datos GENERALES también cuentan.
+     *
+     * Antes la ficha del cliente se armaba SOLO con los datos de FE. El negocio
+     * que no tiene facturación electrónica —o que todavía no la llenó— llegaba a
+     * la lista de clientes con el puro nombre: sin cédula, sin teléfono y sin
+     * dirección, y había que buscarlos a mano para poder facturarle. Esos datos
+     * casi siempre están en Configuración → General, que es lo que el negocio
+     * llena primero.
+     */
+    const genByTenant: Record<string, any> = {};
+    try {
+      const { data: rows } = await db.from('settings')
+        .select('tenant_id, config').eq('type', 'general').in('tenant_id', ids);
+      for (const r of (rows ?? []) as any[]) genByTenant[r.tenant_id] = r.config ?? {};
+    } catch (e: any) { console.warn('[sync-customers] general config:', e?.message); }
+
+    // Correo y teléfono del dueño, como último respaldo.
+    const ownerById: Record<string, any> = {};
     try {
       const ownerIds = targets.map((t: any) => t.owner_id).filter(Boolean);
       if (ownerIds.length > 0) {
-        const { data: us } = await db.from('users').select('id, email').in('id', ownerIds);
-        for (const u of (us ?? []) as any[]) if (u.email) emailByOwner[u.id] = u.email;
+        const { data: us } = await db.from('users').select('id, email, phone').in('id', ownerIds);
+        for (const u of (us ?? []) as any[]) ownerById[u.id] = u;
       }
-    } catch (e: any) { console.warn('[sync-customers] owner emails:', e?.message); }
+    } catch (e: any) { console.warn('[sync-customers] owners:', e?.message); }
 
     // Clientes que ya tengo, indexados por cédula y por nombre (para no duplicar).
-    const { data: existing } = await db.from('customers')
-      .select('id, name, identification').eq('tenant_id', myTenant);
+    // Paginado: con más de mil clientes el índice salía incompleto y se duplicaban.
+    const existing: any[] = [];
+    for (let desde = 0; ; desde += 1000) {
+      const { data: page } = await db.from('customers')
+        .select('id, name, identification').eq('tenant_id', myTenant).range(desde, desde + 999);
+      existing.push(...(page ?? []));
+      if ((page ?? []).length < 1000) break;
+    }
     const byIdent: Record<string, string> = {};
     const byName:  Record<string, string> = {};
-    for (const cu of (existing ?? []) as any[]) {
+    for (const cu of existing) {
       const ident = String(cu.identification ?? '').replace(/\D/g, '');
       if (ident) byIdent[ident] = cu.id;
       const n = String(cu.name ?? '').trim().toLowerCase();
       if (n) byName[n] = cu.id;
     }
 
+    const primero = (...valores: any[]) => {
+      for (const v of valores) {
+        const s = String(v ?? '').trim();
+        if (s) return s;
+      }
+      return '';
+    };
+
     let created = 0, updated = 0;
     const errors: string[] = [];
+    /** Negocios que quedaron sin algún dato, para poder ir a completarlos. */
+    const incompletos: Array<{ negocio: string; faltan: string[] }> = [];
+
     for (const t of targets as any[]) {
-      const fe = feByTenant[t.id] ?? {};
-      const ident = String(fe.emisor_identification ?? '').replace(/\D/g, '');
-      const name  = String(fe.emisor_name || t.name || '').trim();
+      // Una ACTIVIDAD hereda los datos de su negocio principal: los suyos están vacíos.
+      const propia = feByTenant[t.id] ?? {};
+      const fe: any = propia.fe_shared_from ? await configEfectiva(t.id, propia) : propia;
+      const gen = genByTenant[t.id] ?? {};
+      const owner = ownerById[t.owner_id] ?? {};
+
+      const ident = primero(fe.emisor_identification, gen.ruc, gen.cedula).replace(/\D/g, '');
+      const name  = primero(fe.emisor_name, gen.businessName, t.name);
       if (!name) continue;
+      const tipoId = primero(fe.emisor_identification_type)
+        || (ident ? (ident.length === 9 ? '01' : ident.length >= 10 ? '02' : null) : null);
+      const direccion = primero(fe.emisor_address, gen.address);
       const payload: Record<string, any> = {
         tenant_id:           myTenant,
         name,
-        commercial_name:     fe.emisor_commercial_name || t.name || null,
+        commercial_name:     primero(fe.emisor_commercial_name, gen.businessName, t.name) || null,
         identification:      ident || null,
-        identification_type: fe.emisor_identification_type || (ident ? (ident.length === 9 ? '01' : '02') : null),
-        email:               fe.emisor_email || emailByOwner[t.owner_id] || null,
-        phone:               fe.emisor_phone || null,
-        address:             fe.emisor_address || null,
+        identification_type: tipoId,
+        email:               primero(fe.emisor_email, gen.email, owner.email) || null,
+        // `notify_phone` es el número al que ya se le mandan los avisos: si está,
+        // es un teléfono bueno del negocio.
+        phone:               primero(fe.emisor_phone, fe.notify_phone, gen.phone, owner.phone) || null,
+        address:             primero(direccion && gen.city ? `${direccion}, ${gen.city}` : direccion, gen.city) || null,
         province_code:       fe.emisor_province_code || null,
         canton_code:         fe.emisor_canton_code || null,
         district_code:       fe.emisor_district_code || null,
         economic_activity_code: fe.economic_activity_code || null,
         is_active:           true,
       };
+
+      const faltan = [
+        !payload.identification && 'cédula',
+        !payload.email && 'correo',
+        !payload.phone && 'teléfono',
+        !payload.address && 'dirección',
+      ].filter(Boolean) as string[];
+      if (faltan.length) incompletos.push({ negocio: name, faltan });
+
       const existingId = (ident && byIdent[ident]) || byName[name.toLowerCase()] || null;
       try {
         if (existingId) {
@@ -2639,16 +2693,22 @@ async function syncTenantsToCustomers(myTenant: string, onlyTenant: string | nul
           if (error) throw new Error(error.message);
           updated++;
         } else {
-          const { error } = await db.from('customers').insert(payload);
+          // Se guarda el id REAL del cliente recién creado: antes se anotaba el
+          // texto «new» y, si otro negocio coincidía en nombre o cédula, el
+          // siguiente guardado intentaba actualizar un id inexistente y fallaba.
+          const { data: creado, error } = await db.from('customers').insert(payload).select('id').maybeSingle();
           if (error) throw new Error(error.message);
           created++;
-          if (ident) byIdent[ident] = 'new';
-          byName[name.toLowerCase()] = 'new';
+          const nuevoId = (creado as any)?.id;
+          if (nuevoId) {
+            if (ident) byIdent[ident] = nuevoId;
+            byName[name.toLowerCase()] = nuevoId;
+          }
         }
       } catch (e: any) { errors.push(`${name}: ${e?.message}`); }
     }
 
-    return { created, updated, total: targets.length, errors };
+    return { created, updated, total: targets.length, errors, incompletos };
   }
 }
 
