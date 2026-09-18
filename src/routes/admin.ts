@@ -442,34 +442,155 @@ admin.patch('/tenants/:id/subscription', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+/**
+ * PUT /tenants/:id/name — cambiarle el nombre al negocio.
+ *
+ * Es el nombre con el que el negocio aparece en el panel, en el selector de
+ * empresa y —salvo que tenga uno propio en Configuración— el que sale impreso en
+ * el ticket. Hasta ahora había que corregirlo en la base.
+ *
+ * NO toca la razón social ni el nombre comercial de los datos de FE: esos tienen
+ * que coincidir con lo inscrito ante Hacienda, y cambiarlos acá haría que los
+ * comprobantes salgan a nombre equivocado.
+ */
+admin.put('/tenants/:id/name', async (c) => {
+  if (!isAdminRole(c)) return fail(c, 'forbidden', 403);
+  try {
+    const { id } = c.req.param();
+    const b = await c.req.json().catch(() => ({} as any));
+    const nombre = String(b?.name ?? '').trim();
+    if (nombre.length < 2) return fail(c, 'El nombre tiene que tener al menos 2 caracteres.', 422);
+    if (nombre.length > 120) return fail(c, 'El nombre es demasiado largo (máximo 120 caracteres).', 422);
+
+    const { data: antes } = await db.from('tenants').select('name').eq('id', id).maybeSingle();
+    if (!antes) return fail(c, 'Negocio no encontrado', 404);
+
+    const { error } = await db.from('tenants')
+      .update({ name: nombre, updated_at: new Date().toISOString() }).eq('id', id);
+    if (error) throw new Error(error.message);
+    // El middleware guarda el negocio en memoria corta: sin esto, el nombre viejo
+    // seguiría apareciendo un rato.
+    forgetCachedTenant(id);
+
+    /**
+     * El ticket imprime `general.businessName`. Se actualiza SOLO si venía igual
+     * al nombre anterior (o vacío): si el negocio puso ahí otro rótulo a
+     * propósito, no se le pisa.
+     */
+    let ticket_actualizado = false;
+    try {
+      const { data: row } = await db.from('settings').select('config')
+        .eq('tenant_id', id).eq('type', 'general').maybeSingle();
+      const cfg: Record<string, any> = { ...((row as any)?.config ?? {}) };
+      const actual = String(cfg.businessName ?? '').trim();
+      if (!actual || actual === String((antes as any).name ?? '').trim() || actual === 'Mi Negocio') {
+        cfg.businessName = nombre;
+        await db.from('settings').upsert({
+          tenant_id: id, type: 'general', config: cfg, updated_at: new Date().toISOString(),
+        }, { onConflict: 'tenant_id,type' });
+        ticket_actualizado = true;
+      }
+    } catch (e: any) { console.warn('[admin] nombre en settings general:', e?.message); }
+
+    return ok(c, { ok: true, name: nombre, anterior: (antes as any).name ?? null, ticket_actualizado });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // POST /delete-owner — delete tenant and all data via edge function
 admin.post('/delete-owner', async (c) => {
   try {
     const { tenantId, ownerId } = await c.req.json();
-    // Use service role to delete directly (edge function not available from backend)
-    //
-    // La base impide borrar facturas YA EMITIDAS a Hacienda (migración 109). Acá
-    // se está borrando el negocio entero, que es el único caso donde eso sí
-    // corresponde, así que se abre la válvula a propósito. Si la función no
-    // existe todavía, se sigue: el borrado funcionará igual salvo que haya
-    // facturas emitidas, y en ese caso el error dice exactamente qué falta.
+    if (!tenantId) return fail(c, 'Falta el negocio a eliminar', 422);
+
+    const { data: negocio } = await db.from('tenants').select('id, name').eq('id', tenantId).maybeSingle();
+    if (!negocio) return ok(c, { deleted: true, ya_no_existia: true });
+
+    /**
+     * El borrado va ENTERO en la base, en una sola transacción.
+     *
+     * La migración 109 impide borrar facturas ya emitidas a Hacienda y la
+     * válvula que lo permite (`permitir_borrado_masivo`) dura solo lo que dura
+     * la transacción. Como cada consulta del backend es su propia transacción,
+     * abrirla desde acá no servía de nada: la factura emitida no se borraba, el
+     * negocio quedaba con datos colgando y el panel decía «eliminado» igual.
+     */
+    const cascada = await db.rpc('delete_tenant_cascade', { p_tenant: tenantId });
+    if (!cascada.error) {
+      return ok(c, { deleted: true, detalle: cascada.data ?? null });
+    }
+    const faltaLaFuncion = /delete_tenant_cascade|does not exist|schema cache|PGRST202/i.test(cascada.error.message ?? '');
+    if (!faltaLaFuncion) {
+      return fail(c,
+        `No se pudo eliminar "${(negocio as any).name}".\n\nDetalle: ${cascada.error.message}`
+        + '\n\nEl negocio quedó como estaba.', 409);
+    }
+    // Sin la migración 114: se intenta como antes, avisando si no alcanza.
+    console.warn('[delete-owner] falta la migración 114 (delete_tenant_cascade); se borra por partes');
     try { await db.rpc('permitir_borrado_masivo'); }
     catch { /* migración 109 sin correr */ }
 
-    // Delete in dependency order
-    await db.from('invoice_items').delete().eq('tenant_id', tenantId);
-    await db.from('invoices').delete().eq('tenant_id', tenantId);
-    await db.from('expenses').delete().eq('tenant_id', tenantId);
-    await db.from('purchases').delete().eq('tenant_id', tenantId);
-    await db.from('accounts_payable').delete().eq('tenant_id', tenantId);
-    await db.from('products').delete().eq('tenant_id', tenantId);
-    await db.from('product_categories').delete().eq('tenant_id', tenantId);
-    await db.from('suppliers').delete().eq('tenant_id', tenantId);
-    await db.from('cash_sessions').delete().eq('tenant_id', tenantId);
-    await db.from('subscriptions').delete().eq('tenant_id', tenantId);
-    await db.from('users').delete().eq('tenant_id', tenantId);
-    await db.from('tenants').delete().eq('id', tenantId);
-    return ok(c, { deleted: true });
+    // Orden de dependencias conocido. Se ignoran los errores de tabla o columna
+    // que no existan: cada instalación tiene módulos distintos.
+    const enOrden = [
+      'invoice_items', 'invoices', 'expenses', 'purchases', 'accounts_payable',
+      'reservation_payments', 'reservation_items', 'reservations',
+      'products', 'product_categories', 'categories', 'unit_types', 'suppliers',
+      'cash_sessions', 'settings', 'user_tenants', 'tenant_group_members',
+      'tenant_fe_plans', 'subscriptions', 'users',
+    ];
+    const borrar = async (tabla: string) => {
+      const { error } = await db.from(tabla).delete().eq('tenant_id', tenantId);
+      if (error && !/does not exist|relation|column/i.test(error.message)) {
+        console.warn(`[delete-owner] ${tabla}:`, error.message);
+      }
+      return error ?? null;
+    };
+    for (const tabla of enOrden) await borrar(tabla);
+
+    /**
+     * Y ahora el negocio, de verdad.
+     *
+     * Antes se intentaba borrar y se respondía «eliminado» sin mirar el
+     * resultado: con cualquier tabla que todavía apuntara al negocio —una
+     * bodega, una ruta, un apartado— la base rechazaba el borrado, el negocio
+     * seguía ahí y el panel decía que se había eliminado. El usuario lo borraba
+     * una y otra vez y volvía a aparecer.
+     *
+     * El rechazo de la base dice EN QUÉ TABLA quedó la referencia. Se usa eso
+     * para limpiarla y reintentar; si después de varias vueltas sigue sin poder,
+     * se devuelve el motivo en vez de fingir que se borró.
+     */
+    let ultimoError: string | null = null;
+    const limpiadas: string[] = [];
+    for (let intento = 0; intento < 12; intento++) {
+      const { error } = await db.from('tenants').delete().eq('id', tenantId);
+      if (!error) { ultimoError = null; break; }
+      ultimoError = error.message;
+      const m = /on table "([^"]+)"/i.exec(error.message);
+      const tabla = m?.[1];
+      if (!tabla || limpiadas.includes(tabla)) break;
+      limpiadas.push(tabla);
+      const { error: e2 } = await db.from(tabla).delete().eq('tenant_id', tenantId);
+      // La tabla puede no tener `tenant_id` (cuelga de otra fila, no del negocio).
+      if (e2) { ultimoError = `${error.message} · no se pudo limpiar ${tabla}: ${e2.message}`; break; }
+    }
+
+    // Se comprueba: si sigue existiendo, NO se dice que se borró.
+    const { data: sigue } = await db.from('tenants').select('id').eq('id', tenantId).maybeSingle();
+    if (sigue) {
+      const porFactura = /emitida a Hacienda|restrict_violation/i.test(ultimoError ?? '');
+      return fail(c,
+        `No se pudo eliminar "${(negocio as any).name}": todavía hay datos que dependen de él.`
+        + (ultimoError ? `\n\nDetalle: ${ultimoError}` : '')
+        + (porFactura
+          ? '\n\nEl negocio tiene comprobantes ya emitidos a Hacienda. Para poder borrarlo hace falta '
+            + 'correr la migración 114 (delete_tenant_cascade), que hace el borrado completo en una sola transacción.'
+          : '\n\nEl negocio quedó como estaba. Pasalo a inactivo o avisá para borrar esos datos primero.'),
+        409);
+    }
+
+    void ownerId;
+    return ok(c, { deleted: true, tablas_limpiadas: limpiadas });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
