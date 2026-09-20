@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
+import { endOfDay } from '../utils/dateRange.js';
 
 /**
  * APARTADOS.
@@ -138,6 +139,69 @@ async function moverStock(items: any[], signo: 1 | -1): Promise<{ ok: boolean; m
   }
   return { ok: true };
 }
+
+/**
+ * GET /payments — abonos de apartados, para el CIERRE DE CAJA.
+ *
+ * El abono de un apartado es plata que entra al cajón pero no es una venta: no
+ * hay factura hasta que la mercadería se retira. El cierre se armaba solo con
+ * facturas, así que ese dinero quedaba fuera del esperado y el arqueo salía con
+ * un sobrante igual a lo abonado en el turno.
+ *
+ * ?session=<id> — abonos ligados a esa caja (lo que usa el cierre).
+ * ?from=&to=    — por fecha, para revisar después.
+ */
+reservations.get('/payments', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const sessionId = c.req.query('session');
+    const desde = c.req.query('from');
+    const hasta = c.req.query('to');
+
+    const columnas = 'id, reservation_id, amount, method, notes, created_at, cash_session_id,'
+      + ' reservation:reservations(number, customer_name)';
+    let q = db.from('reservation_payments')
+      .select(columnas).eq('tenant_id', tenantId).order('created_at');
+    if (sessionId) q = q.eq('cash_session_id', sessionId);
+    if (desde) q = q.gte('created_at', desde);
+    if (hasta) q = q.lte('created_at', endOfDay(hasta) ?? hasta);
+
+    let { data, error } = await q;
+    if (error) throw new Error(error.message);
+
+    /**
+     * Respaldo por HORARIO, igual que las ventas de la caja.
+     *
+     * Los abonos cobrados antes de que el sistema los ligara a la caja —o los
+     * que se tomaron sin conexión— no tienen `cash_session_id`. Sin esto, esa
+     * plata está en el cajón y no aparece en ningún cierre. Se toman los abonos
+     * SIN caja que caen dentro del horario de este turno.
+     */
+    if (sessionId && (data ?? []).length === 0) {
+      const { data: ses } = await db.from('cash_sessions')
+        .select('opening_date, closing_date').eq('id', sessionId).eq('tenant_id', tenantId).maybeSingle();
+      const abre = (ses as any)?.opening_date;
+      if (abre) {
+        const cierra = (ses as any)?.closing_date ?? new Date().toISOString();
+        const r = await db.from('reservation_payments')
+          .select(columnas).eq('tenant_id', tenantId).is('cash_session_id', null)
+          .gte('created_at', abre).lte('created_at', cierra).order('created_at');
+        if (!r.error) data = r.data;
+      }
+    }
+
+    return ok(c, (data ?? []).map((p: any) => ({
+      id: p.id,
+      reservation_id: p.reservation_id,
+      numero: p.reservation?.number ?? null,
+      cliente: p.reservation?.customer_name ?? null,
+      amount: Number(p.amount ?? 0),
+      method: p.method ?? 'cash',
+      notes: p.notes ?? null,
+      created_at: p.created_at,
+    })));
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
 
 // GET / — lista de apartados. ?status=open|delivered|cancelled|expired|all
 reservations.get('/', async (c) => {
