@@ -1473,6 +1473,15 @@ hacienda.get('/received', async (c) => {
       id: d.id, clave: d.clave, issuer_name: d.issuer_name, issuer_id: d.issuer_id,
       document_type: d.document_type, date: d.doc_date, total: Number(d.total ?? 0),
       tax: Number(d.tax ?? 0), ack_status: d.ack_status,
+      /**
+       * `ack_id` es el comprobante de que el Mensaje Receptor SÍ salió a
+       * Hacienda. No se devolvía, así que la pantalla no tenía cómo saberlo y
+       * marcaba «Aceptado · sin enviar» incluso cuando se había enviado.
+       */
+      ack_id: d.ack_id ?? null,
+      /** Por qué falló el último envío, si falló. Antes no se guardaba en ningún lado. */
+      ack_error: d.raw?.ack_error ?? null,
+      ack_error_at: d.raw?.ack_error_at ?? null,
       source: d.source ?? null, email_from: d.email_from ?? null,
       purchase_id: d.purchase_id ?? null,
       purchase_number: d.purchase_id ? (poNumber.get(d.purchase_id) ?? null) : null,
@@ -1484,6 +1493,77 @@ hacienda.get('/received', async (c) => {
     return fail(c, err.message, 500);
   }
 });
+
+/**
+ * Arma el MENSAJE RECEPTOR (la respuesta del comprador a Hacienda).
+ *
+ * Estaba escrito dos veces —al aceptar y al reenviar—, así que cualquier
+ * corrección había que hacerla en los dos lados o quedaban distintos.
+ */
+async function construirMensajeReceptor(
+  tenantId: string, cfg: any, doc: any, estado: string, companyId: string, motivo?: string,
+) {
+  const m5 = (n: any) => (Math.round(Number(n || 0) * 1e5) / 1e5).toFixed(5);
+  const issuerId = String(doc.issuer_id ?? '').replace(/\D/g, '');
+  // Tipo de identificación del EMISOR original (proveedor): 9 díg = física, 10 = jurídica.
+  const issuerType = issuerId.length === 9 ? '01' : '02';
+  /**
+   * Consecutivo del mensaje receptor.
+   *
+   * Es una numeración propia del receptor, aparte de la de las facturas. Se
+   * cuenta cuántos mensajes se mandaron y se sigue de ahí; el piso configurado
+   * (`consecutivo_mr`) permite continuar la numeración de un sistema anterior,
+   * que si no Hacienda rechaza por número ya usado.
+   */
+  const { count: enviados } = await db.from('received_documents')
+    .select('id', { count: 'exact', head: true })
+    .eq('tenant_id', tenantId).not('ack_id', 'is', null);
+  const piso = parseInt(String(cfg.consecutivo_mr ?? '').replace(/\D/g, ''), 10);
+  const numero = Math.max((enviados ?? 0) + 1, Number.isFinite(piso) && piso > 0 ? piso : 1);
+
+  const totalDoc = Number(doc.total ?? 0);
+  const taxDoc = Number(doc.tax ?? 0);
+  return {
+    idDoc: { key: String(doc.clave ?? '').replace(/\D/g, '') },
+    sender: { identification: { identificationType: issuerType, identificationNumber: issuerId } },
+    receiver: {
+      id: String(companyId),
+      consecutiveNumber: {
+        headquarters: String(cfg.sucursal ?? '1').replace(/\D/g, '').padStart(3, '0').slice(-3),
+        terminal: String(cfg.terminal ?? '1').replace(/\D/g, '').padStart(5, '0').slice(-5),
+        numberOfDocument: String(numero),
+      },
+    },
+    information: {
+      message: estado,                                 // 1 acepta · 2 parcial · 3 rechaza
+      ...(estado === '3' && motivo ? { messageDetail: String(motivo) } : {}),
+      activityCode: String(cfg.economic_activity_code ?? '').trim(),
+      taxCondition: '01',                              // 01 = genera crédito IVA
+    },
+    totals: {
+      totalTaxCredit: m5(taxDoc),                      // IVA acreditable
+      totalApplicableExpense: m5(totalDoc - taxDoc),   // gasto aplicable (neto)
+      totalTax: m5(taxDoc),
+      totalVoucher: m5(totalDoc),
+    },
+  } as Record<string, any>;
+}
+
+/**
+ * Deja escrito POR QUÉ no se pudo enviar el mensaje receptor.
+ *
+ * Antes el motivo solo viajaba en la respuesta de esa llamada: si el cajero
+ * cerraba la pantalla, se perdía. Quedaban decenas de comprobantes «aceptado ·
+ * sin enviar» sin ninguna forma de saber qué había pasado.
+ */
+async function anotarFalloMensajeReceptor(tenantId: string, docId: string, raw: any, motivo: string) {
+  try {
+    await db.from('received_documents').update({
+      raw: { ...(raw ?? {}), ack_error: motivo, ack_error_at: new Date().toISOString() },
+      updated_at: new Date().toISOString(),
+    }).eq('id', docId).eq('tenant_id', tenantId);
+  } catch (e: any) { console.warn('[MR] no se pudo anotar el fallo:', e?.message); }
+}
 
 // POST /received/confirm — envía el Mensaje Receptor a Hacienda vía Alanube
 // (aceptación total 1 / rechazo 3). body: { id, state: '1'|'3', reason? }
@@ -1545,58 +1625,38 @@ hacienda.post('/received/confirm', async (c) => {
     // tenant no usa Alanube o falla, igual se marca aceptado/rechazado localmente.
     // Estructura confirmada contra el OAS de CRI (createReceiverMessage).
     let mrId: string | null = null;
+    let mrError: string | null = null;
     const isSandboxEnv = String(cfg.environment ?? 'production') === 'sandbox';
     const senderCompanyId = (isSandboxEnv ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id;
-    if (cfg.fe_provider === 'alanube' && senderCompanyId) {
-      const m5 = (n: any) => (Math.round(Number(n || 0) * 1e5) / 1e5).toFixed(5);
-      const issuerId = String(d.issuer_id ?? '').replace(/\D/g, '');
-      // Tipo de identificación del EMISOR original (proveedor): 9 díg = física, 10 = jurídica.
-      const issuerType = issuerId.length === 9 ? '01' : issuerId.length >= 10 ? '02' : '02';
-      // Consecutivo del mensaje receptor (por tenant): cantidad de MR ya enviados + 1.
-      const { count: mrCount } = await db.from('received_documents')
-        .select('id', { count: 'exact', head: true })
-        .eq('tenant_id', tenantId).not('ack_id', 'is', null);
-      const totalDoc = Number(d.total ?? 0);
-      const taxDoc = Number(d.tax ?? 0);
-      const payload: Record<string, any> = {
-        idDoc: { key: String(d.clave ?? '').replace(/\D/g, '') },
-        sender: { identification: { identificationType: issuerType, identificationNumber: issuerId } },
-        receiver: {
-          id: String(senderCompanyId),
-          consecutiveNumber: {
-            headquarters: String(cfg.sucursal ?? '1').replace(/\D/g, '').padStart(3, '0').slice(-3),
-            terminal: String(cfg.terminal ?? '1').replace(/\D/g, '').padStart(5, '0').slice(-5),
-            numberOfDocument: String((mrCount ?? 0) + 1),
-          },
-        },
-        information: {
-          message: st,                                   // 1 acepta · 2 parcial · 3 rechaza
-          ...(st === '3' && reason ? { messageDetail: String(reason) } : {}),
-          activityCode: String(cfg.economic_activity_code ?? '').trim(),
-          taxCondition: '01',                            // 01 = genera crédito IVA
-        },
-        totals: {
-          totalTaxCredit: m5(taxDoc),                    // IVA acreditable
-          totalApplicableExpense: m5(totalDoc - taxDoc), // gasto aplicable (neto)
-          totalTax: m5(taxDoc),
-          totalVoucher: m5(totalDoc),
-        },
-      };
+    if (!senderCompanyId) {
+      mrError = `La empresa no está dada de alta en Alanube (${isSandboxEnv ? 'sandbox' : 'producción'}), así que el mensaje no se puede enviar.`;
+      messages.push(`⚠️ ${mrError}`);
+    } else {
+      const payload = await construirMensajeReceptor(tenantId, cfg, d, st, String(senderCompanyId), reason);
       try {
-        const resp = await alanube.forTenant(cfg).sendReceiverMessage(payload, String(senderCompanyId));
+        const resp = await alanube.forTenant(cfg).sendReceiverMessage(
+          payload, String(senderCompanyId), { asCompany: cfg.alanube_company_type === 'associated' });
         mrId = resp?.id ?? deepFind(resp, /(^id$|_id$)/i, 40) ?? null;
+        if (!mrId) {
+          mrError = 'Alanube respondió sin id de mensaje receptor.';
+          messages.push(`⚠️ ${mrError} Revisá el reporte de Alanube.`);
+        }
       } catch (e: any) {
-        messages.push(`⚠️ No se pudo enviar el mensaje a Hacienda (Alanube): ${e?.message ?? 'error'}. Se marcó localmente.`);
+        mrError = e instanceof AlanubeError ? friendlyAlanubeError(e.message) : (e?.message ?? 'error');
+        messages.push(`⚠️ No se pudo enviar el mensaje a Hacienda: ${mrError}. Se marcó localmente.`);
       }
     }
 
-    // Limpiar pendientes y marcar el estado.
-    const newRaw = { ...(d.raw ?? {}), pending_products: [] };
+    // Limpiar pendientes y marcar el estado. El motivo del fallo QUEDA GUARDADO:
+    // si no, «aceptado · sin enviar» no dice nada y no hay por dónde empezar.
+    const newRaw: Record<string, any> = { ...(d.raw ?? {}), pending_products: [] };
+    if (mrError) { newRaw.ack_error = mrError; newRaw.ack_error_at = new Date().toISOString(); }
+    else { delete newRaw.ack_error; delete newRaw.ack_error_at; }
     await db.from('received_documents').update({
       ack_status: st === '1' ? 'accepted' : 'rejected', ack_id: mrId, raw: newRaw, updated_at: new Date().toISOString(),
     }).eq('id', id).eq('tenant_id', tenantId);
 
-    return ok(c, { ok: true, state: st, mr_id: mrId, created: createdCount, messages });
+    return ok(c, { ok: true, state: st, mr_id: mrId, ack_error: mrError, created: createdCount, messages });
   } catch (err: any) {
     const status = err instanceof AlanubeError ? err.status : 500;
     return fail(c, err.message, status);
@@ -1658,45 +1718,29 @@ hacienda.post('/received/:id/resend-ack', async (c) => {
       return fail(c, `La empresa no está dada de alta en Alanube para el ambiente ${isSandboxEnv ? 'sandbox' : 'producción'}.`, 422);
     }
 
-    const m5 = (n: any) => (Math.round(Number(n || 0) * 1e5) / 1e5).toFixed(5);
-    const issuerId = String((d as any).issuer_id ?? '').replace(/\D/g, '');
-    const issuerType = issuerId.length === 9 ? '01' : '02';
-    const { count: mrCount } = await db.from('received_documents')
-      .select('id', { count: 'exact', head: true })
-      .eq('tenant_id', tenantId).not('ack_id', 'is', null);
-    const totalDoc = Number((d as any).total ?? 0);
-    const taxDoc = Number((d as any).tax ?? 0);
+    const payload = await construirMensajeReceptor(tenantId, cfg, d as any, st, String(senderCompanyId));
 
-    const payload: Record<string, any> = {
-      idDoc: { key: String((d as any).clave ?? '').replace(/\D/g, '') },
-      sender: { identification: { identificationType: issuerType, identificationNumber: issuerId } },
-      receiver: {
-        id: String(senderCompanyId),
-        consecutiveNumber: {
-          headquarters: String(cfg.sucursal ?? '1').replace(/\D/g, '').padStart(3, '0').slice(-3),
-          terminal: String(cfg.terminal ?? '1').replace(/\D/g, '').padStart(5, '0').slice(-5),
-          numberOfDocument: String((mrCount ?? 0) + 1),
-        },
-      },
-      information: {
-        message: st,
-        activityCode: String(cfg.economic_activity_code ?? '').trim(),
-        taxCondition: '01',
-      },
-      totals: {
-        totalTaxCredit: m5(taxDoc),
-        totalApplicableExpense: m5(totalDoc - taxDoc),
-        totalTax: m5(taxDoc),
-        totalVoucher: m5(totalDoc),
-      },
-    };
-
-    const resp = await alanube.forTenant(cfg).sendReceiverMessage(payload, String(senderCompanyId));
+    let resp: any;
+    try {
+      resp = await alanube.forTenant(cfg).sendReceiverMessage(
+        payload, String(senderCompanyId), { asCompany: cfg.alanube_company_type === 'associated' });
+    } catch (e: any) {
+      const motivo = e instanceof AlanubeError ? friendlyAlanubeError(e.message) : (e?.message ?? 'error');
+      await anotarFalloMensajeReceptor(tenantId, id, (d as any).raw, motivo);
+      return fail(c, motivo, 502);
+    }
     const mrId = resp?.id ?? deepFind(resp, /(^id$|_id$)/i, 40) ?? null;
-    if (!mrId) return fail(c, 'Alanube respondió sin id de mensaje receptor. Revisá el reporte de Alanube.', 502);
+    if (!mrId) {
+      const motivo = 'Alanube respondió sin id de mensaje receptor.';
+      await anotarFalloMensajeReceptor(tenantId, id, (d as any).raw, motivo);
+      return fail(c, `${motivo} Revisá el reporte de Alanube.`, 502);
+    }
 
+    // Se envió: se limpia el motivo del fallo anterior.
+    const rawLimpio: Record<string, any> = { ...((d as any).raw ?? {}) };
+    delete rawLimpio.ack_error; delete rawLimpio.ack_error_at;
     await db.from('received_documents')
-      .update({ ack_id: mrId, updated_at: new Date().toISOString() })
+      .update({ ack_id: mrId, raw: rawLimpio, updated_at: new Date().toISOString() })
       .eq('id', id).eq('tenant_id', tenantId);
 
     return ok(c, { ok: true, ack_id: mrId });

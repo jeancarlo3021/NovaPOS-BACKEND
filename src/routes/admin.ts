@@ -4262,24 +4262,69 @@ admin.get('/fe-quotas', async (c) => {
 admin.get('/tenants/:id/features', async (c) => {
   try {
     const { id } = c.req.param();
-    // Features del plan vigente (base).
-    const { data: sub } = await db.from('subscriptions')
-      .select('plan_id')
-      .eq('tenant_id', id)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    let base: Record<string, any> = {};
-    if ((sub as any)?.plan_id) {
-      const { data: plan } = await db.from('subscription_plans')
-        .select('features').eq('id', (sub as any).plan_id).maybeSingle();
-      base = ((plan as any)?.features && typeof (plan as any).features === 'object') ? (plan as any).features : {};
+    /**
+     * Los módulos QUE TRAE EL PLAN, incluido el plan HEREDADO.
+     *
+     * Antes se miraba solo la suscripción propia del negocio (y la última, aunque
+     * estuviera cancelada). Una sucursal o una actividad no tiene suscripción
+     * propia: hereda la del principal. En la pantalla de Módulos salían TODOS
+     * apagados, como si su plan no trajera nada, y para darle un módulo había que
+     * encenderlo a mano uno por uno —justo lo contrario de lo que el plan dice—.
+     *
+     * Se resuelve igual que en la app (tenant-plan): suscripción ACTIVA propia;
+     * si no tiene, la del negocio principal de su sociedad; si no, la de la
+     * matriz de su grupo.
+     */
+    const planDe = async (tid: string) => {
+      const { data } = await db.from('subscriptions')
+        .select('plan_id, status, subscription_plans(name, features)')
+        .eq('tenant_id', tid).eq('status', 'active')
+        .order('created_at', { ascending: false }).limit(1).maybeSingle();
+      return (data as any)?.subscription_plans ? data : null;
+    };
+
+    let sub: any = await planDe(id);
+    let heredadoDe: string | null = null;
+
+    if (!sub) {
+      const principal = await principalFiscal(id);
+      if (principal !== id) { sub = await planDe(principal); if (sub) heredadoDe = principal; }
     }
+    if (!sub) {
+      const { data: gm } = await db.from('tenant_group_members').select('group_id').eq('tenant_id', id).maybeSingle();
+      const groupId = (gm as any)?.group_id;
+      if (groupId) {
+        const { data: grp } = await db.from('tenant_groups').select('*').eq('id', groupId).maybeSingle();
+        let matriz = (grp as any)?.main_tenant_id ?? null;
+        if (!matriz) {
+          const { data: m } = await db.from('tenant_group_members')
+            .select('tenant_id').eq('group_id', groupId).eq('role', 'main').maybeSingle();
+          matriz = (m as any)?.tenant_id ?? null;
+        }
+        if (matriz && matriz !== id) { sub = await planDe(matriz); if (sub) heredadoDe = matriz; }
+      }
+    }
+
+    const plan = (sub as any)?.subscription_plans ?? null;
+    const base: Record<string, any> = (plan?.features && typeof plan.features === 'object') ? plan.features : {};
+
+    let heredado_de_nombre: string | null = null;
+    if (heredadoDe) {
+      const { data: t } = await db.from('tenants').select('name').eq('id', heredadoDe).maybeSingle();
+      heredado_de_nombre = (t as any)?.name ?? null;
+    }
+
     // Overrides por tenant.
     const { data: ovRow } = await db.from('settings')
       .select('config').eq('tenant_id', id).eq('type', 'feature-overrides').maybeSingle();
     const overrides = (ovRow as any)?.config ?? {};
-    return ok(c, { base, overrides });
+    return ok(c, {
+      base, overrides,
+      plan_name: plan?.name ?? null,
+      /** Id y nombre del negocio del que se hereda el plan (null = es propio). */
+      heredado_de: heredadoDe,
+      heredado_de_nombre,
+    });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

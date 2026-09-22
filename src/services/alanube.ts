@@ -304,8 +304,24 @@ function clientFor(env: AlanubeEnv, tokenOverride?: string | null) {
       return f(`/documents/key/${encodeURIComponent(key)}/status${qs}`,
         { method: 'GET', timeoutMs: 14_000 });
     },
-    sendReceiverMessage: (payload: Record<string, any>, _companyId?: string) => {
-      return f('/receiver-messages', { method: 'POST', body: JSON.stringify(payload) });
+    /**
+     * Mensaje receptor (la respuesta del comprador a Hacienda).
+     *
+     * Con una empresa ASOCIADA hay que decir de parte de quién va, igual que al
+     * emitir: sin `idCompany`, Alanube no sabe con qué empresa firmarlo. Se
+     * manda por query y por header, que es como acepta el resto de recursos.
+     */
+    sendReceiverMessage: (
+      payload: Record<string, any>, _companyId?: string, opts?: { asCompany?: boolean },
+    ) => {
+      const useCompany = opts?.asCompany && _companyId;
+      const path = useCompany
+        ? `/receiver-messages?idCompany=${encodeURIComponent(String(_companyId))}`
+        : '/receiver-messages';
+      const headers = useCompany
+        ? { idCompany: String(_companyId), 'X-Company-Id': String(_companyId) }
+        : undefined;
+      return f(path, { method: 'POST', body: JSON.stringify(payload), headers });
     },
     getReceiverMessage: (id: string, companyId?: string) => {
       const headers = companyId ? { idCompany: companyId, 'X-Company-Id': companyId } : undefined;

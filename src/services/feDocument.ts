@@ -77,41 +77,74 @@ export function tipoComprobante(documentType?: string): string {
 }
 
 // ── Unidad de medida → código del catálogo de Hacienda v4.4 ───────────────────
-// Hacienda es CASE-SENSITIVE: el kilogramo es "Kg" (no "kg"), litro "L", etc.
-// Los códigos válidos exactos (subconjunto comercial del XSD v4.4).
+//
+// La lista de abajo es EXACTAMENTE la que acepta el proveedor, copiada de su
+// rechazo (factura #000177 de 2026-09-22):
+//   «itemDetails.0.unitMeasurement: Value must be one of: 1,´,´´,°C,A,…,Unid»
+//
+// Es CASE-SENSITIVE y tiene trampas: el metro es «M» (no «m»), el centímetro
+// «Cm», el gramo «G». Antes se mandaba «m» para los productos medidos en metros
+// —que hasta parece lo correcto— y el comprobante se caía con un error que solo
+// decía «la unidad no es válida». Lo que no está en la lista (hora, tonelada,
+// día) se manda como «Otros», que siempre se acepta.
 const UNIDADES_VALIDAS = new Set([
-  'Unid', 'Kg', 'G', 'L', 'mL', 'm', 'cm', 'Cm', 'Mm', 'Km', 'm²', 'm³',
-  'Gal', 'Oz', 'h', 'Min', 's', 'd', 'Sp', 'Spe', 'St', 'Al', 'Alc', 'Os',
-  'Otros', 'Cc', 'Cu', 'Fa', 'Qq', 'Acv', 't',
+  '1', '´', '´´', '°C', 'A', 'A/m', 'A/m²', 'Al', 'Alc', 'B', 'Bq', 'C', 'C/kg',
+  'C/m²', 'C/m³', 'Cd', 'cd/m²', 'Cm', 'D', 'eV', 'F', 'F/m', 'Gy', 'Gy/s', 'H',
+  'H/m', 'Hz', 'I', 'J', 'J/(kg·K)', 'J/(mol·K)', 'J/K', 'J/kg', 'J/m³', 'J/mol',
+  'K', 'Kat', 'kat/m³', 'Km', 'Kw', 'kWh', 'Lm', 'Lx', 'm/s', 'm/s²', 'Min', 'N',
+  'N/m', 'N·m', 'Np', 'º', 'Os', 'Pa', 'Pa·s', 'Rad', 'rad/s', 'rad/s²', 'S',
+  'Sp', 'Spe', 'Sr', 'St', 'Sv', 'T', 'Ua', 'V', 'V/m', 'W', 'W/(m·K)',
+  'W/(m²·sr)', 'W/m²', 'W/sr', 'Wb', 'Ω', '1/m', 'Acv', 'Cc', 'Cu', 'Fa', 'G',
+  'Gal', 'Kg', 'kg/m³', 'L', 'Ln', 'M', 'm²', 'm³', 'mL', 'Mm', 'Mol', 'mol/m³',
+  'Otros', 'Oz', 'Qq', 'U', 'Unid',
 ]);
 // Variantes comunes (en minúscula) → código oficial.
 const UNIDAD_MAP: Record<string, string> = {
   unid: 'Unid', und: 'Unid', un: 'Unid', u: 'Unid', uni: 'Unid',
   unidad: 'Unid', unidades: 'Unid', pza: 'Unid', pzas: 'Unid', pieza: 'Unid',
   piezas: 'Unid', pcs: 'Unid', ea: 'Unid', caja: 'Unid', cajas: 'Unid',
-  paquete: 'Unid', paq: 'Unid', bolsa: 'Unid', saco: 'Unid', doc: 'Unid',
+  paquete: 'Unid', paq: 'Unid', paqu: 'Unid', bolsa: 'Unid', saco: 'Unid',
+  bulto: 'Unid', bult: 'Unid', resma: 'Unid', resm: 'Unid', set: 'Unid', doc: 'Unid',
   kg: 'Kg', kgs: 'Kg', kilo: 'Kg', kilos: 'Kg', kilogramo: 'Kg', kilogramos: 'Kg', k: 'Kg',
   g: 'G', gr: 'G', grs: 'G', gramo: 'G', gramos: 'G',
   l: 'L', lt: 'L', ltr: 'L', lts: 'L', litro: 'L', litros: 'L',
-  ml: 'mL', mililitro: 'mL', mililitros: 'mL', cc: 'mL',
-  m: 'm', metro: 'm', metros: 'm', mt: 'm', mts: 'm',
-  cm: 'cm', centimetro: 'cm', centimetros: 'cm',
-  mm: 'Mm', km: 'Km',
-  m2: 'm²', m3: 'm³',
+  ml: 'mL', mililitro: 'mL', mililitros: 'mL', cc: 'Cc',
+  // METRO: el código es «M», en mayúscula.
+  m: 'M', metro: 'M', metros: 'M', mt: 'M', mts: 'M', mtr: 'M', ml_lineal: 'M',
+  cm: 'Cm', centimetro: 'Cm', centimetros: 'Cm',
+  mm: 'Mm', milimetro: 'Mm', milimetros: 'Mm',
+  km: 'Km', kilometro: 'Km', kilometros: 'Km',
+  m2: 'm²', 'm²': 'm²', mt2: 'm²', m3: 'm³', 'm³': 'm³', mt3: 'm³',
   gal: 'Gal', galon: 'Gal', galones: 'Gal',
   oz: 'Oz', onza: 'Oz', onzas: 'Oz',
-  h: 'h', hr: 'h', hrs: 'h', hora: 'h', horas: 'h',
   min: 'Min', minuto: 'Min', minutos: 'Min',
   sp: 'Sp', serv: 'Sp', servicio: 'Sp', servicios: 'Sp',
-  qq: 'Qq', quintal: 'Qq', quintales: 'Qq', t: 't', ton: 't', tonelada: 't',
+  qq: 'Qq', quintal: 'Qq', quintales: 'Qq',
+  kw: 'Kw', kwh: 'kWh',
+  // Sin código propio en la lista del proveedor: van como «Otros», que se acepta
+  // siempre, en vez de tumbar el comprobante.
+  h: 'Otros', hr: 'Otros', hrs: 'Otros', hora: 'Otros', horas: 'Otros',
+  dia: 'D', dias: 'D', d: 'D',
+  seg: 'S', segundo: 'S', segundos: 'S', s: 'S',
+  t: 'Otros', ton: 'Otros', tonelada: 'Otros', toneladas: 'Otros',
 };
 
 /** Normaliza la unidad del producto al código exacto del catálogo de Hacienda.
  *  Si ya es un código válido, lo respeta; si no, mapea variantes comunes;
  *  desconocidas → "Unid" (siempre aceptada). */
+/**
+ * Códigos válidos que en una tienda SIEMPRE significan otra cosa.
+ *
+ * «K» es kelvin en el catálogo, pero ningún negocio vende en kelvin: en los
+ * productos reales («POSTA DE CERDO (K)») quiere decir kilo. Como el código es
+ * válido, se colaba tal cual y el comprobante salía en kelvin.
+ */
+const AMBIGUAS: Record<string, string> = { K: 'Kg' };
+
 export function haciendaUnit(unit?: string | null): string {
   const raw = String(unit ?? '').trim();
   if (!raw) return 'Unid';
+  if (AMBIGUAS[raw]) return AMBIGUAS[raw];
   if (UNIDADES_VALIDAS.has(raw)) return raw;      // ya es válido (respeta mayúsculas)
   return UNIDAD_MAP[raw.toLowerCase()] ?? 'Unid';
 }

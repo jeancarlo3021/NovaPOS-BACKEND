@@ -743,11 +743,46 @@ reports.get('/cash-sessions', async (c) => {
 
     // Get invoices for each session to calculate sales by method
     const sessionIds = (sessions ?? []).map((s: any) => s.id);
+    const idsParaBuscar = sessionIds.length > 0 ? sessionIds : ['null'];
     const { data: invoices } = await db.from('invoices')
       .select('cash_session_id, payment_method, total')
       .eq('tenant_id', tenantId)
       .neq('status', 'cancelled')
-      .in('cash_session_id', sessionIds.length > 0 ? sessionIds : ['null']);
+      .in('cash_session_id', idsParaBuscar);
+
+    /**
+     * ENTRADAS Y SALIDAS de efectivo, ANULACIONES y ABONOS de apartados.
+     *
+     * El esperado se calculaba como fondo + ventas en efectivo, y nada más. Si
+     * el cajero sacó plata para una compra o metió un vale, la diferencia salía
+     * torcida por ese monto exacto y el reporte marcaba faltantes que no
+     * existían. Las anulaciones tampoco aparecían por ningún lado, y el abono de
+     * un apartado es plata que entró al cajón sin factura.
+     */
+    const { data: movimientos } = await db.from('cash_movements')
+      .select('cash_session_id, type, amount')
+      .in('cash_session_id', idsParaBuscar).neq('type', 'sale');
+    const { data: anuladas } = await db.from('invoices')
+      .select('cash_session_id, total')
+      .eq('tenant_id', tenantId).eq('status', 'cancelled')
+      .in('cash_session_id', idsParaBuscar);
+    let abonos: any[] = [];
+    try {
+      const r = await db.from('reservation_payments')
+        .select('cash_session_id, amount, method')
+        .eq('tenant_id', tenantId).in('cash_session_id', idsParaBuscar);
+      abonos = r.data ?? [];
+    } catch { /* sin apartados (migración 108 sin correr) */ }
+
+    const entradasDe = (id: string) => (movimientos ?? [])
+      .filter((m: any) => m.cash_session_id === id && (m.type === 'income' || m.type === 'cash_in'))
+      .reduce((t: number, m: any) => t + Math.abs(Number(m.amount || 0)), 0);
+    const salidasDe = (id: string) => (movimientos ?? [])
+      .filter((m: any) => m.cash_session_id === id && (m.type === 'expense' || m.type === 'cash_out'))
+      .reduce((t: number, m: any) => t + Math.abs(Number(m.amount || 0)), 0);
+    const abonosDe = (id: string, metodo?: string) => abonos
+      .filter((p: any) => p.cash_session_id === id && (!metodo || String(p.method) === metodo))
+      .reduce((t: number, p: any) => t + Number(p.amount || 0), 0);
 
     // Resolver el vendedor (dueño) de cada sesión.
     const userIds = [...new Set((sessions ?? []).map((s: any) => s.user_id).filter(Boolean))] as string[];
@@ -774,7 +809,14 @@ reports.get('/cash-sessions', async (c) => {
         totalSales += Number(inv.total ?? 0);
       });
 
-      const expectedClosing = (s.opening_amount ?? 0) + salesByMethod.cash;
+      const entradas = entradasDe(s.id);
+      const salidas = salidasDe(s.id);
+      const abonosEfectivo = abonosDe(s.id, 'cash');
+      const anuladasSesion = (anuladas ?? []).filter((i: any) => i.cash_session_id === s.id);
+
+      // Mismo criterio que el cierre de caja: fondo + lo que entró en efectivo
+      // (ventas y abonos) + entradas − salidas.
+      const expectedClosing = (s.opening_amount ?? 0) + salesByMethod.cash + abonosEfectivo + entradas - salidas;
       const discrepancy = s.status === 'closed' && s.closing_amount !== null
         ? (s.closing_amount ?? 0) - expectedClosing
         : null;
@@ -787,6 +829,15 @@ reports.get('/cash-sessions', async (c) => {
         card_sales: salesByMethod.card,
         sinpe_sales: salesByMethod.sinpe,
         invoice_count: sessionInvoices.length,
+        /** Movimientos manuales del fondo de caja. */
+        cash_in: entradas,
+        cash_out: salidas,
+        /** Ventas anuladas de ese turno: no suman, pero hay que poder verlas. */
+        voids_count: anuladasSesion.length,
+        voids_total: anuladasSesion.reduce((t: number, i: any) => t + Number(i.total || 0), 0),
+        /** Abonos de apartados cobrados en la caja (plata sin factura todavía). */
+        reservations_total: abonosDe(s.id),
+        reservations_cash: abonosEfectivo,
         expected_closing: expectedClosing,
         discrepancy,
         duration_min: s.closing_date && s.opening_date
