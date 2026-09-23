@@ -35,9 +35,64 @@ reports.get('/sales', async (c) => {
       total_usd: usdRows.reduce((s: number, r: any) => s + (Number(r.exchange_rate) > 0 ? Number(r.total ?? 0) / Number(r.exchange_rate) : 0), 0),
     };
 
-    return ok(c, { total_revenue: totalRevenue, total_invoices: totalCount,
+    /**
+     * Los ABONOS de apartados también son venta del día.
+     *
+     * El apartado se cobra de a poco y la mercadería sale al final, así que no
+     * hay factura hasta la entrega. Pero la plata entró el día del abono: sin
+     * contarla, el reporte de ese día muestra menos de lo que se recibió y no
+     * cuadra con la caja. Se suman al total y al desglose por medio de pago
+     * —que es como entró el dinero— y además se devuelven aparte, para poder
+     * explicar de dónde sale la diferencia con las facturas.
+     */
+    /**
+     * OJO con la hora: los abonos se guardan en UTC y las ventas en hora de
+     * Costa Rica («reloj de pared»). Comparar el mismo texto en los dos lados
+     * dejaba fuera los abonos de la tarde —las 7pm de acá ya son del día
+     * siguiente en UTC— y el reporte del día salía sin ellos. Se corre la
+     * ventana seis horas, que es la diferencia de Costa Rica.
+     */
+    const aUtc = (fecha?: string | null) => {
+      if (!fecha) return null;
+      const texto = String(fecha).includes('T') ? String(fecha) : `${fecha}T00:00:00`;
+      return new Date(new Date(`${texto}Z`).getTime() + 6 * 3600 * 1000).toISOString();
+    };
+    let abonos: any[] = [];
+    try {
+      let qa = db.from('reservation_payments')
+        .select('id, amount, method, created_at, reservation:reservations(number, customer_name)')
+        .eq('tenant_id', tenantId).order('created_at', { ascending: false });
+      const desdeUtc = aUtc(from);
+      const hastaUtc = aUtc(to);
+      if (desdeUtc) qa = qa.gte('created_at', desdeUtc);
+      if (hastaUtc) qa = qa.lte('created_at', hastaUtc);
+      const ra = await qa;
+      abonos = ra.data ?? [];
+    } catch { /* sin apartados (migración 108 sin correr) */ }
+
+    const abonosTotal = abonos.reduce((t: number, p: any) => t + Number(p.amount ?? 0), 0);
+    for (const p of abonos) {
+      const m = String(p.method ?? 'cash');
+      byMethod[m] = (byMethod[m] ?? 0) + Number(p.amount ?? 0);
+    }
+
+    return ok(c, {
+      total_revenue: totalRevenue + abonosTotal,
+      /** Solo facturas, sin los abonos (lo que el reporte mostraba antes). */
+      invoices_revenue: totalRevenue,
+      total_invoices: totalCount,
       average_ticket: totalCount > 0 ? totalRevenue / totalCount : 0,
-      by_payment_method: byMethod, usd, invoices: data });
+      by_payment_method: byMethod, usd, invoices: data,
+      reservations: {
+        count: abonos.length,
+        total: abonosTotal,
+        payments: abonos.map((p: any) => ({
+          id: p.id, amount: Number(p.amount ?? 0), method: p.method ?? 'cash',
+          date: p.created_at, numero: p.reservation?.number ?? null,
+          cliente: p.reservation?.customer_name ?? null,
+        })),
+      },
+    });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

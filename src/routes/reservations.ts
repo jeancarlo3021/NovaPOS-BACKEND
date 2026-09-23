@@ -174,10 +174,13 @@ reservations.get('/payments', async (c) => {
      *
      * Los abonos cobrados antes de que el sistema los ligara a la caja —o los
      * que se tomaron sin conexión— no tienen `cash_session_id`. Sin esto, esa
-     * plata está en el cajón y no aparece en ningún cierre. Se toman los abonos
-     * SIN caja que caen dentro del horario de este turno.
+     * plata está en el cajón y no aparece en ningún cierre.
+     *
+     * Se agregan SIEMPRE, no solo cuando la caja no tiene ninguno ligado: en un
+     * turno con un abono nuevo y otro viejo, la regla anterior se quedaba solo
+     * con el nuevo y el viejo desaparecía del cierre.
      */
-    if (sessionId && (data ?? []).length === 0) {
+    if (sessionId) {
       const { data: ses } = await db.from('cash_sessions')
         .select('opening_date, closing_date').eq('id', sessionId).eq('tenant_id', tenantId).maybeSingle();
       const abre = (ses as any)?.opening_date;
@@ -186,7 +189,10 @@ reservations.get('/payments', async (c) => {
         const r = await db.from('reservation_payments')
           .select(columnas).eq('tenant_id', tenantId).is('cash_session_id', null)
           .gte('created_at', abre).lte('created_at', cierra).order('created_at');
-        if (!r.error) data = r.data;
+        if (!r.error) {
+          const yaEstan = new Set((data ?? []).map((p: any) => p.id));
+          data = [...(data ?? []), ...(r.data ?? []).filter((p: any) => !yaEstan.has(p.id))];
+        }
       }
     }
 
@@ -209,7 +215,7 @@ reservations.get('/', async (c) => {
     const tenantId = c.get('tenantId');
     const status = String(c.req.query('status') ?? 'open');
 
-    let q = db.from('reservations').select('*, reservation_items(*)')
+    let q = db.from('reservations').select('*, reservation_items(*), payments:reservation_payments(id, amount, method, notes, created_at, cash_session_id)')
       .eq('tenant_id', tenantId)
       .order('created_at', { ascending: false })
       .limit(500);
@@ -342,6 +348,94 @@ reservations.post('/:id/payments', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+/**
+ * PATCH /payments/:pagoId — corrige un abono ya registrado.
+ *
+ * Los abonos viejos se guardaron todos como «efectivo», porque el sistema no
+ * preguntaba con qué se pagaba. El total del día está bien, pero el cierre y el
+ * reporte por medio de pago muestran la plata en la columna equivocada, y eso
+ * no había forma de arreglarlo desde la pantalla.
+ *
+ * Se puede cambiar el medio de pago, la nota y a qué caja pertenece. El MONTO
+ * no: cambiarlo movería el saldo del apartado y lo que ya se cobró. Si el monto
+ * está mal, se borra el abono y se vuelve a registrar.
+ */
+reservations.patch('/payments/:pagoId', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const pagoId = c.req.param('pagoId');
+    const b = await c.req.json().catch(() => ({} as any));
+
+    const { data: pago } = await db.from('reservation_payments')
+      .select('*').eq('id', pagoId).eq('tenant_id', tenantId).maybeSingle();
+    if (!pago) return fail(c, 'Abono no encontrado', 404);
+
+    const patch: Record<string, any> = {};
+    if (b?.method !== undefined) {
+      const metodo = String(b.method ?? '').trim();
+      const VALIDOS = ['cash', 'card', 'sinpe', 'transfer', 'check', 'digital', 'third_party', 'other'];
+      if (!VALIDOS.includes(metodo)) return fail(c, `Medio de pago inválido: ${metodo}`, 422);
+      patch.method = metodo;
+    }
+    if (b?.notes !== undefined) patch.notes = String(b.notes ?? '').trim() || null;
+    /**
+     * Ligarlo a una caja.
+     *
+     * Un abono sin caja igual sale en el cierre del turno en cuyo horario cae,
+     * pero ligarlo deja el dato firme (por ejemplo si después se corrige el
+     * horario de la caja o si el abono se tomó sin conexión).
+     */
+    if (b?.cash_session_id !== undefined) patch.cash_session_id = b.cash_session_id || null;
+
+    if (Object.keys(patch).length === 0) return fail(c, 'No hay nada que cambiar', 422);
+
+    const { data, error } = await db.from('reservation_payments')
+      .update(patch).eq('id', pagoId).eq('tenant_id', tenantId).select('*').single();
+    if (error) throw new Error(error.message);
+    return ok(c, data);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/**
+ * DELETE /payments/:pagoId — borra un abono mal registrado.
+ *
+ * Lo abonado del apartado se recalcula sumando los abonos que quedan: si se
+ * restara a ciegas, dos borrados seguidos con un error en medio dejarían el
+ * saldo torcido para siempre.
+ *
+ * No se toca un apartado ya ENTREGADO: esa plata cerró la cuenta y la mercadería
+ * salió; borrar el abono dejaría una entrega sin pagar.
+ */
+reservations.delete('/payments/:pagoId', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const pagoId = c.req.param('pagoId');
+
+    const { data: pago } = await db.from('reservation_payments')
+      .select('id, reservation_id, amount').eq('id', pagoId).eq('tenant_id', tenantId).maybeSingle();
+    if (!pago) return fail(c, 'Abono no encontrado', 404);
+
+    const { data: r } = await db.from('reservations')
+      .select('id, status, total').eq('id', (pago as any).reservation_id).eq('tenant_id', tenantId).maybeSingle();
+    if ((r as any)?.status === 'delivered') {
+      return fail(c, 'El apartado ya se entregó: no se puede borrar un abono que cerró la cuenta.', 409);
+    }
+
+    const { error } = await db.from('reservation_payments')
+      .delete().eq('id', pagoId).eq('tenant_id', tenantId);
+    if (error) throw new Error(error.message);
+
+    const { data: quedan } = await db.from('reservation_payments')
+      .select('amount').eq('reservation_id', (pago as any).reservation_id);
+    const abonado = round2((quedan ?? []).reduce((t: number, p: any) => t + Number(p.amount ?? 0), 0));
+    const { data: upd } = await db.from('reservations')
+      .update({ paid: abonado, updated_at: new Date().toISOString() })
+      .eq('id', (pago as any).reservation_id).eq('tenant_id', tenantId).select('*').maybeSingle();
+
+    return ok(c, { deleted: true, paid: abonado, reservation: upd ?? null });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // POST /:id/cancel — anula el apartado y devuelve la mercadería a la venta.
 reservations.post('/:id/cancel', async (c) => {
   try {
@@ -429,6 +523,73 @@ reservations.post('/:id/deliver', async (c) => {
      */
     await moverStock((r as any).reservation_items ?? [], -1);
     return ok(c, data);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/**
+ * POST /:id/deliver-paid — entrega un apartado YA PAGADO y descuenta el stock.
+ *
+ * El apartado se cobra con abonos, y cada abono ya entró a la caja el día que se
+ * recibió. Cuando se termina de pagar no hay nada más que cobrar: pasar por el
+ * punto de venta crearía una venta por el total y esa plata quedaría contada dos
+ * veces —una como abonos y otra como venta—.
+ *
+ * Entonces acá se cierra: se marca entregado, se libera lo apartado y se
+ * descuenta la mercadería del inventario (eso lo hacía la venta). El comprobante
+ * que se lleva el cliente es el TICKET DE CAJA del apartado, que se imprime
+ * desde la pantalla.
+ */
+reservations.post('/:id/deliver-paid', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const id = c.req.param('id');
+
+    const { data: r } = await db.from('reservations')
+      .select('*, reservation_items(*)').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+    if (!r) return fail(c, 'Apartado no encontrado', 404);
+    if ((r as any).status !== 'open') return fail(c, 'Este apartado ya no está vigente', 409);
+
+    const saldo = round2(Number((r as any).total ?? 0) - Number((r as any).paid ?? 0));
+    if (saldo > 0.005) {
+      return fail(c, `Todavía debe ${saldo}. Cobrá el saldo como abono y después entregá.`, 409);
+    }
+
+    const items = ((r as any).reservation_items ?? []) as any[];
+
+    /**
+     * La mercadería SALE del inventario acá.
+     *
+     * Al apartar solo se movió a «apartado» (reserved_quantity): el stock siguió
+     * igual porque la venta todavía no existía. Si no se descuenta en la entrega
+     * —que es cuando el producto se va de la tienda— el sistema seguiría
+     * creyendo que está.
+     */
+    const descontados: string[] = [];
+    for (const it of items) {
+      if (!it.product_id) continue;
+      const { data: p } = await db.from('products')
+        .select('name, stock_quantity, tracks_stock').eq('id', it.product_id).eq('tenant_id', tenantId).maybeSingle();
+      if (!p || (p as any).tracks_stock === false) continue;
+      const { error } = await db.from('products').update({
+        stock_quantity: Number((p as any).stock_quantity ?? 0) - Number(it.quantity ?? 0),
+        updated_at: new Date().toISOString(),
+      }).eq('id', it.product_id).eq('tenant_id', tenantId);
+      if (error) return fail(c, `No se pudo descontar ${(p as any).name}: ${error.message}`, 500);
+      descontados.push(String(it.product_id));
+    }
+
+    // Deja de estar apartado (ya no está en la tienda).
+    await moverStock(items, -1);
+
+    const { data, error } = await db.from('reservations').update({
+      status: 'delivered', updated_at: new Date().toISOString(),
+    }).eq('id', id).eq('tenant_id', tenantId).select('*, reservation_items(*)').single();
+    if (error) throw new Error(error.message);
+
+    const { data: pagos } = await db.from('reservation_payments')
+      .select('*').eq('reservation_id', id).order('created_at');
+
+    return ok(c, { ...(data as any), payments: pagos ?? [], productos_descontados: descontados.length });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
