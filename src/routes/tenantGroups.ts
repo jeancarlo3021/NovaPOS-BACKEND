@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { finISOSegunCiclo } from '../utils/planCiclo.js';
 import { z } from 'zod';
 import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
@@ -669,10 +670,10 @@ export async function createGroupClient(
       try {
         const { data: planRow } = await db.from('subscription_plans')
           .select('billing_cycle').eq('id', plan_id).maybeSingle();
-        const cycleDays = (planRow?.billing_cycle ?? 'monthly').toLowerCase() === 'yearly' ? 365 : 30;
         const { data: sub } = await db.from('subscriptions').insert({
           tenant_id: tenantId, plan_id, status: 'active', auto_renew: true,
-          ends_at: new Date(Date.now() + cycleDays * 86400000).toISOString(),
+          // Vitalicio → sin fecha de fin (ver utils/planCiclo).
+          ends_at: finISOSegunCiclo(planRow?.billing_cycle),
         }).select('id').single();
         if (sub?.id) await db.from('tenants').update({ subscription_id: sub.id }).eq('id', tenantId);
       } catch (e: any) { console.warn('[clients] suscripción:', e?.message); }

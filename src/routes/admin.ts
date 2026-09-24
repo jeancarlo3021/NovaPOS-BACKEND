@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { finISOSegunCiclo, esVitalicio } from '../utils/planCiclo.js';
 import { db, anonClient } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
 import { sendEmail, paymentReceiptEmailHtml, customInvoiceEmailHtml, planFeatureLabels } from '../services/emailService.js';
@@ -690,9 +691,9 @@ admin.post('/change-plan', async (c) => {
     if (!updated || updated.length === 0) {
       const { data: plan } = await db.from('subscription_plans')
         .select('billing_cycle').eq('id', newPlanId).maybeSingle();
-      const cycleDays = String((plan as any)?.billing_cycle ?? 'monthly').toLowerCase() === 'yearly' ? 365 : 30;
       const nowISO = new Date().toISOString();
-      const endsAt = new Date(Date.now() + cycleDays * 86_400_000).toISOString();
+      // Vitalicio → sin fecha de fin (ver utils/planCiclo).
+      const endsAt = finISOSegunCiclo((plan as any)?.billing_cycle);
       const { data: sub, error: sErr } = await db.from('subscriptions').insert({
         tenant_id: tenantId, plan_id: newPlanId, status: 'active',
         started_at: nowISO, ends_at: endsAt, auto_renew: true,
@@ -802,6 +803,7 @@ admin.post('/payment-receipts', async (c) => {
         if (sub) {
           // 2) Ciclo del plan
           let cycleDays = 30;
+          let vitalicio = false;
           if (sub.plan_id) {
             const { data: plan } = await db
               .from('subscription_plans')
@@ -810,6 +812,7 @@ admin.post('/payment-receipts', async (c) => {
               .maybeSingle();
             const cycle = (plan?.billing_cycle ?? 'monthly').toLowerCase();
             cycleDays = cycle === 'yearly' ? 365 : 30;
+            vitalicio = esVitalicio(cycle);
           }
 
           // 3) Base de cálculo: si la suscripción ya estaba vencida (o sin
@@ -819,7 +822,8 @@ admin.post('/payment-receipts', async (c) => {
           const currentEnds = sub.ends_at ? new Date(sub.ends_at).getTime() : null;
           const paymentMs   = new Date(paymentDate + 'T12:00:00').getTime();
           const baseMs = (currentEnds && currentEnds > now) ? currentEnds : paymentMs;
-          const newEndsAt = new Date(baseMs + cycleDays * 86400000).toISOString();
+          // Un plan vitalicio no vence: el pago no le pone fecha.
+          const newEndsAt = vitalicio ? null : new Date(baseMs + cycleDays * 86400000).toISOString();
           nextBilling = newEndsAt;
 
           await db.from('subscriptions')

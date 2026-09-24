@@ -1059,9 +1059,6 @@ export async function emitInvoiceCore(
         updated_at: new Date().toISOString(),
       }).eq('id', invoice_id).eq('tenant_id', tenantId);
 
-      // El correo al cliente se envía AUTOMÁTICAMENTE al ACEPTARSE (con los dos
-      // XML + PDF), no al emitir — la respuesta de Hacienda aún no existe acá.
-
       /**
        * El XML firmado SÍ existe desde ya: se guarda en el momento de la venta.
        *
@@ -1070,6 +1067,22 @@ export async function emitInvoiceCore(
        * aceptarse el comprobante.
        */
       await guardarXmlDelComprobante(tenantId, invoice_id, { plazoMs: 3_500 });
+
+      /**
+       * El correo al cliente sale AL EMITIR, no cuando Hacienda responde.
+       *
+       * Antes se esperaba la aceptación: el cliente se iba de la tienda sin su
+       * comprobante y lo recibía minutos —u horas— después, o nunca si el aviso
+       * de Hacienda se perdía. El XML firmado ya existe en este punto, que es lo
+       * que el cliente necesita guardar.
+       *
+       * Va sin bloquear el cobro (el cajero no espera al correo) y SOLO si el
+       * XML ya está: si todavía no, no se manda un correo a medias — lo toma el
+       * envío al aceptarse, que sigue funcionando igual. Así el cliente recibe
+       * un solo correo, no dos.
+       */
+      void autoSendComprobanteToCustomer(tenantId, invoice_id, { soloConXml: true })
+        .catch(() => {});
 
       void maybeNotifyQuotaLow(tenantId);
       return ok(c, {
@@ -1438,9 +1451,23 @@ hacienda.get('/received', async (c) => {
   try {
     const tenantId = c.get('tenantId');
 
-    const { data, error } = await db.from('received_documents')
+    /**
+     * Rango de fechas.
+     *
+     * La bandeja traía siempre los últimos 300 y nada más: para cuadrar un mes
+     * con el contador había que ir bajando y contando a ojo, y lo más viejo
+     * simplemente no aparecía.
+     */
+    const desde = c.req.query('from');
+    const hasta = c.req.query('to');
+    let q = db.from('received_documents')
       .select('*').eq('tenant_id', tenantId)
-      .order('doc_date', { ascending: false }).limit(300);
+      .order('doc_date', { ascending: false });
+    if (desde) q = q.gte('doc_date', desde);
+    if (hasta) q = q.lte('doc_date', endOfDay(hasta) ?? hasta);
+    // Con rango se traen todos los del período; sin rango, los últimos 300.
+    if (!desde && !hasta) q = q.limit(300);
+    const { data, error } = await q;
     if (error) {
       // Si la tabla aún no existe (migración sin correr), devolvemos vacío con nota.
       if (/received_documents/.test(error.message)) return ok(c, []);
@@ -2357,10 +2384,17 @@ export async function alanubeXmlFiles(
   cfg: any, docId: string, kind: any, companyId?: string | null,
 ): Promise<{ xml: string | null; xmlHacienda: string | null }> {
   const client = alanube.forTenant(cfg);
-  // GUIONES primero: es la forma que Alanube acepta. Con comas responde 400, y
-  // cada 400 hacía que se probaran los cuatro tipos de documento antes de pasar a
-  // la forma buena — segundos tirados que terminaban agotando el tiempo.
-  for (const documents of ['xml-xmlHacienda', 'xml,xmlHacienda']) {
+  /**
+   * Los valores que Alanube acepta, separados por GUIONES.
+   *
+   * Con comas responde 400 —lo dice su propio mensaje de error— y ese intento
+   * fallido se hacía en CADA descarga: además de perder el viaje, cada 400 hace
+   * que se prueben los cuatro tipos de documento antes de seguir. Se quitó.
+   *
+   * El segundo intento pide solo el XML firmado: mientras Hacienda no responda,
+   * el de respuesta no existe todavía, y pedir los dos juntos vuelve vacío.
+   */
+  for (const documents of ['xml-xmlHacienda', 'xml']) {
     try {
       const resp: any = await client.getDocument(String(docId), {
         kind, documents, companyId: companyId ? String(companyId) : undefined,
@@ -2604,7 +2638,10 @@ export async function guardarXmlDelComprobante(
 /** Qué pasó con un envío automático: lo usa el barrido de reintentos. */
 export type ResultadoEnvio = 'enviado' | 'ya_enviado' | 'sin_correo' | 'sin_xml' | 'error';
 
-export async function autoSendComprobanteToCustomer(tenantId: string, invoiceId: string): Promise<ResultadoEnvio> {
+export async function autoSendComprobanteToCustomer(
+  tenantId: string, invoiceId: string,
+  opts: { soloConXml?: boolean } = {},
+): Promise<ResultadoEnvio> {
   try {
     const cfg = await loadFEConfig(tenantId);
     const { data: inv } = await db.from('invoices')
@@ -2622,6 +2659,18 @@ export async function autoSendComprobanteToCustomer(tenantId: string, invoiceId:
     const atts = cfg.fe_provider === 'alanube'
       ? await alanubeAttachments(cfg, (inv as any).fe_consecutivo, feKindOf((inv as any).document_type), (inv as any).fe_clave, feCompanyId(cfg))
       : undefined;
+    /**
+     * Al emitir se manda SOLO si el XML ya está.
+     *
+     * Un comprobante sin XML no le sirve al cliente para nada, y mandarlo igual
+     * obligaría a mandar un segundo correo cuando el XML aparezca. Si todavía no
+     * está, no se hace nada acá: el envío al aceptarse lo toma.
+     */
+    if (opts.soloConXml) {
+      const hayXml = !!(inv as any).fe_xml
+        || (atts ?? []).some((a: any) => String(a?.filename ?? '').toLowerCase().endsWith('.xml'));
+      if (!hayXml) return 'sin_xml';
+    }
     await saveFeXml(tenantId, invoiceId, (inv as any).fe_clave, atts, (inv as any).fe_xml);
     const { hasXml } = await sendComprobanteEmail(email, inv as any, atts, { tenantId, invoiceId });
     if (!hasXml) {
@@ -2980,6 +3029,117 @@ hacienda.get('/fe-xml/:id', async (c) => {
 
 // GET /fe-pdf/:id — devuelve el PDF que genera ALANUBE (en base64) para abrirlo
 // tal cual desde el botón "PDF". Solo aplica a comprobantes emitidos con Alanube.
+/**
+ * CONSOLIDADO de XML: los comprobantes de un período, EN TANDAS.
+ *
+ * El contribuyente tiene que guardar el XML de cada comprobante y el contador
+ * los pide todos juntos al cerrar el mes. Bajarlos de a uno desde la bitácora
+ * —cientos de tiquetes— no es trabajo de nadie.
+ *
+ * Va por tandas a propósito: los XML que no están guardados hay que pedírselos
+ * a Alanube uno por uno, y el servidor muere a los 30 segundos. Con tandas
+ * chicas cada llamada termina rápido, la pantalla puede mostrar cuánto lleva, y
+ * un período grande deja de ser «esperar sin saber» o un error a los 30s.
+ *
+ * ?from=&to= (AAAA-MM-DD) · ?tipo=todos|factura|tiquete · ?desde_fila= · ?cantidad=
+ */
+hacienda.get('/fe-xml-lote', async (c) => {
+  const tenantId = c.get('tenantId');
+  try {
+    const desde = c.req.query('from');
+    const hasta = c.req.query('to');
+    const tipo = String(c.req.query('tipo') ?? 'todos');
+    const inicio = Math.max(0, parseInt(String(c.req.query('desde_fila') ?? '0'), 10) || 0);
+    const cantidad = Math.min(50, Math.max(1, parseInt(String(c.req.query('cantidad') ?? '15'), 10) || 15));
+
+    let q = db.from('invoices')
+      .select('id, invoice_number, issued_at, document_type, total, customer_name, status,'
+        + ' fe_clave, fe_consecutivo, fe_status, fe_xml, fe_nc_clave, fe_nc_doc_id, fe_nd_clave, fe_nd_doc_id',
+        { count: 'exact' })
+      .eq('tenant_id', tenantId).not('fe_clave', 'is', null)
+      .order('issued_at', { ascending: true })
+      .range(inicio, inicio + cantidad - 1);
+    if (desde) q = q.gte('issued_at', `${desde}T00:00:00`);
+    if (hasta) q = q.lte('issued_at', endOfDay(hasta) ?? `${hasta}T23:59:59`);
+    if (tipo === 'factura') q = q.eq('document_type', 'factura_electronica');
+    if (tipo === 'tiquete') q = q.eq('document_type', 'tiquete_electronico');
+
+    const { data, error, count } = await q;
+    if (error) throw new Error(error.message);
+    const filas = (data ?? []) as any[];
+
+    const cfg = await loadFEConfig(tenantId);
+    const tipoLabel = (d: string) => d === 'factura_electronica' ? 'Factura' : 'Tiquete';
+    const archivos: Array<{ ruta: string; xml_base64: string }> = [];
+    const resumen: Array<Record<string, any>> = [];
+
+    for (const f of filas) {
+      const fecha = String(f.issued_at ?? '').slice(0, 10);
+      const carpeta = fecha.slice(0, 7) || 'sin-fecha';
+      const clave = String(f.fe_clave ?? '');
+
+      let xml: string | null = f.fe_xml ?? null;
+      let motivo: string | null = null;
+      if (!xml && f.fe_consecutivo) {
+        try {
+          const r = await alanubeXmlFiles(cfg, String(f.fe_consecutivo), feKindOf(f.document_type), feCompanyId(cfg));
+          if (r.xml) {
+            xml = Buffer.from(r.xml, 'base64').toString('utf8');
+            // Queda guardado: la próxima vez sale de la base, sin esperar.
+            await db.from('invoices').update({ fe_xml: xml })
+              .eq('id', f.id).eq('tenant_id', tenantId).then(() => {}, () => {});
+          } else motivo = 'el proveedor no devolvió el XML';
+        } catch (e: any) { motivo = e?.message ?? 'no se pudo pedir al proveedor'; }
+      } else if (!xml) {
+        motivo = 'sin id del proveedor guardado';
+      }
+
+      if (xml) {
+        archivos.push({
+          ruta: `${carpeta}/${tipoLabel(f.document_type)}-${f.invoice_number ?? ''}-${clave}.xml`,
+          xml_base64: Buffer.from(xml, 'utf8').toString('base64'),
+        });
+      }
+      resumen.push({
+        fecha, tipo: tipoLabel(f.document_type), consecutivo: f.invoice_number, clave,
+        cliente: f.customer_name, monto: Number(f.total ?? 0),
+        estado: f.status === 'cancelled' ? 'ANULADA' : (f.fe_status ?? ''),
+        xml: xml ? 'incluido' : `no disponible (${motivo ?? 'sin XML'})`,
+      });
+
+      // Notas de crédito y débito del mismo comprobante.
+      for (const [claveNota, docId, etiqueta, kind] of [
+        [f.fe_nc_clave, f.fe_nc_doc_id, 'NotaCredito', 'credit-note'],
+        [f.fe_nd_clave, f.fe_nd_doc_id, 'NotaDebito', 'debit-note'],
+      ] as const) {
+        if (!claveNota || !docId) continue;
+        try {
+          const r = await alanubeXmlFiles(cfg, String(docId), kind as any, feCompanyId(cfg));
+          if (r.xml) {
+            archivos.push({
+              ruta: `${carpeta}/${etiqueta}-${claveNota}.xml`,
+              xml_base64: Buffer.from(Buffer.from(r.xml, 'base64').toString('utf8'), 'utf8').toString('base64'),
+            });
+            resumen.push({
+              fecha, tipo: etiqueta, consecutivo: f.invoice_number, clave: claveNota,
+              cliente: f.customer_name, monto: '', estado: '', xml: 'incluido',
+            });
+          }
+        } catch { /* la nota queda fuera; el comprobante ya está */ }
+      }
+    }
+
+    return ok(c, {
+      total: count ?? filas.length,
+      desde_fila: inicio,
+      procesados: filas.length,
+      hay_mas: inicio + filas.length < (count ?? 0),
+      archivos,
+      resumen,
+    });
+  } catch (err: any) { return fail(c, err.message, err?.status ?? 500); }
+});
+
 hacienda.get('/fe-pdf/:id', async (c) => {
   try {
     const tenantId = c.get('tenantId');
@@ -3559,9 +3719,11 @@ hacienda.post('/emit-direct', async (c) => {
         // Consecutivo REAL de Hacienda (20 díg) embebido en la clave (pos 22-41).
         const claveDig = String(clave ?? '').replace(/\D/g, '');
         const consecutivo = claveDig.length === 50 ? claveDig.slice(21, 41) : null;
-        // El correo al cliente sale automáticamente al ACEPTARSE (dos XML + PDF).
         // El XML firmado se guarda ya, con plazo corto: el cajero espera esto.
         await guardarXmlDelComprobante(tenantId, inv.id, { plazoMs: 3_500 });
+        // Y el correo al cliente sale AL EMITIR, igual que en el POS normal (si
+        // el XML todavía no está, lo toma el envío al aceptarse).
+        void autoSendComprobanteToCustomer(tenantId, inv.id, { soloConXml: true }).catch(() => {});
         return ok(c, { ok: true, provider: 'alanube', invoice_id: inv.id, invoice_number: inv.invoice_number, clave, consecutivo, alanube_doc_id: docId, alanube_status: alanubeStatus, tipo: tipoDoc });
       } catch (emitErr: any) {
         const msg = emitErr instanceof AlanubeError ? friendlyAlanubeError(emitErr.message) : (emitErr?.message ?? 'Error emitiendo con Alanube');

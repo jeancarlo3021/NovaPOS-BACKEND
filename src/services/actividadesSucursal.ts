@@ -1,4 +1,5 @@
 import { db } from '../db/client.js';
+import { finISOSegunCiclo } from '../utils/planCiclo.js';
 import { normalizarActividad, siguienteSucursal, sucursalesDeActividad } from './feCompartida.js';
 
 /**
@@ -44,8 +45,8 @@ export async function crearNegocio(
     try {
       const { data: planRow } = await db.from('subscription_plans')
         .select('billing_cycle').eq('id', nt.plan_id).maybeSingle();
-      const cycleDays = (planRow?.billing_cycle ?? 'monthly').toLowerCase() === 'yearly' ? 365 : 30;
-      const endsAt = new Date(Date.now() + cycleDays * 86400000).toISOString();
+      // Vitalicio → sin fecha de fin (ver utils/planCiclo).
+      const endsAt = finISOSegunCiclo(planRow?.billing_cycle);
 
       const { data: subData } = await db.from('subscriptions')
         .insert({
