@@ -506,8 +506,17 @@ demoRequests.get('/plans', async (c) => {
       .select('id, name, price, billing_cycle, is_active')
       .eq('is_active', true).order('price');
     if (error) throw new Error(error.message);
-    // Los planes generados para cada demo no se ofrecen: son de un solo negocio.
-    return ok(c, (data ?? []).filter((p: any) => !String(p.name ?? '').startsWith('Demo · ')));
+    /**
+     * Ningún plan de demo se ofrece para convertir una demo en cliente.
+     *
+     * Los «Demo · Negocio» son de un solo negocio, y el «Demo» genérico es de ₡0:
+     * elegir cualquiera de los dos dejaría al cliente nuevo sin nada que cobrar y
+     * con un plan que el limpiador de demos puede borrar.
+     */
+    const esDemo = (n: string, precio: number) =>
+      /^demo\s*[·:.\-]/i.test(n.trim()) || (precio === 0 && /demo/i.test(n));
+    return ok(c, (data ?? []).filter(
+      (p: any) => !esDemo(String(p.name ?? ''), Number(p.price ?? 0))));
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
