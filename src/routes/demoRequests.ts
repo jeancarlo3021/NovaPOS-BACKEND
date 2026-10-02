@@ -148,6 +148,167 @@ demoRequests.get('/', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+/**
+ * GET /usage — ¿QUÉ TANTO USARON LA DEMO?
+ *
+ * Es la pregunta que decide el seguimiento. Una demo entregada no dice nada por
+ * sí sola: el prospecto que facturó treinta veces en seis días distintos está
+ * vendiendo con el sistema y hay que llamarlo HOY; el que hizo tres ventas el
+ * primer día y no volvió a entrar lo probó y lo dejó. Hasta ahora eso solo se
+ * podía averiguar entrando a cada demo a mirar, así que en la práctica no se
+ * averiguaba, y el vendedor llamaba a ciegas.
+ *
+ * Los DÍAS DISTINTOS con ventas importan más que el total: veinte facturas de
+ * una tarde son una prueba; cinco facturas en cinco días es un negocio que ya
+ * está trabajando con esto.
+ *
+ * Respeta el alcance de siempre: un vendedor ve el uso de SUS demos, gerencia el
+ * de todas.
+ */
+demoRequests.get('/usage', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const userId = c.get('userId');
+    const manager = await isManager(c);
+
+    let q = db.from('demo_requests')
+      .select('id, number, business_name, contact_name, phone, status, demo_tenant_id, '
+        + 'delivered_at, expires_on, purge_on, requester_name, created_at, modules')
+      .eq('tenant_id', tenantId)
+      .not('demo_tenant_id', 'is', null)
+      .order('created_at', { ascending: false }).limit(300);
+    if (!manager) q = q.eq('requested_by', userId);
+
+    const { data: solicitudes, error } = await q;
+    if (error) throw new Error(error.message);
+    const demos = (solicitudes ?? []) as any[];
+    if (demos.length === 0) return ok(c, { demos: [] });
+
+    const ids = [...new Set(demos.map(d => String(d.demo_tenant_id)).filter(Boolean))];
+
+    interface Uso {
+      ventas: number; monto: number; dias: Set<string>;
+      ultima_venta: string | null; productos: number; usuarios: number;
+      ultimo_ingreso: string | null; cajas: number;
+    }
+    const uso = new Map<string, Uso>();
+    for (const id of ids) {
+      uso.set(id, {
+        ventas: 0, monto: 0, dias: new Set(), ultima_venta: null,
+        productos: 0, usuarios: 0, ultimo_ingreso: null, cajas: 0,
+      });
+    }
+
+    /** Las consultas van POR PÁGINAS: Supabase corta en 1000 filas. */
+    const PAGE = 1000;
+    const porPaginas = async (
+      tabla: string, cols: string, aplicar: (fila: any) => void,
+    ): Promise<void> => {
+      for (let from = 0; ; from += PAGE) {
+        const { data, error: e } = await db.from(tabla).select(cols)
+          .in('tenant_id', ids)
+          .order('id', { ascending: true }).range(from, from + PAGE - 1);
+        // Un error acá no debe tumbar el reporte entero: se informa lo que haya.
+        if (e) return;
+        const chunk = (data ?? []) as any[];
+        for (const fila of chunk) aplicar(fila);
+        if (chunk.length < PAGE) return;
+      }
+    };
+
+    await porPaginas('invoices', 'tenant_id, status, issued_at, total', (r) => {
+      const u = uso.get(String(r.tenant_id));
+      if (!u || r.status === 'cancelled') return;
+      u.ventas++;
+      u.monto += Number(r.total || 0);
+      const f = String(r.issued_at ?? '');
+      if (f) {
+        u.dias.add(f.slice(0, 10));
+        if (!u.ultima_venta || f > u.ultima_venta) u.ultima_venta = f;
+      }
+    });
+
+    await porPaginas('products', 'tenant_id', (r) => {
+      const u = uso.get(String(r.tenant_id));
+      if (u) u.productos++;
+    });
+
+    await porPaginas('cash_sessions', 'tenant_id', (r) => {
+      const u = uso.get(String(r.tenant_id));
+      if (u) u.cajas++;
+    });
+
+    await porPaginas('users', 'tenant_id, last_login_at', (r) => {
+      const u = uso.get(String(r.tenant_id));
+      if (!u) return;
+      u.usuarios++;
+      const l = r.last_login_at ? String(r.last_login_at) : null;
+      if (l && (!u.ultimo_ingreso || l > u.ultimo_ingreso)) u.ultimo_ingreso = l;
+    });
+
+    const diaCR = (d: Date | string): string =>
+      new Date(d).toLocaleDateString('en-CA', { timeZone: 'America/Costa_Rica' });
+    const hoy = new Date(`${diaCR(new Date())}T00:00:00Z`).getTime();
+    /** Días calendario entre hoy y una fecha (negativo = ya pasó). */
+    const diasHasta = (f: any): number | null => {
+      if (!f) return null;
+      return Math.round((new Date(`${diaCR(f)}T00:00:00Z`).getTime() - hoy) / 86_400_000);
+    };
+    const diasDesde = (f: any): number | null => {
+      const d = diasHasta(f);
+      return d == null ? null : -d;
+    };
+
+    const filas = demos.map(d => {
+      const u = uso.get(String(d.demo_tenant_id));
+      const diasConVentas = u ? u.dias.size : 0;
+      /**
+       * Interés, en una palabra.
+       *
+       * No es un puntaje inventado: es la lectura que el vendedor hace igual al
+       * ver los números, puesta donde se ve de un vistazo para poder ordenar por
+       * ella. «Caliente» es el que vendió en tres días distintos o más.
+       */
+      const interes = diasConVentas >= 3 ? 'caliente'
+        : (u?.ventas ?? 0) > 0 ? 'tibio'
+        : (u?.productos ?? 0) > 0 ? 'cargando'
+        : 'sin uso';
+      return {
+        id: d.id,
+        number: d.number,
+        business_name: d.business_name,
+        contact_name: d.contact_name,
+        phone: d.phone,
+        status: d.status,
+        requester_name: d.requester_name,
+        modules: Array.isArray(d.modules) ? d.modules.length : 0,
+        demo_tenant_id: d.demo_tenant_id,
+        delivered_at: d.delivered_at,
+        expires_on: d.expires_on,
+        purge_on: d.purge_on,
+        /** Días que le quedan de prueba (negativo = ya venció). */
+        dias_restantes: diasHasta(d.expires_on),
+        /** Días para que se borre sola si nadie la convierte. */
+        dias_para_borrarse: diasHasta(d.purge_on),
+        dias_desde_entrega: diasDesde(d.delivered_at ?? d.created_at),
+        ventas: u?.ventas ?? 0,
+        monto: Math.round(u?.monto ?? 0),
+        dias_con_ventas: diasConVentas,
+        productos: u?.productos ?? 0,
+        usuarios: u?.usuarios ?? 0,
+        cajas: u?.cajas ?? 0,
+        ultima_venta: u?.ultima_venta ?? null,
+        dias_sin_vender: diasDesde(u?.ultima_venta ?? null),
+        ultimo_ingreso: u?.ultimo_ingreso ?? null,
+        dias_sin_entrar: diasDesde(u?.ultimo_ingreso ?? null),
+        interes,
+      };
+    }).sort((a, b) => b.dias_con_ventas - a.dias_con_ventas || b.ventas - a.ventas);
+
+    return ok(c, { demos: filas });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 demoRequests.post('/', async (c) => {
   try {
     const tenantId = c.get('tenantId');
