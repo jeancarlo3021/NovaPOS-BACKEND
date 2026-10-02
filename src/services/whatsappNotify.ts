@@ -3,6 +3,7 @@
  *
  * Centraliza los 3 casos de uso y los nombres/plantillas en un solo lugar:
  *   1. recordatorio_pago       — la suscripción a ColónClick está por vencer
+ *   1b. tiempo_de_gracia       — ya venció y corre la gracia (aviso diario)
  *   2. documentos_por_acabarse — la cuota de comprobantes electrónicos está baja
  *   3. error_facturacion       — falló la emisión de un comprobante electrónico
  *
@@ -98,6 +99,39 @@ export async function notifyPaymentDue(tenantId: string, days: number): Promise<
     + `Renová a tiempo para no perder el servicio (POS, facturación, etc.).\n\n¡Gracias por confiar en ColónClick!`;
   return registrar('recordatorio_pago', tenantId,
     await deliver(phone, text, () => sendTemplate(phone, 'recordatorio_pago', [name, days])));
+}
+
+/**
+ * 1b. TIEMPO DE GRACIA: el aviso diario de después del vencimiento.
+ *
+ * Los recordatorios de cobro (7, 4, 2 y 1 días) se callaban en el momento en que
+ * el cliente más necesita enterarse: el día que vence. Después de eso el sistema
+ * sigue andando unos días y el negocio no se da cuenta de nada… hasta que un
+ * lunes a las 7 de la mañana no puede facturar, con el local abierto.
+ *
+ * Este sale TODOS LOS DÍAS mientras corre la gracia, y dice exactamente cuántos
+ * días quedan. Al llegar a cero avisa que es hoy.
+ */
+export async function notifyGracePeriod(tenantId: string, diasRestantes: number): Promise<WaResult> {
+  const { phone, name } = await businessContact(tenantId);
+  if (!phone) return registrar('tiempo_de_gracia', tenantId, { ok: false, skipped: true, error: 'el negocio no tiene teléfono configurado' });
+  const d = Math.max(0, Math.round(diasRestantes));
+  const cuanto = d === 0 ? '*hoy mismo*'
+    : d === 1 ? 'te queda *1 día*'
+    : `te quedan *${d} días*`;
+  const text = `⏳ *ColónClick*
+
+`
+    + `${name}: ya pasó el tiempo de aviso. Ahora corre el *tiempo de gracia*: `
+    + `${d === 0 ? 'hoy mismo el sistema deja de funcionar' : `${cuanto} para que el sistema deje de funcionar`}.
+
+`
+    + `Cuando se acabe vas a poder *ver* tu información, pero no vender ni facturar.
+
+`
+    + `Para seguir trabajando, ponete al día con el pago. Si ya pagaste, escribinos y lo activamos.`;
+  return registrar('tiempo_de_gracia', tenantId,
+    await deliver(phone, text, () => sendTemplate(phone, 'tiempo_de_gracia', [name, d])));
 }
 
 /** 2. Aviso de comprobantes por acabarse. */

@@ -1,4 +1,5 @@
 import { createMiddleware } from 'hono/factory';
+import { DIAS_DE_GRACIA } from '../utils/gracia.js';
 import { db } from '../db/client.js';
 import { maybeResetDemo } from '../services/demoReset.js';
 
@@ -17,7 +18,8 @@ export function forgetCachedTenant(tenantId: string): void {
 const BLOCKED = new Set(['suspended', 'inactive', 'cancelled']);
 
 // Días de gracia tras el vencimiento antes de pasar a SOLO LECTURA.
-const GRACE_DAYS = 6;
+// El número vive en un solo lugar: los avisos de WhatsApp cuentan los mismos.
+const GRACE_DAYS = DIAS_DE_GRACIA;
 
 // Rutas que SIEMPRE deben pasar (panel admin, info propia del tenant para que
 // el frontend pueda renderizar el modal con datos coherentes).

@@ -1,15 +1,25 @@
 import { db } from '../db/client.js';
-import { notifyPaymentDue } from './whatsappNotify.js';
+import { notifyPaymentDue, notifyGracePeriod } from './whatsappNotify.js';
+import { DIAS_DE_GRACIA, graciaRestante } from '../utils/gracia.js';
 
 /**
  * Avisos automáticos de cobro por WhatsApp.
  *
- * Se manda cuando faltan 7, 4, 2 y 1 días para el vencimiento: el primero avisa
- * con tiempo y los últimos aprietan cerca de la fecha. Antes existía el envío
- * masivo pero había que dispararlo a mano, así que en la práctica no salía.
+ * Son dos tandas:
+ *
+ *   ANTES de vencer — a los 7, 4, 2 y 1 días. El primero avisa con tiempo y los
+ *   últimos aprietan cerca de la fecha.
+ *
+ *   DESPUÉS de vencer — TODOS LOS DÍAS mientras corre el tiempo de gracia,
+ *   diciendo cuántos días quedan para que el sistema deje de funcionar. Antes
+ *   los avisos se callaban justo el día del vencimiento: el sistema seguía
+ *   andando unos días más y el negocio no se enteraba de nada, hasta que un
+ *   lunes a las 7 de la mañana no podía facturar con el local abierto.
  *
  * Cada aviso queda registrado en `wa_payment_reminders`. Sin eso, el proceso
- * —que corre cada pocos minutos— repetiría el mismo mensaje todo el día.
+ * —que corre cada pocos minutos— repetiría el mismo mensaje todo el día. Los de
+ * gracia se anotan con el día en NEGATIVO (0 = venció hoy, −3 = hace tres días),
+ * así la misma clave única da exactamente un mensaje por día.
  */
 export const UMBRALES = [7, 4, 2, 1];
 
@@ -26,7 +36,7 @@ function diasHasta(endsAt: string): number {
 
 export interface ResumenAvisos {
   revisados: number;
-  enviados: Array<{ tenant_id: string; dias: number }>;
+  enviados: Array<{ tenant_id: string; dias: number; gracia?: number }>;
   ya_enviados: number;
   sin_enviar: Array<{ tenant_id: string; dias: number; motivo: string }>;
 }
@@ -34,14 +44,20 @@ export interface ResumenAvisos {
 export async function enviarAvisosDeCobro(opts: { dryRun?: boolean } = {}): Promise<ResumenAvisos> {
   const res: ResumenAvisos = { revisados: 0, enviados: [], ya_enviados: 0, sin_enviar: [] };
 
-  // Suscripciones activas que vencen dentro de la ventana más amplia (7 días).
+  /**
+   * Las que vencen pronto Y las que ya vencieron pero siguen en gracia.
+   *
+   * El extremo de abajo era «ayer», así que una suscripción vencida se caía de
+   * la consulta al día siguiente y no había forma de avisar durante la gracia.
+   */
   const limite = new Date(Date.now() + 8 * 86_400_000).toISOString();
+  const desde = new Date(Date.now() - (DIAS_DE_GRACIA + 1) * 86_400_000).toISOString();
   const { data: subs } = await db.from('subscriptions')
     .select('tenant_id, ends_at')
     .eq('status', 'active')
     .not('ends_at', 'is', null)
     .lte('ends_at', limite)
-    .gte('ends_at', new Date(Date.now() - 86_400_000).toISOString());
+    .gte('ends_at', desde);
 
   const candidatos = (subs ?? []) as any[];
   if (candidatos.length === 0) return res;
@@ -61,11 +77,22 @@ export async function enviarAvisosDeCobro(opts: { dryRun?: boolean } = {}): Prom
     if (!t || t.is_demo === true || t.status !== 'active') continue;
 
     const dias = diasHasta(s.ends_at);
-    if (!UMBRALES.includes(dias)) continue;
+    /**
+     * ¿Le toca aviso hoy?
+     *
+     * Antes de vencer, solo en los umbrales. Desde el día del vencimiento y
+     * hasta que se acaba la gracia, TODOS los días.
+     */
+    const gracia = dias <= 0 ? graciaRestante(dias) : null;
+    const leToca = dias > 0 ? UMBRALES.includes(dias) : gracia! >= 0;
+    if (!leToca) continue;
     res.revisados++;
 
     const vence = diaCR(s.ends_at);
-    if (opts.dryRun) { res.enviados.push({ tenant_id: s.tenant_id, dias }); continue; }
+    if (opts.dryRun) {
+      res.enviados.push({ tenant_id: s.tenant_id, dias, ...(gracia != null ? { gracia } : {}) });
+      continue;
+    }
 
     /**
      * Se APARTA el aviso antes de mandarlo.
@@ -82,9 +109,11 @@ export async function enviarAvisosDeCobro(opts: { dryRun?: boolean } = {}): Prom
       continue;
     }
 
-    const r = await notifyPaymentDue(s.tenant_id, dias);
+    const r = gracia != null
+      ? await notifyGracePeriod(s.tenant_id, gracia)
+      : await notifyPaymentDue(s.tenant_id, dias);
     if (r.ok) {
-      res.enviados.push({ tenant_id: s.tenant_id, dias });
+      res.enviados.push({ tenant_id: s.tenant_id, dias, ...(gracia != null ? { gracia } : {}) });
     } else {
       // No salió: se suelta la marca para poder reintentarlo.
       await db.from('wa_payment_reminders')

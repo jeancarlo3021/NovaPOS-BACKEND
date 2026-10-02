@@ -38,7 +38,8 @@ const handler = async (c: any) => {
       console.warn('[cron] limpieza de demos:', e?.message);
     }
     /**
-     * Avisos de cobro (7, 4, 2 y 1 días antes del vencimiento).
+     * Avisos de cobro: 7, 4, 2 y 1 días antes del vencimiento, y después uno
+     * DIARIO mientras corre el tiempo de gracia.
      *
      * Van acá por lo mismo que la limpieza de demos: este es el trabajo
      * programado que sí está corriendo. La tabla de avisos enviados impide que
@@ -90,8 +91,9 @@ const reintentoCorreosHandler = async (c: any) => {
 cron.get('/retry-fe-emails', reintentoCorreosHandler);
 cron.post('/retry-fe-emails', reintentoCorreosHandler);
 
-// Avisos de cobro por WhatsApp a los 7, 4, 2 y 1 días. `?debug=1` solo informa
-// a quién le tocaría, sin mandar nada.
+// Avisos de cobro por WhatsApp: 7, 4, 2 y 1 días antes de vencer, y uno por día
+// durante el tiempo de gracia. `?debug=1` solo informa a quién le tocaría hoy
+// (y cuántos días de gracia le quedan), sin mandar nada.
 const cobrosHandler = async (c: any) => {
   if (!authorized(c)) return fail(c, 'No autorizado', 401);
   try {

@@ -236,6 +236,154 @@ admin.get('/users-lite', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+/**
+ * GET /usage — REPORTE DE USO POR NEGOCIO.
+ *
+ * Responde a una pregunta que antes había que contestar a mano, negocio por
+ * negocio: ¿quién está usando el sistema y quién no?
+ *
+ * Importa para dos cosas. Para cobrar: un negocio que factura mil veces al mes
+ * no puede estar en el mismo plan que uno que factura veinte. Y para no perder
+ * clientes: el que dejó de vender hace tres semanas no avisa que se va, se va
+ * callado, y cuando llega la factura la cancela. Con la última venta y el último
+ * ingreso a la vista, se puede llamar antes.
+ *
+ * Parámetro `days` (por defecto 30): la ventana que se mide.
+ */
+admin.get('/usage', async (c) => {
+  try {
+    const dias = Math.min(365, Math.max(1, Number(c.req.query('days') ?? 30) || 30));
+    const hasta = new Date();
+    const desde = new Date(hasta.getTime() - dias * 86_400_000);
+    const desdeISO = desde.toISOString();
+
+    // ── Negocios ──
+    const { data: tenants, error: eT } = await db.from('tenants')
+      .select('id, name, is_demo, status, created_at');
+    if (eT) throw new Error(eT.message);
+    const negocios = (tenants ?? []) as any[];
+    if (negocios.length === 0) return ok(c, { desde: desdeISO, dias, negocios: [] });
+
+    // ── Plan de cada uno (la suscripción activa más reciente) ──
+    const plan = new Map<string, string | null>();
+    {
+      const { data: subs } = await db.from('subscriptions')
+        .select('tenant_id, created_at, subscription_plans(name)')
+        .eq('status', 'active').order('created_at', { ascending: false });
+      for (const s of (subs ?? []) as any[]) {
+        if (!plan.has(String(s.tenant_id))) plan.set(String(s.tenant_id), s.subscription_plans?.name ?? null);
+      }
+    }
+
+    /**
+     * Las facturas se traen POR PÁGINAS.
+     *
+     * Supabase corta en 1000 filas por consulta: sin paginar, el reporte diría
+     * que los negocios grandes venden menos que los chicos —justo al revés— y
+     * nadie lo notaría, porque el número igual se ve razonable.
+     */
+    const PAGE = 1000;
+    interface Uso {
+      ventas: number; monto: number; electronicos: number; anuladas: number;
+      ultima_venta: string | null; cajas: number;
+    }
+    const uso = new Map<string, Uso>();
+    const deNegocio = (tid: string): Uso => {
+      let u = uso.get(tid);
+      if (!u) {
+        u = { ventas: 0, monto: 0, electronicos: 0, anuladas: 0, ultima_venta: null, cajas: 0 };
+        uso.set(tid, u);
+      }
+      return u;
+    };
+
+    for (let from = 0; ; from += PAGE) {
+      const { data, error } = await db.from('invoices')
+        .select('tenant_id, status, issued_at, total, fe_clave, fe_status')
+        .gte('issued_at', desdeISO)
+        .order('id', { ascending: true }).range(from, from + PAGE - 1);
+      if (error) throw new Error(error.message);
+      const chunk = (data ?? []) as any[];
+      for (const r of chunk) {
+        const u = deNegocio(String(r.tenant_id));
+        if (r.status === 'cancelled') { u.anuladas++; continue; }
+        u.ventas++;
+        u.monto += Number(r.total || 0);
+        // Electrónico solo si de verdad se emitió: el tipo elegido no alcanza.
+        if (r.fe_clave && r.fe_status !== 'rejected' && r.fe_status !== 'error') u.electronicos++;
+        const f = String(r.issued_at ?? '');
+        if (f && (!u.ultima_venta || f > u.ultima_venta)) u.ultima_venta = f;
+      }
+      if (chunk.length < PAGE) break;
+    }
+
+    // ── Cajas abiertas en la ventana (señal de que alguien trabajó) ──
+    for (let from = 0; ; from += PAGE) {
+      const { data, error } = await db.from('cash_sessions')
+        .select('tenant_id, opening_date')
+        .gte('opening_date', desdeISO)
+        .order('id', { ascending: true }).range(from, from + PAGE - 1);
+      if (error) break;   // sin cajas no se cae el reporte entero
+      const chunk = (data ?? []) as any[];
+      for (const r of chunk) deNegocio(String(r.tenant_id)).cajas++;
+      if (chunk.length < PAGE) break;
+    }
+
+    // ── Usuarios y último ingreso ──
+    const usuarios = new Map<string, { total: number; activos: number; ultimo: string | null }>();
+    for (let from = 0; ; from += PAGE) {
+      const { data, error } = await db.from('users')
+        .select('tenant_id, last_login_at')
+        .order('id', { ascending: true }).range(from, from + PAGE - 1);
+      if (error) break;
+      const chunk = (data ?? []) as any[];
+      for (const u of chunk) {
+        const tid = String(u.tenant_id ?? '');
+        if (!tid) continue;
+        const acc = usuarios.get(tid) ?? { total: 0, activos: 0, ultimo: null };
+        acc.total++;
+        const l = u.last_login_at ? String(u.last_login_at) : null;
+        if (l) {
+          if (l >= desdeISO) acc.activos++;
+          if (!acc.ultimo || l > acc.ultimo) acc.ultimo = l;
+        }
+        usuarios.set(tid, acc);
+      }
+      if (chunk.length < PAGE) break;
+    }
+
+    const hoy = Date.now();
+    const diasDesde = (f: string | null) =>
+      f ? Math.floor((hoy - new Date(/(Z|[+-]\d{2}:?\d{2})$/.test(f) ? f : `${f}Z`).getTime()) / 86_400_000) : null;
+
+    const filas = negocios.map(t => {
+      const u = uso.get(String(t.id));
+      const us = usuarios.get(String(t.id));
+      return {
+        tenant_id: t.id,
+        name: t.name,
+        is_demo: !!t.is_demo,
+        status: t.status,
+        plan_name: plan.get(String(t.id)) ?? null,
+        creado: t.created_at,
+        ventas: u?.ventas ?? 0,
+        monto: Math.round(u?.monto ?? 0),
+        electronicos: u?.electronicos ?? 0,
+        anuladas: u?.anuladas ?? 0,
+        cajas: u?.cajas ?? 0,
+        ultima_venta: u?.ultima_venta ?? null,
+        dias_sin_vender: diasDesde(u?.ultima_venta ?? null),
+        usuarios: us?.total ?? 0,
+        usuarios_activos: us?.activos ?? 0,
+        ultimo_ingreso: us?.ultimo ?? null,
+        dias_sin_entrar: diasDesde(us?.ultimo ?? null),
+      };
+    }).sort((a, b) => b.ventas - a.ventas || b.monto - a.monto);
+
+    return ok(c, { desde: desdeISO, hasta: hasta.toISOString(), dias, negocios: filas });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // GET /invoices-monthly — conteo de facturas no anuladas del mes en curso por
 // tenant. Reservado para tracking de Facturación Electrónica futura, donde
 // el costo del servicio suele ir por volumen mensual.
