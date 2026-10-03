@@ -110,6 +110,11 @@ settings.put('/:type', async (c) => {
         'emisor_email', 'emisor_emails',
         'emisor_province_code', 'emisor_canton_code', 'emisor_district_code',
         'economic_activity_code', 'economic_activities',
+        // El CONCEPTO de cada actividad («4711.2» → «Pulpería»). No viaja al
+        // comprobante: es para que en el selector de negocios se sepa en cuál se
+        // está facturando, que con dos actividades de la misma cédula no era
+        // evidente y facturar en la equivocada no se arregla después.
+        'economic_activity_names',
         'default_document_type',    // qué comprobante sale por defecto en el POS
       ];
       for (const k of EDITABLES) {

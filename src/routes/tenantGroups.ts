@@ -1134,6 +1134,60 @@ groups.get('/my/tenant-plan/:tenantId', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+/**
+ * GET /my/activities — la ACTIVIDAD de cada negocio al que el usuario entra.
+ *
+ * Una sociedad con varias actividades se lleva como varios negocios: la misma
+ * cédula, pero una es la soda y otra el alquiler del salón. En el selector de
+ * perfiles los dos aparecían con el nombre que les pusieron y nada más, y como
+ * suelen llamarse parecido («La Central», «La Central · 4711.2»), el cajero no
+ * sabía en cuál estaba entrando. Facturar en la actividad equivocada no se
+ * arregla: el comprobante ya declaró una actividad que no corresponde.
+ *
+ * Devuelve el código y su CONCEPTO —el nombre que el propio negocio le puso a
+ * esa actividad—, que es lo que de verdad distingue un perfil del otro.
+ */
+groups.get('/my/activities', async (c) => {
+  try {
+    const userId = c.get('userId');
+    if (!userId) return ok(c, []);
+
+    // Los negocios del usuario: el suyo y los que tenga asignados.
+    const ids = new Set<string>();
+    const propio = c.get('tenantId');
+    if (propio) ids.add(String(propio));
+    try {
+      const { data: ut } = await db.from('user_tenants').select('tenant_id').eq('user_id', userId);
+      for (const r of (ut ?? []) as any[]) if (r.tenant_id) ids.add(String(r.tenant_id));
+    } catch { /* sin la tabla: queda el propio */ }
+    if (ids.size === 0) return ok(c, []);
+
+    const { data: cfgs } = await db.from('settings').select('tenant_id, config')
+      .eq('type', 'electronic-invoice').in('tenant_id', [...ids]);
+
+    const filas: any[] = [];
+    for (const r of (cfgs ?? []) as any[]) {
+      const propia = r.config ?? {};
+      // `configEfectiva` trae los datos de la sociedad: el catálogo de conceptos
+      // vive en el negocio principal, así que una actividad puede resolver el
+      // nombre de su propio código sin tenerlo copiado.
+      const efectiva: any = await configEfectiva(String(r.tenant_id), propia).catch(() => propia);
+      const code = String(propia.economic_activity_code ?? efectiva.economic_activity_code ?? '').trim();
+      if (!code) continue;
+      const nombres = (efectiva.economic_activity_names ?? {}) as Record<string, string>;
+      filas.push({
+        tenant_id: String(r.tenant_id),
+        code,
+        concepto: String(nombres?.[code] ?? '').trim() || null,
+        sucursal: propia.sucursal ?? null,
+        /** Si comparte cédula con otro negocio, de cuál es la sociedad. */
+        shared_from: propia.fe_shared_from ?? null,
+      });
+    }
+    return ok(c, filas);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // ── GET /my/branches-stats — métricas por sucursal del grupo del owner ────
 // Devuelve, para cada tenant donde el caller es 'owner' en user_tenants:
 //   { tenant_id, tenant_name, users_count, invoices_month, warehouses_count }

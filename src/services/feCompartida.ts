@@ -120,8 +120,23 @@ export async function guardarRepartido(tenantId: string, config: Record<string, 
   const nuevaPropia: Record<string, any> = { ...propia };
   const nuevoPrincipal: Record<string, any> = { ...principal };
   for (const [k, v] of Object.entries(config)) {
-    if (esDeLaActividad(k)) nuevaPropia[k] = v;
-    else nuevoPrincipal[k] = v;
+    if (esDeLaActividad(k)) { nuevaPropia[k] = v; continue; }
+    /**
+     * El catálogo de CONCEPTOS de las actividades se MEZCLA, no se reemplaza.
+     *
+     * Vive en el principal porque es de la sociedad, pero cada actividad solo
+     * conoce el suyo: su pantalla manda un mapa con una sola entrada. Guardarlo
+     * entero borraría los nombres de las demás actividades, y el selector de
+     * negocios volvería a mostrar códigos pelados.
+     *
+     * El principal sí reemplaza (ver el retorno temprano de arriba): es la única
+     * pantalla que ve la lista completa, así que es la única que puede quitar.
+     */
+    if (k === 'economic_activity_names') {
+      nuevoPrincipal[k] = { ...(principal[k] ?? {}), ...((v ?? {}) as Record<string, any>) };
+      continue;
+    }
+    nuevoPrincipal[k] = v;
   }
   // La marca nunca se pierde por un guardado que no la traía.
   nuevaPropia.fe_shared_from = principalId;

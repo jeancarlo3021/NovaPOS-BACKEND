@@ -237,6 +237,119 @@ admin.get('/users-lite', async (c) => {
 });
 
 /**
+ * GET /tenants/:id/products/count — cuántos productos tiene a la vista.
+ *
+ * Se pregunta ANTES de borrar: una confirmación que no dice el número («¿borrar
+ * todos los productos?») no alcanza para una acción que no se puede deshacer.
+ * Con el número a la vista, 5.065 se lee distinto que 12.
+ */
+admin.get('/tenants/:id/products/count', async (c) => {
+  try {
+    const { id } = c.req.param();
+    const { count, error } = await db.from('products')
+      .select('id', { count: 'exact', head: true })
+      .eq('tenant_id', id).is('deleted_at', null);
+    if (error) throw new Error(error.message);
+    const { count: ocultos } = await db.from('products')
+      .select('id', { count: 'exact', head: true })
+      .eq('tenant_id', id).not('deleted_at', 'is', null);
+    return ok(c, { activos: count ?? 0, ocultos: ocultos ?? 0 });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/**
+ * POST /tenants/:id/products/purge — borra el catálogo de un negocio, POR TANDAS.
+ *
+ * Se usa cuando un catálogo entró mal: la importación equivocada, el archivo del
+ * sistema viejo con los precios corridos, la demo que quedó con productos de
+ * prueba. Borrarlos a mano es imposible —hay negocios con más de cinco mil— y
+ * una sola petición para todos se corta por tiempo a la mitad, dejando el
+ * catálogo peor que antes: medio borrado y sin saber dónde quedó.
+ *
+ * Por eso va por tandas: el navegador llama hasta que `restantes` llega a cero y
+ * muestra el avance. Cada tanda es independiente, así que si se corta la red se
+ * retoma donde quedó.
+ *
+ * Un producto CON ventas o compras no se borra de verdad —se perdería el
+ * historial, y las facturas ya emitidas tienen que seguir cuadrando—: se OCULTA,
+ * igual que al borrarlo uno por uno desde el inventario. La respuesta dice
+ * cuántos se borraron y cuántos se ocultaron, que no es lo mismo.
+ */
+admin.post('/tenants/:id/products/purge', async (c) => {
+  try {
+    const { id: tenantId } = c.req.param();
+    const body = await c.req.json().catch(() => ({}));
+    const porTanda = Math.min(500, Math.max(10, Number(body?.limit ?? 200) || 200));
+
+    const { data: t } = await db.from('tenants').select('id, name').eq('id', tenantId).maybeSingle();
+    if (!t) return fail(c, 'Negocio no encontrado', 404);
+
+    /** Cuántos quedan a la vista (los ocultos ya no cuentan). */
+    const cuantosQuedan = async (): Promise<number> => {
+      const { count } = await db.from('products')
+        .select('id', { count: 'exact', head: true })
+        .eq('tenant_id', tenantId).is('deleted_at', null);
+      return count ?? 0;
+    };
+
+    const total = await cuantosQuedan();
+    if (total === 0) return ok(c, { total: 0, borrados: 0, ocultados: 0, restantes: 0, fallidos: [] });
+
+    const { data: lote, error: eLote } = await db.from('products')
+      .select('id, sku')
+      .eq('tenant_id', tenantId).is('deleted_at', null)
+      .order('id', { ascending: true }).limit(porTanda);
+    if (eLote) throw new Error(eLote.message);
+    const ids = (lote ?? []).map((p: any) => String(p.id));
+    if (ids.length === 0) return ok(c, { total, borrados: 0, ocultados: 0, restantes: 0, fallidos: [] });
+
+    let borrados = 0, ocultados = 0;
+    const fallidos: Array<{ id: string; motivo: string }> = [];
+
+    // Primero se intenta la tanda completa: cuando ningún producto tiene
+    // historial —el caso de una importación recién hecha— es una sola consulta.
+    const enBloque = await db.from('products').delete().eq('tenant_id', tenantId).in('id', ids);
+    if (!enBloque.error) {
+      borrados = ids.length;
+    } else {
+      // Alguno tiene ventas o compras: hay que ir uno por uno para salvar los
+      // que sí se pueden borrar y ocultar los que no.
+      for (const pid of ids) {
+        const uno = await db.from('products').delete().eq('tenant_id', tenantId).eq('id', pid);
+        if (!uno.error) { borrados++; continue; }
+        const esFk = /foreign key|violates|_items|_fkey|23503/i.test(uno.error.message ?? '');
+        if (!esFk) { fallidos.push({ id: pid, motivo: uno.error.message }); continue; }
+        /**
+         * Se libera el código al ocultar.
+         *
+         * El `sku` es único por negocio: si el producto oculto se lo queda, el
+         * catálogo nuevo no puede volver a usar ese código. Al original se le
+         * pega un sufijo para no perder la referencia del historial.
+         */
+        const sku = (lote ?? []).find((p: any) => String(p.id) === pid)?.sku;
+        const sufijo = `#x${Date.now().toString(36)}`;
+        const soft = await db.from('products').update({
+          deleted_at: new Date().toISOString(),
+          sku: sku ? String(sku).slice(0, 40) + sufijo : `del${sufijo}`,
+          sku2: null,
+        }).eq('tenant_id', tenantId).eq('id', pid);
+        if (soft.error) fallidos.push({ id: pid, motivo: soft.error.message });
+        else ocultados++;
+      }
+    }
+
+    const restantes = await cuantosQuedan();
+    return ok(c, {
+      negocio: (t as any).name,
+      total, borrados, ocultados, restantes,
+      fallidos: fallidos.slice(0, 20),
+      /** Nada avanzó y todavía quedan: el navegador tiene que parar. */
+      atascado: borrados === 0 && ocultados === 0 && restantes > 0,
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/**
  * GET /usage — REPORTE DE USO POR NEGOCIO.
  *
  * Responde a una pregunta que antes había que contestar a mano, negocio por
