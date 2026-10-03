@@ -23,8 +23,57 @@ reports.get('/sales', async (c) => {
 
     const totalRevenue = data?.reduce((s, r) => s + Number(r.total ?? 0), 0) ?? 0;
     const totalCount   = data?.length ?? 0;
+    /**
+     * EL DESGLOSE POR MEDIO DE PAGO RESPETA LOS PAGOS MIXTOS.
+     *
+     * Acá se sumaba el total completo de la factura al medio que tuviera en
+     * `payment_method`, y una venta mixta trae el reparto de verdad en
+     * `payments`. El resultado estaba mal de dos formas distintas:
+     *
+     *   · La venta de ₡23.500 marcada «card» que en realidad fue ₡10.000 en
+     *     efectivo y ₡13.500 con tarjeta sumaba ₡23.500 a tarjeta. El reporte
+     *     decía que entraron ₡10.000 más por tarjeta y ₡10.000 menos al cajón, y
+     *     no cuadraba con el cierre de caja —que sí reparte bien—.
+     *   · Las marcadas «mixed» metían todo el monto en una bolsa llamada
+     *     «mixto», que no es un medio de pago: esa plata no se podía arquear
+     *     contra nada.
+     *
+     * De las 12.695 facturas de la base, 195 traen reparto y solo 72 están
+     * marcadas «mixed»: las otras 123 venían con el nombre de UN medio y el
+     * monto de dos.
+     */
     const byMethod: Record<string, number> = {};
-    data?.forEach(r => { const m = r.payment_method ?? 'cash'; byMethod[m] = (byMethod[m] ?? 0) + Number(r.total ?? 0); });
+    let mixtas = 0;
+    data?.forEach(r => {
+      const reparto = Array.isArray((r as any).payments) && (r as any).payments.length > 0
+        ? (r as any).payments as Array<{ method?: string; amount?: number }>
+        : null;
+      if (reparto) {
+        mixtas++;
+        for (const p of reparto) {
+          const m = String(p.method ?? 'cash');
+          byMethod[m] = (byMethod[m] ?? 0) + Number(p.amount ?? 0);
+        }
+        /**
+         * Si el reparto no suma el total, la diferencia se asigna al medio
+         * principal en vez de desaparecer.
+         *
+         * Pasa con repartos guardados a medias. Perder el sobrante haría que el
+         * desglose no sumara el ingreso del día, que es peor que atribuirlo con
+         * el mejor dato que hay.
+         */
+        const sumado = reparto.reduce((t, p) => t + Number(p.amount ?? 0), 0);
+        const resto = Math.round((Number(r.total ?? 0) - sumado) * 100) / 100;
+        if (Math.abs(resto) >= 0.01) {
+          const m = String(r.payment_method ?? 'cash') === 'mixed'
+            ? 'other' : String(r.payment_method ?? 'cash');
+          byMethod[m] = (byMethod[m] ?? 0) + resto;
+        }
+        return;
+      }
+      const m = r.payment_method ?? 'cash';
+      byMethod[m] = (byMethod[m] ?? 0) + Number(r.total ?? 0);
+    });
 
     // Ventas cobradas en dólares (moneda de la venta = USD). Se reporta el total
     // en ₡ (moneda base) y el equivalente en $ según el tipo de cambio de cada venta.
@@ -83,6 +132,8 @@ reports.get('/sales', async (c) => {
       total_invoices: totalCount,
       average_ticket: totalCount > 0 ? totalRevenue / totalCount : 0,
       by_payment_method: byMethod, usd, invoices: data,
+      /** Cuántas ventas del período se cobraron con más de un medio de pago. */
+      mixed_count: mixtas,
       reservations: {
         count: abonos.length,
         total: abonosTotal,
