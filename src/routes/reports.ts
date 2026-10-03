@@ -3,6 +3,30 @@ import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
 import { endOfDay } from '../utils/dateRange.js';
 
+/**
+ * CÓMO SE REPARTIÓ EL COBRO DE UNA FACTURA.
+ *
+ * El punto de venta guarda en `payment_method` el medio DOMINANTE (el de mayor
+ * monto) y el reparto de verdad en `payments`. Es a propósito —así los reportes
+ * viejos siguen mostrando algo— pero significa que cualquier reporte que lea
+ * solo `payment_method` le atribuye la venta COMPLETA a un medio por el que no
+ * entró toda la plata.
+ *
+ * Una venta de ₡23.500 cobrada ₡10.000 en efectivo y ₡13.500 con tarjeta
+ * aparecía como ₡23.500 de tarjeta: ₡10.000 de más en tarjeta y ₡10.000 de menos
+ * en el cajón, en un reporte que después no cuadra con el cierre de caja —que sí
+ * reparte bien—.
+ *
+ * Todo reporte que desglose por medio de pago tiene que pasar por acá.
+ */
+function repartoDe(inv: any): Array<{ method: string; amount: number }> {
+  const p = inv?.payments;
+  if (Array.isArray(p) && p.length > 0) {
+    return p.map((x: any) => ({ method: String(x?.method ?? 'cash'), amount: Number(x?.amount ?? 0) }));
+  }
+  return [{ method: String(inv?.payment_method ?? 'cash'), amount: Number(inv?.total ?? 0) }];
+}
+
 const reports = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
 reports.get('/sales', async (c) => {
@@ -717,7 +741,9 @@ reports.get('/profit', async (c) => {
     const from = c.req.query('from');
     const to   = endOfDay(c.req.query('to'));
 
-    let salesQ = db.from('invoices').select('id, total, payment_method, issued_at').eq('tenant_id', tenantId).neq('status', 'cancelled');
+    // `payments` es imprescindible: sin el reparto, una venta mixta se le
+    // atribuye entera al medio dominante (ver repartoDe).
+    let salesQ = db.from('invoices').select('id, total, payment_method, payments, issued_at').eq('tenant_id', tenantId).neq('status', 'cancelled');
     if (from) salesQ = salesQ.gte('issued_at', from);
     if (to)   salesQ = salesQ.lte('issued_at', to);
 
@@ -805,10 +831,16 @@ reports.get('/profit', async (c) => {
       check:    { label: 'Cheque',         total: 0, color: '#6b7280' },
     };
 
+    /**
+     * Antes: `if (methodMap[method])` con el medio dominante.
+     *
+     * Una venta marcada «mixed» no es ninguna de las llaves del mapa, así que su
+     * monto NO se sumaba a ninguna parte: desaparecía del reporte entero. En un
+     * negocio con muchos cobros mixtos eran millones que simplemente no estaban.
+     */
     (sales ?? []).forEach((s: any) => {
-      const method = s.payment_method ?? 'cash';
-      if (methodMap[method]) {
-        methodMap[method].total += Number(s.total ?? 0);
+      for (const p of repartoDe(s)) {
+        if (methodMap[p.method]) methodMap[p.method].total += p.amount;
       }
     });
 
@@ -851,7 +883,7 @@ reports.get('/cash-sessions', async (c) => {
     const sessionIds = (sessions ?? []).map((s: any) => s.id);
     const idsParaBuscar = sessionIds.length > 0 ? sessionIds : ['null'];
     const { data: invoices } = await db.from('invoices')
-      .select('cash_session_id, payment_method, total')
+      .select('cash_session_id, payment_method, payments, total')
       .eq('tenant_id', tenantId)
       .neq('status', 'cancelled')
       .in('cash_session_id', idsParaBuscar);
@@ -908,9 +940,13 @@ reports.get('/cash-sessions', async (c) => {
       let totalSales = 0;
 
       sessionInvoices.forEach((inv: any) => {
-        const method = inv.payment_method ?? 'cash';
-        if (salesByMethod.hasOwnProperty(method)) {
-          salesByMethod[method] += Number(inv.total ?? 0);
+        // El total sí se contaba completo, pero el desglose se saltaba las ventas
+        // mixtas: las columnas por método no sumaban el total de la caja y no
+        // había forma de ver dónde estaba la diferencia.
+        for (const p of repartoDe(inv)) {
+          if (Object.prototype.hasOwnProperty.call(salesByMethod, p.method)) {
+            salesByMethod[p.method] += p.amount;
+          }
         }
         totalSales += Number(inv.total ?? 0);
       });

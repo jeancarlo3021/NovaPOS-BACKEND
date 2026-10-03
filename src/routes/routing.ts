@@ -4,6 +4,32 @@ import { ok, fail } from '../utils/response.js';
 import { createReceivable } from './accountsReceivable.js';
 
 // Módulo de Ruteo (reparto en camión). Ver migrations/18_routing.sql
+/**
+ * CÓMO SE REPARTIÓ EL COBRO de una factura de ruta.
+ *
+ * El reparto real está en `payments`. El repartidor escribe «mixed» en
+ * `payment_method`, pero una venta mixta hecha desde el punto de venta queda
+ * marcada con el medio DOMINANTE —el de mayor monto— y el reparto igual en
+ * `payments`.
+ *
+ * Mirar solo `payment_method` tenía dos efectos en el cierre de ruta, y los dos
+ * caen sobre la plata que el repartidor entrega en la mano:
+ *
+ *   · «mixed» no es ninguno de los cuatro medios de la ruta, así que caía en el
+ *     `else` y se contaba TODO como efectivo. Al repartidor se le pedía en
+ *     efectivo lo que había cobrado por SINPE.
+ *   · Una mixta del punto de venta se le atribuía entera al medio dominante.
+ *
+ * De las 189 ventas mixtas de la base, 69 son de ruta.
+ */
+function repartoDeFactura(inv: any): Array<{ method: string; amount: number }> {
+  const p = inv?.payments;
+  if (Array.isArray(p) && p.length > 0) {
+    return p.map((x: any) => ({ method: String(x?.method ?? 'cash'), amount: Number(x?.amount ?? 0) }));
+  }
+  return [{ method: String(inv?.payment_method ?? 'cash'), amount: Number(inv?.total ?? 0) }];
+}
+
 const routing = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
 // GET /report?from=&to= — reporte de rutas y camiones con sus ventas.
@@ -27,7 +53,7 @@ routing.get('/report', async (c) => {
     const totalsByMethod = { cash: 0, card: 0, sinpe: 0, credit: 0 };
     if (routeIds.length > 0) {
       const { data: invs } = await db.from('invoices')
-        .select('route_id, total, status, payment_method').eq('tenant_id', tenantId).in('route_id', routeIds);
+        .select('route_id, total, status, payment_method, payments').eq('tenant_id', tenantId).in('route_id', routeIds);
       for (const i of (invs ?? []) as any[]) {
         const k = i.route_id;
         salesByRoute[k] ??= { count: 0, total: 0, voids: 0, cash: 0, card: 0, sinpe: 0, credit: 0 };
@@ -35,9 +61,11 @@ routing.get('/report', async (c) => {
         salesByRoute[k].count++;
         const t = Number(i.total ?? 0);
         salesByRoute[k].total += t;
-        const m = (i.payment_method ?? 'cash') as 'cash' | 'card' | 'sinpe' | 'credit';
-        if (m === 'card' || m === 'sinpe' || m === 'credit') { salesByRoute[k][m] += t; totalsByMethod[m] += t; }
-        else { salesByRoute[k].cash += t; totalsByMethod.cash += t; }
+        for (const p of repartoDeFactura(i)) {
+          const m = p.method as 'cash' | 'card' | 'sinpe' | 'credit';
+          if (m === 'card' || m === 'sinpe' || m === 'credit') { salesByRoute[k][m] += p.amount; totalsByMethod[m] += p.amount; }
+          else { salesByRoute[k].cash += p.amount; totalsByMethod.cash += p.amount; }
+        }
       }
     }
     // Nombres de repartidor.
@@ -1179,13 +1207,10 @@ routing.post('/:id/close', async (c) => {
       else byMethod.cash += amt;
     };
     for (const i of sales) {
-      // Pago MIXTO: repartir por cada split (antes se contaba todo como efectivo,
-      // así la parte de tarjeta/SINPE/crédito del mixto no se contabilizaba).
-      if (i.payment_method === 'mixed' && Array.isArray(i.payments) && i.payments.length > 0) {
-        for (const p of i.payments) addMethod(p.method ?? 'cash', Number(p.amount ?? 0));
-        continue;
-      }
-      addMethod(i.payment_method ?? 'cash', Number(i.total ?? 0));
+      // Se reparte SIEMPRE que haya reparto guardado: antes solo se miraba
+      // cuando `payment_method` decía «mixed», y una mixta cobrada desde el
+      // punto de venta viene marcada con el medio dominante.
+      for (const p of repartoDeFactura(i)) addMethod(p.method, p.amount);
     }
 
     // El camión aparece VACÍO pero se había cargado: el stock del camión se
@@ -1323,14 +1348,16 @@ routing.get('/:id/close-summary', async (c) => {
 
     // Recomputar ventas por método desde las facturas (siempre disponibles).
     const { data: invs } = await db.from('invoices')
-      .select('id, total, status, payment_method').eq('tenant_id', tenantId).eq('route_id', id);
+      .select('id, total, status, payment_method, payments').eq('tenant_id', tenantId).eq('route_id', id);
     const sales = (invs ?? []).filter((i: any) => i.status !== 'cancelled');
     const voids = (invs ?? []).filter((i: any) => i.status === 'cancelled');
     const byMethod = { cash: 0, card: 0, sinpe: 0, credit: 0 };
     for (const i of sales) {
-      const m = (i.payment_method ?? 'cash') as 'cash' | 'card' | 'sinpe' | 'credit';
-      if (m === 'card' || m === 'sinpe' || m === 'credit') byMethod[m] += Number(i.total ?? 0);
-      else byMethod.cash += Number(i.total ?? 0);
+      for (const p of repartoDeFactura(i)) {
+        const m = p.method as 'cash' | 'card' | 'sinpe' | 'credit';
+        if (m === 'card' || m === 'sinpe' || m === 'credit') byMethod[m] += p.amount;
+        else byMethod.cash += p.amount;
+      }
     }
 
     // Sobrante: 1) el guardado en close_summary; 2) lo que HAY hoy en el camión
