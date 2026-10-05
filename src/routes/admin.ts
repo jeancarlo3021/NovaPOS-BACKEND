@@ -237,6 +237,43 @@ admin.get('/users-lite', async (c) => {
 });
 
 /**
+ * GET /tenants/:id/backups — los respaldos que hay de un negocio.
+ *
+ * Un respaldo que nadie puede ver no tranquiliza a nadie: esto lista las semanas
+ * guardadas con su peso, para saber de un vistazo que el respaldo está corriendo.
+ */
+admin.get('/tenants/:id/backups', async (c) => {
+  try {
+    const { id } = c.req.param();
+    const { respaldosDe, SEMANAS_QUE_SE_GUARDAN } = await import('../services/tenantBackup.js');
+    return ok(c, { respaldos: await respaldosDe(id), se_guardan: SEMANAS_QUE_SE_GUARDAN });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/**
+ * GET /tenants/:id/backups/:semana — enlace temporal para bajarlo.
+ *
+ * El bucket es privado (tiene los clientes, los precios y las ventas), así que se
+ * firma un enlace que vive diez minutos en vez de exponer el archivo.
+ */
+admin.get('/tenants/:id/backups/:semana', async (c) => {
+  try {
+    const { id, semana } = c.req.param();
+    const { enlaceDeRespaldo } = await import('../services/tenantBackup.js');
+    return ok(c, { url: await enlaceDeRespaldo(id, semana) });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/** POST /tenants/:id/backups — respaldar AHORA (antes de algo riesgoso). */
+admin.post('/tenants/:id/backups', async (c) => {
+  try {
+    const { id } = c.req.param();
+    const { respaldarNegocio } = await import('../services/tenantBackup.js');
+    return ok(c, await respaldarNegocio(id));
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/**
  * GET /tenants/:id/products/count — cuántos productos tiene a la vista.
  *
  * Se pregunta ANTES de borrar: una confirmación que no dice el número («¿borrar

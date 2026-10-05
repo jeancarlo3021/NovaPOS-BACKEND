@@ -52,7 +52,22 @@ const handler = async (c: any) => {
     } catch (e: any) {
       console.warn('[cron] avisos de cobro:', e?.message);
     }
-    return ok(c, { ok: true, ...summary, demos, cobros });
+    /**
+     * Respaldo semanal de cada negocio.
+     *
+     * Va colgado de este trabajo por lo mismo que la limpieza de demos y los
+     * avisos de cobro: es el único que está corriendo de verdad. Que exista el
+     * archivo de la semana es la marca de «ya está», así que llamarlo cada pocos
+     * minutos es inofensivo: respalda a los que falten y se detiene por tiempo.
+     */
+    let respaldos: any = null;
+    try {
+      const { respaldoSemanal } = await import('../services/tenantBackup.js');
+      respaldos = await respaldoSemanal({ presupuestoMs: 18_000 });
+    } catch (e: any) {
+      console.warn('[cron] respaldos:', e?.message);
+    }
+    return ok(c, { ok: true, ...summary, demos, cobros, respaldos });
   } catch (err: any) {
     return fail(c, err?.message ?? 'Error al procesar correos', 500);
   }
@@ -106,5 +121,25 @@ const cobrosHandler = async (c: any) => {
 };
 cron.get('/payment-reminders', cobrosHandler);
 cron.post('/payment-reminders', cobrosHandler);
+
+// Respaldo semanal por negocio. `?debug=1` solo dice a quién le toca esta semana,
+// sin escribir nada. Pensado para correr suelto cuando hay que forzarlo.
+const respaldosHandler = async (c: any) => {
+  if (!authorized(c)) return fail(c, 'No autorizado', 401);
+  try {
+    const { respaldoSemanal } = await import('../services/tenantBackup.js');
+    const debug = c.req.query('debug') === '1';
+    const res = await respaldoSemanal({
+      dryRun: debug,
+      // Suelto se le da más tiempo que colgado del cron de correos.
+      presupuestoMs: Number(c.req.query('ms') ?? 25_000) || 25_000,
+    });
+    return ok(c, { ok: true, simulacion: debug, ...res });
+  } catch (err: any) {
+    return fail(c, err?.message ?? 'Error al respaldar', 500);
+  }
+};
+cron.get('/backups', respaldosHandler);
+cron.post('/backups', respaldosHandler);
 
 export default cron;
