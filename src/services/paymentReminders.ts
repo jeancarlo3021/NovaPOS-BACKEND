@@ -27,6 +27,36 @@ export const UMBRALES = [7, 4, 2, 1];
 const diaCR = (d: Date | string): string =>
   new Date(d).toLocaleDateString('en-CA', { timeZone: 'America/Costa_Rica' });
 
+/**
+ * HORARIO EN EL QUE SE PUEDE ESCRIBIR AL CLIENTE.
+ *
+ * El trabajo programado corre cada pocos minutos, y el aviso del día salía en la
+ * PRIMERA corrida después de la medianoche: al negocio le llegaba un WhatsApp de
+ * cobro a las 12 de la noche. Además de molesto, a esa hora nadie lo atiende y el
+ * aviso se pierde entre las notificaciones del día siguiente.
+ *
+ * Fuera de la ventana no se manda nada y no se marca nada: el aviso queda
+ * pendiente y sale en la primera corrida de la mañana. El tope de la tarde existe
+ * por lo mismo que el de la mañana: si el proceso estuvo caído todo el día, es
+ * mejor escribir mañana a las 8 que hoy a las 11 de la noche.
+ */
+const HORA_DESDE = Math.min(23, Math.max(0, Number(process.env.AVISOS_HORA_DESDE ?? 8)));
+const HORA_HASTA = Math.min(23, Math.max(0, Number(process.env.AVISOS_HORA_HASTA ?? 20)));
+
+/** Hora de Costa Rica (0-23), sin depender de la zona del servidor. */
+export function horaCR(d = new Date()): number {
+  const h = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Costa_Rica', hour: 'numeric', hourCycle: 'h23',
+  }).format(d);
+  return Number(h) % 24;
+}
+
+/** ¿Es hora de escribirle al cliente? */
+export function enHorarioDeAvisos(d = new Date()): boolean {
+  const h = horaCR(d);
+  return h >= HORA_DESDE && h <= HORA_HASTA;
+}
+
 /** Días CALENDARIO que faltan: 0 = vence hoy. */
 function diasHasta(endsAt: string): number {
   const hoy = new Date(`${diaCR(new Date())}T00:00:00Z`).getTime();
@@ -35,14 +65,37 @@ function diasHasta(endsAt: string): number {
 }
 
 export interface ResumenAvisos {
+  /** Hora de Costa Rica en la que se evaluó, para poder explicar un «no salió». */
+  hora_cr?: number;
+  /** Se saltó porque está fuera del horario de avisos. */
+  fuera_de_horario?: boolean;
   revisados: number;
   enviados: Array<{ tenant_id: string; dias: number; gracia?: number }>;
   ya_enviados: number;
   sin_enviar: Array<{ tenant_id: string; dias: number; motivo: string }>;
 }
 
-export async function enviarAvisosDeCobro(opts: { dryRun?: boolean } = {}): Promise<ResumenAvisos> {
-  const res: ResumenAvisos = { revisados: 0, enviados: [], ya_enviados: 0, sin_enviar: [] };
+export async function enviarAvisosDeCobro(
+  opts: { dryRun?: boolean; ignorarHorario?: boolean } = {},
+): Promise<ResumenAvisos> {
+  const res: ResumenAvisos = {
+    hora_cr: horaCR(), revisados: 0, enviados: [], ya_enviados: 0, sin_enviar: [],
+  };
+
+  /**
+   * Fuera del horario no se manda NI se marca.
+   *
+   * Es importante que no se marque: la marca es lo que impide repetir el aviso, y
+   * si se pusiera a medianoche el aviso de ese día ya no saldría nunca —el cliente
+   * se quedaría sin enterarse—. Así, a las 8 de la mañana la corrida lo encuentra
+   * pendiente y lo manda.
+   *
+   * `ignorarHorario` existe para poder forzarlo a mano desde el panel.
+   */
+  if (!opts.ignorarHorario && !opts.dryRun && !enHorarioDeAvisos()) {
+    res.fuera_de_horario = true;
+    return res;
+  }
 
   /**
    * Las que vencen pronto Y las que ya vencieron pero siguen en gracia.

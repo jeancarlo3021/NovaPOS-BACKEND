@@ -107,13 +107,19 @@ cron.get('/retry-fe-emails', reintentoCorreosHandler);
 cron.post('/retry-fe-emails', reintentoCorreosHandler);
 
 // Avisos de cobro por WhatsApp: 7, 4, 2 y 1 días antes de vencer, y uno por día
-// durante el tiempo de gracia. `?debug=1` solo informa a quién le tocaría hoy
-// (y cuántos días de gracia le quedan), sin mandar nada.
+// durante el tiempo de gracia. Solo entre las 8 y las 20 de Costa Rica.
+// `?debug=1` informa a quién le tocaría sin mandar nada; `?ahora=1` manda aunque
+// sea fuera de ese horario.
 const cobrosHandler = async (c: any) => {
   if (!authorized(c)) return fail(c, 'No autorizado', 401);
   try {
     const { enviarAvisosDeCobro } = await import('../services/paymentReminders.js');
-    const res = await enviarAvisosDeCobro({ dryRun: c.req.query('debug') === '1' });
+    const res = await enviarAvisosDeCobro({
+      dryRun: c.req.query('debug') === '1',
+      // `?ahora=1` manda aunque sea fuera del horario: es para soporte, cuando
+      // hay que avisarle a alguien en el momento.
+      ignorarHorario: c.req.query('ahora') === '1',
+    });
     return ok(c, { ok: true, simulacion: c.req.query('debug') === '1', ...res });
   } catch (err: any) {
     return fail(c, err?.message ?? 'Error al enviar los avisos de cobro', 500);
