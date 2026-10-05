@@ -239,28 +239,28 @@ admin.get('/users-lite', async (c) => {
 /**
  * GET /tenants/:id/backups — los respaldos que hay de un negocio.
  *
- * Un respaldo que nadie puede ver no tranquiliza a nadie: esto lista las semanas
- * guardadas con su peso, para saber de un vistazo que el respaldo está corriendo.
+ * Un respaldo que nadie puede ver no tranquiliza a nadie: esto lista los días
+ * guardados con su peso, para saber de un vistazo que el respaldo está corriendo.
  */
 admin.get('/tenants/:id/backups', async (c) => {
   try {
     const { id } = c.req.param();
-    const { respaldosDe, SEMANAS_QUE_SE_GUARDAN } = await import('../services/tenantBackup.js');
-    return ok(c, { respaldos: await respaldosDe(id), se_guardan: SEMANAS_QUE_SE_GUARDAN });
+    const { respaldosDe, DIAS_QUE_SE_GUARDAN } = await import('../services/tenantBackup.js');
+    return ok(c, { respaldos: await respaldosDe(id), se_guardan: DIAS_QUE_SE_GUARDAN });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
 /**
- * GET /tenants/:id/backups/:semana — enlace temporal para bajarlo.
+ * GET /tenants/:id/backups/:dia — enlace temporal para bajarlo.
  *
  * El bucket es privado (tiene los clientes, los precios y las ventas), así que se
  * firma un enlace que vive diez minutos en vez de exponer el archivo.
  */
-admin.get('/tenants/:id/backups/:semana', async (c) => {
+admin.get('/tenants/:id/backups/:dia', async (c) => {
   try {
-    const { id, semana } = c.req.param();
+    const { id, dia } = c.req.param();
     const { enlaceDeRespaldo } = await import('../services/tenantBackup.js');
-    return ok(c, { url: await enlaceDeRespaldo(id, semana) });
+    return ok(c, { url: await enlaceDeRespaldo(id, dia) });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

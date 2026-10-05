@@ -2,7 +2,7 @@ import AdmZip from 'adm-zip';
 import { db } from '../db/client.js';
 
 /**
- * RESPALDO SEMANAL DE CADA NEGOCIO.
+ * RESPALDO DIARIO DE CADA NEGOCIO.
  *
  * ── Qué cubre y qué no ─────────────────────────────────────────────────────
  * Supabase respalda la base completa, pero restaurar eso devuelve TODO: no sirve
@@ -72,8 +72,15 @@ const TABLAS_HIJAS: Array<{ tabla: string; fk: string; padre: string }> = [
 ];
 
 export const BUCKET = 'respaldos';
-/** Semanas que se conservan. Con 8 hay más de un mes y medio de historia. */
-export const SEMANAS_QUE_SE_GUARDAN = 8;
+/**
+ * Días que se conservan.
+ *
+ * Con 14 hay dos semanas de historia, que es lo que de verdad se usa: un error se
+ * descubre en días, no en meses. Más días es más espacio por poco valor — el
+ * negocio más grande pesa 2 MB por día, así que 41 negocios × 14 días rondan los
+ * 200 MB en total.
+ */
+export const DIAS_QUE_SE_GUARDAN = Number(process.env.RESPALDOS_DIAS ?? 14);
 
 /** Páginas de lectura. Las facturas traen el XML, así que van en tandas chicas. */
 const PAGINA = (tabla: string) => (tabla === 'invoices' ? 300 : 1000);
@@ -81,7 +88,7 @@ const PAGINA = (tabla: string) => (tabla === 'invoices' ? 300 : 1000);
 export interface ResumenRespaldo {
   tenant_id: string;
   negocio: string;
-  semana: string;
+  dia: string;
   archivo: string;
   bytes: number;
   filas: Record<string, number>;
@@ -91,14 +98,15 @@ export interface ResumenRespaldo {
   segundos: number;
 }
 
-/** Semana ISO, que es como se nombra cada respaldo: 2026-W41. */
-export function semanaDe(d = new Date()): string {
-  const x = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
-  // Jueves de la misma semana: define el año ISO.
-  x.setUTCDate(x.getUTCDate() + 4 - (x.getUTCDay() || 7));
-  const inicio = new Date(Date.UTC(x.getUTCFullYear(), 0, 1));
-  const semana = Math.ceil((((x.getTime() - inicio.getTime()) / 86_400_000) + 1) / 7);
-  return `${x.getUTCFullYear()}-W${String(semana).padStart(2, '0')}`;
+/**
+ * El DÍA de Costa Rica, que es como se nombra cada respaldo: 2026-10-06.
+ *
+ * En hora de Costa Rica, no del servidor: en Railway el servidor corre en UTC, y
+ * con la fecha de allá el respaldo de las 7 de la noche quedaría nombrado con el
+ * día siguiente — y el del día real nunca aparecería como hecho.
+ */
+export function diaDe(d = new Date()): string {
+  return d.toLocaleDateString('en-CA', { timeZone: 'America/Costa_Rica' });
 }
 
 /** Crea el bucket privado la primera vez. No falla si ya está. */
@@ -174,7 +182,7 @@ async function leerTodo(
  * Devuelve el resumen con las filas de cada tabla: es lo que permite mirar un
  * respaldo y saber si trajo lo que tenía que traer, sin abrirlo.
  */
-export async function respaldarNegocio(tenantId: string, semana = semanaDe()): Promise<ResumenRespaldo> {
+export async function respaldarNegocio(tenantId: string, dia = diaDe()): Promise<ResumenRespaldo> {
   const t0 = Date.now();
   await asegurarBucket();
 
@@ -214,7 +222,7 @@ export async function respaldarNegocio(tenantId: string, semana = semanaDe()): P
   const manifiesto = {
     version: 1,
     negocio: { id: (tenant as any).id, nombre: (tenant as any).name },
-    semana,
+    dia,
     generado: new Date().toISOString(),
     filas,
     total_filas: Object.values(filas).reduce((a, b) => a + b, 0),
@@ -229,7 +237,7 @@ export async function respaldarNegocio(tenantId: string, semana = semanaDe()): P
    *
    * Si una tabla no se pudo leer —se cortó la red a mitad, por ejemplo— subir el
    * archivo igual sería peor que no tener nada: queda un respaldo que parece
-   * bueno, con el nombre de la semana puesto, y el día que haya que restaurar
+   * bueno, con el nombre del día puesto, y el día que haya que restaurar
    * aparecen las facturas sin líneas. Mejor que falle y que la próxima corrida lo
    * reintente, porque la marca de «ya está» es justamente que el archivo exista.
    *
@@ -242,7 +250,7 @@ export async function respaldarNegocio(tenantId: string, semana = semanaDe()): P
   }
 
   const buffer = zip.toBuffer();
-  const archivo = `${tenantId}/${semana}.zip`;
+  const archivo = `${tenantId}/${dia}.zip`;
   const { error: eSubida } = await db.storage.from(BUCKET)
     .upload(archivo, buffer, { contentType: 'application/zip', upsert: true });
   if (eSubida) throw new Error(`No se pudo guardar el respaldo: ${eSubida.message}`);
@@ -250,7 +258,7 @@ export async function respaldarNegocio(tenantId: string, semana = semanaDe()): P
   return {
     tenant_id: tenantId,
     negocio: (tenant as any).name,
-    semana, archivo,
+    dia, archivo,
     bytes: buffer.length,
     filas, omitidas,
     sin_cubrir: [],
@@ -261,19 +269,19 @@ export async function respaldarNegocio(tenantId: string, semana = semanaDe()): P
 /** Borra los respaldos viejos de un negocio, dejando los últimos N. */
 async function limpiarViejos(tenantId: string): Promise<string[]> {
   const { data } = await db.storage.from(BUCKET).list(tenantId, { limit: 200 });
-  const semanas = (data ?? [])
+  const archivos = (data ?? [])
     .map(f => f.name)
     .filter(n => n.endsWith('.zip'))
-    .sort()              // 2026-W09 < 2026-W10: el orden alfabético es cronológico
+    .sort()              // 2026-10-05 < 2026-10-06: el orden alfabético es cronológico
     .reverse();
-  const sobran = semanas.slice(SEMANAS_QUE_SE_GUARDAN);
+  const sobran = archivos.slice(DIAS_QUE_SE_GUARDAN);
   if (sobran.length === 0) return [];
   await db.storage.from(BUCKET).remove(sobran.map(n => `${tenantId}/${n}`));
   return sobran;
 }
 
-export interface ResumenSemanal {
-  semana: string;
+export interface ResumenDiario {
+  dia: string;
   respaldados: Array<{ negocio: string; bytes: number; filas: number; segundos: number }>;
   ya_estaban: number;
   fallidos: Array<{ negocio: string; motivo: string }>;
@@ -283,24 +291,23 @@ export interface ResumenSemanal {
 }
 
 /**
- * Respalda los negocios que todavía no tienen el archivo de ESTA semana.
+ * Respalda los negocios que todavía no tienen el archivo de HOY.
  *
- * Va con presupuesto de tiempo porque lo llama el cron, que corre cada pocos
- * minutos y tiene su propio límite: si no alcanza, los que faltan quedan para la
- * próxima vuelta. Que exista el archivo de la semana es la marca de «ya está»,
+ * Va con presupuesto de tiempo porque lo llama el cron, que corre cada pocos minutos y tiene su propio límite: si no alcanza, los que faltan quedan para la
+ * próxima vuelta. Que exista el archivo del día es la marca de «ya está»,
  * así que repetir la llamada es inofensivo y no hace falta otra tabla para
  * llevar la cuenta.
  */
-export async function respaldoSemanal(opts: {
+export async function respaldoDiario(opts: {
   presupuestoMs?: number;
   /** Solo informa a quién le toca, sin escribir nada. */
   dryRun?: boolean;
-} = {}): Promise<ResumenSemanal> {
+} = {}): Promise<ResumenDiario> {
   const presupuesto = opts.presupuestoMs ?? 22_000;
   const t0 = Date.now();
-  const semana = semanaDe();
-  const res: ResumenSemanal = {
-    semana, respaldados: [], ya_estaban: 0, fallidos: [], borrados: 0, pendientes: 0,
+  const dia = diaDe();
+  const res: ResumenDiario = {
+    dia, respaldados: [], ya_estaban: 0, fallidos: [], borrados: 0, pendientes: 0,
   };
 
   await asegurarBucket();
@@ -308,7 +315,7 @@ export async function respaldoSemanal(opts: {
   /**
    * Las DEMOS no se respaldan.
    *
-   * Nacen para una prueba y se borran solas; guardarles ocho semanas de historia
+   * Nacen para una prueba y se borran solas; guardarles dos semanas de historia
    * es gastar espacio en datos que nadie va a querer de vuelta.
    */
   const { data: tenants } = await db.from('tenants')
@@ -319,12 +326,12 @@ export async function respaldoSemanal(opts: {
     if (Date.now() - t0 > presupuesto) { res.pendientes++; continue; }
 
     const { data: ya } = await db.storage.from(BUCKET).list(String(t.id), { limit: 200 });
-    if ((ya ?? []).some(f => f.name === `${semana}.zip`)) { res.ya_estaban++; continue; }
+    if ((ya ?? []).some(f => f.name === `${dia}.zip`)) { res.ya_estaban++; continue; }
 
     if (opts.dryRun) { res.respaldados.push({ negocio: t.name, bytes: 0, filas: 0, segundos: 0 }); continue; }
 
     try {
-      const r = await respaldarNegocio(String(t.id), semana);
+      const r = await respaldarNegocio(String(t.id), dia);
       res.respaldados.push({
         negocio: r.negocio, bytes: r.bytes,
         filas: Object.values(r.filas).reduce((a, b) => a + b, 0),
@@ -340,24 +347,24 @@ export async function respaldoSemanal(opts: {
 
 /** Los respaldos que hay de un negocio, del más nuevo al más viejo. */
 export async function respaldosDe(tenantId: string): Promise<Array<{
-  semana: string; bytes: number; creado: string | null;
+  dia: string; bytes: number; creado: string | null;
 }>> {
   const { data, error } = await db.storage.from(BUCKET).list(tenantId, { limit: 200 });
   if (error) return [];
   return (data ?? [])
     .filter(f => f.name.endsWith('.zip'))
     .map(f => ({
-      semana: f.name.replace('.zip', ''),
+      dia: f.name.replace('.zip', ''),
       bytes: Number((f as any).metadata?.size ?? 0),
       creado: (f as any).created_at ?? null,
     }))
-    .sort((a, b) => b.semana.localeCompare(a.semana));
+    .sort((a, b) => b.dia.localeCompare(a.dia));
 }
 
 /** Enlace temporal para bajar un respaldo (el bucket es privado). */
-export async function enlaceDeRespaldo(tenantId: string, semana: string, segundos = 600): Promise<string> {
+export async function enlaceDeRespaldo(tenantId: string, dia: string, segundos = 600): Promise<string> {
   const { data, error } = await db.storage.from(BUCKET)
-    .createSignedUrl(`${tenantId}/${semana}.zip`, segundos);
+    .createSignedUrl(`${tenantId}/${dia}.zip`, segundos);
   if (error || !data?.signedUrl) throw new Error(error?.message ?? 'No se pudo crear el enlace');
   return data.signedUrl;
 }
