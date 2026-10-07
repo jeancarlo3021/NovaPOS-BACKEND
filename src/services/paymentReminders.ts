@@ -1,6 +1,7 @@
 import { db } from '../db/client.js';
 import { notifyPaymentDue, notifyGracePeriod } from './whatsappNotify.js';
 import { DIAS_DE_GRACIA, graciaRestante } from '../utils/gracia.js';
+import { esVitalicio } from '../utils/planCiclo';
 
 /**
  * Avisos automáticos de cobro por WhatsApp.
@@ -106,14 +107,33 @@ export async function enviarAvisosDeCobro(
   const limite = new Date(Date.now() + 8 * 86_400_000).toISOString();
   const desde = new Date(Date.now() - (DIAS_DE_GRACIA + 1) * 86_400_000).toISOString();
   const { data: subs } = await db.from('subscriptions')
-    .select('tenant_id, ends_at')
+    .select('tenant_id, ends_at, plan_id')
     .eq('status', 'active')
     .not('ends_at', 'is', null)
     .lte('ends_at', limite)
     .gte('ends_at', desde);
 
-  const candidatos = (subs ?? []) as any[];
+  let candidatos = (subs ?? []) as any[];
   if (candidatos.length === 0) return res;
+
+  /**
+   * Un plan VITALICIO no se cobra, aunque la suscripción traiga fecha.
+   *
+   * Varias suscripciones de planes vitalicios quedaron con un `ends_at` viejo,
+   * de cuando la fecha se calculaba sin mirar el ciclo. Con eso, el día que esa
+   * fecha llegara se les iba un aviso de cobro a clientes que no tienen nada
+   * que pagar. El ciclo del plan manda sobre la fecha guardada.
+   */
+  const planIds = [...new Set(candidatos.map(s => s.plan_id).filter(Boolean))];
+  if (planIds.length > 0) {
+    const { data: planes } = await db.from('subscription_plans')
+      .select('id, billing_cycle').in('id', planIds);
+    const vitalicios = new Set((planes ?? [])
+      .filter((p: any) => esVitalicio(p.billing_cycle)).map((p: any) => String(p.id)));
+    if (vitalicios.size > 0)
+      candidatos = candidatos.filter(s => !vitalicios.has(String(s.plan_id)));
+    if (candidatos.length === 0) return res;
+  }
 
   // Las DEMOS no reciben avisos de cobro: no hay nada que cobrarles, y su
   // vencimiento se maneja aparte (bloqueo y borrado).

@@ -534,6 +534,327 @@ admin.get('/usage', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+/**
+ * GET /fe-usage?months=6 — USO DE FACTURACIÓN ELECTRÓNICA, por razón social.
+ *
+ * Para qué: saber a quién le queda chica la bolsa (y hay que ofrecerle el plan
+ * de arriba), a quién le sobra la mitad (y se va a quejar del precio), quién
+ * paga FE y no emite —el que cancela el mes que viene— y a quién le están
+ * rechazando comprobantes sin que nadie se haya dado cuenta.
+ *
+ * Se agrupa por RAZÓN SOCIAL, no por negocio, porque la bolsa se cobra así: una
+ * sociedad con tres actividades tiene una sola bolsa y la gastan entre las tres.
+ * Mostrarlo por negocio daría tres filas, cada una diciendo que usó un tercio.
+ *
+ * La cuenta de la bolsa vigente (incluidos + arrastre − usados) es la misma de
+ * `computeFeQuota`, pero hecha en bloque: esa función resuelve la razón social
+ * con varias consultas POR NEGOCIO, y con cien negocios el reporte no cargaba.
+ * Si se cambia la regla de la bolsa, hay que cambiarla en los dos lados.
+ */
+admin.get('/fe-usage', async (c) => {
+  try {
+    const meses = Math.min(24, Math.max(1, Number(c.req.query('months') ?? 6) || 6));
+    const PAGE = 1000;
+
+    // Primer día del mes, hace `meses-1` meses, en hora de Costa Rica (00:00 CR = 06:00 UTC).
+    const crNow = new Date(Date.now() - 6 * 3_600_000);
+    const desdeMes = new Date(Date.UTC(crNow.getUTCFullYear(), crNow.getUTCMonth() - (meses - 1), 1, 6, 0, 0));
+    const desdeISO = desdeMes.toISOString();
+    /** Etiqueta de mes (2026-10) de una fecha, en hora de Costa Rica. */
+    const mesDe = (f: string): string => {
+      const d = new Date(/(Z|[+-]\d{2}:?\d{2})$/.test(f) ? f : `${f}Z`);
+      if (isNaN(d.getTime())) return '';
+      const cr = new Date(d.getTime() - 6 * 3_600_000);
+      return `${cr.getUTCFullYear()}-${String(cr.getUTCMonth() + 1).padStart(2, '0')}`;
+    };
+    const etiquetas: string[] = [];
+    for (let i = 0; i < meses; i++) {
+      const d = new Date(Date.UTC(crNow.getUTCFullYear(), crNow.getUTCMonth() - (meses - 1 - i), 1));
+      etiquetas.push(`${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`);
+    }
+
+    // ── Negocios, planes y config de FE (todo en bloque) ──
+    const { data: tenants, error: eT } = await db.from('tenants')
+      .select('id, name, is_demo, status, created_at');
+    if (eT) throw new Error(eT.message);
+    const negocios = (tenants ?? []) as any[];
+    const nombre = new Map<string, any>(negocios.map(t => [String(t.id), t]));
+
+    const planSaaS = new Map<string, { name: string | null; price: number | null }>();
+    {
+      const { data: subs } = await db.from('subscriptions')
+        .select('tenant_id, created_at, subscription_plans(name, price)')
+        .eq('status', 'active').order('created_at', { ascending: false });
+      for (const s of (subs ?? []) as any[]) {
+        const k = String(s.tenant_id);
+        if (!planSaaS.has(k)) planSaaS.set(k, {
+          name: s.subscription_plans?.name ?? null,
+          price: s.subscription_plans?.price ?? null,
+        });
+      }
+    }
+
+    const cfgDe = new Map<string, any>();
+    for (let from = 0; ; from += PAGE) {
+      const { data, error } = await db.from('settings').select('tenant_id, config')
+        .eq('type', 'electronic-invoice')
+        .order('tenant_id', { ascending: true }).range(from, from + PAGE - 1);
+      if (error) throw new Error(error.message);
+      const chunk = (data ?? []) as any[];
+      for (const r of chunk) cfgDe.set(String(r.tenant_id), r.config ?? {});
+      if (chunk.length < PAGE) break;
+    }
+
+    const catalogo = new Map<string, any>();
+    {
+      const { data } = await db.from('fe_plan_catalog').select('*');
+      for (const p of (data ?? []) as any[]) catalogo.set(String(p.id), p);
+    }
+
+    // Matriz del grupo de cada negocio: la bolsa de una sucursal es de la matriz.
+    const matrizDe = new Map<string, string>();
+    {
+      const { data: miembros } = await db.from('tenant_group_members').select('tenant_id, group_id');
+      const { data: grupos } = await db.from('tenant_groups').select('id, main_tenant_id');
+      const mainDeGrupo = new Map<string, string>();
+      for (const g of (grupos ?? []) as any[]) {
+        if (g.main_tenant_id) mainDeGrupo.set(String(g.id), String(g.main_tenant_id));
+      }
+      for (const m of (miembros ?? []) as any[]) {
+        const main = mainDeGrupo.get(String(m.group_id));
+        if (main && main !== String(m.tenant_id)) matrizDe.set(String(m.tenant_id), main);
+      }
+    }
+
+    const cedula = (id: string): string => {
+      const propia = cfgDe.get(id) ?? {};
+      const comp = String(propia.fe_shared_from ?? '').trim();
+      const fuente = comp && comp !== id ? (cfgDe.get(comp) ?? propia) : propia;
+      return String(fuente?.emisor_identification ?? '').replace(/\D/g, '').replace(/^0+/, '');
+    };
+
+    /** Mismo criterio que `razonSocialDe`, resuelto con lo ya cargado. */
+    const titularDe = (id: string): string => {
+      const cfg = cfgDe.get(id) ?? {};
+      const comp = String(cfg.fe_shared_from ?? '').trim();
+      if (comp && comp !== id && nombre.has(comp)) return comp;
+      const matriz = matrizDe.get(id);
+      if (matriz && nombre.has(matriz)) {
+        const propia = cedula(id);
+        // Sin cédula propia (aún sin FE) o con la misma: es de la sociedad de la matriz.
+        if (!propia || propia === cedula(matriz)) return matriz;
+      }
+      return id;
+    };
+
+    // ── Comprobantes electrónicos, por negocio y por mes ──
+    interface Cuenta { docs: number; nc: number; nd: number; rechazados: number; monto: number; ultimo: string | null; }
+    const nuevaCuenta = (): Cuenta => ({ docs: 0, nc: 0, nd: 0, rechazados: 0, monto: 0, ultimo: null });
+    /** tenant → mes → cuenta. */
+    const porNegocio = new Map<string, Map<string, Cuenta>>();
+    const cuenta = (tid: string, mes: string): Cuenta => {
+      let m = porNegocio.get(tid);
+      if (!m) { m = new Map(); porNegocio.set(tid, m); }
+      let a = m.get(mes);
+      if (!a) { a = nuevaCuenta(); m.set(mes, a); }
+      return a;
+    };
+
+    /**
+     * Comprobantes de la BOLSA VIGENTE, contados por fecha.
+     *
+     * La bolsa arranca en `fe_quota_start` del titular (se reinicia al renovar).
+     * Agrupando por mes no alcanzaba: una bolsa que arrancó el 18 contaría
+     * también lo del 1 al 17, que ya se cobró en la bolsa anterior.
+     */
+    const inicioBolsaDe = new Map<string, string>();
+    for (const t of negocios) {
+      const cfgTit = cfgDe.get(titularDe(String(t.id))) ?? {};
+      const ini = String(cfgTit.fe_quota_start ?? '').trim();
+      if (ini) inicioBolsaDe.set(String(t.id), ini);
+    }
+    const bolsaDe = new Map<string, number>();
+
+    /**
+     * Desde dónde se piden las facturas.
+     *
+     * Normalmente, la ventana del reporte. Pero una bolsa puede haber arrancado
+     * ANTES —se renueva cuando el cliente paga, no el primero de mes—: pidiendo
+     * solo la ventana, a esa bolsa le faltarían comprobantes y el reporte diría
+     * que le queda saldo cuando ya se pasó.
+     */
+    let desdeConsulta = desdeISO;
+    for (const ini of inicioBolsaDe.values()) if (ini < desdeConsulta) desdeConsulta = ini;
+
+    const falló = (s: any) => s === 'rejected' || s === 'error';
+    const COLS = 'tenant_id, created_at, issued_at, total, fe_clave, fe_status, fe_nc_clave, fe_nc_status, fe_nd_clave, fe_nd_status';
+    let columnasCompletas = true;
+    for (let from = 0; ; from += PAGE) {
+      let q = db.from('invoices').select(columnasCompletas ? COLS : 'tenant_id, created_at, issued_at, total, fe_clave, fe_status')
+        .gte('created_at', desdeConsulta)
+        .order('id', { ascending: true }).range(from, from + PAGE - 1);
+      q = columnasCompletas
+        ? q.or('fe_clave.not.is.null,fe_nc_clave.not.is.null,fe_nd_clave.not.is.null')
+        : q.not('fe_clave', 'is', null);
+      const { data, error } = await q;
+      if (error) {
+        // Columnas de NC/ND sin migrar: se cuenta lo que sí existe y se sigue.
+        if (columnasCompletas) { columnasCompletas = false; from -= PAGE; continue; }
+        throw new Error(error.message);
+      }
+      const chunk = (data ?? []) as any[];
+      for (const r of chunk) {
+        const mes = mesDe(String(r.issued_at ?? r.created_at ?? ''));
+        if (!mes) continue;
+        const a = cuenta(String(r.tenant_id), mes);
+        if (r.fe_clave) {
+          if (falló(r.fe_status)) a.rechazados++;
+          else { a.docs++; a.monto += Number(r.total || 0); }
+        }
+        if (r.fe_nc_clave && !falló(r.fe_nc_status)) a.nc++;
+        if (r.fe_nd_clave && !falló(r.fe_nd_status)) a.nd++;
+        const f = String(r.issued_at ?? r.created_at ?? '');
+        if (f && (!a.ultimo || f > a.ultimo)) a.ultimo = f;
+
+        const tid = String(r.tenant_id);
+        const ini = inicioBolsaDe.get(tid);
+        const creada = String(r.created_at ?? r.issued_at ?? '');
+        if (!ini || (creada && creada >= ini)) {
+          let n = 0;
+          if (r.fe_clave && !falló(r.fe_status)) n++;
+          if (r.fe_nc_clave && !falló(r.fe_nc_status)) n++;
+          if (r.fe_nd_clave && !falló(r.fe_nd_status)) n++;
+          if (n) bolsaDe.set(tid, (bolsaDe.get(tid) ?? 0) + n);
+        }
+      }
+      if (chunk.length < PAGE) break;
+    }
+
+    // ── Una fila por razón social ──
+    interface Fila {
+      titular: string; name: string; is_demo: boolean; status: string;
+      cedula: string; miembros: { id: string; name: string }[];
+      plan_saas: string | null; plan_saas_precio: number | null;
+      fe_plan_id: string | null; fe_plan_name: string | null; fe_plan_precio: number | null;
+      incluidos_plan: number; arrastre: number; incluidos: number;
+      precio_extra: number; bolsa_desde: string | null;
+      usados_bolsa: number; disponibles: number | null; excedente: number; cargo_extra: number;
+      pct_bolsa: number | null;
+      por_mes: Record<string, number>;
+      total_periodo: number; promedio_mes: number; mejor_mes: number;
+      notas: number; rechazados: number; monto_facturado: number;
+      ultimo: string | null; dias_sin_emitir: number | null;
+      /** Qué conviene hacer con este cliente. */
+      senal: 'sobre_cuota' | 'al_limite' | 'holgado' | 'paga_y_no_usa' | 'sin_plan' | 'ilimitado' | 'normal';
+    }
+
+    const grupos = new Map<string, string[]>();
+    for (const t of negocios) {
+      const tit = titularDe(String(t.id));
+      const g = grupos.get(tit) ?? [];
+      g.push(String(t.id));
+      grupos.set(tit, g);
+    }
+
+    const hoy = Date.now();
+    const filas: Fila[] = [];
+    for (const [titular, miembros] of grupos) {
+      const cfg = cfgDe.get(titular) ?? {};
+      const planFe = cfg.fe_plan_id ? catalogo.get(String(cfg.fe_plan_id)) : null;
+
+      // Suma de todos los negocios de la razón social.
+      const porMes: Record<string, number> = {};
+      for (const e of etiquetas) porMes[e] = 0;
+      let notas = 0, rechazados = 0, monto = 0, ultimo: string | null = null;
+      for (const id of miembros) {
+        for (const [mes, a] of (porNegocio.get(id) ?? new Map<string, Cuenta>())) {
+          // Puede haber meses anteriores a la ventana (se piden por la bolsa
+          // vigente): esos no entran en los totales del período.
+          if (!(mes in porMes)) continue;
+          porMes[mes] += a.docs + a.nc + a.nd;
+          notas += a.nc + a.nd;
+          rechazados += a.rechazados;
+          monto += a.monto;
+          if (a.ultimo && (!ultimo || a.ultimo > ultimo)) ultimo = a.ultimo;
+        }
+      }
+      const total = etiquetas.reduce((s, e) => s + porMes[e], 0);
+
+      // Nada de FE y nada emitido: no es cliente de FE, no ensucia el reporte.
+      const incluidosPlan = Number(cfg.fe_included_docs ?? 0);
+      if (!cfg.fe_plan_id && !incluidosPlan && total === 0 && rechazados === 0) continue;
+
+      // Bolsa VIGENTE: desde `fe_quota_start` (se reinicia al renovar).
+      const bolsaDesde = String(cfg.fe_quota_start ?? '').trim() || null;
+      // Sin `fe_quota_start` la bolsa arranca con el negocio: vale todo el período.
+      let usadosBolsa = 0;
+      for (const id of miembros) usadosBolsa += bolsaDe.get(id) ?? 0;
+      const arrastre = Math.max(0, Number(cfg.fe_quota_carryover ?? 0));
+      const incluidos = incluidosPlan > 0 ? incluidosPlan + arrastre : 0;
+      const disponibles = incluidos > 0 ? incluidos - usadosBolsa : null;
+      const excedente = incluidos > 0 ? Math.max(0, usadosBolsa - incluidos) : 0;
+      const precioExtra = Number(cfg.fe_extra_fee ?? 0);
+      const pct = incluidos > 0 ? Math.round((usadosBolsa / incluidos) * 100) : null;
+      const t = nombre.get(titular) ?? { name: titular, is_demo: false, status: '—' };
+      const dias = ultimo
+        ? Math.floor((hoy - new Date(/(Z|[+-]\d{2}:?\d{2})$/.test(ultimo) ? ultimo : `${ultimo}Z`).getTime()) / 86_400_000)
+        : null;
+
+      /**
+       * La señal es el reporte: es lo que hay que hacer con el cliente.
+       *
+       * «Paga y no usa» es la más valiosa y la que nunca se veía: tiene plan de
+       * FE contratado y no emitió nada en el período. Ese es el que no renueva.
+       */
+      const senal: Fila['senal'] =
+        excedente > 0 ? 'sobre_cuota'
+        : (cfg.fe_plan_id || incluidos > 0) && total === 0 ? 'paga_y_no_usa'
+        : pct !== null && pct >= 85 ? 'al_limite'
+        : pct !== null && pct <= 35 && total > 0 ? 'holgado'
+        : incluidos === 0 && total > 0 ? (cfg.fe_plan_id ? 'ilimitado' : 'sin_plan')
+        : 'normal';
+
+      filas.push({
+        titular, name: t.name, is_demo: !!t.is_demo, status: t.status,
+        cedula: cedula(titular),
+        miembros: miembros.map(id => ({ id, name: nombre.get(id)?.name ?? id })),
+        plan_saas: planSaaS.get(titular)?.name ?? null,
+        plan_saas_precio: planSaaS.get(titular)?.price ?? null,
+        fe_plan_id: cfg.fe_plan_id ?? null,
+        fe_plan_name: planFe?.name ?? null,
+        fe_plan_precio: planFe?.price == null ? null : Number(planFe.price),
+        incluidos_plan: incluidosPlan, arrastre, incluidos,
+        precio_extra: precioExtra, bolsa_desde: bolsaDesde,
+        usados_bolsa: usadosBolsa, disponibles, excedente,
+        cargo_extra: precioExtra * excedente,
+        pct_bolsa: pct,
+        por_mes: porMes,
+        total_periodo: total,
+        promedio_mes: Math.round(total / meses),
+        mejor_mes: etiquetas.reduce((m, e) => Math.max(m, porMes[e]), 0),
+        notas, rechazados, monto_facturado: Math.round(monto),
+        ultimo, dias_sin_emitir: dias,
+        senal,
+      });
+    }
+
+    filas.sort((a, b) => b.total_periodo - a.total_periodo || b.usados_bolsa - a.usados_bolsa);
+
+    // El catálogo va en la respuesta para poder ofrecer «el plan de arriba» sin
+    // tener que ir a buscarlo a otra pantalla.
+    const planes = [...catalogo.values()]
+      .filter(p => p.is_active !== false)
+      .map(p => ({
+        id: p.id, name: p.name, price: Number(p.price ?? 0),
+        docs_per_month: p.docs_per_month == null ? null : Number(p.docs_per_month),
+        extra_doc_price: Number(p.extra_doc_price ?? 0),
+      }))
+      .sort((a, b) => (a.docs_per_month ?? 1e9) - (b.docs_per_month ?? 1e9));
+
+    return ok(c, { meses: etiquetas, desde: desdeISO, negocios: filas, planes });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // GET /invoices-monthly — conteo de facturas no anuladas del mes en curso por
 // tenant. Reservado para tracking de Facturación Electrónica futura, donde
 // el costo del servicio suele ir por volumen mensual.

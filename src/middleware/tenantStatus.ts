@@ -2,6 +2,7 @@ import { createMiddleware } from 'hono/factory';
 import { DIAS_DE_GRACIA } from '../utils/gracia.js';
 import { db } from '../db/client.js';
 import { maybeResetDemo } from '../services/demoReset.js';
+import { esVitalicio } from '../utils/planCiclo';
 
 type Variables = { userId: string; tenantId: string; role: string };
 
@@ -141,13 +142,28 @@ export const enforceActiveTenant = createMiddleware<{ Variables: Variables }>(as
   if (method !== 'GET' && method !== 'OPTIONS' && method !== 'HEAD') {
     const { data: sub } = await db
       .from('subscriptions')
-      .select('ends_at')
+      .select('ends_at, plan_id')
       .eq('tenant_id', tenantId)
       .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle();
     const endsAt = (sub as any)?.ends_at;
-    if (endsAt) {
+    /**
+     * Un plan VITALICIO no vence, aunque la suscripción traiga fecha.
+     *
+     * Hay suscripciones de planes vitalicios —«Fe solo»— con un `ends_at` viejo,
+     * de cuando la fecha se calculaba sin mirar el ciclo del plan. Mirando solo
+     * esa fecha, el día que llegara el negocio se iba a solo-lectura: no podía
+     * facturar, por una fecha que nadie le puso y un plan que dice que no vence.
+     * El ciclo del plan manda sobre la fecha guardada.
+     */
+    let vitalicio = false;
+    if (endsAt && (sub as any)?.plan_id) {
+      const { data: plan } = await db.from('subscription_plans')
+        .select('billing_cycle').eq('id', (sub as any).plan_id).maybeSingle();
+      vitalicio = esVitalicio((plan as any)?.billing_cycle);
+    }
+    if (endsAt && !vitalicio) {
       const graceMs = GRACE_DAYS * 24 * 60 * 60 * 1000;
       if (new Date(endsAt).getTime() + graceMs < Date.now()) {
         return c.json({
