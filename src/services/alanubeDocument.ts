@@ -33,6 +33,8 @@ export interface AlanubeInvoiceMeta {
   /** Venta por plataforma de delivery: el dinero lo recauda un tercero. */
   is_delivery?: boolean;
   issued_at?: string;
+  /** Nota que el cajero le puso a la factura (va como `Otros/OtroTexto`). */
+  notes?: string;
 }
 
 // Hacienda MedioPago: 01 efectivo, 02 tarjeta, 03 cheque, 04 transf, 06 SINPE.
@@ -96,6 +98,46 @@ export const DISCOUNT_SHAPES: Array<(amount: string, nature: string) => Record<s
   (amount, nature) => ({ discount: [{ discountAmount: amount, discountNature: nature }] }),
 ];
 
+/**
+ * Formas conocidas del bloque de NOTAS (Hacienda: `Otros/OtroTexto`).
+ *
+ * La nota que el cajero le pone a la factura tiene que viajar en el comprobante
+ * o no existe: el PDF y el XML los genera Alanube con lo que le mandamos, así
+ * que una nota que se quede en nuestra base no aparece en el documento que
+ * recibe el cliente.
+ *
+ * El nombre exacto de las propiedades de `others.otherTexts` no está publicado
+ * en la referencia (la doc muestra el objeto pero no expande sus ítems), así que
+ * se prueban en orden —igual que el bloque de descuento— hasta que una pase, y
+ * se recuerda la que funcionó.
+ *
+ * La ÚLTIMA forma es «sin notas», a propósito: una nota es un comentario, y
+ * ningún comentario puede dejar a un negocio sin poder facturar. Si Alanube
+ * rechaza todas las formas, el comprobante sale sin la nota.
+ */
+export const NOTE_SHAPES: Array<(text: string) => Record<string, any>> = [
+  // Primero SIN `code`: el `codigo` de `OtroTexto` se valida contra un catálogo
+  // de Hacienda, y un código que no esté en el catálogo lo rechaza Hacienda
+  // DESPUÉS de emitir —la factura queda rechazada—. Un campo que falte, en
+  // cambio, lo rechaza Alanube de una, antes de emitir, y el reintento de acá
+  // abajo lo corrige solo. Entre las dos, se arriesga la barata.
+  text => ({ others: { otherTexts: [{ text }] } }),
+  text => ({ others: { otherTexts: [{ code: '99', text }] } }),
+  text => ({ others: { otherTexts: [{ code: '99', content: text }] } }),
+  text => ({ others: { otherTexts: [{ otherText: text }] } }),
+  () => ({}),
+];
+
+/** ¿El error de Alanube se queja del bloque de notas? Entonces vale reintentar. */
+export function isNoteShapeError(msg: string): boolean {
+  const m = String(msg ?? '').toLowerCase();
+  // El error del DESCUENTO también dice «other» (otherDiscountCode): si no se
+  // descarta primero, una queja por el descuento se trataría como queja por la
+  // nota y se reintentaría cambiando lo que no estaba mal.
+  if (/discount|descuento/.test(m)) return false;
+  return /othertext|otro\s?texto|\bothers?\b|\botros\b|othercontent/.test(m);
+}
+
 /** ¿El error de Alanube se queja del bloque de descuento? Entonces vale reintentar. */
 export function isDiscountShapeError(msg: string): boolean {
   const m = String(msg ?? '').toLowerCase();
@@ -121,6 +163,17 @@ export function buildAlanubeDocument(
      * `DISCOUNT_SHAPES`) y guarda la que funcionó.
      */
     discountShape?: number;
+    /**
+     * Forma del bloque de notas (`NOTE_SHAPES`), por la misma razón.
+     *
+     * Sin este campo NO se manda la nota. Es a propósito: el nombre exacto de
+     * las propiedades todavía no está confirmado, y solo el emisor de
+     * facturas/tiquetes sabe reintentar con otra forma. Los demás caminos
+     * —notas de crédito y débito— arman el documento de una sola vez, así que
+     * quedan afuera hasta que se confirme: no tienen cómo recuperarse de un
+     * rechazo, y un rechazo ahí deja al negocio sin poder anular una factura.
+     */
+    noteShape?: number;
     // Para nota de crédito (03): referencia al documento que anula.
     reference?: {
       documentType: string;     // tipo del doc original (01/04)
@@ -292,6 +345,25 @@ export function buildAlanubeDocument(
   // La cédula, el nombre y el certificado con que sale el comprobante son los que
   // tenga cargada ESA empresa en Alanube — no se pueden mandar por documento.
   if (opts.senderId) payload.sender = { id: String(opts.senderId) };
+
+  /**
+   * Nota de la factura → `Otros` del comprobante.
+   *
+   * Es el «detalle» que escribe el cajero («entrega el jueves», «orden de
+   * compra 4471»). Se limpian los saltos de línea y los caracteres de control
+   * —el XML de Hacienda no los admite— y se recorta a 500 caracteres, que es
+   * largo de sobra para una observación y deja afuera el caso de que alguien
+   * pegue media página.
+   */
+  const nota = String(inv.notes ?? '')
+    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 500);
+  if (nota && opts.noteShape !== undefined) {
+    const forma = NOTE_SHAPES[opts.noteShape] ?? NOTE_SHAPES[0];
+    Object.assign(payload, forma(nota));
+  }
 
   // Resumen de la factura. Hacienda EXIGE el desglose completo (servicios/mercancías
   // gravados, total gravado, total impuesto y TotalDesgloseImpuesto) cuando hay

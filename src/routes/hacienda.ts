@@ -3,7 +3,7 @@ import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
 import { tipoComprobante, type FELine } from '../services/feDocument.js';
 import { alanube, AlanubeError, tenantAlanubeToken } from '../services/alanube.js';
-import { buildAlanubeDocument, DISCOUNT_SHAPES, isDiscountShapeError } from '../services/alanubeDocument.js';
+import { buildAlanubeDocument, DISCOUNT_SHAPES, isDiscountShapeError, NOTE_SHAPES, isNoteShapeError } from '../services/alanubeDocument.js';
 import { endOfDay } from '../utils/dateRange.js';
 import { sendEmail } from '../services/emailService.js';
 import { comprobanteEmailHtml, comprobanteEmailAsunto, type DatosCorreoComprobante } from '../services/comprobanteEmail.js';
@@ -987,14 +987,26 @@ export async function emitInvoiceCore(
         return (q > 0 ? net / q : net) <= 0 && Number(l.unit_price) > 0;
       });
       const savedShape = Number(cfg.alanube_discount_shape ?? 0) || 0;
+      /**
+       * ¿La factura lleva nota? Entonces el comprobante lleva `Otros`.
+       *
+       * La nota se queda en nuestra base y no aparecía ni en el XML ni en el PDF
+       * que arma Alanube —los dos los genera él con lo que le mandamos—, así que
+       * el cliente recibía el comprobante sin el detalle que le habían escrito.
+       * El nombre de las propiedades de ese bloque no está documentado, así que
+       * se aprende igual que el del descuento (ver `NOTE_SHAPES`).
+       */
+      const hasNote = String((inv as any).notes ?? '').trim().length > 0;
+      const savedNote = Number(cfg.alanube_note_shape ?? 0) || 0;
       const consecReservado = await takeConsecutivo(String(cfg.sucursal ?? '1'), terminalOf(c, cfg));
-      const buildDoc = (shapeIdx: number) => buildAlanubeDocument(emisor, inv as any, lines, receptor, {
+      const buildDoc = (shapeIdx: number, noteIdx: number = savedNote) => buildAlanubeDocument(emisor, inv as any, lines, receptor, {
         tipoDoc,
         headquarters: cfg.sucursal, terminal: terminalOf(c, cfg),
         // El consecutivo se reserva UNA vez: reintentar la forma del descuento no
         // puede quemar numeración (Hacienda rechaza los saltos con -99).
         numberOfDocument: consecReservado,
         discountShape: shapeIdx,
+        noteShape: noteIdx,
         // Empresa emisora en Alanube según el ambiente (para que emita el tenant y
         // no la 'main' de la cuenta). Sin id, Alanube usa la main por defecto.
         senderId: (String(cfg.environment ?? 'production') === 'sandbox'
@@ -1014,15 +1026,25 @@ export async function emitInvoiceCore(
         const shapes = hasBonus
           ? [savedShape, ...DISCOUNT_SHAPES.map((_, i) => i).filter(i => i !== savedShape)]
           : [savedShape];
+        // Formas del bloque de notas, la guardada primero. La última de la lista
+        // es «sin notas»: una observación no puede dejar la venta sin facturar.
+        const notas = hasNote
+          ? [savedNote, ...NOTE_SHAPES.map((_, i) => i).filter(i => i !== savedNote)]
+          : [savedNote];
         let lastErr: any = null;
-        for (const idx of shapes) {
-          doc = buildDoc(idx);
+        let di = 0, ni = 0;
+        for (let intento = 0; intento < shapes.length + notas.length; intento++) {
+          doc = buildDoc(shapes[di], notas[ni]);
           try {
             resp = await alanube.forTenant(cfg).emitDocument(kind as any, doc, feCompanyId(cfg), { asCompany: cfg.alanube_company_type === 'associated' });
-            if (idx !== savedShape) {
-              // Se recuerda para que la próxima venta con regalía salga al primer intento.
+            // Se recuerda lo que funcionó, para que la próxima venta igual salga
+            // al primer intento.
+            const aprendido: Record<string, any> = {};
+            if (shapes[di] !== savedShape) aprendido.alanube_discount_shape = shapes[di];
+            if (notas[ni] !== savedNote) aprendido.alanube_note_shape = notas[ni];
+            if (Object.keys(aprendido).length > 0) {
               await db.from('settings').update({
-                config: { ...cfg, alanube_discount_shape: idx }, updated_at: new Date().toISOString(),
+                config: { ...cfg, ...aprendido }, updated_at: new Date().toISOString(),
               }).eq('tenant_id', tenantId).eq('type', 'electronic-invoice').then(() => {}, () => {});
             }
             lastErr = null;
@@ -1030,7 +1052,12 @@ export async function emitInvoiceCore(
           } catch (e: any) {
             lastErr = e;
             const msg = e instanceof AlanubeError ? e.message : (e?.message ?? '');
-            if (!(hasBonus && isDiscountShapeError(msg))) break;   // no es por el descuento
+            // Un 400 de validación significa que el documento NO se creó: se puede
+            // reintentar cambiando la forma del bloque del que se queja, sin
+            // riesgo de duplicar ni de quemar numeración.
+            if (hasBonus && isDiscountShapeError(msg) && di + 1 < shapes.length) { di++; continue; }
+            if (hasNote && isNoteShapeError(msg) && ni + 1 < notas.length) { ni++; continue; }
+            break;
           }
         }
         if (lastErr) throw lastErr;
