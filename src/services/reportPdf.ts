@@ -11,12 +11,21 @@ export async function reportPdfBase64(
   title: string, subtitle: string, sections: ReportSection[],
 ): Promise<string> {
   const { default: PDFDocument } = await import('pdfkit');
+  const { registrarFuentes } = await import('./pdfFont.js');
   return new Promise<string>((resolve, reject) => {
     // Ancho tipo ticket (~80mm ≈ 226pt). La altura pagina sola si es largo.
     const W = 240;
     const M = 14;
     const inner = W - M * 2;
     const doc = new PDFDocument({ size: [W, 800], margins: { top: M, left: M, right: M, bottom: M } });
+    /**
+     * Tipografía con el símbolo del colón.
+     *
+     * Con las fuentes estándar de pdfkit, cada «₡» del cierre de caja salía
+     * impreso como «¡»: el reporte que recibe el dueño por correo decía
+     * «¡125 000» donde tenía que decir «₡125 000». Ver `services/pdfFont.ts`.
+     */
+    const F = registrarFuentes(doc);
     const chunks: Buffer[] = [];
     doc.on('data', (d) => chunks.push(d as Buffer));
     doc.on('end', () => resolve(Buffer.concat(chunks).toString('base64')));
@@ -28,7 +37,7 @@ export async function reportPdfBase64(
     };
 
     // Título con marco
-    doc.font('Courier-Bold').fontSize(15);
+    doc.font(F.negrita).fontSize(15);
     doc.moveDown(0.2);
     const tY = doc.y;
     line(tY, 2);
@@ -37,7 +46,7 @@ export async function reportPdfBase64(
     doc.moveDown(0.4);
 
     if (subtitle) {
-      doc.font('Courier').fontSize(9).text(subtitle, M, doc.y, { width: inner, align: 'center' });
+      doc.font(F.normal).fontSize(9).text(subtitle, M, doc.y, { width: inner, align: 'center' });
       doc.moveDown(0.4);
     }
 
@@ -46,21 +55,21 @@ export async function reportPdfBase64(
         doc.moveDown(0.3);
         const hY = doc.y;
         line(hY, 1.5);
-        doc.font('Courier-Bold').fontSize(10).text(s.heading.toUpperCase(), M, hY + 3, { width: inner, align: 'center', characterSpacing: 0.5 });
+        doc.font(F.negrita).fontSize(10).text(s.heading.toUpperCase(), M, hY + 3, { width: inner, align: 'center', characterSpacing: 0.5 });
         line(doc.y + 2, 1.5);
         doc.moveDown(0.3);
       }
-      doc.font('Courier').fontSize(10);
+      doc.font(F.normal).fontSize(10);
       for (const [a, b] of s.rows) {
         const y = doc.y;
-        doc.font('Courier').text(a, M, y, { width: inner * 0.6, align: 'left' });
-        doc.font('Courier-Bold').text(b, M + inner * 0.4, y, { width: inner * 0.6, align: 'right' });
+        doc.font(F.normal).text(a, M, y, { width: inner * 0.6, align: 'left' });
+        doc.font(F.negrita).text(b, M + inner * 0.4, y, { width: inner * 0.6, align: 'right' });
         doc.moveDown(0.15);
       }
     }
 
     doc.moveDown(0.6);
-    doc.font('Courier').fontSize(8).fillColor('#666')
+    doc.font(F.normal).fontSize(8).fillColor('#666')
       .text('Generado automáticamente por ColónClick', M, doc.y, { width: inner, align: 'center' });
 
     doc.end();

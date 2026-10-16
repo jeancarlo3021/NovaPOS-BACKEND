@@ -1673,6 +1673,106 @@ admin.get('/tenants/:id/fe-config', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+/**
+ * RÉGIMEN TRIBUTARIO del negocio: tradicional o simplificado.
+ *
+ * Antes esto no existía como dato: se deducía de tres banderas que significan
+ * cosas distintas y que nadie mantenía sincronizadas —`fe.enabled`,
+ * `fe.simplificado` y `general.taxEnabled`—. El resultado medido: 10 negocios
+ * con el impuesto apagado y NINGUNO marcado como simplificado. Con eso, el día
+ * que el sistema calcule un impuesto, lo va a calcular mal.
+ *
+ * Qué significa cada régimen, y por eso las tres banderas se mueven juntas:
+ *
+ *   SIMPLIFICADO — no cobra IVA al cliente (impuesto apagado), no emite
+ *   factura electrónica (FE apagada) y el tiquete lleva la leyenda del oficio
+ *   1197. Declara sobre sus COMPRAS, no sobre sus ventas.
+ *
+ *   TRADICIONAL — cobra IVA y puede emitir comprobantes electrónicos. La FE no
+ *   se enciende acá: eso es una decisión aparte (y se paga aparte), así que
+ *   pasar a tradicional solo devuelve el impuesto, no activa la facturación.
+ *
+ * Va en un endpoint y no en la pantalla a propósito: si el frontend tuviera que
+ * acordarse de escribir tres cosas, en la cuarta pantalla que lo use se va a
+ * olvidar de una.
+ */
+admin.put('/tenants/:id/tax-regime', async (c) => {
+  try {
+    const { id } = c.req.param();
+    const body = await c.req.json().catch(() => ({}));
+    const regimen = String(body?.regimen ?? '').trim().toLowerCase();
+    if (regimen !== 'simplificado' && regimen !== 'tradicional') {
+      return fail(c, "El régimen debe ser 'simplificado' o 'tradicional'", 422);
+    }
+    const esSimplificado = regimen === 'simplificado';
+
+    // ── Facturación electrónica + leyenda del tiquete ──
+    const { data: feRow } = await db.from('settings').select('config')
+      .eq('tenant_id', id).eq('type', 'electronic-invoice').maybeSingle();
+    const fe: Record<string, any> = { ...(((feRow as any)?.config) ?? {}) };
+    fe.simplificado = esSimplificado;
+    // Un simplificado no emite comprobantes electrónicos. Al volver a
+    // tradicional NO se enciende sola: encenderla es otra decisión.
+    if (esSimplificado) fe.enabled = false;
+    await db.from('settings').upsert({
+      tenant_id: id, type: 'electronic-invoice', config: fe, updated_at: new Date().toISOString(),
+    }, { onConflict: 'tenant_id,type' });
+
+    // ── Impuesto en las ventas ──
+    const { data: genRow } = await db.from('settings').select('config')
+      .eq('tenant_id', id).eq('type', 'general').maybeSingle();
+    const gen: Record<string, any> = { ...(((genRow as any)?.config) ?? {}) };
+    gen.taxEnabled = !esSimplificado;
+    // Al volver a tradicional, si nunca tuvo porcentaje, queda el 13% de ley.
+    if (!esSimplificado && !(Number(gen.taxPercentage) > 0)) gen.taxPercentage = 13;
+    await db.from('settings').upsert({
+      tenant_id: id, type: 'general', config: gen, updated_at: new Date().toISOString(),
+    }, { onConflict: 'tenant_id,type' });
+
+    return ok(c, {
+      ok: true, regimen,
+      fe_enabled: fe.enabled === true,
+      tax_enabled: gen.taxEnabled === true,
+      tax_percentage: gen.taxPercentage ?? null,
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/**
+ * Régimen de TODOS los negocios, para pintarlo en la lista sin una consulta
+ * por fila. Mismo patrón que `/admin/fe-quotas`.
+ *
+ * Un negocio sin la bandera puesta se informa como `tradicional`, que es lo que
+ * es mientras nadie diga lo contrario; `impuesto_apagado` viaja aparte para
+ * poder ver los casos que no concuerdan —impuesto apagado sin ser
+ * simplificado— sin tener que adivinar cuál de los dos manda.
+ */
+admin.get('/tax-regimes', async (c) => {
+  try {
+    const salida: Record<string, { regimen: 'simplificado' | 'tradicional'; impuesto_apagado: boolean; fe_enabled: boolean }> = {};
+    const { data: fes } = await db.from('settings').select('tenant_id, config').eq('type', 'electronic-invoice');
+    const { data: gens } = await db.from('settings').select('tenant_id, config').eq('type', 'general');
+    const genDe = new Map<string, any>();
+    for (const g of (gens ?? []) as any[]) genDe.set(String(g.tenant_id), g.config ?? {});
+    const ids = new Set<string>([
+      ...((fes ?? []) as any[]).map(f => String(f.tenant_id)),
+      ...genDe.keys(),
+    ]);
+    const feDe = new Map<string, any>();
+    for (const f of (fes ?? []) as any[]) feDe.set(String(f.tenant_id), f.config ?? {});
+    for (const id of ids) {
+      const fe = feDe.get(id) ?? {};
+      const gen = genDe.get(id) ?? {};
+      salida[id] = {
+        regimen: fe.simplificado === true ? 'simplificado' : 'tradicional',
+        impuesto_apagado: gen.taxEnabled === false,
+        fe_enabled: fe.enabled === true,
+      };
+    }
+    return ok(c, salida);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 admin.put('/tenants/:id/fe-config', async (c) => {
   try {
     const { id } = c.req.param();
@@ -2956,6 +3056,53 @@ admin.get('/tenants/:id/products', async (c) => {
 // POST /tenants/:id/products-import — importa productos por Excel para un tenant
 // (desde el panel admin). Resuelve/crea categorías y unidades por nombre y crea
 // los productos con el service-role. body: { rows: [...] }.
+/**
+ * CABYS que YA tiene el negocio para esos nombres de producto.
+ *
+ * Al importar un Excel, muchas filas vienen sin CABYS: el negocio lo tiene
+ * puesto en el producto que ya existe, pero el archivo que le pasó el
+ * proveedor —o el que armó en su compu— no lo trae. Sin esto, cada
+ * importación pisa productos buenos con CABYS vacío y el comprobante
+ * electrónico empieza a fallar con «Estos productos no tienen código CABYS».
+ *
+ * Devuelve `{ nombre normalizado: cabys }` para que la pantalla de importación
+ * los complete ANTES de importar y se pueda ver qué se va a usar. Se resuelve
+ * acá y no en el navegador porque el panel importa hacia OTRO negocio, cuyos
+ * productos el navegador no puede leer.
+ */
+admin.post('/tenants/:id/cabys-por-nombre', async (c) => {
+  try {
+    const { id } = c.req.param();
+    const body = await c.req.json().catch(() => ({}));
+    const nombres: string[] = Array.isArray(body?.names) ? body.names : [];
+    if (nombres.length === 0) return ok(c, {});
+
+    const norm = (v: any) => String(v ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
+    const buscados = new Set(nombres.map(norm).filter(Boolean));
+
+    // Se traen los productos CON cabys del negocio; el emparejamiento se hace
+    // acá por nombre normalizado (acentos y espacios de más no deberían
+    // impedir reconocer el mismo producto).
+    const salida: Record<string, string> = {};
+    const PAGE = 1000;
+    for (let from = 0; ; from += PAGE) {
+      const { data, error } = await db.from('products')
+        .select('name, cabys_code').eq('tenant_id', id)
+        .not('cabys_code', 'is', null)
+        .order('id', { ascending: true }).range(from, from + PAGE - 1);
+      if (error) throw new Error(error.message);
+      const chunk = (data ?? []) as any[];
+      for (const p of chunk) {
+        const k = norm(p.name);
+        const cab = String(p.cabys_code ?? '').replace(/\D/g, '');
+        if (k && cab && buscados.has(k) && !salida[k]) salida[k] = cab;
+      }
+      if (chunk.length < PAGE) break;
+    }
+    return ok(c, salida);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 admin.post('/tenants/:id/products-import', async (c) => {
   try {
     const { id } = c.req.param();

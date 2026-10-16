@@ -31,6 +31,8 @@ export interface DatosCorreoComprobante {
   impuesto?: number | null;
   total: number;
   lineas?: Array<{ nombre: string; cantidad: number; precio: number; importe: number }>;
+  /** Nota que el negocio le puso a la factura («entrega el jueves», «OC 4471»). */
+  nota?: string | null;
   /** Se adjuntó el XML firmado (y respuesta de Hacienda / PDF si vinieron). */
   adjuntos?: { xml: boolean; respuesta: boolean; pdf: boolean };
 }
@@ -75,6 +77,42 @@ export function comprobanteEmailAsunto(d: DatosCorreoComprobante): string {
   return `${tipoDeClave(d.clave)} ${d.numero} · ${d.negocio.nombre}`;
 }
 
+/** Leyenda obligatoria al pie del comprobante electrónico (resolución DGT 4.4). */
+const FE_RESOLUTION_FOOTER =
+  'Autorizada mediante resolución MH-DGT-RES-0027-2024 del 13 de noviembre del 2024 de la DGTD. Version 4.4';
+
+/**
+ * Importe con el formato del tiquete: sin decimales si es redondo.
+ *
+ * El tiquete térmico imprime colones enteros. Mostrar «₡3.800,00» donde el
+ * papel dice «₡3.800» rompe el parecido por nada; pero si el monto trae
+ * céntimos hay que enseñarlos, o el cliente suma las líneas y no le da.
+ */
+const monto = (n: any): string => {
+  const v = Number(n || 0);
+  const dec = Math.abs(v % 1) > 0.004 ? 2 : 0;
+  return `₡${v.toLocaleString('es-CR', { minimumFractionDigits: dec, maximumFractionDigits: dec })}`;
+};
+
+/**
+ * EL CORREO SE VE COMO EL TIQUETE.
+ *
+ * El cliente ya vio el tiquete en el mostrador: papel angosto, letra de máquina
+ * de escribir, líneas de guiones, el total entre dos rayas. Cuando después le
+ * llega un correo con otra cara —tarjetas, grises, tipografía de sitio web—
+ * tiene que volver a leerlo todo para convencerse de que es la misma compra.
+ *
+ * Acá se repite la forma del tiquete: el mismo orden de bloques, la misma
+ * tipografía monoespaciada, los mismos separadores y el mismo total destacado.
+ * Tres diferencias a propósito, porque el correo no es papel:
+ *
+ *   · los separadores son bordes punteados y no filas de guiones: una fila de
+ *     «-» se parte distinto en cada cliente de correo y en el celular queda en
+ *     dos renglones;
+ *   · el estado de Hacienda va arriba, visible, porque es lo primero que el
+ *     cliente quiere saber de un comprobante que le llega por correo;
+ *   · sigue el aviso de los adjuntos, que en el papel no existe.
+ */
 export function comprobanteEmailHtml(d: DatosCorreoComprobante): string {
   const tipo = tipoDeClave(d.clave);
   const consecutivo = consecutivoDeClave(d.clave);
@@ -82,54 +120,70 @@ export function comprobanteEmailHtml(d: DatosCorreoComprobante): string {
   const n = d.negocio;
 
   const estado = d.estado === 'accepted'
-    ? { txt: 'Aceptado por Hacienda', bg: '#ecfdf5', fg: '#047857', borde: '#a7f3d0' }
+    ? { txt: 'ACEPTADO POR HACIENDA', bg: '#ecfdf5', fg: '#047857', borde: '#a7f3d0' }
     : d.estado === 'rejected'
-      ? { txt: 'Rechazado por Hacienda', bg: '#fef2f2', fg: '#b91c1c', borde: '#fecaca' }
-      : { txt: 'En proceso en Hacienda', bg: '#fffbeb', fg: '#b45309', borde: '#fde68a' };
+      ? { txt: 'RECHAZADO POR HACIENDA', bg: '#fef2f2', fg: '#b91c1c', borde: '#fecaca' }
+      : { txt: 'EN PROCESO EN HACIENDA', bg: '#fffbeb', fg: '#b45309', borde: '#fde68a' };
 
   // Logo solo si es una dirección pública: los clientes de correo bloquean las
   // imágenes incrustadas, y un recuadro roto se ve peor que no tener logo.
   const logo = n.logoUrl && /^https:\/\//i.test(n.logoUrl)
-    ? `<img src="${esc(n.logoUrl)}" alt="${esc(n.nombre)}" height="48" style="display:block;height:48px;max-width:180px;border:0;margin:0 0 12px;">`
+    ? `<img src="${esc(n.logoUrl)}" alt="${esc(n.nombre)}" height="56" style="display:inline-block;height:56px;max-width:70%;border:0;margin:0 0 8px;">`
     : '';
 
-  const fila = (etiqueta: string, valor: string | null | undefined, mono = false) => valor
-    ? `<tr>
-         <td style="padding:7px 0;color:#6b7280;font-size:13px;width:38%;vertical-align:top;">${etiqueta}</td>
-         <td style="padding:7px 0;color:#111827;font-size:13px;text-align:right;${mono ? 'font-family:Consolas,Menlo,monospace;' : ''}">${valor}</td>
-       </tr>`
-    : '';
+  /** Línea punteada, el separador del tiquete. */
+  const sep = (margen = '8px') =>
+    `<div style="border-top:1px dashed #9ca3af;margin:${margen} 0;font-size:0;line-height:0;">&nbsp;</div>`;
 
-  const lineas = (d.lineas ?? []).slice(0, 40);
-  const tablaLineas = lineas.length ? `
-    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin:20px 0 4px;">
-      <tr>
-        <td style="padding:0 0 8px;color:#6b7280;font-size:11px;font-weight:bold;text-transform:uppercase;letter-spacing:.04em;">Detalle</td>
-        <td style="padding:0 0 8px;color:#6b7280;font-size:11px;font-weight:bold;text-transform:uppercase;letter-spacing:.04em;text-align:right;">Importe</td>
-      </tr>
-      ${lineas.map(l => `
-      <tr>
-        <td style="padding:9px 0;border-top:1px solid #f3f4f6;font-size:13px;color:#111827;">
-          ${esc(l.nombre)}
-          <div style="color:#9ca3af;font-size:12px;margin-top:2px;">${cant(l.cantidad)} × ${crc(l.precio)}</div>
-        </td>
-        <td style="padding:9px 0;border-top:1px solid #f3f4f6;font-size:13px;color:#111827;text-align:right;white-space:nowrap;vertical-align:top;">${crc(l.importe)}</td>
-      </tr>`).join('')}
-      ${(d.lineas?.length ?? 0) > lineas.length ? `
-      <tr><td colspan="2" style="padding:8px 0;color:#9ca3af;font-size:12px;border-top:1px solid #f3f4f6;">
-        y ${(d.lineas!.length - lineas.length)} línea(s) más — el detalle completo va en el PDF adjunto.
-      </td></tr>` : ''}
-    </table>` : '';
+  /** Rótulo de sección, pegado a la izquierda como en el papel. */
+  const rotulo = (t: string) =>
+    `<div style="font-weight:bold;font-size:13px;color:#111827;margin:0 0 2px;">${t}</div>`;
+
+  /**
+   * Las líneas se muestran CON IMPUESTO, igual que en el tiquete.
+   *
+   * En la base los renglones están sin IVA (así lo exige la factura), pero el
+   * papel enseña el precio final: es lo que el cliente pagó y lo que le permite
+   * sumar las líneas y llegar al total. Se reparte el IVA del documento con la
+   * misma proporción que usa el tiquete, para que los dos digan lo mismo.
+   */
+  const base = Number(d.subtotal ?? 0);
+  const iva = Number(d.impuesto ?? 0);
+  const tasa = base > 0 && iva > 0 ? iva / base : 0;
+  const conIva = (v: number) => (tasa > 0 ? Math.round(v * (1 + tasa)) : v);
+
+  const lineas = (d.lineas ?? []).slice(0, 60);
+  const filasArticulos = lineas.map(l => `
+    <tr>
+      <td style="padding:3px 0 0;font-size:13px;color:#111827;font-weight:bold;word-break:break-word;">${esc(l.nombre)}</td>
+      <td style="padding:3px 0 0;font-size:13px;color:#111827;font-weight:bold;text-align:right;white-space:nowrap;">${monto(conIva(l.importe))}</td>
+    </tr>
+    <tr>
+      <td colspan="2" style="padding:0 0 3px;font-size:12px;color:#374151;">&nbsp;&nbsp;${cant(l.cantidad)} × ${monto(conIva(l.precio))}</td>
+    </tr>`).join('');
+
+  const masLineas = (d.lineas?.length ?? 0) > lineas.length
+    ? `<tr><td colspan="2" style="padding:4px 0;font-size:12px;color:#6b7280;">y ${(d.lineas!.length - lineas.length)} línea(s) más — el detalle completo va en los adjuntos.</td></tr>`
+    : '';
 
   const totales = `
-    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin-top:${lineas.length ? '4px' : '16px'};">
-      ${d.subtotal != null ? `<tr><td style="padding:4px 0;color:#6b7280;font-size:13px;">Subtotal</td><td style="padding:4px 0;color:#111827;font-size:13px;text-align:right;">${crc(d.subtotal)}</td></tr>` : ''}
-      ${Number(d.impuesto) > 0 ? `<tr><td style="padding:4px 0;color:#6b7280;font-size:13px;">IVA</td><td style="padding:4px 0;color:#111827;font-size:13px;text-align:right;">${crc(d.impuesto)}</td></tr>` : ''}
+    ${iva > 0 ? `
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
       <tr>
-        <td style="padding:12px 0 0;border-top:2px solid #111827;color:#111827;font-size:15px;font-weight:bold;">Total</td>
-        <td style="padding:12px 0 0;border-top:2px solid #111827;color:#111827;font-size:20px;font-weight:bold;text-align:right;white-space:nowrap;">${crc(d.total)}</td>
+        <td style="padding:2px 0;font-size:13px;color:#111827;">IVA incluido:</td>
+        <td style="padding:2px 0;font-size:13px;color:#111827;text-align:right;white-space:nowrap;">${monto(iva)}</td>
       </tr>
-    </table>`;
+    </table>
+    ${sep()}` : ''}
+    <div style="border-top:2px solid #111827;border-bottom:2px solid #111827;padding:7px 0;margin:8px 0;text-align:center;font-size:19px;font-weight:bold;color:#111827;letter-spacing:1px;">
+      *** TOTAL: ${monto(d.total)} ***
+    </div>`;
+
+  const nota = String(d.nota ?? '').trim();
+  const bloqueNota = nota ? `
+    ${sep()}
+    ${rotulo('NOTA')}
+    <div style="font-size:13px;color:#111827;white-space:pre-wrap;word-break:break-word;">${esc(nota)}</div>` : '';
 
   const a = d.adjuntos;
   const adjuntos = a ? [
@@ -138,62 +192,80 @@ export function comprobanteEmailHtml(d: DatosCorreoComprobante): string {
     a.pdf ? 'el PDF' : null,
   ].filter(Boolean) : [];
   const notaAdjuntos = adjuntos.length ? `
-    <div style="margin-top:22px;padding:12px 14px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:10px;color:#4b5563;font-size:12px;line-height:1.5;">
+    <div style="margin-top:14px;padding:10px 12px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;color:#4b5563;font-size:12px;line-height:1.5;font-family:Arial,Helvetica,sans-serif;">
       📎 Adjuntamos ${adjuntos.length > 1 ? adjuntos.slice(0, -1).join(', ') + ' y ' + adjuntos[adjuntos.length - 1] : adjuntos[0]}.
       ${a?.xml ? 'El XML es el comprobante con validez ante Hacienda: guardalo para tu contabilidad.' : ''}
     </div>` : '';
 
-  const contacto = [n.telefono ? `Tel. ${esc(n.telefono)}` : null, n.correo ? esc(n.correo) : null]
-    .filter(Boolean).join(' · ');
+  /** Datos del negocio, centrados bajo el nombre, como en el papel. */
+  const lineaTienda = (t: string | null | undefined) =>
+    t ? `<div style="font-size:12px;color:#111827;word-break:break-word;">${esc(t)}</div>` : '';
 
   return `<!DOCTYPE html>
 <html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="light"><title>${esc(tipo)} ${esc(d.numero)}</title></head>
-<body style="margin:0;padding:0;background:#f3f4f6;">
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;">
-<tr><td align="center" style="padding:28px 12px;">
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:580px;background:#ffffff;border-radius:16px;border:1px solid #e5e7eb;font-family:Arial,Helvetica,sans-serif;">
+<body style="margin:0;padding:0;background:#e5e7eb;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#e5e7eb;">
+<tr><td align="center" style="padding:24px 10px;">
 
-    <!-- Emisor -->
-    <tr><td style="padding:28px 28px 20px;border-bottom:1px solid #f3f4f6;">
-      ${logo}
-      <div style="color:#111827;font-size:19px;font-weight:bold;">${esc(n.nombre)}</div>
-      ${n.razonSocial && n.razonSocial !== n.nombre ? `<div style="color:#6b7280;font-size:13px;margin-top:2px;">${esc(n.razonSocial)}</div>` : ''}
-      ${n.cedula ? `<div style="color:#6b7280;font-size:13px;margin-top:2px;">Cédula ${esc(n.cedula)}</div>` : ''}
-    </td></tr>
+  <!-- El «papel»: angosto y monoespaciado, como el tiquete -->
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:400px;background:#ffffff;border:1px solid #d1d5db;font-family:'Courier New',Courier,monospace;">
+    <tr><td style="padding:18px 18px 20px;">
 
-    <!-- Documento -->
-    <tr><td style="padding:24px 28px 8px;">
-      <div style="color:#6b7280;font-size:12px;font-weight:bold;text-transform:uppercase;letter-spacing:.05em;">${esc(tipo)}</div>
-      <div style="color:#111827;font-size:26px;font-weight:bold;margin:4px 0 12px;">N° ${esc(d.numero)}</div>
-      <span style="display:inline-block;padding:5px 12px;border-radius:999px;background:${estado.bg};color:${estado.fg};border:1px solid ${estado.borde};font-size:12px;font-weight:bold;">${estado.txt}</span>
+      <!-- Encabezado -->
+      <div style="text-align:center;">
+        ${logo}
+        <div style="font-size:16px;font-weight:bold;color:#111827;letter-spacing:1px;text-transform:uppercase;">${esc(tipo)}</div>
+        <div style="font-size:13px;font-weight:bold;color:#111827;margin-top:2px;">Factura #${esc(d.numero)}</div>
+        ${consecutivo ? `<div style="font-size:11px;color:#374151;margin-top:2px;">Consecutivo: ${esc(consecutivo)}</div>` : ''}
+        <!-- La clave se parte ENTRE bloques de diez, no en cualquier dígito: con
+             break-all quedaba un dígito suelto en la última línea y así no se
+             puede ni dictar ni copiar. -->
+        <div style="font-size:10px;color:#374151;overflow-wrap:break-word;line-height:1.4;margin-top:3px;">Clave: ${claveEnBloques(d.clave)}</div>
+        ${fecha ? `<div style="font-size:12px;color:#111827;margin-top:2px;">${esc(fecha)}</div>` : ''}
+        <div style="margin-top:8px;">
+          <span style="display:inline-block;padding:4px 10px;background:${estado.bg};color:${estado.fg};border:1px solid ${estado.borde};font-size:11px;font-weight:bold;letter-spacing:.04em;">${estado.txt}</span>
+        </div>
+      </div>
 
-      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin-top:18px;">
-        ${fila('Cliente', d.cliente ? esc(d.cliente) : null)}
-        ${fila('Fecha', fecha)}
-        ${fila('Consecutivo Hacienda', consecutivo, true)}
+      <!-- Negocio -->
+      <div style="text-align:center;margin-top:10px;">
+        <div style="font-size:14px;font-weight:bold;color:#111827;">${esc(n.nombre)}</div>
+        ${n.razonSocial && n.razonSocial !== n.nombre ? lineaTienda(n.razonSocial) : ''}
+        ${lineaTienda(n.cedula ? `Céd. ${n.cedula}` : null)}
+        ${lineaTienda(n.direccion)}
+        ${lineaTienda(n.telefono ? `Tel. ${n.telefono}` : null)}
+        ${lineaTienda(n.correo)}
+      </div>
+
+      ${sep('10px')}
+
+      ${d.cliente ? `${rotulo('CLIENTE')}<div style="font-size:13px;color:#111827;word-break:break-word;">${esc(d.cliente)}</div>${sep()}` : ''}
+
+      ${filasArticulos ? `
+      ${rotulo('ARTÍCULOS')}
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+        ${filasArticulos}
+        ${masLineas}
       </table>
+      ${sep()}` : ''}
 
-      ${tablaLineas}
       ${totales}
+      ${bloqueNota}
 
-      <div style="margin-top:22px;color:#6b7280;font-size:11px;font-weight:bold;text-transform:uppercase;letter-spacing:.04em;">Clave numérica</div>
-      <div style="margin-top:4px;color:#374151;font-size:12px;font-family:Consolas,Menlo,monospace;word-break:break-all;">${claveEnBloques(d.clave)}</div>
+      ${sep()}
+      <div style="text-align:center;font-size:11px;color:#374151;line-height:1.5;">${FE_RESOLUTION_FOOTER}</div>
 
       ${notaAdjuntos}
-    </td></tr>
 
-    <!-- Contacto del negocio -->
-    <tr><td style="padding:20px 28px 26px;">
-      <div style="border-top:1px solid #f3f4f6;padding-top:16px;color:#6b7280;font-size:12px;line-height:1.6;">
+      <div style="margin-top:14px;border-top:1px dashed #9ca3af;padding-top:10px;text-align:center;font-size:12px;color:#374151;font-family:Arial,Helvetica,sans-serif;line-height:1.5;">
         ¿Dudas sobre este comprobante? Respondé este correo o comunicate con ${esc(n.nombre)}.
-        ${contacto ? `<br>${contacto}` : ''}
-        ${n.direccion ? `<br>${esc(n.direccion)}` : ''}
       </div>
+
     </td></tr>
   </table>
 
-  <div style="max-width:580px;margin:14px auto 0;color:#9ca3af;font-size:11px;font-family:Arial,Helvetica,sans-serif;text-align:center;">
+  <div style="max-width:400px;margin:12px auto 0;color:#6b7280;font-size:11px;font-family:Arial,Helvetica,sans-serif;text-align:center;">
     Comprobante emitido con ColónClick
   </div>
 </td></tr>

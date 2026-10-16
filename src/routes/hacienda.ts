@@ -11,6 +11,7 @@ import { comprobanteEmailHtml, comprobanteEmailAsunto, type DatosCorreoComproban
 import { parseHaciendaXml } from '../services/haciendaXml.js';
 import { notifyFeError, notifyQuotaLow } from '../services/whatsappNotify.js';
 import { configEfectiva, razonSocialDe } from '../services/feCompartida.js';
+import { esTenantDemo, marcarComprobanteDemo, AMBIENTE_DEMO, CABYS_DEMO } from '../services/feDemo.js';
 
 // Próximo consecutivo de orden de compra (mismo formato que el POS: PO-XXXX).
 async function nextPurchaseNumber(tenantId: string): Promise<string> {
@@ -288,7 +289,14 @@ async function maybeNotifyQuotaLow(tenantId: string): Promise<void> {
 
 // GET /quota — cuota de comprobantes del plan (para Mi Plan y avisos).
 hacienda.get('/quota', async (c) => {
-  try { return ok(c, await computeFeQuota(c.get('tenantId'))); }
+  try {
+    const tenantId = c.get('tenantId');
+    // `demo` viaja acá porque es lo único que el POS electrónico ya consulta al
+    // abrir: con eso muestra el aviso de que los comprobantes son ficticios sin
+    // una llamada más (ver `services/feDemo.ts`).
+    const [cuota, demo] = await Promise.all([computeFeQuota(tenantId), esTenantDemo(tenantId)]);
+    return ok(c, { ...cuota, demo });
+  }
   catch (err: any) { return fail(c, err.message, 500); }
 });
 
@@ -777,11 +785,16 @@ export async function emitInvoiceCore(
     if (!invoice_id) return fail(c, 'Falta invoice_id', 422);
 
     const cfg = await loadFEConfig(tenantId);
-    if (!cfg.enabled) return fail(c, 'La facturación electrónica no está activada', 409);
+    // Demo: comprobantes ficticios, sin cédula ni empresa en el proveedor.
+    // Ver `services/feDemo.ts`; es el mismo criterio del POS electrónico.
+    const demo = await esTenantDemo(tenantId);
     const provider = 'alanube';
-    // Se acepta el id del AMBIENTE activo (o el legacy). Con empresas asociadas el
-    // id es obligatorio: es lo que le dice a Alanube con cuál emisor firmar.
-    if (provider === 'alanube' && !feCompanyId(cfg)) return fail(c, 'La empresa no está dada de alta en Alanube. Usá «Crear empresa en Alanube».', 422);
+    if (!demo) {
+      if (!cfg.enabled) return fail(c, 'La facturación electrónica no está activada', 409);
+      // Se acepta el id del AMBIENTE activo (o el legacy). Con empresas asociadas el
+      // id es obligatorio: es lo que le dice a Alanube con cuál emisor firmar.
+      if (provider === 'alanube' && !feCompanyId(cfg)) return fail(c, 'La empresa no está dada de alta en Alanube. Usá «Crear empresa en Alanube».', 422);
+    }
     const env = cfg.environment === 'sandbox' ? 'sandbox' : 'production'; // default producción
 
     // Factura + ítems.
@@ -919,10 +932,15 @@ export async function emitInvoiceCore(
     }
 
     // Hacienda exige CodigoCABYS en cada línea. Avisar con nombre del producto.
+    // En una DEMO se rellena en vez de frenar: ver `CABYS_DEMO`.
     const sinCabys = lines.filter((l: FELine) => !l.cabys_code);
     if (sinCabys.length > 0) {
-      const nombres = [...new Set(sinCabys.map((l: FELine) => l.product_name))].join(', ');
-      return await failFE(`Estos productos no tienen código CABYS: ${nombres}. Asignáselo en el producto (o configurá un CABYS por defecto en Facturación Electrónica).`);
+      if (demo) {
+        for (const l of sinCabys) (l as any).cabys_code = CABYS_DEMO;
+      } else {
+        const nombres = [...new Set(sinCabys.map((l: FELine) => l.product_name))].join(', ');
+        return await failFE(`Estos productos no tienen código CABYS: ${nombres}. Asignáselo en el producto (o configurá un CABYS por defecto en Facturación Electrónica).`);
+      }
     }
 
     // Receptor (cliente), opcional para tiquete.
@@ -999,6 +1017,21 @@ export async function emitInvoiceCore(
       const hasNote = String((inv as any).notes ?? '').trim().length > 0;
       const savedNote = Number(cfg.alanube_note_shape ?? 0) || 0;
       const consecReservado = await takeConsecutivo(String(cfg.sucursal ?? '1'), terminalOf(c, cfg));
+      if (demo) {
+        // Sin XML ni correo: no hay comprobante que guardar ni que mandar.
+        const { clave, consecutivo } = await marcarComprobanteDemo(tenantId, invoice_id, {
+          tipoDoc, consecutivo: consecReservado,
+          cedula: cfg.emisor_identification, sucursal: cfg.sucursal, terminal: terminalOf(c, cfg),
+          documento: buildAlanubeDocument(emisor, inv as any, lines, receptor, {
+            tipoDoc, headquarters: cfg.sucursal, terminal: terminalOf(c, cfg),
+            numberOfDocument: consecReservado,
+          }),
+        });
+        return ok(c, {
+          ok: true, demo: true, provider: 'demo', clave, consecutivo,
+          aviso: 'Comprobante de demostración: no se envió a Hacienda',
+        });
+      }
       const buildDoc = (shapeIdx: number, noteIdx: number = savedNote) => buildAlanubeDocument(emisor, inv as any, lines, receptor, {
         tipoDoc,
         headquarters: cfg.sucursal, terminal: terminalOf(c, cfg),
@@ -2484,16 +2517,16 @@ async function alanubeAttachments(cfg: any, docId: string | null | undefined, ki
  */
 async function datosParaCorreo(tenantId: string, invoiceId: string): Promise<{
   negocio: DatosCorreoComprobante['negocio'];
-  fecha: string | null; subtotal: number | null; impuesto: number | null;
+  fecha: string | null; nota: string | null; subtotal: number | null; impuesto: number | null;
   lineas: DatosCorreoComprobante['lineas'];
 }> {
-  const vacio = { negocio: { nombre: 'Comprobante electrónico' }, fecha: null, subtotal: null, impuesto: null, lineas: [] };
+  const vacio = { negocio: { nombre: 'Comprobante electrónico' }, fecha: null, nota: null, subtotal: null, impuesto: null, lineas: [] };
   try {
     const [cfg, recibo, general, venta] = await Promise.all([
       loadFEConfig(tenantId),
       db.from('settings').select('config').eq('tenant_id', tenantId).eq('type', 'receipt').maybeSingle(),
       db.from('settings').select('config').eq('tenant_id', tenantId).eq('type', 'general').maybeSingle(),
-      db.from('invoices').select('issued_at, created_at, subtotal, tax_amount, invoice_items(*)')
+      db.from('invoices').select('issued_at, created_at, subtotal, tax_amount, notes, invoice_items(*)')
         .eq('id', invoiceId).eq('tenant_id', tenantId).maybeSingle(),
     ]);
     const rc = ((recibo as any)?.data?.config ?? {}) as any;
@@ -2513,6 +2546,16 @@ async function datosParaCorreo(tenantId: string, invoiceId: string): Promise<{
         logoUrl: String(rc.logoUrl ?? '').trim() || null,
       },
       fecha: v.issued_at ?? v.created_at ?? null,
+      /**
+       * La NOTA de la factura, para que el cliente la vea.
+       *
+       * El PDF lo genera Alanube y su plantilla no tiene dónde ponerla, así que
+       * la nota («entrega el jueves», «orden de compra 4471») no le llegaba al
+       * cliente por ningún lado: ni en el PDF, ni en el correo, ni en el XML.
+       * En el XML ya va (bloque `Otros`); el correo lo escribimos nosotros, y
+       * es el único de los tres que seguro se lee.
+       */
+      nota: String(v.notes ?? '').trim() || null,
       subtotal: v.subtotal != null ? Number(v.subtotal) : null,
       impuesto: v.tax_amount != null ? Number(v.tax_amount) : null,
       lineas: ((v.invoice_items ?? []) as any[]).map(it => ({
@@ -2542,9 +2585,8 @@ async function sendComprobanteEmail(to: string, i: {
     const saved = await toB64(i.fe_xml);
     if (saved) atts.push({ filename: `${i.fe_clave}.xml`, content: saved });
   }
-  const nombres = atts.map(a => a.filename.toLowerCase());
   const extra = ctx ? await datosParaCorreo(ctx.tenantId, ctx.invoiceId)
-    : { negocio: { nombre: 'Comprobante electrónico' }, fecha: null, subtotal: null, impuesto: null, lineas: [] };
+    : { negocio: { nombre: 'Comprobante electrónico' }, fecha: null, nota: null, subtotal: null, impuesto: null, lineas: [] };
 
   const datos: DatosCorreoComprobante = {
     negocio: extra.negocio,
@@ -2553,15 +2595,49 @@ async function sendComprobanteEmail(to: string, i: {
     estado: i.fe_status ?? null,
     cliente: i.customer_name ?? null,
     fecha: extra.fecha,
+    nota: extra.nota,
     subtotal: extra.subtotal,
     impuesto: extra.impuesto,
     total: Number(i.total ?? 0),
     lineas: extra.lineas,
-    adjuntos: {
-      xml: nombres.some(f => f.endsWith('.xml') && !f.includes('respuesta')),
-      respuesta: nombres.some(f => f.includes('respuesta') && f.endsWith('.xml')),
-      pdf: nombres.some(f => f.endsWith('.pdf')),
-    },
+  };
+
+  /**
+   * EL PDF LO HACEMOS NOSOTROS.
+   *
+   * El que adjuntábamos lo generaba Alanube, y su plantilla no tiene dónde
+   * mostrar la NOTA de la factura: lo que el negocio le escribe al cliente
+   * —«entrega el jueves», una orden de compra— no llegaba a ninguna parte, y no
+   * se podía arreglar de nuestro lado porque esa plantilla es de ellos.
+   *
+   * El nuestro tiene la forma del tiquete, la misma del correo, y lleva todo lo
+   * que la representación impresa necesita. El comprobante con validez legal
+   * sigue siendo el XML, que va adjunto en el mismo correo.
+   *
+   * Si fallara, se deja el de Alanube: antes un PDF de ellos que ninguno.
+   */
+  try {
+    const { comprobantePdfBase64 } = await import('../services/comprobantePdf.js');
+    const propio = await comprobantePdfBase64(datos);
+    if (propio) {
+      // Fuera el PDF de Alanube: dos PDF en el mismo correo solo confunden.
+      // (`i` acá arriba es la factura: el índice se llama distinto a propósito.)
+      for (let k = atts.length - 1; k >= 0; k--) {
+        if (atts[k].filename.toLowerCase().endsWith('.pdf')) atts.splice(k, 1);
+      }
+      atts.push({ filename: `${i.fe_clave}.pdf`, content: propio });
+    }
+  } catch (e: any) {
+    console.warn('[FE email] no se pudo generar nuestro PDF, va el de Alanube:', e?.message);
+  }
+
+  // Después de resolver el PDF: el aviso de adjuntos tiene que decir lo que de
+  // verdad se está mandando.
+  const nombres = atts.map(a => a.filename.toLowerCase());
+  datos.adjuntos = {
+    xml: nombres.some(f => f.endsWith('.xml') && !f.includes('respuesta')),
+    respuesta: nombres.some(f => f.includes('respuesta') && f.endsWith('.xml')),
+    pdf: nombres.some(f => f.endsWith('.pdf')),
   };
 
   await sendEmail({
@@ -2747,6 +2823,9 @@ export async function reintentarCorreosPendientes(opts: {
       .select('id, tenant_id')
       .eq('fe_status', 'accepted')
       .not('fe_clave', 'is', null)
+      // Los comprobantes de DEMO quedan fuera: no existe XML que adjuntar y el
+      // reintento los tomaría una y otra vez para siempre.
+      .or(`fe_environment.is.null,fe_environment.neq.${AMBIENTE_DEMO}`)
       // Nulo en las filas anteriores a la columna: también cuenta como no enviado.
       .or('fe_emailed.is.null,fe_emailed.eq.false')
       .gte('issued_at', desde);
@@ -3530,11 +3609,23 @@ hacienda.post('/emit-direct', async (c) => {
     const FAKE_CONSECUTIVO = '9999999999';
 
     const cfg = await loadFEConfig(tenantId);
-    if (!cfg.enabled) return fail(c, 'La facturación electrónica no está activada', 409);
+    /**
+     * DEMO: comprobantes ficticios, ilimitados.
+     *
+     * Una demo no tiene cédula, ni certificado, ni empresa en el proveedor —no
+     * puede tenerlos—, así que las dos validaciones de abajo la frenaban en el
+     * primer clic y el POS electrónico, que es la función que hay que mostrar
+     * para vender, no arrancaba nunca. Acá la venta se crea igual y el
+     * comprobante se SIMULA (ver `services/feDemo.ts`).
+     */
+    const demo = await esTenantDemo(tenantId);
     const provider = 'alanube';
     const alanubeCompanyId = (String(cfg.environment ?? 'production') === 'sandbox'
       ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id;
-    if (provider === 'alanube' && !alanubeCompanyId) return fail(c, 'La empresa no está dada de alta en Alanube.', 422);
+    if (!demo) {
+      if (!cfg.enabled) return fail(c, 'La facturación electrónica no está activada', 409);
+      if (provider === 'alanube' && !alanubeCompanyId) return fail(c, 'La empresa no está dada de alta en Alanube.', 422);
+    }
     const env = cfg.environment === 'sandbox' ? 'sandbox' : 'production'; // default producción
     const defaultCabys = String(cfg.default_cabys ?? '').replace(/\D/g, '') || null;
 
@@ -3585,9 +3676,11 @@ hacienda.post('/emit-direct', async (c) => {
     if (lines.length === 0) return fail(c, 'No hay líneas válidas', 422);
 
     const sinCabys = lines.filter(l => !l.cabys_code);
+    // En una DEMO se rellena en vez de frenar: ver `CABYS_DEMO`.
+    if (demo) for (const l of sinCabys) (l as any).cabys_code = CABYS_DEMO;
     if (sinCabys.length > 0) {
       const nombres = [...new Set(sinCabys.map(l => l.product_name))].join(', ');
-      return fail(c, `Estos productos no tienen código CABYS: ${nombres}. Asignáselo en el producto.`, 422);
+      if (!demo) return fail(c, `Estos productos no tienen código CABYS: ${nombres}. Asignáselo en el producto.`, 422);
     }
 
     const subtotal = Math.round(lines.reduce((s, l) => s + l.subtotal, 0) * 100) / 100;
@@ -3704,13 +3797,16 @@ hacienda.post('/emit-direct', async (c) => {
     // ── Proveedor ALANUBE ─────────────────────────────────────────────────────
     if (provider === 'alanube') {
       const kind = tipoDoc === '01' ? 'invoice' : 'ticket';
+      // El consecutivo se resuelve ANTES de armar el documento porque también lo
+      // necesita la clave del comprobante simulado de la demo.
+      const consecReservado = preview ? FAKE_CONSECUTIVO : await reserveConsecutivo(
+        tenantId, tipoDoc, consecFloor, String(cfg.sucursal ?? '1'), terminalOf(c, cfg));
       const doc = buildAlanubeDocument(emisor, invForDoc as any, lines, receptor as any, {
         tipoDoc,
         headquarters: cfg.sucursal, terminal: terminalOf(c, cfg),
         // En la prueba se usa un consecutivo imaginario: reservar uno de verdad
         // lo quemaría y dejaría un hueco en la numeración por haber ensayado.
-        numberOfDocument: preview ? FAKE_CONSECUTIVO : await reserveConsecutivo(
-          tenantId, tipoDoc, consecFloor, String(cfg.sucursal ?? '1'), terminalOf(c, cfg)),
+        numberOfDocument: consecReservado,
         // Empresa emisora del tenant (si no, Alanube usa la 'main' de la cuenta).
         senderId: (String(cfg.environment ?? 'production') === 'sandbox'
           ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id,
@@ -3729,6 +3825,26 @@ hacienda.post('/emit-direct', async (c) => {
           lineas: lines.length,
           faltantes: previewChecks(cfg, emisor, receptor, lines, tipoDoc),
           documento: doc,
+        });
+      }
+
+      /**
+       * Demo: se marca como emitido y aceptado SIN tocar Hacienda.
+       *
+       * No se guarda XML ni se le manda correo a nadie: no existe comprobante
+       * que mandar, y mandarle a un cliente de mentira un documento que parece
+       * fiscal sería lo peor que podríamos hacer en una demostración.
+       */
+      if (demo) {
+        const { clave, consecutivo } = await marcarComprobanteDemo(tenantId, inv.id, {
+          tipoDoc, consecutivo: consecReservado,
+          cedula: cfg.emisor_identification, sucursal: cfg.sucursal, terminal: terminalOf(c, cfg),
+          documento: doc,
+        });
+        return ok(c, {
+          ok: true, demo: true, provider: 'demo', invoice_id: inv.id,
+          invoice_number: inv.invoice_number, clave, consecutivo, tipo: tipoDoc,
+          aviso: 'Comprobante de demostración: no se envió a Hacienda',
         });
       }
 

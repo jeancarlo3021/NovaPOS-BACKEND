@@ -35,43 +35,85 @@ function registrar(caso: string, tenantId: string, r: WaResult): WaResult {
 }
 
 /** Teléfono + nombre del negocio (para dirigir los avisos al dueño). */
+/**
+ * DÓNDE SE BUSCA EL TELÉFONO DEL NEGOCIO, y por qué en ese orden.
+ *
+ * El número puede estar en cinco lugares según por dónde lo haya cargado quien
+ * configuró el negocio. Se buscan en este orden, y el orden importa: el
+ * primero que aparezca es al que se le escribe.
+ *
+ *   1. `general.notify_phone` — el campo DEDICADO a avisos; es donde lo
+ *      guarda el Panel Admin al crear el negocio. Es el que manda.
+ *   2. `general.emisor_phone` — variante vieja del mismo campo.
+ *   3. `electronic-invoice.notify_phone` / `.emisor_phone` — los datos de
+ *      Hacienda (incluye los heredados del principal, si es una actividad).
+ *   4. `general.phone` — **el teléfono del negocio**, el que se escribe en
+ *      Configuración → General. ESTE FALTABA.
+ *   5. `users.phone` del dueño, como último recurso.
+ *
+ * ── El error que esto corrige ──────────────────────────────────────────────
+ * Faltaba el punto 4, que es justamente donde un negocio pone su número
+ * cuando se lo piden como «Teléfono del negocio». Quien lo cargaba ahí no
+ * recibía ningún aviso de cobro y no había forma de saber por qué: el envío se
+ * salta en silencio cuando no encuentra teléfono.
+ *
+ * Los puntos 1 a 3 quedan EXACTAMENTE como estaban, a propósito: así ningún
+ * negocio al que ya le llegaban los avisos cambia de número por este arreglo.
+ */
 export async function businessContact(tenantId: string): Promise<BizContact> {
   let phone = '';
   let name = '';
+  let fuente = '';
+  /** Guarda el primer teléfono válido que aparezca, y de dónde salió. */
+  const tomar = (valor: any, de: string) => {
+    if (phone) return;
+    const n = normalizePhone(valor);
+    if (n) { phone = n; fuente = de; }
+  };
+
+  // 1 y 2 — configuración general (donde el panel guarda el número de avisos).
+  let general: any = {};
   try {
     const { data: s } = await db.from('settings').select('config')
       .eq('tenant_id', tenantId).eq('type', 'general').maybeSingle();
-    const cfg: any = (s as any)?.config ?? {};
-    // Preferimos el número DEDICADO a avisos (notify_phone) si está guardado;
-    // si no, el teléfono del emisor.
-    phone = normalizePhone(cfg.notify_phone || cfg.emisor_phone);
-    name = String(cfg.emisor_commercial_name || cfg.emisor_name || '').trim();
+    general = (s as any)?.config ?? {};
+    tomar(general.notify_phone, 'general.notify_phone');
+    tomar(general.emisor_phone, 'general.emisor_phone');
+    name = String(general.emisor_commercial_name || general.emisor_name || '').trim();
   } catch { /* ignore */ }
 
-  // Los datos del EMISOR viven en la config de facturación electrónica, no en la
-  // general. Sin este respaldo, los avisos quedaban sin teléfono (y no se enviaban)
-  // en todos los negocios que solo llenaron «Datos de FE».
+  // 3 — datos de facturación electrónica (con lo heredado del principal).
   if (!phone || !name) {
     try {
       const { data: fe } = await db.from('settings').select('config')
         .eq('tenant_id', tenantId).eq('type', 'electronic-invoice').maybeSingle();
       const f: any = await configEfectiva(tenantId, (fe as any)?.config ?? {});
-      if (!phone) phone = normalizePhone(f.notify_phone || f.emisor_phone);
-      if (!name)  name  = String(f.emisor_commercial_name || f.emisor_name || '').trim();
+      tomar(f.notify_phone, 'fe.notify_phone');
+      tomar(f.emisor_phone, 'fe.emisor_phone');
+      if (!name) name = String(f.emisor_commercial_name || f.emisor_name || '').trim();
     } catch { /* ignore */ }
   }
+
+  // 4 — el teléfono del negocio de Configuración → General.
+  tomar(general.phone, 'general.phone');
+  tomar(general.whatsapp ?? general.whatsapp_phone, 'general.whatsapp');
+  if (!name) name = String(general.businessName ?? '').trim();
 
   const { data: t } = await db.from('tenants').select('name, owner_id').eq('id', tenantId).maybeSingle();
   if (!name) name = String((t as any)?.name ?? 'su negocio').trim();
 
-  // Fallback: teléfono del usuario dueño.
+  // 5 — último recurso: el teléfono del usuario dueño.
   if (!phone) {
     const ownerId = (t as any)?.owner_id;
     if (ownerId) {
       const { data: u } = await db.from('users').select('phone').eq('id', ownerId).maybeSingle();
-      phone = normalizePhone((u as any)?.phone);
+      tomar((u as any)?.phone, 'users.phone');
     }
   }
+
+  // Queda en el registro de dónde salió: cuando alguien reclama que no le llegó
+  // el aviso, lo primero que hay que saber es a qué número se le escribió.
+  if (phone) console.log(`[wa] negocio ${tenantId}: teléfono ${phone} (${fuente})`);
   return { phone, name };
 }
 
