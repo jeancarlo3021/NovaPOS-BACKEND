@@ -1,5 +1,6 @@
 import { db } from '../db/client.js';
 import { medirInfraestructura } from './infraUsage.js';
+import { costoFE, documentosFE } from './costoFE.js';
 import { leerGlobal } from './globalSettings.js';
 
 /**
@@ -151,8 +152,22 @@ export async function economiaDeLosPlanes() {
   const LIBRE = { base: 500 * 1048576, archivos: 1073741824, mau: 50_000 };
   const dentroDelGratis = baseB <= LIBRE.base && archB <= LIBRE.archivos && mau <= LIBRE.mau;
 
-  const costoUsdHoy = dentroDelGratis ? 0 : 25;          // Supabase Pro
-  const costoUsdSiPaga = 25 + 20;                         // Supabase Pro + Vercel Pro
+  /**
+   * EL COSTO DE VERDAD incluye el proveedor de facturación electrónica.
+   *
+   * Esta pantalla decía «la infraestructura cuesta US$0» porque Supabase y
+   * Vercel caben en el plan gratuito, y eso hacía ver todos los planes con
+   * margen completo. Faltaba el costo real del negocio: el proveedor de FE
+   * se paga todos los meses y, pasada la bolsa, cobra por documento.
+   */
+  const cFE = await costoFE();
+  const docsFE = await documentosFE(30);
+  const extrasFE = Math.max(0, docsFE.total - cFE.incluidos);
+  const costoExtraFECrc = Math.round(extrasFE * cFE.extra_crc);
+
+  const costoServidoresUsd = dentroDelGratis ? 0 : 25;    // Supabase Pro
+  const costoUsdHoy = costoServidoresUsd + cFE.mensual_usd;
+  const costoUsdSiPaga = 25 + 20 + cFE.mensual_usd;       // + Vercel Pro
   /**
    * Dólares a colones. Cero es cero en las dos monedas: sin esta salida
    * temprana, un costo de US$0 se mostraba como «—» cuando no hay tipo de
@@ -267,9 +282,20 @@ export async function economiaDeLosPlanes() {
        * y hoy emite diez cargaba como si siguiera emitiendo miles. Lo que
        * mueve la factura de este mes es lo que se emitió este mes.
        */
-      const costoPorPeso = aColones(costoMensualUsd * (f.facturas_mes / facturas30Totales));
+      const parte = f.facturas_mes / facturas30Totales;
+      const costoPorPeso = aColones(costoMensualUsd * parte);
+      /**
+       * El costo también en DÓLARES, siempre.
+       *
+       * Sin tipo de cambio guardado, la columna en colones salía «—» y daba
+       * a entender que no se sabe cuánto cuesta. Sí se sabe: la factura del
+       * proveedor viene en dólares. Lo que falta es la conversión, no el
+       * dato, y la pantalla puede mostrar el que hay.
+       */
+      const costoPorPesoUsd = Math.round(costoMensualUsd * parte * 100) / 100;
       return {
         ...f,
+        costo_por_peso_usd: costoPorPesoUsd,
         ingreso_declarado: hayDeclarado ? declarado : null,
         ingreso_mensual: ingreso,
         /** Repartiendo la factura por partes iguales entre negocios. */
@@ -307,6 +333,19 @@ export async function economiaDeLosPlanes() {
       costo_crc_hoy: aColones(costoUsdHoy),
       costo_usd_si_pagaras: costoUsdSiPaga,
       costo_crc_si_pagaras: aColones(costoUsdSiPaga),
+      /** De dónde sale cada dólar: sin esto, «US$56» no se puede verificar. */
+      desglose: {
+        servidores_usd: costoServidoresUsd,
+        facturacion_electronica_usd: cFE.mensual_usd,
+        documentos_extra_crc: costoExtraFECrc,
+      },
+      fe: {
+        incluidos: cFE.incluidos,
+        usados: docsFE.total,
+        libres: Math.max(0, cFE.incluidos - docsFE.total),
+        extra_crc: cFE.extra_crc,
+        pasados: extrasFE,
+      },
       nota: 'Es un PISO, no la factura: el egreso de Supabase y el consumo de Vercel no se '
         + 'pueden medir con las llaves que tenemos.',
     },

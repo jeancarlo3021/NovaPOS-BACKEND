@@ -16,7 +16,15 @@ CREATE TABLE IF NOT EXISTS public.anuncios (
   mensaje     TEXT NOT NULL,
   -- A quién iba dirigido: planes elegidos y si incluía morosos/inactivos.
   segmento    JSONB NOT NULL DEFAULT '{}'::jsonb,
-  estado      TEXT NOT NULL DEFAULT 'borrador',   -- borrador | enviado
+  estado      TEXT NOT NULL DEFAULT 'borrador',   -- borrador | programado | enviando | enviado | cancelado
+  /**
+   * Cuándo sale. NULL = ya salió o sale ahora.
+   *
+   * Se guarda en UTC como todo lo demás; la pantalla lo muestra en hora de
+   * Costa Rica. Guardar «14:30» sin zona es el error clásico: el servidor
+   * corre en UTC y el aviso saldría a las 8:30 de la mañana.
+   */
+  programado_para TIMESTAMPTZ,
   enviados    INTEGER NOT NULL DEFAULT 0,
   fallidos    INTEGER NOT NULL DEFAULT 0,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -41,6 +49,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS anuncio_envios_unico
 
 CREATE INDEX IF NOT EXISTS anuncio_envios_anuncio_idx
   ON public.anuncio_envios (anuncio_id);
+
+-- Para que el trabajo programado encuentre rápido lo que le toca mandar.
+CREATE INDEX IF NOT EXISTS anuncios_pendientes_idx
+  ON public.anuncios (estado, programado_para);
 
 -- ── AJUSTES GLOBALES (no son de ningún negocio) ──────────────────────────
 -- Hay cosas que no pertenecen a un negocio: el tipo de cambio del día, o

@@ -200,7 +200,138 @@ anuncios.get('/', async (c) => {
 });
 
 /**
- * POST /enviar  { titulo, mensaje, planes[], estados[], prueba? }
+ * DESPACHAR UN ANUNCIO, por tandas y reanudable.
+ *
+ * ── Por qué por tandas ───────────────────────────────────────────────────
+ * Entre mensaje y mensaje hay una pausa de más de un segundo (una ráfaga de
+ * envíos seguidos es el patrón que hace que WhatsApp marque la cuenta). Con
+ * veintisiete destinatarios eso son treinta y dos segundos, y la función del
+ * servidor se corta a los treinta: la tanda quedaba a medio mandar, unos
+ * recibían y otros no, y quien apretó el botón veía un error de red sin saber
+ * a quién le había llegado.
+ *
+ * Ahora cada corrida manda lo que le entra en su presupuesto de tiempo y
+ * deja constancia de a quién. La siguiente —el botón otra vez, o el trabajo
+ * programado— sigue por donde quedó. El índice único de `anuncio_envios`
+ * (anuncio + negocio) es lo que garantiza que nadie reciba dos veces.
+ */
+export async function despacharAnuncio(
+  anuncioId: string, presupuestoMs = 20_000,
+): Promise<{ enviados: number; fallidos: number; faltan: number; errores: string[] }> {
+  const hasta = Date.now() + presupuestoMs;
+
+  const { data: anuncio } = await db.from('anuncios')
+    .select('mensaje, segmento').eq('id', anuncioId).maybeSingle();
+  if (!anuncio) return { enviados: 0, fallidos: 0, faltan: 0, errores: ['Anuncio no encontrado'] };
+  const seg: any = (anuncio as any).segmento ?? {};
+  const mensaje = String((anuncio as any).mensaje ?? '');
+
+  const todos = await destinatarios();
+  const lista = todos.filter(d =>
+    ((seg.planes ?? []).length === 0 || (seg.planes ?? []).includes(d.plan_id))
+    && (seg.estados ?? ['al_dia']).includes(d.estado)
+    && d.telefono);
+
+  // A quién YA se le mandó (o se intentó): no se repite.
+  const { data: yaIntentados } = await db.from('anuncio_envios')
+    .select('tenant_id').eq('anuncio_id', anuncioId);
+  const hechos = new Set(((yaIntentados ?? []) as any[]).map(x => x.tenant_id));
+  const pendientes = lista.filter(d => !hechos.has(d.tenant_id));
+
+  let enviados = 0, fallidos = 0;
+  const errores: string[] = [];
+  for (const d of pendientes) {
+    if (Date.now() > hasta) break;             // se acabó el presupuesto: sigue la próxima
+    const r = await enviarAnuncio(d.telefono!, mensaje);
+    if (r.ok) enviados += 1;
+    else { fallidos += 1; if (r.error && errores.length < 5) errores.push(`${d.negocio}: ${r.error}`); }
+    await db.from('anuncio_envios').insert({
+      anuncio_id: anuncioId, tenant_id: d.tenant_id,
+      telefono: d.telefono, ok: r.ok, error: r.error ?? null,
+    }).then(() => {}, () => {});
+    await new Promise(res => setTimeout(res, 1200));
+  }
+
+  const faltan = pendientes.length - enviados - fallidos;
+  // Los totales se recalculan de la tabla de envíos, no se suman a ciegas:
+  // así quedan bien aunque una corrida se haya cortado a la mitad.
+  const { data: todosEnvios } = await db.from('anuncio_envios')
+    .select('ok').eq('anuncio_id', anuncioId);
+  const okTotal = ((todosEnvios ?? []) as any[]).filter(x => x.ok).length;
+  const malTotal = ((todosEnvios ?? []) as any[]).length - okTotal;
+  await db.from('anuncios').update({
+    enviados: okTotal, fallidos: malTotal,
+    estado: faltan > 0 ? 'enviando' : 'enviado',
+    sent_at: new Date().toISOString(),
+  }).eq('id', anuncioId);
+
+  return { enviados, fallidos, faltan, errores };
+}
+
+/**
+ * GET /pendientes — los programados que todavía no salieron.
+ *
+ * Incluye los que quedaron a medio mandar: para quien mira, «faltan ocho» y
+ * «sale mañana a las 9» son el mismo tipo de cosa, algo que todavía no
+ * terminó.
+ */
+anuncios.get('/pendientes', async (c) => {
+  try {
+    const { data, error } = await db.from('anuncios')
+      .select('*').in('estado', ['programado', 'enviando'])
+      .order('programado_para', { ascending: true });
+    if (error) {
+      if (/anuncios|programado_para/.test(error.message)) return ok(c, { sin_tabla: true, pendientes: [] });
+      throw new Error(error.message);
+    }
+    return ok(c, { pendientes: data ?? [] });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/** DELETE /:id — cancelar uno programado. No borra los que ya salieron. */
+anuncios.delete('/:id', async (c) => {
+  try {
+    const { id } = c.req.param();
+    const { data: a } = await db.from('anuncios').select('estado').eq('id', id).maybeSingle();
+    if (!a) return fail(c, 'No encontrado', 404);
+    if ((a as any).estado === 'enviado') {
+      return fail(c, 'Ese anuncio ya salió: no se puede cancelar lo que la gente ya recibió.', 422);
+    }
+    const { error } = await db.from('anuncios').update({ estado: 'cancelado' }).eq('id', id);
+    if (error) throw new Error(error.message);
+    return ok(c, { cancelado: true });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/**
+ * DESPACHAR LO QUE TOCA. Lo llama el trabajo programado.
+ *
+ * Toma los anuncios cuya hora ya pasó y los que quedaron a medias, y les da
+ * tiempo a cada uno. El presupuesto total queda por debajo del límite de la
+ * función: más vale terminar la semana que viene que cortarse a la mitad.
+ */
+export async function despacharPendientes(presupuestoMs = 20_000) {
+  const ahora = new Date().toISOString();
+  const { data, error } = await db.from('anuncios')
+    .select('id, estado, programado_para')
+    .in('estado', ['programado', 'enviando'])
+    .order('programado_para', { ascending: true }).limit(10);
+  if (error) return { revisados: 0, despachados: [] as any[] };
+
+  const hasta = Date.now() + presupuestoMs;
+  const despachados: any[] = [];
+  for (const a of ((data ?? []) as any[])) {
+    if (Date.now() > hasta) break;
+    // Un programado para más adelante no se toca; uno «enviando» sí, siempre.
+    if (a.estado === 'programado' && a.programado_para && String(a.programado_para) > ahora) continue;
+    const r = await despacharAnuncio(a.id, Math.max(3000, hasta - Date.now()));
+    despachados.push({ id: a.id, ...r });
+  }
+  return { revisados: (data ?? []).length, despachados };
+}
+
+/**
+ * POST /enviar  { titulo, mensaje, planes[], estados[], prueba?, programar_para? }
  *
  * `prueba` manda el anuncio a UN solo número y no registra nada. Es el paso
  * que conviene dar siempre antes de la tanda: un error de redacción visto en
@@ -236,32 +367,49 @@ anuncios.post('/enviar', async (c) => {
       return fail(c, 'Con esos filtros no queda nadie con teléfono registrado.', 422);
     }
 
+    /**
+     * ¿Ahora o más tarde?
+     *
+     * La hora llega en UTC desde la pantalla, que la convierte desde la hora
+     * de Costa Rica. Acá solo se valida que sea futura: programar algo para
+     * ayer no es un error de tipeo recuperable —saldría de inmediato y sin
+     * que nadie lo esperara—, así que se rechaza.
+     */
+    const cuando = String(b?.programar_para ?? '').trim();
+    let programado: string | null = null;
+    if (cuando) {
+      const t = new Date(cuando);
+      if (!Number.isFinite(t.getTime())) return fail(c, 'La fecha y hora no se entienden', 422);
+      if (t.getTime() < Date.now() - 60_000) {
+        return fail(c, 'Esa hora ya pasó. Elegí una futura, o mandalo ahora mismo.', 422);
+      }
+      programado = t.toISOString();
+    }
+
     const { data: creado, error: errA } = await db.from('anuncios').insert({
-      titulo, mensaje, estado: 'enviado',
+      titulo, mensaje,
+      estado: programado ? 'programado' : 'enviando',
+      programado_para: programado,
       segmento: { planes, estados, destinatarios: lista.length },
-      sent_at: new Date().toISOString(),
     }).select('id').single();
     if (errA) throw new Error(errA.message);
     const anuncioId = (creado as any).id;
 
-    let enviados = 0, fallidos = 0;
-    const errores: string[] = [];
-    for (const d of lista) {
-      const r = await enviarAnuncio(d.telefono!, mensaje);
-      if (r.ok) enviados += 1; else { fallidos += 1; if (r.error && errores.length < 5) errores.push(`${d.negocio}: ${r.error}`); }
-      // Queda constancia incluso de los que fallaron: sin eso, reintentar
-      // mandaría de nuevo a los que SÍ recibieron.
-      await db.from('anuncio_envios').insert({
-        anuncio_id: anuncioId, tenant_id: d.tenant_id,
-        telefono: d.telefono, ok: r.ok, error: r.error ?? null,
-      }).then(() => {}, () => {});
-      // Un respiro entre mensajes: una ráfaga de cuarenta envíos seguidos es
-      // justo el patrón que hace que WhatsApp marque la cuenta.
-      await new Promise(res => setTimeout(res, 1200));
+    if (programado) {
+      return ok(c, {
+        id: anuncioId, programado: true, para: programado, destinatarios: lista.length,
+      });
     }
 
-    await db.from('anuncios').update({ enviados, fallidos }).eq('id', anuncioId);
-    return ok(c, { id: anuncioId, enviados, fallidos, errores });
+    /**
+     * Se manda lo que entre en veinte segundos y el resto queda pendiente.
+     *
+     * La función del servidor se corta a los treinta, y con la pausa entre
+     * mensajes veintisiete destinatarios no caben. Lo que falte lo sigue el
+     * trabajo programado, o el mismo botón otra vez: nadie recibe dos veces.
+     */
+    const r = await despacharAnuncio(anuncioId, 20_000);
+    return ok(c, { id: anuncioId, ...r });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

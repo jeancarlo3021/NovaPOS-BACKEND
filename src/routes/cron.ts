@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { ok, fail } from '../utils/response.js';
 import { fetchAndProcessReceivedEmails } from '../services/receivedEmails.js';
+import { despacharPendientes } from './anuncios.js';
 
 // Rutas de CRON — públicas pero protegidas por un token secreto (CRON_SECRET).
 // Pensadas para un cron externo (cron-job.org) que las llama cada 15 min.
@@ -67,11 +68,43 @@ const handler = async (c: any) => {
     } catch (e: any) {
       console.warn('[cron] respaldos:', e?.message);
     }
-    return ok(c, { ok: true, ...summary, demos, cobros, respaldos });
+    /**
+     * Los ANUNCIOS programados, por lo mismo que todo lo de arriba.
+     *
+     * Con poco presupuesto: va al final y este trabajo ya gastó tiempo en el
+     * correo y los respaldos. Un anuncio que tarda dos corridas en salir no
+     * molesta a nadie; que este trabajo se pase del límite y se corte, sí —se
+     * llevaría puesto también al respaldo—.
+     */
+    let avisos: any = null;
+    try {
+      const { despacharPendientes } = await import('./anuncios.js');
+      avisos = await despacharPendientes(6_000);
+    } catch (e: any) {
+      console.warn('[cron] anuncios programados:', e?.message);
+    }
+    return ok(c, { ok: true, ...summary, demos, cobros, respaldos , avisos});
   } catch (err: any) {
     return fail(c, err?.message ?? 'Error al procesar correos', 500);
   }
 };
+
+/**
+ * Los ANUNCIOS programados.
+ *
+ * Tiene su propia dirección y además va colgado del trabajo de correos, que
+ * es el que seguro está configurado. Un aviso que debía salir a las nueve y
+ * sale a las nueve y cuarto no molesta a nadie; uno que no sale nunca porque
+ * su cron no se configuró, sí.
+ */
+const anunciosHandler = async (c: any) => {
+  if (!authorized(c)) return fail(c, 'No autorizado', 401);
+  try {
+    return ok(c, await despacharPendientes(20_000));
+  } catch (err: any) { return fail(c, err.message, 500); }
+};
+cron.get('/anuncios', anunciosHandler);
+cron.post('/anuncios', anunciosHandler);
 
 cron.get('/fetch-received-emails', handler);
 cron.post('/fetch-received-emails', handler);

@@ -1,5 +1,6 @@
 import { db } from '../db/client.js';
 import { economiaDeLosPlanes } from './planEconomics.js';
+import { costoFE, documentosFE, costoDeAgregar } from './costoFE.js';
 
 /**
  * ANALIZAR UN PLAN QUE TODAVÍA NO EXISTE.
@@ -74,6 +75,20 @@ function modulosDe(texto: string): string[] {
   return MODULOS.filter(m => m.palabras.some(p => t.includes(norm(p)))).map(m => m.nombre);
 }
 
+/**
+ * Cuántas facturas al mes emitiría un cliente de este plan.
+ *
+ * Si se dice en el texto («para quien factura 300 al mes»), se usa ese
+ * número. Si no, se usa el promedio REAL de los clientes que hoy facturan
+ * electrónicamente: suponer un número redondo cuando hay una medición al
+ * lado sería tirar el dato que sirve.
+ */
+function facturasEsperadas(texto: string): number | null {
+  const t = norm(texto);
+  const m = t.match(/(\d{1,5})\s*(?:facturas?|documentos?|comprobantes?)/);
+  return m ? parseInt(m[1], 10) : null;
+}
+
 export async function analizarPlan(texto: string): Promise<Analisis> {
   const precio = precioDe(texto);
   const anual = /\banual|por a[nñ]o|al a[nñ]o\b/.test(norm(texto));
@@ -136,19 +151,82 @@ export async function analizarPlan(texto: string): Promise<Analisis> {
    * con el número evita la conversación de «¿no saldrá muy barato?».
    */
   const costoUsd = eco.infraestructura.costo_usd_hoy;
-  const costoPorNegocioCrc = eco.tipo_cambio && eco.negocios_activos
-    ? (costoUsd * eco.tipo_cambio) / eco.negocios_activos
-    : null;
-  if (costoPorNegocioCrc != null) {
-    numeros.costo_de_infraestructura_por_negocio = money(costoPorNegocioCrc);
-    bueno.push(`La infraestructura te cuesta ${money(costoPorNegocioCrc)} por negocio al mes, `
-      + `así que a ${money(mensualPropuesto)} el margen bruto es prácticamente todo.`);
-  } else if (costoUsd === 0) {
-    numeros.costo_de_infraestructura = 'US$0 (todo cabe en los planes gratuitos)';
-    bueno.push('Hoy la infraestructura no te cuesta nada: todo cabe en los planes gratuitos. '
-      + 'A este precio, el margen lo limita tu tiempo de soporte, no el servidor.');
+  if (costoUsd === 0) {
+    numeros.costo_de_servidores = 'US$0 (Supabase y Vercel caben en el plan gratuito)';
   } else {
-    noPuedo.push('Cuánto costaría en colones: no hay tipo de cambio guardado.');
+    numeros.costo_de_servidores = `US$${costoUsd}/mes`;
+  }
+
+  /**
+   * EL COSTO QUE DE VERDAD IMPORTA: la facturación electrónica.
+   *
+   * Es el único costo variable del negocio. Antes este análisis decía «el
+   * margen es prácticamente todo» porque solo miraba los servidores, que
+   * están en plan gratuito, e ignoraba que el proveedor de FE se paga todos
+   * los meses y cobra por documento pasada la bolsa.
+   *
+   * Y la bolsa está casi llena, así que el costo del próximo cliente NO es
+   * cero: es lo que emita, por el precio del documento extra.
+   */
+  const cFE = await costoFE();
+  const docs = await documentosFE(30);
+  const libres = Math.max(0, cFE.incluidos - docs.total);
+  numeros.proveedor_de_fe = `US$${cFE.mensual_usd}/mes · ${cFE.incluidos} documentos incluidos · `
+    + `₡${cFE.extra_crc} cada uno de más`;
+  numeros.documentos_este_mes = `${docs.total} de ${cFE.incluidos} (${libres} libres)`;
+
+  const esPlanFE = modulos.length === 0 || modulos.includes('Facturación electrónica');
+  const dichas = facturasEsperadas(texto);
+  // Promedio real de los que hoy facturan electrónicamente, no un número redondo.
+  const emisores = [...docs.por_tenant.values()].filter(n => n > 0);
+  const promedio = emisores.length
+    ? Math.round(emisores.reduce((a, b) => a + b, 0) / emisores.length) : 0;
+  const esperadas = dichas ?? promedio;
+
+  if (esPlanFE && esperadas > 0) {
+    const costoCliente = costoDeAgregar(esperadas, docs.total, cFE);
+    numeros.facturas_esperadas_por_cliente = dichas
+      ? `${esperadas}/mes (lo dijiste vos)`
+      : `${esperadas}/mes (promedio real de los que facturan hoy)`;
+    numeros.costo_fe_por_cliente_nuevo = money(costoCliente);
+
+    if (costoCliente === 0) {
+      bueno.push(`Todavía quedan ${libres} documentos de la bolsa de ${cFE.incluidos}, así que un `
+        + `cliente que emita ${esperadas} al mes no agrega costo: entra en lo ya pagado.`);
+      const cabenAun = Math.floor(libres / esperadas);
+      if (cabenAun >= 1) {
+        numeros.clientes_que_caben_sin_costo_extra = cabenAun;
+        malo.push(`Pero solo caben ${cabenAun} cliente(s) más así antes de pasarse de la bolsa. `
+          + `Del siguiente en adelante, cada uno cuesta unos ${money(esperadas * cFE.extra_crc)} por mes.`);
+      }
+    } else {
+      const margen = mensualPropuesto - costoCliente;
+      numeros.margen_por_cliente = money(margen);
+      if (margen <= 0) {
+        malo.push(`A ${money(mensualPropuesto)} PERDÉS plata con cada cliente: emitiendo ${esperadas} `
+          + `documentos al mes te cuesta ${money(costoCliente)} en facturación electrónica.`);
+      } else if (costoCliente > mensualPropuesto * 0.3) {
+        malo.push(`La facturación electrónica se come ${money(costoCliente)} de los `
+          + `${money(mensualPropuesto)} (${Math.round((costoCliente / mensualPropuesto) * 100)}%): `
+          + 'ya pasaste la bolsa incluida y cada documento se paga aparte.');
+      } else {
+        bueno.push(`Deja ${money(margen)} por cliente después de pagar la facturación electrónica `
+          + `(${money(costoCliente)} por ${esperadas} documentos).`);
+      }
+    }
+
+    /** Cuándo deja de dar plata. El número que nadie calcula. */
+    if (cFE.extra_crc > 0) {
+      const tope = Math.floor(mensualPropuesto / cFE.extra_crc);
+      numeros.facturas_con_las_que_deja_de_dar_plata = `${tope.toLocaleString('es-CR')}/mes`;
+      if (esperadas > tope * 0.5) {
+        malo.push(`Un cliente que emita más de ${tope.toLocaleString('es-CR')} documentos al mes te `
+          + `cuesta más de lo que paga. Con ${esperadas} de promedio ya estás a mitad de camino.`);
+      }
+    }
+  } else if (!esPlanFE) {
+    bueno.push('Sin facturación electrónica, el costo variable es cero: lo único que cuesta es '
+      + 'tu tiempo de soporte.');
   }
 
   /** Si pide módulos, mirar si los clientes de hoy los usan. */
@@ -180,7 +258,7 @@ export async function analizarPlan(texto: string): Promise<Analisis> {
 
   /** Lo que NO está en la base y hay que poner de afuera. */
   noPuedo.push('Cuánto tiempo de soporte te va a pedir cada cliente de este plan: eso no está '
-    + 'en ningún lado y a este precio es lo que define si deja plata.');
+    + 'en ningún lado, y con el costo de facturación ya contado, es lo que queda por definir.');
   noPuedo.push('Cuántos clientes nuevos traería. Lo de arriba dice qué pasa con los que YA '
     + 'tenés; lo que entra depende del mercado.');
 
