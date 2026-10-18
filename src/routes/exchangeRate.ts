@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { ok } from '../utils/response.js';
 import { db } from '../db/client.js';
+import { leerGlobal, guardarGlobal } from '../services/globalSettings.js';
 
 /**
  * Tipo de cambio del dólar (BCCR).
@@ -68,30 +69,27 @@ async function fetchFrom(src: Source): Promise<{ venta: number; compra: number }
   } finally { clearTimeout(t); }
 }
 
-/** Guarda el último tipo de cambio conocido. Sobrevive a los reinicios. */
+/**
+ * Guarda el último tipo de cambio conocido. Sobrevive a los reinicios.
+ *
+ * Va a `global_settings` y no a `settings`. Antes escribía en `settings` con
+ * un `tenant_id` de ceros, y eso NUNCA funcionó: esa columna tiene clave
+ * foránea contra `tenants`, el insert fallaba por integridad y el error
+ * quedaba atrapado en el `catch`. Medido contra la base de producción: cero
+ * filas guardadas en toda la vida del sistema.
+ *
+ * No era un detalle. `lastKnown()` existe para que, si el BCCR está caído, se
+ * use el último valor conocido en vez de quedarse sin tipo de cambio; como
+ * nunca se guardó ninguno, ese respaldo nunca tuvo nada que devolver.
+ */
 async function persist(r: RateCache): Promise<void> {
-  try {
-    await db.from('settings').upsert({
-      // Sin tenant: el tipo de cambio es del país, no de un negocio.
-      tenant_id: '00000000-0000-0000-0000-000000000000',
-      type: 'exchange-rate',
-      config: r,
-      updated_at: new Date().toISOString(),
-    }, { onConflict: 'tenant_id,type' });
-  } catch (e: any) {
-    console.warn('[tipo de cambio] no se pudo guardar:', e?.message);
-  }
+  await guardarGlobal('exchange-rate', r);
 }
 
 /** Último tipo de cambio guardado, de cualquier día. */
 async function lastKnown(): Promise<RateCache | null> {
-  try {
-    const { data } = await db.from('settings').select('config')
-      .eq('tenant_id', '00000000-0000-0000-0000-000000000000')
-      .eq('type', 'exchange-rate').maybeSingle();
-    const c: any = (data as any)?.config;
-    return c?.venta > 0 ? c as RateCache : null;
-  } catch { return null; }
+  const c = await leerGlobal<RateCache>('exchange-rate');
+  return c && (c as any).venta > 0 ? c : null;
 }
 
 // GET /exchange-rate — { date, venta, compra, source, stale? } del día (CR).

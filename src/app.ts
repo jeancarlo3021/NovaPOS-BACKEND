@@ -49,6 +49,7 @@ import warrantiesRoute  from './routes/warranties.js';
 import leadsRoute       from './routes/leads.js';
 import demoRequestsRoute from './routes/demoRequests.js';
 import { digitalMenu, publicMenu } from './routes/digitalMenu.js';
+import { landingPublic, landingAdmin } from './routes/landing.js';
 import { ia } from './routes/ia.js';
 import windowOrders     from './routes/windowOrders.js';
 import exchangeRate     from './routes/exchangeRate.js';
@@ -134,6 +135,16 @@ app.route('/fe-external', feExternal);
 // sesión. Va acá arriba, fuera del grupo con `auth`, porque justamente su razón
 // de ser es que no haga falta iniciar sesión para verlo.
 app.route('/public-menu', publicMenu);
+
+/**
+ * La PÁGINA PÚBLICA de presentación, también sin sesión.
+ *
+ * Va junto al menú digital y fuera del grupo con `auth` por el mismo motivo:
+ * la abre gente que todavía no tiene cuenta. Es la única parte del sistema a
+ * la que le puede escribir un desconocido, así que el formulario tiene límite
+ * por IP y campo trampa (ver routes/landing.ts).
+ */
+app.route('/landing', landingPublic);
 
 const api = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 api.use('*', auth);

@@ -1,6 +1,13 @@
 import { Hono } from 'hono';
 import { finISOSegunCiclo, esVitalicio } from '../utils/planCiclo.js';
 import { db, anonClient } from '../db/client.js';
+import { medirInfraestructura } from '../services/infraUsage.js';
+import { economiaDeLosPlanes } from '../services/planEconomics.js';
+import { analizarPlan } from '../services/analizarPlan.js';
+import { respuesta as respuestaIA, modoIA, pedirAlModelo } from '../services/ia.js';
+import { leerGlobal, guardarGlobal } from '../services/globalSettings.js';
+import { landingAdmin } from './landing.js';
+import { anuncios } from './anuncios.js';
 import { ok, fail } from '../utils/response.js';
 import { sendEmail, paymentReceiptEmailHtml, customInvoiceEmailHtml, planFeatureLabels } from '../services/emailService.js';
 import { alanube, AlanubeError, tenantAlanubeToken } from '../services/alanube.js';
@@ -6665,6 +6672,197 @@ admin.delete('/vendor-payments/:id', async (c) => {
     const { error } = await db.from('vendor_payments').delete().eq('id', id);
     if (error) throw new Error(error.message);
     return ok(c, { deleted: true });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/**
+ * GET /infra-usage — cuánto estamos usando de Supabase y de Vercel.
+ *
+ * Es una medición cara (cuenta las cien tablas y pesa todos los archivos),
+ * así que se guarda un rato: nadie necesita el dato al segundo, y recargar la
+ * pantalla tres veces no debería costar trescientas consultas.
+ */
+let cacheInfra: { en: number; datos: any } | null = null;
+const INFRA_TTL = 10 * 60_000;
+
+admin.get('/infra-usage', async (c) => {
+  try {
+    const refrescar = c.req.query('refresh') === '1';
+    if (!refrescar && cacheInfra && Date.now() - cacheInfra.en < INFRA_TTL) {
+      return ok(c, { ...cacheInfra.datos, desde_cache: true });
+    }
+    const datos = await medirInfraestructura({ refrescar: refrescar });
+    cacheInfra = { en: Date.now(), datos };
+    return ok(c, { ...datos, desde_cache: false });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/**
+ * La edición de la página pública cuelga del panel admin, así que hereda su
+ * guardia: solo el administrador de la plataforma puede cambiar lo que ve
+ * internet.
+ */
+/**
+ * GET /planes-costos — precio de costo contra precio de venta, por plan.
+ *
+ * Comparte el caché de la medición de infraestructura, que es la parte cara.
+ */
+let cachePlanes: { en: number; datos: any } | null = null;
+admin.get('/planes-costos', async (c) => {
+  try {
+    if (c.req.query('refresh') !== '1' && cachePlanes && Date.now() - cachePlanes.en < 10 * 60_000) {
+      return ok(c, { ...cachePlanes.datos, desde_cache: true });
+    }
+    const datos = await economiaDeLosPlanes();
+    cachePlanes = { en: Date.now(), datos };
+    return ok(c, { ...datos, desde_cache: false });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/**
+ * PUT /planes-costos/ingreso  { plan_id, monto }
+ *
+ * Declarar cuánto deja POR NEGOCIO Y POR MES un plan que el sistema tiene en
+ * ₡0. Pasa con los vitalicios y con lo que se cobra por fuera —una bolsa de
+ * facturas, un arreglo aparte—: el sistema no tiene cómo saberlo y los
+ * mostraba como un lastre cuando en realidad son entrada de plata.
+ *
+ * Es información comercial, no configuración del producto: se guarda aparte
+ * y NO cambia lo que se le cobra a ningún cliente.
+ */
+admin.put('/planes-costos/ingreso', async (c) => {
+  try {
+    const b = await c.req.json().catch(() => ({} as any));
+    const planId = String(b?.plan_id ?? '');
+    if (!planId) return fail(c, 'Falta el plan', 422);
+    const monto = Number(b?.monto);
+    if (!Number.isFinite(monto) || monto < 0) return fail(c, 'El monto tiene que ser un número de cero para arriba', 422);
+
+    const cfg: any = (await leerGlobal<any>('plan-ingresos')) ?? {};
+    // Monto 0 = borrar lo declarado y volver al precio del plan.
+    if (monto === 0) delete cfg[planId]; else cfg[planId] = monto;
+
+    if (!(await guardarGlobal('plan-ingresos', cfg))) {
+      return fail(c, 'No se pudo guardar. ¿Corriste la migración 120? Crea la tabla global_settings.', 500);
+    }
+    cachePlanes = null;          // el cálculo cambió: que se vuelva a hacer
+    return ok(c, { guardado: true, declarado: cfg[planId] ?? null });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/**
+ * POST /planes-costos/publicar  { plan_id }
+ *
+ * Manda un plan a la página pública: lo agrega a los artículos del borrador
+ * con su precio y sus módulos REALES. Va al borrador y no a lo publicado, a
+ * propósito: que un clic acá cambie lo que ve internet sin una revisión sería
+ * demasiado fácil de hacer sin querer.
+ */
+admin.post('/planes-costos/publicar', async (c) => {
+  try {
+    const { plan_id } = await c.req.json().catch(() => ({} as any));
+    if (!plan_id) return fail(c, 'Falta el plan', 422);
+
+    const { data: plan } = await db.from('subscription_plans')
+      .select('name, price, billing_cycle, features, description').eq('id', plan_id).maybeSingle();
+    if (!plan) return fail(c, 'Plan no encontrado', 404);
+    const p: any = plan;
+
+    const { data: fila } = await db.from('landing_content')
+      .select('draft').eq('key', 'default').maybeSingle();
+    const borrador: any = (fila as any)?.draft ?? {};
+    const productos: any[] = Array.isArray(borrador.productos) ? borrador.productos : [];
+
+    const precio = Number(p.price ?? 0);
+    const ciclo = String(p.billing_cycle ?? '').toLowerCase();
+    const esAnual = ciclo.includes('year') || ciclo.includes('anual');
+    const esVitalicio = ciclo.includes('life') || ciclo.includes('vitalic');
+
+    /**
+     * El precio anual se PROPONE, no se inventa.
+     *
+     * Si el plan ya se cobra por año, ese es el anual y el mensual sale de
+     * dividirlo. Si se cobra por mes, se propone el año con dos meses de
+     * regalo —el descuento habitual— pero queda en el BORRADOR para que se
+     * revise: cuánto descuento dar es una decisión comercial, no una fórmula.
+     */
+    const mensual = esAnual ? Math.round(precio / 12) : precio;
+    const anual = esAnual ? precio : Math.round(precio * 10);
+    // ₡ y no ¢: esto se muestra en la página web, no en un PDF.
+    const fmt = (n: number) => `₡${n.toLocaleString('es-CR')}`;
+
+    const nuevo = {
+      nombre: p.name,
+      precio: esVitalicio
+        ? (precio > 0 ? `${fmt(precio)} una vez` : '')
+        : (mensual > 0 ? `${fmt(mensual)}/mes` : ''),
+      precio_anual: esVitalicio || anual <= 0 ? '' : `${fmt(anual)}/año`,
+      ahorro: esVitalicio || anual <= 0 || mensual <= 0
+        ? '' : `Ahorrás ${fmt(mensual * 12 - anual)}`,
+      descripcion: String(p.description ?? '').trim(),
+      incluye: planFeatureLabels(p.features),
+      destacado: false,
+      imagen: '',
+    };
+
+    // Si ya estaba, se actualiza en su lugar: publicarlo dos veces no debe
+    // dejar la página con el mismo plan repetido.
+    const i = productos.findIndex(x => String(x?.nombre ?? '').toLowerCase() === String(p.name).toLowerCase());
+    if (i >= 0) productos[i] = { ...productos[i], ...nuevo, imagen: productos[i].imagen ?? '' };
+    else productos.push(nuevo);
+
+    const { error } = await db.from('landing_content').upsert(
+      { key: 'default', draft: { ...borrador, productos }, updated_at: new Date().toISOString() },
+      { onConflict: 'key' },
+    );
+    if (error) throw new Error(error.message);
+    return ok(c, { agregado: i < 0, actualizado: i >= 0, articulo: nuevo });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+admin.route('/landing', landingAdmin);
+
+/**
+ * Los anuncios cuelgan del panel admin, así que heredan su guardia: le
+ * escriben por WhatsApp a clientes reales y eso no lo puede disparar
+ * cualquiera.
+ */
+admin.route('/anuncios', anuncios);
+
+/**
+ * POST /analizar-plan  { mensaje }
+ *
+ * El chat para pensar un plan antes de sacarlo. Se escribe en español —«un
+ * plan de ₡8.000 con inventario y facturación»— y contesta qué tiene de bueno
+ * y qué de malo, con los números del negocio.
+ *
+ * Los números NO pasan por el modelo. Un modelo contesta cosas ciertas y
+ * genéricas —«considerá el valor percibido»— que ya se saben; lo que cambia
+ * una decisión es saber que a ese precio hay once clientes pagando más que se
+ * cambiarían. Eso sale de la base. Con la IA encendida, el modelo redacta el
+ * cierre; el análisis sigue saliendo de acá.
+ */
+admin.post('/analizar-plan', async (c) => {
+  try {
+    const { mensaje } = await c.req.json().catch(() => ({ mensaje: '' }));
+    const texto = String(mensaje ?? '').trim();
+    if (!texto) return fail(c, 'Escribí qué plan querés analizar', 422);
+
+    const analisis = await analizarPlan(texto);
+
+    if (modoIA() === 'real' && analisis.entendido.precio) {
+      const redactado = await pedirAlModelo({
+        sistema: 'Sos un asesor comercial de un sistema de punto de venta en Costa Rica. '
+          + 'Te paso un análisis YA CALCULADO con datos reales. Escribí un cierre de tres '
+          + 'líneas en español de Costa Rica. NO inventes ningún número: usá solo los que te doy.',
+        mensaje: `Propuesta: ${texto}\nA favor: ${analisis.bueno.join(' | ')}\n`
+          + `En contra: ${analisis.malo.join(' | ')}\nNúmeros: ${JSON.stringify(analisis.numeros)}`,
+        maxTokens: 220,
+      });
+      if (redactado && redactado.trim()) analisis.veredicto = redactado.trim();
+    }
+
+    return ok(c, respuestaIA(analisis));
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

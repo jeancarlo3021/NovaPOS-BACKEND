@@ -3,6 +3,7 @@ import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
 import { respuesta, modoIA, pedirAlModelo } from '../services/ia.js';
 import { sugerirCabys } from './cabys.js';
+import { planFeatureLabels } from '../services/emailService.js';
 
 /**
  * Las funciones de IA del sistema, hoy en MODO DEMOSTRACIÓN (ver services/ia.ts).
@@ -545,6 +546,116 @@ ia.post('/cabys', async (c) => {
         para_revisar: dudosos.length,
         revisados_por_el_modelo: revisados,
       },
+    }));
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// TEXTOS PARA LOS ARTÍCULOS DE LA PÁGINA PÚBLICA
+// ══════════════════════════════════════════════════════════════════════════
+
+/**
+ * POST /landing-articulo  { nombre, precio?, publico? }
+ *
+ * Escribir la ficha de un plan a mano es lo que hace que la página quede a
+ * medio llenar: hay que acordarse de TODO lo que incluye, y lo que incluye
+ * cambia cada vez que se toca un plan.
+ *
+ * ── De dónde sale el texto, y por qué eso importa ─────────────────────────
+ * De los PLANES REALES del sistema. Se busca el plan por nombre y se listan
+ * sus módulos activos con las mismas etiquetas que ya usan los correos
+ * (`planFeatureLabels`). O sea: lo que la página promete es exactamente lo
+ * que el plan entrega.
+ *
+ * Un modelo de lenguaje escribiendo esto libremente produciría una lista
+ * preciosa con dos funciones que no existen, y eso en una página de precios
+ * no es un detalle: es prometerle a un cliente algo que no va a recibir. Por
+ * eso los puntos salen de la base y el modelo —cuando se encienda— solo
+ * puede redactar la frase de presentación.
+ */
+ia.post('/landing-articulo', async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const nombre = String(body?.nombre ?? '').trim();
+    if (!nombre) return fail(c, 'Escribí primero el nombre del plan', 422);
+
+    const { data: planes } = await db.from('subscription_plans')
+      .select('name, description, price, features, is_active');
+
+    /**
+     * El plan que corresponde, buscándolo con tolerancia.
+     *
+     * Quien escribe «Básico» en la página se refiere al plan «basico fe con
+     * inventario»: exigir el nombre exacto convertiría la ayuda en un «no
+     * encontré nada» casi siempre. Se descartan los planes «Demo · <negocio>»,
+     * que son de un cliente concreto y no se venden.
+     */
+    const limpio = (x: any) => norm(String(x ?? ''));
+    const n = limpio(nombre);
+    const candidatos = ((planes ?? []) as any[])
+      .filter(p => !/^demo\s*·/i.test(String(p.name ?? '')));
+    const plan = candidatos.find(p => limpio(p.name) === n)
+      ?? candidatos.find(p => limpio(p.name).includes(n) || n.includes(limpio(p.name)))
+      ?? null;
+
+    if (!plan) {
+      return ok(c, respuesta({
+        encontrado: false,
+        nombres_disponibles: candidatos.map(p => p.name).slice(0, 12),
+        aviso_vacio: `No hay ningún plan que se parezca a «${nombre}». Escribí el nombre como está `
+          + 'en Planes y volvé a intentar, o llená la ficha a mano.',
+      }));
+    }
+
+    const incluye = planFeatureLabels(plan.features);
+    const precio = Number(plan.price ?? 0);
+
+    /**
+     * La frase de presentación.
+     *
+     * En modo demostración se arma con lo que el plan TIENE, no con adjetivos:
+     * «Punto de venta, inventario y facturación electrónica para un negocio
+     * con una sucursal». Es menos vistoso que lo que escribiría un modelo y
+     * tiene una ventaja que lo compensa: todo lo que dice es verificable.
+     */
+    const f: any = plan.features ?? {};
+    const partes: string[] = [];
+    if (f.pos) partes.push('punto de venta');
+    if (f.inventory) partes.push('inventario');
+    if (f.electronic_invoicing) partes.push('facturación electrónica a Hacienda');
+    if (f.reports) partes.push('reportes');
+    const cola = f.multi_branch ? 'con varias sucursales'
+      : f.hr ? 'con planilla'
+      : 'de una sola sucursal';
+    const descripcion = partes.length
+      ? `${partes.slice(0, -1).join(', ')}${partes.length > 1 ? ' y ' : ''}${partes[partes.length - 1]}`
+        .replace(/^./, ch => ch.toUpperCase()) + ` para un negocio ${cola}.`
+      : String(plan.description ?? '').trim();
+
+    // Con el modelo encendido se mejora SOLO la redacción. Los puntos de
+    // `incluye` nunca pasan por él: son datos, no estilo.
+    let descripcionFinal = descripcion;
+    if (modoIA() === 'real') {
+      const r = await pedirAlModelo({
+        sistema: 'Escribís para la página de precios de un sistema de punto de venta en Costa Rica. '
+          + 'Reescribí la descripción en UNA frase, en español de Costa Rica, clara y sin adjetivos '
+          + 'publicitarios. NO agregues ninguna función que no esté en la lista.',
+        mensaje: `Plan: ${plan.name}\nIncluye: ${incluye.join(', ')}\nBorrador: ${descripcion}`,
+        maxTokens: 120,
+      });
+      if (r && r.trim()) descripcionFinal = r.trim();
+    }
+
+    return ok(c, respuesta({
+      encontrado: true,
+      plan: plan.name,
+      descripcion: descripcionFinal,
+      incluye,
+      precio_sugerido: precio > 0
+        ? `₡${precio.toLocaleString('es-CR')}/mes`
+        : '',
+      fuente: `Tomado del plan «${plan.name}» tal como está configurado hoy: `
+        + `${incluye.length} módulo(s) activos.`,
     }));
   } catch (err: any) { return fail(c, err.message, 500); }
 });

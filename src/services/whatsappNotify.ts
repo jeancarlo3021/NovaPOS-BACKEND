@@ -132,6 +132,32 @@ async function deliver(phone: string, workerText: string, template: () => WaResu
   return { ok: false, skipped: true };
 }
 
+/**
+ * ENVÍO DE UN ANUNCIO: texto libre, a un negocio.
+ *
+ * Un anuncio es distinto de un recordatorio: el texto cambia cada vez —un
+ * módulo nuevo, un cambio de precio— y no hay forma de tener una plantilla
+ * aprobada por Meta para cada cosa que se vaya a contar.
+ *
+ * Por eso esto SOLO sale por el worker de WhatsApp (el del código QR). Si no
+ * está conectado, NO se intenta por la Cloud API: Meta rechaza el texto libre
+ * fuera de la ventana de 24 horas, y el resultado sería una tanda de envíos
+ * fallidos que, repetida, termina en una cuenta marcada. Vale más decir que
+ * no se puede mandar que mandar mal.
+ */
+export async function enviarAnuncio(phone: string, texto: string): Promise<WaResult> {
+  if (!phone) return { ok: false, skipped: true, error: 'El negocio no tiene teléfono registrado' };
+  if (!workerEnabled()) {
+    return {
+      ok: false, skipped: true,
+      error: 'El worker de WhatsApp (el del código QR) no está conectado. Un anuncio es texto '
+        + 'libre, y por la Cloud API de Meta eso solo se puede mandar dentro de las 24 horas '
+        + 'posteriores a que el cliente escriba. Conectá el worker en la pestaña de WhatsApp.',
+    };
+  }
+  return sendViaWorker(phone, texto);
+}
+
 /** 1. Recordatorio de pago de la suscripción. */
 export async function notifyPaymentDue(tenantId: string, days: number): Promise<WaResult> {
   const { phone, name } = await businessContact(tenantId);

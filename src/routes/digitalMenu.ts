@@ -63,12 +63,15 @@ const hoyCR = (): string =>
  * la caja y la pierde el negocio.
  */
 function etiquetaPromo(p: any): string {
+  // El signo del colón es ₡ (U+20A1), no ¢ (centavo). Acá va ₡ porque esto se
+  // muestra en una PÁGINA WEB, que lo dibuja sin problema. El ¢ se usa solo en
+  // los PDF, donde las fuentes estándar no tienen el ₡ y sale un «¡».
   const n = (v: any) => Number(v ?? 0).toLocaleString('es-CR');
   if (p.type === 'percentage') return `${p.value}% desc.`;
-  if (p.type === 'fixed')      return `-¢${n(p.value)}`;
+  if (p.type === 'fixed')      return `-₡${n(p.value)}`;
   if (p.type === '2x1')        return '2×1';
-  if (p.type === 'qty_bundle') return `${n(p.bundle_qty)} × ¢${n(p.value)}`;
-  if (p.type === 'combo')      return p.combo_mode === 'percent' ? `Combo -${p.value}%` : `Combo ¢${n(p.value)}`;
+  if (p.type === 'qty_bundle') return `${n(p.bundle_qty)} × ₡${n(p.value)}`;
+  if (p.type === 'combo')      return p.combo_mode === 'percent' ? `Combo -${p.value}%` : `Combo ₡${n(p.value)}`;
   return '';
 }
 

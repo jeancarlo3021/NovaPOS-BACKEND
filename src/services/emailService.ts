@@ -261,7 +261,19 @@ export function planFeatureLabels(features: Record<string, unknown> | null | und
   if (on('hr')) a.push('Recursos humanos');
   if (on('users')) a.push('Gestión de usuarios');
   if (on('settings')) a.push('Configuración del negocio');
-  if (on('electronic_invoicing')) a.push('Facturación electrónica');
+  /**
+   * LA BANDERA SE LLAMA `electronic_invoice`, no `electronic_invoicing`.
+   *
+   * Durante mucho tiempo acá se consultó el nombre largo, que NO EXISTE en
+   * ningún plan: medido contra la base, `electronic_invoice` está activa en 16
+   * planes y `electronic_invoicing` en cero. O sea que esta lista —la que va
+   * en los correos de bienvenida y de plan— nunca mencionó la facturación
+   * electrónica, que es justamente lo que más pesa en la decisión de compra.
+   * Se deja el nombre viejo también, por si alguna fila quedó con él.
+   */
+  if (on('electronic_invoice') || on('electronic_invoicing')) a.push('Facturación electrónica');
+  // Facturar desde la pantalla de venta es un módulo aparte en los planes.
+  if (on('fe_pos')) a.push('Facturación electrónica desde el punto de venta');
   if (on('kiosk')) a.push('Modo kiosko');
   if (on('android_app')) a.push('App de Android');
   return a;
