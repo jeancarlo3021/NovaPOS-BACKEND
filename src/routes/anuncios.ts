@@ -227,10 +227,23 @@ export async function despacharAnuncio(
   const mensaje = String((anuncio as any).mensaje ?? '');
 
   const todos = await destinatarios();
-  const lista = todos.filter(d =>
-    ((seg.planes ?? []).length === 0 || (seg.planes ?? []).includes(d.plan_id))
-    && (seg.estados ?? ['al_dia']).includes(d.estado)
-    && d.telefono);
+  /**
+   * A QUIÉN LE TOCA, exactamente.
+   *
+   * Si al mandar se eligieron negocios uno por uno, esa lista MANDA sobre
+   * los filtros. Importa que sea así también acá y no solo al apretar el
+   * botón: este despachador corre otra vez después —desde el trabajo
+   * programado o al reintentar— y si rearmara la lista desde los filtros,
+   * la segunda corrida le escribiría a gente que se había destildado a
+   * propósito.
+   */
+  const elegidos: string[] = Array.isArray(seg.tenant_ids) ? seg.tenant_ids : [];
+  const lista = elegidos.length > 0
+    ? todos.filter(d => elegidos.includes(d.tenant_id) && d.telefono)
+    : todos.filter(d =>
+        ((seg.planes ?? []).length === 0 || (seg.planes ?? []).includes(d.plan_id))
+        && (seg.estados ?? ['al_dia']).includes(d.estado)
+        && d.telefono);
 
   // A quién YA se le mandó (o se intentó): no se repite.
   const { data: yaIntentados } = await db.from('anuncio_envios')
@@ -357,14 +370,21 @@ anuncios.post('/enviar', async (c) => {
 
     const planes: string[] = Array.isArray(b?.planes) ? b.planes : [];
     const estados: Estado[] = Array.isArray(b?.estados) ? b.estados : ['al_dia'];
+    /** Negocios elegidos uno por uno. Si vienen, mandan sobre los filtros. */
+    const tenantIds: string[] = Array.isArray(b?.tenant_ids) ? b.tenant_ids.map(String) : [];
+
     const todos = await destinatarios();
-    const lista = todos.filter(d =>
-      (planes.length === 0 || planes.includes(d.plan_id))
-      && estados.includes(d.estado)
-      && d.telefono);
+    const lista = tenantIds.length > 0
+      ? todos.filter(d => tenantIds.includes(d.tenant_id) && d.telefono)
+      : todos.filter(d =>
+          (planes.length === 0 || planes.includes(d.plan_id))
+          && estados.includes(d.estado)
+          && d.telefono);
 
     if (lista.length === 0) {
-      return fail(c, 'Con esos filtros no queda nadie con teléfono registrado.', 422);
+      return fail(c, tenantIds.length > 0
+        ? 'Ninguno de los negocios que elegiste tiene teléfono registrado.'
+        : 'Con esos filtros no queda nadie con teléfono registrado.', 422);
     }
 
     /**
@@ -390,7 +410,12 @@ anuncios.post('/enviar', async (c) => {
       titulo, mensaje,
       estado: programado ? 'programado' : 'enviando',
       programado_para: programado,
-      segmento: { planes, estados, destinatarios: lista.length },
+      // La lista exacta queda guardada: es lo que vuelve reanudable el envío
+      // sin riesgo de ampliar el público por el camino.
+      segmento: {
+        planes, estados, destinatarios: lista.length,
+        tenant_ids: tenantIds.length > 0 ? lista.map(d => d.tenant_id) : undefined,
+      },
     }).select('id').single();
     if (errA) throw new Error(errA.message);
     const anuncioId = (creado as any).id;
