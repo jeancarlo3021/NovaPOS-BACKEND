@@ -26,6 +26,10 @@ interface ParsedDoc {
   receiver: { name: string; id: string }; // nuestra empresa (receptor)
   total: number;
   tax: number;
+  /** Moneda del comprobante: 'CRC', 'USD', 'EUR'… Nunca vacío. */
+  currency: string;
+  /** Colones por una unidad de esa moneda. 1 si el comprobante es en colones. */
+  exchangeRate: number;
   lines: ParsedLine[];
 }
 
@@ -88,6 +92,37 @@ export function parseHaciendaXml(xml: string): ParsedDoc | null {
     code: commercialCode(l),
   }));
 
+  /**
+   * LA MONEDA DEL COMPROBANTE.
+   *
+   * Los montos del XML vienen en la moneda del emisor, no en colones, y hasta
+   * ahora se guardaban como si siempre fueran colones. Con datos reales de la
+   * bandeja eso significaba registrar una factura de ALANUBE de US$56,50 como
+   * ₡56,50 —veinticinco mil colones de diferencia— y una de KAIMANDUC de
+   * US$3.390 como ₡3.390, cuando son ₡1.525.500.
+   *
+   * La etiqueta cambió de lugar entre versiones del esquema de Hacienda:
+   *   v4.2/4.3 → <ResumenFactura><CodigoTipoMoneda><CodigoMoneda>USD</…>
+   *   v4.0/4.1 → <ResumenFactura><CodigoMoneda>USD</CodigoMoneda>
+   * Se leen las dos, porque en una bandeja conviven comprobantes de emisores
+   * que todavía no migraron.
+   *
+   * Sin etiqueta son colones: así lo define Hacienda, y es además lo que
+   * asumía el sistema hasta hoy, de modo que nada de lo ya guardado cambia de
+   * sentido.
+   */
+  const monedaNodo = resumen.CodigoTipoMoneda ?? {};
+  const currency = (str(monedaNodo.CodigoMoneda ?? resumen.CodigoMoneda) || 'CRC').toUpperCase();
+  /**
+   * El tipo de cambio que declaró el EMISOR, no el de hoy.
+   *
+   * Es el que usó para calcular los impuestos de ese comprobante, así que es
+   * el único con el que las cuentas cierran. Tomar el del día de hoy daría un
+   * total distinto al del papel que mandó el proveedor.
+   */
+  const tcDeclarado = num(monedaNodo.TipoCambio ?? resumen.TipoCambio);
+  const exchangeRate = currency === 'CRC' ? 1 : (tcDeclarado > 0 ? tcDeclarado : 0);
+
   return {
     clave: str(root.Clave),
     docType: ROOT_TO_TYPE[rootKey],
@@ -102,6 +137,8 @@ export function parseHaciendaXml(xml: string): ParsedDoc | null {
     },
     total: num(resumen.TotalComprobante),
     tax: num(resumen.TotalImpuesto),
+    currency,
+    exchangeRate,
     lines,
   };
 }

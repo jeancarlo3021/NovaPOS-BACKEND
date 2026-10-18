@@ -42,6 +42,64 @@ const esCatalogo = (k: any): boolean => String(k ?? '').toLowerCase() === 'catal
 /** El tipo pedido, con 'menu' como valor por omisión (lo que ya existía). */
 const tipoDe = (c: any): TipoPagina => esCatalogo(c.req.query('kind')) ? 'catalogo' : 'menu';
 
+// ══════════════════════════════════════════════════════════════════════════
+// PROMOCIONES EN LA PÁGINA PÚBLICA
+// ══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Hoy en hora de Costa Rica.
+ *
+ * No en UTC: a las 7 de la noche de acá ya es el día siguiente en UTC, y una
+ * promo que vence hoy desaparecería de la carta media tarde antes de hora —
+ * justo en la hora de más visitas.
+ */
+const hoyCR = (): string =>
+  new Date().toLocaleDateString('en-CA', { timeZone: 'America/Costa_Rica' });
+
+/**
+ * La etiqueta que lee el cliente. Es el mismo texto que usa el POS
+ * (`promoLabel` en services/promotions/promotionsService.ts), a propósito: si
+ * la vitrina dice «20% desc.» y el tiquete dice otra cosa, la discusión es en
+ * la caja y la pierde el negocio.
+ */
+function etiquetaPromo(p: any): string {
+  const n = (v: any) => Number(v ?? 0).toLocaleString('es-CR');
+  if (p.type === 'percentage') return `${p.value}% desc.`;
+  if (p.type === 'fixed')      return `-¢${n(p.value)}`;
+  if (p.type === '2x1')        return '2×1';
+  if (p.type === 'qty_bundle') return `${n(p.bundle_qty)} × ¢${n(p.value)}`;
+  if (p.type === 'combo')      return p.combo_mode === 'percent' ? `Combo -${p.value}%` : `Combo ¢${n(p.value)}`;
+  return '';
+}
+
+/**
+ * Cuál promo le toca a un producto.
+ *
+ * Copia exacta de la precedencia del POS (`getProductPromotion`): primero la
+ * que nombra al producto, después la de su categoría, y de último la general.
+ * NO se acumulan — y eso hay que respetarlo aunque acá tiente mostrar el
+ * descuento más grande, porque el precio que se publica tiene que ser el que
+ * la caja va a cobrar.
+ *
+ * Los combos quedan fuera: se resuelven con el carrito armado, no por
+ * producto, así que no pueden cambiar un precio unitario. Igual se publican
+ * en la lista de promos, porque para el cliente son lo más atractivo.
+ */
+function promoDe(productId: string, categoryId: string | null, activas: any[]): any | null {
+  const aplican = activas.filter(p => p.type !== 'combo');
+  return aplican.find(p => p.applies_to === 'products' && (p.product_ids ?? []).includes(productId))
+    ?? (categoryId ? aplican.find(p => p.applies_to === 'category' && p.category_id === categoryId) : null)
+    ?? aplican.find(p => p.applies_to === 'all')
+    ?? null;
+}
+
+/** El precio con la promo aplicada, SIN impuesto (el impuesto se suma después). */
+function precioConPromo(base: number, p: any): number {
+  if (p.type === 'percentage') return base * (1 - Number(p.value) / 100);
+  if (p.type === 'fixed')      return Math.max(0, base - Number(p.value));
+  return base;   // 2×1, combo y por cantidad dependen de la cantidad
+}
+
 const SectionSchema = z.object({
   id: z.string(),
   title: z.string(),
@@ -259,12 +317,13 @@ publicMenu.get('/:slug', async (c) => {
       // filtración, y acá cualquiera que escanee el QR es un desconocido.
       // `iva_rate` viaja para poder publicar el precio final: cada producto
       // puede tener su tarifa (13%, 1% de canasta básica, exento).
+      // `category_id` viaja para poder resolver las promos por categoría.
       const cols = kind === 'catalogo'
-        ? 'id, name, description, unit_price, image_url, iva_rate, sku, stock_quantity, tracks_stock'
-        : 'id, name, description, unit_price, image_url, iva_rate';
+        ? 'id, name, description, unit_price, image_url, iva_rate, category_id, sku, stock_quantity, tracks_stock'
+        : 'id, name, description, unit_price, image_url, iva_rate, category_id';
       let prods: any = await db.from('products')
         .select(cols).eq('tenant_id', tenantId).in('id', ids).is('deleted_at', null);
-      if (prods.error && /sku|stock_quantity|tracks_stock|iva_rate/i.test(prods.error.message ?? '')) {
+      if (prods.error && /sku|stock_quantity|tracks_stock|iva_rate|category_id/i.test(prods.error.message ?? '')) {
         prods = await db.from('products')
           .select('id, name, description, unit_price, image_url')
           .eq('tenant_id', tenantId).in('id', ids).is('deleted_at', null);
@@ -273,6 +332,8 @@ publicMenu.get('/:slug', async (c) => {
         const it: any = {
           id: p.id, name: p.name, description: p.description ?? null,
           price: precioPublicado(p.unit_price, p.iva_rate), image_url: p.image_url ?? null,
+          /** Internos: se usan para resolver la promo y se borran antes de responder. */
+          _neto: Number(p.unit_price) || 0, _iva: p.iva_rate, _cat: p.category_id ?? null,
         };
         if (kind === 'catalogo') {
           it.sku = p.sku ?? null;
@@ -302,12 +363,84 @@ publicMenu.get('/:slug', async (c) => {
       }
     }
 
+    /**
+     * PROMOCIONES VIGENTES HOY.
+     *
+     * Solo las que están corriendo: una programada para la semana que viene no
+     * va en la vitrina (el cliente la pediría hoy) y una vencida tampoco. Se
+     * filtra por fecha acá y no en la consulta porque `ends_at` vacío significa
+     * «permanente», y eso en SQL pide un OR que se lee peor que esta línea.
+     */
+    let promosOut: any[] = [];
+    try {
+      const hoy = hoyCR();
+      const { data: todas } = await db.from('promotions')
+        .select('id, name, description, type, value, combo_mode, bundle_qty, applies_to, category_id, product_ids, starts_at, ends_at, is_active')
+        .eq('tenant_id', tenantId).eq('is_active', true);
+      const activas = ((todas ?? []) as any[])
+        .filter(p => p.starts_at <= hoy && (!p.ends_at || p.ends_at >= hoy));
+
+      if (activas.length) {
+        /** A qué ítems PUBLICADOS les toca cada promo. Una promo que no alcanza
+         *  nada de lo publicado no se muestra: sería ofrecer algo que el cliente
+         *  no puede encontrar en la página. */
+        const alcance = new Map<string, string[]>();
+        for (const it of itemById.values()) {
+          const pr = promoDe(it.id, it._cat, activas);
+          if (pr) {
+            // El descuento se aplica al precio NETO y el impuesto se suma
+            // después, igual que en la caja. Al revés —descontar sobre el
+            // precio con IVA— da unos colones de diferencia en los montos
+            // fijos, y esa diferencia aparece justo al pagar.
+            const neto = precioConPromo(it._neto, pr);
+            const nuevo = precioPublicado(neto, it._iva);
+            if (nuevo < it.price) { it.precio_antes = it.price; it.price = nuevo; }
+            it.promo_id = pr.id;
+            it.promo_etiqueta = etiquetaPromo(pr);
+            alcance.set(pr.id, [...(alcance.get(pr.id) ?? []), it.id]);
+          }
+        }
+        // Los combos no cambian precios unitarios, pero sí nombran productos:
+        // se les calcula el alcance aparte para que el filtro de la página
+        // pueda mostrar de qué está hecho el combo.
+        for (const pr of activas.filter(p => p.type === 'combo')) {
+          const dentro = (pr.product_ids ?? []).filter((id: string) => itemById.has(id));
+          if (dentro.length) alcance.set(pr.id, dentro);
+        }
+
+        promosOut = activas
+          .filter(p => (alcance.get(p.id) ?? []).length > 0)
+          .map(p => ({
+            id: p.id, nombre: p.name, descripcion: p.description ?? null,
+            tipo: p.type, etiqueta: etiquetaPromo(p),
+            /**
+             * Las DOS fechas, no solo la de fin.
+             *
+             * Una promo que dice «hasta el 20» deja al cliente sin saber si ya
+             * está corriendo o arranca mañana, y la pregunta termina en el
+             * mostrador. Con las dos, el cartel se lee solo. La de inicio
+             * puede estar en el pasado: igual se publica, porque «del 1 al 20»
+             * es lo que la gente espera ver en una oferta.
+             */
+            empieza: p.starts_at || null,
+            termina: p.ends_at || null,
+            item_ids: alcance.get(p.id) ?? [],
+          }));
+      }
+    } catch { /* sin promos la carta se muestra igual: nunca deben costar una página */ }
+
     // Los platos que ya no existen se caen solos: un menú que ofrece algo
     // inexistente hace quedar mal al negocio delante del cliente.
     const outSections = sections.map(s => ({
       id: s.id, title: s.title, note: s.note ?? null,
       items: (s.product_ids ?? []).map((id: string) => itemById.get(id)).filter(Boolean),
     })).filter(s => s.items.length > 0);
+
+    // Fuera los campos internos: el costo neto y la categoría del producto no
+    // son asunto de quien escanea un QR desde la calle.
+    for (const sec of outSections) {
+      for (const it of sec.items) { delete it._neto; delete it._iva; delete it._cat; }
+    }
 
     // Contador de visitas. Se hace leyendo y sumando, no con un RPC: Supabase
     // resuelve (no rechaza) cuando la función no existe, así que un `.catch()`
@@ -329,6 +462,7 @@ publicMenu.get('/:slug', async (c) => {
       // configuración del negocio, que el navegador no puede leer.
       config: { ...cfgMenu, impuesto_incluido: impuestoActivo ? conIva : null },
       sections: outSections,
+      promos: promosOut,
     });
   } catch (err: any) { return fail(c, err.message, 500); }
 });

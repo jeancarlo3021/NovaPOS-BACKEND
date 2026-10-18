@@ -105,6 +105,12 @@ async function processXml(
     doc_date: doc.date,
     total: doc.total,
     tax: doc.tax,
+    // En la moneda del comprobante, no en colones: `total` queda tal cual lo
+    // declaró el emisor y la conversión se hace donde se usa, con ESTE tipo de
+    // cambio. Guardar ya convertido perdería el monto original, que es el que
+    // el proveedor va a reclamar si hay diferencia.
+    currency: doc.currency,
+    exchange_rate: doc.exchangeRate,
     ack_status: 'pending',
     source: 'email',
     email_from: emailFrom,

@@ -1,7 +1,8 @@
 import { Hono } from 'hono';
 import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
-import { respuesta, modoIA } from '../services/ia.js';
+import { respuesta, modoIA, pedirAlModelo } from '../services/ia.js';
+import { sugerirCabys } from './cabys.js';
 
 /**
  * Las funciones de IA del sistema, hoy en MODO DEMOSTRACIÓN (ver services/ia.ts).
@@ -54,6 +55,33 @@ function periodoDe(pregunta: string): { desde: string; hasta: string; etiqueta: 
   return { desde: diaCR(ini), hasta: hoyCR, etiqueta: 'este mes' };
 }
 
+/**
+ * El período ANTERIOR del mismo largo.
+ *
+ * «Vendí ₡800.000 este mes» no dice nada solo: ¿es bueno o malo? La respuesta
+ * útil es «₡800.000, 12% más que el mes pasado». Se compara contra un tramo
+ * del mismo largo terminando justo antes, no contra «el mes calendario
+ * anterior», porque si hoy es 5 comparar 5 días contra 30 da una caída del 80%
+ * que no existe y asusta a cualquiera.
+ */
+function periodoAnterior(desde: string, hasta: string): { desde: string; hasta: string } {
+  const d0 = new Date(desde + 'T12:00:00').getTime();
+  const d1 = new Date(hasta + 'T12:00:00').getTime();
+  const largo = Math.max(86_400_000, d1 - d0 + 86_400_000);
+  return { desde: diaCR(new Date(d0 - largo)), hasta: diaCR(new Date(d0 - 86_400_000)) };
+}
+
+/** Cómo se dice una variación en castellano, sin falsa precisión. */
+function variacion(ahora: number, antes: number): string | null {
+  // Devuelve una frase COMPLETA, no un pedazo: antes se anteponía «Es » y
+  // salía «Es no hay con qué comparar», que se lee como un error del sistema.
+  if (antes <= 0) return ahora > 0 ? 'En el período anterior no hubo ventas, así que no hay con qué comparar.' : null;
+  const pct = ((ahora - antes) / antes) * 100;
+  if (Math.abs(pct) < 1) return 'Es prácticamente igual que el período anterior.';
+  const signo = pct > 0 ? 'más' : 'menos';
+  return `Es un ${Math.abs(Math.round(pct))}% ${signo} que el período anterior (${money(antes)}).`;
+}
+
 /** Facturas no anuladas del período (paginadas: Supabase corta en 1000). */
 async function ventasDe(tenantId: string, desde: string, hasta: string) {
   const filas: any[] = [];
@@ -98,6 +126,8 @@ ia.post('/preguntar', async (c) => {
     const esPagar = /pagar|proveedor|debo/.test(p);
     // «se está acabando», «se acaba», «por acabarse», «qué hay que reponer»…
     const esStock = /stock|existencia|acab|agotad|repon|minimo|bajo de/.test(p);
+    const esClientes = /client|quien me compra|quien compra|mejor comprador/.test(p);
+    const esGastos = /gast|egres|compr[eé]|cuanto sali|salida de plata/.test(p);
 
     if (esVentas && !esProductos) {
       const ventas = await ventasDe(tenantId, desde, hasta);
@@ -110,14 +140,26 @@ ia.post('/preguntar', async (c) => {
       }
       const detalle = Object.entries(porMetodo).sort((a, b) => b[1] - a[1])
         .map(([k, v]) => `${k}: ${money(v)}`).join(' · ');
+
+      // La comparación va SIEMPRE, no solo si la preguntan: es lo que
+      // convierte una cifra en una noticia.
+      const prev = periodoAnterior(desde, hasta);
+      let comparacion: string | null = null;
+      try {
+        const antes = await ventasDe(tenantId, prev.desde, prev.hasta);
+        comparacion = variacion(total, antes.reduce((s2, v) => s2 + Number(v.total || 0), 0));
+      } catch { /* sin comparación la respuesta sirve igual */ }
+
       return ok(c, respuesta({
         respuesta: ventas.length === 0
           ? `No hay ventas registradas ${etiqueta}.`
           : `${etiqueta.charAt(0).toUpperCase()}${etiqueta.slice(1)} vendiste ${money(total)} en ${ventas.length} factura(s), `
             + `con un promedio de ${money(total / ventas.length)} por venta.`
+            + (comparacion ? ` ${comparacion}` : '')
             + (iva > 0 ? ` IVA incluido: ${money(iva)}.` : ''),
         detalle: detalle || null,
-        fuente: `Facturas no anuladas del ${desde} al ${hasta}.`,
+        fuente: `Facturas no anuladas del ${desde} al ${hasta}`
+          + (comparacion ? `, comparadas con el ${prev.desde} al ${prev.hasta}` : '') + '.',
       }));
     }
 
@@ -200,6 +242,83 @@ ia.post('/preguntar', async (c) => {
       }));
     }
 
+    if (esClientes) {
+      const ventas = await ventasDe(tenantId, desde, hasta);
+      const porCliente = new Map<string, { n: number; monto: number }>();
+      for (const v of ventas) {
+        // Las ventas de mostrador no tienen cliente: agruparlas como «Contado»
+        // y no como «Sin nombre» es lo que hace que la respuesta se entienda.
+        const k = String(v.customer_name ?? '').trim() || 'Contado (sin cliente)';
+        const a = porCliente.get(k) ?? { n: 0, monto: 0 };
+        a.n += 1; a.monto += Number(v.total || 0);
+        porCliente.set(k, a);
+      }
+      const top = [...porCliente.entries()].sort((a, b) => b[1].monto - a[1].monto).slice(0, 5);
+      const identificados = [...porCliente.entries()].filter(([k]) => !k.startsWith('Contado'));
+      return ok(c, respuesta({
+        respuesta: top.length === 0
+          ? `No hay ventas ${etiqueta} para ver quién compra.`
+          : `${etiqueta.charAt(0).toUpperCase()}${etiqueta.slice(1)} te compraron ${porCliente.size} cliente(s) distintos. `
+            + `El que más dejó: ${top[0][0]} con ${money(top[0][1].monto)} en ${top[0][1].n} compra(s).`
+            + (identificados.length === 0
+              ? ' Ojo: ninguna venta tiene cliente asignado, así que no se puede seguir a nadie en el tiempo.'
+              : ''),
+        detalle: top.map(([k, v]) => `${k}: ${money(v.monto)} (${v.n})`).join(' · '),
+        fuente: `Facturas no anuladas del ${desde} al ${hasta}, agrupadas por cliente.`,
+      }));
+    }
+
+    if (esGastos) {
+      /**
+       * Gastos del período.
+       *
+       * Se leen de `expenses` y, si la tabla no existe en esta instalación, la
+       * respuesta lo DICE en vez de contestar «₡0»: un cero inventado sobre
+       * una tabla que no existe es peor que un «no sé», porque se parece a un
+       * dato.
+       */
+      let filas: any[] | null = null;
+      try {
+        // Las columnas son `date` y `category_id`, no `expense_date` ni
+        // `category`. Lo digo acá porque equivocarse NO daba un error visible:
+        // caía en el catch y la respuesta era «el módulo de gastos no está
+        // disponible» sobre una tabla que existe y tiene datos. Un «no hay»
+        // falso es peor que un error, porque nadie lo va a ir a revisar.
+        const { data, error } = await db.from('expenses')
+          .select('amount, date, category_id, description')
+          .eq('tenant_id', tenantId).gte('date', desde).lte('date', hasta).limit(5000);
+        if (error) throw new Error(error.message);
+        filas = data ?? [];
+      } catch { filas = null; }
+
+      if (filas === null) {
+        return ok(c, respuesta({
+          respuesta: 'No puedo ver los gastos en este negocio: el módulo de gastos no está disponible.',
+          detalle: null, fuente: null,
+        }));
+      }
+      const total = filas.reduce((s2, g) => s2 + Number(g.amount || 0), 0);
+      // El nombre de la categoría, no su id: «3f2a-…» no le dice nada a nadie.
+      const nombreCat = new Map<string, string>();
+      try {
+        const { data } = await db.from('expense_categories').select('id, name').eq('tenant_id', tenantId);
+        for (const x of (data ?? []) as any[]) nombreCat.set(String(x.id), String(x.name));
+      } catch { /* sin nombres se agrupa igual */ }
+      const porCat = new Map<string, number>();
+      for (const g of filas) {
+        const k = nombreCat.get(String(g.category_id)) ?? 'Sin categoría';
+        porCat.set(k, (porCat.get(k) ?? 0) + Number(g.amount || 0));
+      }
+      const top = [...porCat.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5);
+      return ok(c, respuesta({
+        respuesta: filas.length === 0
+          ? `No hay gastos registrados ${etiqueta}.`
+          : `${etiqueta.charAt(0).toUpperCase()}${etiqueta.slice(1)} gastaste ${money(total)} en ${filas.length} registro(s).`,
+        detalle: top.map(([k, v]) => `${k}: ${money(v)}`).join(' · ') || null,
+        fuente: `Gastos con fecha del ${desde} al ${hasta}.`,
+      }));
+    }
+
     if (esStock) {
       const { data } = await db.from('products')
         .select('name, stock_quantity, min_stock_level, tracks_stock')
@@ -215,14 +334,44 @@ ia.post('/preguntar', async (c) => {
       }));
     }
 
-    // No se reconoció: se dice QUÉ se puede preguntar, en vez de inventar.
+    /**
+     * No se reconoció la pregunta.
+     *
+     * En vez de recitar la lista entera de lo que sabe hacer, se busca el tema
+     * MÁS CERCANO por palabras compartidas y se ofrece esa pregunta concreta.
+     * «¿cuánto entró en caja?» no cae en ninguna regla, pero comparte «caja» y
+     * «entró» con ventas: ofrecerle «¿Cuánto vendí este mes?» lo deja a un
+     * toque de la respuesta, mientras que una lista de cinco temas lo deja
+     * leyendo.
+     */
+    const TEMAS = [
+      { pregunta: '¿Cuánto vendí este mes?',          claves: 'vender ventas facturar ingreso caja entro plata cuanto hice total' },
+      { pregunta: '¿Qué producto me deja más plata?', claves: 'producto plato articulo vendido mejor top ranking deja gana' },
+      { pregunta: '¿Quién me compra más?',            claves: 'cliente comprador quien compra frecuente fiel' },
+      { pregunta: '¿Cuánto me deben?',                claves: 'deben cobrar pendiente credito deuda saldo moroso' },
+      { pregunta: '¿Cuánto debo a proveedores?',      claves: 'pagar proveedor debo cuenta pagar' },
+      { pregunta: '¿Cuánto gasté este mes?',          claves: 'gasto egreso salida compra pago servicio alquiler' },
+      { pregunta: '¿Qué se está acabando?',           claves: 'stock existencia acabar agotar reponer minimo inventario falta' },
+    ];
+    const tokensPregunta = new Set(norm(texto).split(/[^a-z0-9ñ]+/).filter(w => w.length > 2));
+    let mejorTema: { pregunta: string; n: number } | null = null;
+    for (const t of TEMAS) {
+      const n = t.claves.split(' ').filter(w => tokensPregunta.has(w)).length;
+      if (n > 0 && (!mejorTema || n > mejorTema.n)) mejorTema = { pregunta: t.pregunta, n };
+    }
+
     return ok(c, respuesta({
-      respuesta: 'Todavía no sé contestar eso. En modo demostración puedo con: '
-        + 'cuánto vendiste (hoy, esta semana, este mes, el mes pasado), qué productos dejan más plata, '
-        + 'cuánto te deben, cuánto debés y qué productos están por agotarse.',
+      respuesta: mejorTema
+        ? `No estoy seguro de haber entendido. ¿Querías preguntar «${mejorTema.pregunta}»?`
+        : 'Todavía no sé contestar eso.',
       detalle: null,
       fuente: null,
       no_entendida: true,
+      // La pantalla las muestra como botones: así se contesta de un toque en
+      // vez de tener que reescribir la pregunta.
+      sugerencias: mejorTema
+        ? [mejorTema.pregunta, ...TEMAS.filter(t => t.pregunta !== mejorTema!.pregunta).slice(0, 3).map(t => t.pregunta)]
+        : TEMAS.map(t => t.pregunta),
     }));
   } catch (err: any) { return fail(c, err.message, 500); }
 });
@@ -310,6 +459,97 @@ ia.post('/descripciones', async (c) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════
+// CABYS ASISTIDO
+// ══════════════════════════════════════════════════════════════════════════
+
+/**
+ * POST /cabys  { nombres: string[] }
+ *
+ * Ponerle código CABYS a un catálogo nuevo es el trabajo más odiado de montar
+ * un negocio en facturación electrónica: son trece dígitos por producto,
+ * elegidos de un catálogo de veinte mil filas, y equivocarse le cuesta al
+ * negocio —no al sistema— frente a Hacienda.
+ *
+ * ── LA REGLA QUE NO SE NEGOCIA ────────────────────────────────────────────
+ * El modelo NUNCA inventa un código. Se le dan los candidatos REALES que
+ * salieron del catálogo oficial y de lo que otros negocios ya clasificaron, y
+ * lo único que hace es ELEGIR entre ellos y explicar por qué. Un modelo de
+ * lenguaje produce trece dígitos con total naturalidad y no hay forma de
+ * distinguir a simple vista un código válido de uno inventado: para cuando
+ * alguien se da cuenta, ya se facturó. Por eso la elección está acotada por
+ * construcción y no por una instrucción en el prompt, que se puede ignorar.
+ *
+ * En modo demostración contesta igual, con el motivo que arma el buscador. La
+ * diferencia con el modelo encendido es la calidad de la elección entre
+ * candidatos, no que aparezcan códigos nuevos.
+ */
+ia.post('/cabys', async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const nombres: string[] = (Array.isArray(body?.nombres) ? body.nombres : body?.names ?? [])
+      .map((x: any) => String(x ?? '').trim()).filter(Boolean);
+    if (nombres.length === 0) return fail(c, 'Mandá al menos un nombre de producto', 422);
+    if (nombres.length > 200) return fail(c, 'Máximo 200 productos por consulta', 422);
+
+    const base = await sugerirCabys(nombres, { alternativas: true });
+
+    /**
+     * Los que quedaron flojos son los que valen la pena repasar.
+     *
+     * Con confianza alta el buscador ya acertó y gastar una llamada al modelo
+     * ahí es tirar plata. El valor está en los dudosos y en los que quedaron
+     * sin código, que son los que hoy terminan en un «0000000000000» o en una
+     * tarde de alguien buscando a mano.
+     */
+    const dudosos = base.filter((x: any) => !x.code || x.confianza !== 'alta');
+
+    let revisados = 0;
+    if (modoIA() === 'real' && dudosos.length > 0) {
+      for (const item of dudosos) {
+        const candidatos = [
+          ...(item.code ? [{ code: item.code, description: item.description }] : []),
+          ...((item.alternativas ?? []) as any[]).map(a => ({ code: a.code, description: a.description })),
+        ];
+        if (candidatos.length < 2) continue;
+        const elegido = await pedirAlModelo({
+          sistema: 'Sos un clasificador de productos para el catálogo CABYS de Costa Rica. '
+            + 'Elegí el código que mejor describe el producto ENTRE LOS CANDIDATOS DADOS. '
+            + 'Respondé solo con el código elegido y una razón de una línea, separados por «|». '
+            + 'Si ninguno sirve, respondé «NINGUNO|» y la razón.',
+          mensaje: `Producto: ${item.name}\nCandidatos:\n`
+            + candidatos.map(x => `${x.code} — ${x.description}`).join('\n'),
+          maxTokens: 120,
+        });
+        if (!elegido) continue;
+        const [codigo, razon] = String(elegido).split('|').map(x => x.trim());
+        // La defensa real: se acepta únicamente si el código está en la lista
+        // que nosotros armamos. Si el modelo devolvió otra cosa, se ignora.
+        const valido = candidatos.find(x => x.code === codigo);
+        if (!valido) continue;
+        item.code = valido.code;
+        item.description = valido.description;
+        item.fuente = 'ia';
+        item.motivo = razon || item.motivo;
+        revisados += 1;
+      }
+    }
+
+    const conCodigo = base.filter((x: any) => x.code).length;
+    return ok(c, respuesta({
+      sugerencias: base,
+      resumen: {
+        total: base.length,
+        con_codigo: conCodigo,
+        sin_codigo: base.length - conCodigo,
+        alta: base.filter((x: any) => x.confianza === 'alta').length,
+        para_revisar: dudosos.length,
+        revisados_por_el_modelo: revisados,
+      },
+    }));
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════
 // PASO 5 — SOPORTE: EXPLICAR UN DIAGNÓSTICO EN CRISTIANO
 // ══════════════════════════════════════════════════════════════════════════
 
@@ -341,6 +581,44 @@ ia.post('/explicar-diagnostico', async (c) => {
           'Entrá a «Configuración del sitio».',
           'Buscá «Dispositivos de la red local» (en inglés, «Apps on this device») y ponelo en Permitir.',
           'Recargá la página y volvé a intentar imprimir.',
+        ],
+      },
+      {
+        /**
+         * Va ANTES que las demás: cuando aparece este texto, todo lo otro ya
+         * pasó y la causa es inequívoca.
+         *
+         * El orden de los pasos salió de un caso real. Primero se mandaba a
+         * probar en incógnito, por las extensiones; el cliente probó y falló
+         * igual. Y tiene sentido: el antivirus con filtro web y las políticas
+         * del navegador SIGUEN ACTIVOS en incógnito, así que incógnito no
+         * descarta nada por sí solo. Ahora primero va la prueba que sí separa
+         * las causas —otro navegador—, y lo del incógnito queda al final, que
+         * es lo que de verdad aporta.
+         */
+        busca: /blocked by client|err_blocked|blocked_by/i,
+        titulo: 'QZ Tray tiene este sitio en su lista de bloqueados',
+        hacer: [
+          'Clic derecho en el icono de QZ Tray, junto al reloj → Advanced → Site Manager.',
+          'Pestaña «Blocked»: borrá TODO lo que haya ahí con «Delete». No busques «colonclick.com»: QZ guarda certificados, no dominios, y sin certificado la entrada figura como «Untrusted» o «Unsigned» — por eso el bloqueo afecta a Chrome, Edge y Firefox por igual.',
+          'En Advanced, desmarcá «Block anonymous requests» si está marcada (sin certificado, nuestras peticiones son anónimas y esa opción las rechaza).',
+          'Volvé a tocar «Conectar QZ Tray» y elegí «Allow», marcando «Remember».',
+          'Si la lista «Blocked» está vacía y sigue igual: cerrá QZ Tray, borrá la carpeta %APPDATA%\\qz y volvé a abrirlo.',
+        ],
+      },
+      {
+        // El navegador cortando el WebSocket es OTRA cosa, y se reconoce solo
+        // por el paso del canal de datos. Separarlas importa: el arreglo de una
+        // está dentro de QZ Tray y el de la otra en el navegador o el antivirus,
+        // y confundirlas fue lo que hizo perder un día de soporte.
+        busca: /websocket|canal de datos/i,
+        titulo: 'Algo entre el navegador y QZ está cortando la conexión',
+        hacer: [
+          'Abrí la página en OTRO navegador (Firefox o Edge). Si ahí imprime, el problema es de Chrome; si tampoco, es algo instalado en la computadora.',
+          'Antivirus: desactivá un rato la «protección web» o el «filtrado SSL» (Kaspersky, ESET, Avast, Bitdefender cortan este tipo de conexión).',
+          'Si la computadora la administra una empresa: abrí chrome://policy y buscá «URLBlocklist»; una regla con ws:// o wss:// lo bloquea todo.',
+          'Recién al final, incógnito (Ctrl+Mayús+N): solo descarta extensiones, no el antivirus ni las políticas.',
+          'Mientras tanto se puede cobrar con «Imprimir por el navegador», que no usa QZ.',
         ],
       },
       {
@@ -379,7 +657,9 @@ ia.post('/explicar-diagnostico', async (c) => {
       resumen: fallaron.length === 0
         ? 'Todo pasó: la impresión está lista para usarse.'
         : `Falló ${fallaron.length} de ${pasos.length} revisiones. Empezá por lo primero de la lista.`,
-      acciones: encontradas.length > 0 ? encontradas : (fallaron.length > 0 ? [{
+      // Sin `busca`: la regex es de uso interno y no tiene nada que hacer
+      // viajando hasta la pantalla del cajero.
+      acciones: encontradas.length > 0 ? encontradas.map(({ titulo, hacer }) => ({ titulo, hacer })) : (fallaron.length > 0 ? [{
         titulo: fallaron[0].nombre,
         hacer: [fallaron[0].detalle || 'Volvé a correr el diagnóstico y mandanos el resultado.'],
       }] : []),

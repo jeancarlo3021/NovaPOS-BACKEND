@@ -46,9 +46,35 @@ const VACIAS = new Set([
   'unidad', 'unidades', 'paq', 'pack', 'caja', 'bolsa', 'x',
 ]);
 
+/**
+ * La RAÍZ de una palabra, para que singular y plural sean la misma.
+ *
+ * El catálogo de Hacienda está escrito en plural («Tornillos de hierro o
+ * acero») y la gente nombra sus productos en singular («Tornillo galvanizado
+ * 3/8»). Sin esto no se cruzaban NUNCA: ese tornillo quedaba sin código
+ * aunque el catálogo tenga seis filas de tornillos, y la persona terminaba
+ * buscando a mano entre veinte mil líneas.
+ *
+ * Se corta la «s» final y después una «e» final, que es lo que vuelve
+ * simétricos los dos plurales del español:
+ *   tornillo / tornillos   → tornillo
+ *   carne    / carnes      → carn
+ *   animal   / animales    → animal
+ *
+ * Las palabras de tres letras no se tocan: «res», «gas» y «mes» no son
+ * plurales de nada y mutilarlas crearía cruces falsos.
+ */
+const raiz = (w: string): string => {
+  if (w.length <= 3) return w;
+  let r = w.endsWith('s') ? w.slice(0, -1) : w;
+  if (r.length > 4 && r.endsWith('e')) r = r.slice(0, -1);
+  return r;
+};
+
 const palabras = (texto: string): string[] =>
   norm(texto).replace(/[^a-z0-9ñ ]+/g, ' ').split(/\s+/)
-    .filter(w => w.length >= 3 && !VACIAS.has(w) && !/^\d+$/.test(w));
+    .filter(w => w.length >= 3 && !VACIAS.has(w) && !/^\d+$/.test(w))
+    .map(raiz);
 
 interface Catalogo {
   filas: Array<{ code: string; description: string; iva_rate: number | null; tokens: string[] }>;
@@ -184,18 +210,23 @@ async function cargarCatalogo(): Promise<Catalogo> {
 }
 
 // POST /sugerir  { names: string[] } → una sugerencia por nombre.
-cabys.post('/sugerir', async (c) => {
-  try {
-    const body = await c.req.json().catch(() => ({}));
-    const nombres: string[] = Array.isArray(body?.names) ? body.names : [];
-    if (nombres.length === 0) return ok(c, []);
-    if (nombres.length > 3000) return fail(c, 'Demasiados productos de una vez (máximo 3000)', 422);
-
+/**
+ * EL MOTOR DE SUGERENCIA, aparte del endpoint.
+ *
+ * Lo usan dos pantallas —el importador masivo y el asistente de IA— y tiene
+ * que ser el MISMO. Si cada una tuviera su copia, en seis meses una tendría
+ * los arreglos y la otra no, y el mismo producto recibiría códigos distintos
+ * según por dónde se entró. Para Hacienda esa inconsistencia es del negocio,
+ * no del sistema.
+ */
+export async function sugerirCabys(
+  nombres: string[],
+  opciones: { alternativas?: boolean } = {},
+): Promise<any[]> {
+  {
     const cat = await cargarCatalogo();
     const total = cat.filas.length || 1;
     const corp = await cargarCorpus();
-    const tenantId = String(c.get('tenantId') ?? '');
-    void tenantId;
 
     /** Descripción y tarifa de un código, para poder mostrar qué se eligió. */
     const infoDe = new Map(cat.filas.map(f => [f.code, f]));
@@ -268,39 +299,51 @@ cabys.post('/sugerir', async (c) => {
       };
     };
 
-    const salida = nombres.map((nombre) => {
-      const tokens = [...new Set(palabras(String(nombre ?? '')))];
-      const vacio = { name: nombre, code: null, description: null, iva_rate: null, confianza: 'baja' as const, fuente: null as string | null };
-      if (tokens.length === 0) return vacio;
-
-      // ── 1) Lo que ya clasificaron otros negocios ──
-      const otros = porOtrosNegocios(String(nombre));
-      if (otros) {
-        // El nombre exacto es la señal más fuerte que hay. Para el resto se
-        // pide que el nombre quede bien explicado Y que el código ganador se
-        // despegue del segundo: un empate significa que no está claro.
-        const conf = otros.exacto ? 'alta'
-          : otros.parecido >= 0.6 ? 'alta'
-          : otros.parecido >= 0.35 ? 'media'
-          : null;
-        if (conf) {
-          const f = infoDe.get(otros.code);
-          return {
-            name: nombre, code: otros.code,
-            description: f?.description ?? null,
-            iva_rate: f?.iva_rate ?? null,
-            confianza: conf as 'alta' | 'media',
-            fuente: 'otros_negocios',
-            negocios: otros.negocios || undefined,
-            exacto: otros.exacto || undefined,
-            parecido: Math.round(otros.parecido * 100),
-          };
-        }
+    /**
+     * Las OTRAS opciones razonables, no solo la ganadora.
+     *
+     * Quien revisa necesita poder decir «esa no, esta otra» sin salir a buscar
+     * en veinte mil filas. Se calculan solo cuando alguien las pide: para una
+     * importación de mil productos nadie las mira y costarían tiempo de más.
+     */
+    const alternativasDelCatalogo = (tokens: string[], excluir: string | null) => {
+      const pesoMax = Math.log(total / 0.5);
+      const peso = (w: string) => {
+        const n = cat.indice.get(w)?.length ?? 0;
+        return n === 0 ? pesoMax : Math.log(total / n);
+      };
+      const pesoTotal = tokens.reduce((a, w) => a + peso(w), 0) || 1;
+      const puntos = new Map<number, number>();
+      for (const w of tokens) {
+        const postings = cat.indice.get(w);
+        if (!postings) continue;
+        const pw = peso(w);
+        for (const i of postings) puntos.set(i, (puntos.get(i) ?? 0) + pw);
       }
+      return [...puntos.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .map(([i, pt]) => ({
+          code: cat.filas[i].code,
+          description: cat.filas[i].description,
+          iva_rate: cat.filas[i].iva_rate,
+          coincidencia: Math.round((pt / pesoTotal) * 100),
+        }))
+        .filter(x => x.code !== excluir)
+        .slice(0, 3);
+    };
 
-      // ── 2) Respaldo: el catálogo de Hacienda ──
+    /**
+     * El mejor candidato del CATÁLOGO OFICIAL de Hacienda.
+     *
+     * Antes esto vivía suelto dentro del map y solo se ejecutaba cuando el
+     * corpus de otros negocios fallaba. Ahora es una función aparte porque
+     * hace falta poder CONSULTARLO para decidir, no solo como respaldo: una
+     * coincidencia floja con lo que clasificó un negocio no debería ganarle a
+     * una buena del catálogo oficial.
+     */
+    const mejorDelCatalogo = (tokens: string[]) => {
       /**
-       * Peso de una palabra en el CATÁLOGO: cuanto más rara, más distingue.
+       * Peso de una palabra: cuanto más rara, más distingue.
        *
        * Una palabra que NO está en el catálogo pesa MÁS que cualquiera, no
        * cero. Pesando cero desaparecía de la cuenta y «Empanada Carne» daba
@@ -313,7 +356,7 @@ cabys.post('/sugerir', async (c) => {
         return n === 0 ? pesoMaximo : Math.log(total / n);
       };
       const pesoTotal = tokens.reduce((s2, w) => s2 + peso(w), 0);
-      if (pesoTotal <= 0) return vacio;
+      if (pesoTotal <= 0) return null;
 
       // Solo se puntean las filas que comparten AL MENOS una palabra: recorrer
       // las 20.000 por cada producto sería tirar el tiempo en las que no tienen
@@ -322,36 +365,139 @@ cabys.post('/sugerir', async (c) => {
       for (const w of tokens) {
         const postings = cat.indice.get(w);
         if (!postings) continue;          // palabra ajena al catálogo: no suma a nadie
-        const p = peso(w);
-        for (const i of postings) puntos.set(i, (puntos.get(i) ?? 0) + p);
+        const pw = peso(w);
+        for (const i of postings) puntos.set(i, (puntos.get(i) ?? 0) + pw);
       }
-      if (puntos.size === 0) return vacio;
+      if (puntos.size === 0) return null;
 
       let mejor = -1, mejorPunto = 0;
-      for (const [i, p] of puntos) {
+      for (const [i, pt] of puntos) {
         // A igual puntaje gana la descripción MÁS CORTA: es la más específica,
         // y las largas suelen ser cajones de sastre que mencionan de todo.
-        if (p > mejorPunto || (p === mejorPunto && mejor >= 0
+        if (pt > mejorPunto || (pt === mejorPunto && mejor >= 0
             && cat.filas[i].tokens.length < cat.filas[mejor].tokens.length)) {
-          mejor = i; mejorPunto = p;
+          mejor = i; mejorPunto = pt;
         }
       }
-      if (mejor < 0) return vacio;
-
-      const cobertura = mejorPunto / pesoTotal;      // cuánto del nombre quedó explicado
-      const confianza = cobertura >= 0.85 ? 'alta' : cobertura >= 0.5 ? 'media' : 'baja';
-      if (confianza === 'baja') return { ...vacio, name: nombre };
-
+      if (mejor < 0) return null;
       const f = cat.filas[mejor];
       return {
-        name: nombre, code: f.code, description: f.description,
-        iva_rate: f.iva_rate, confianza,
-        fuente: 'catalogo',
-        cobertura: Math.round(cobertura * 100),
+        code: f.code, description: f.description, iva_rate: f.iva_rate,
+        cobertura: mejorPunto / pesoTotal,              // cuánto del nombre quedó explicado
+        compartidas: tokens.filter(w => f.tokens.includes(w)),
       };
+    };
+
+    const salida = nombres.map((nombre) => {
+      const tokens = [...new Set(palabras(String(nombre ?? '')))];
+      const vacio = { name: nombre, code: null, description: null, iva_rate: null, confianza: 'baja' as const, fuente: null as string | null };
+      if (tokens.length === 0) return vacio;
+
+      const alt = (excluir: string | null) =>
+        (opciones.alternativas ? alternativasDelCatalogo(tokens, excluir) : undefined);
+
+      const deCatalogo = (m: NonNullable<ReturnType<typeof mejorDelCatalogo>>, conf: 'alta' | 'media') => ({
+        name: nombre, code: m.code, description: m.description, iva_rate: m.iva_rate,
+        confianza: conf, fuente: 'catalogo',
+        cobertura: Math.round(m.cobertura * 100),
+        motivo: m.compartidas.length
+          ? `La descripción oficial comparte ${m.compartidas.length === 1 ? 'la palabra' : 'las palabras'} `
+            + m.compartidas.slice(0, 4).map(w => '«' + w + '»').join(', ')
+            + ` y explica un ${Math.round(m.cobertura * 100)}% del nombre.`
+          : `Del catálogo oficial de Hacienda, con un ${Math.round(m.cobertura * 100)}% de coincidencia.`,
+        alternativas: alt(m.code),
+      });
+
+      // ── 1) Lo que ya clasificaron otros negocios ──
+      const otros = porOtrosNegocios(String(nombre));
+      if (otros) {
+        const f = infoDe.get(otros.code);
+        const resultadoCorpus = (conf: 'alta' | 'media') => ({
+          name: nombre, code: otros.code,
+          description: f?.description ?? null,
+          iva_rate: f?.iva_rate ?? null,
+          confianza: conf,
+          fuente: 'otros_negocios',
+          negocios: otros.negocios || undefined,
+          exacto: otros.exacto || undefined,
+          parecido: Math.round(otros.parecido * 100),
+          motivo: otros.exacto
+            ? `${otros.negocios || 'Otro'} negocio(s) venden un producto con este mismo nombre y le pusieron este código.`
+            : `Se parece un ${Math.round(otros.parecido * 100)}% a un producto que ya clasificó otro negocio.`,
+          alternativas: alt(otros.code),
+        });
+
+        // El nombre EXACTO es la señal más fuerte que existe: otro negocio
+        // vende literalmente esto y ya resolvió el código.
+        if (otros.exacto || otros.parecido >= 0.6) return resultadoCorpus('alta');
+
+        /**
+         * Zona dudosa: se le pregunta también al catálogo oficial.
+         *
+         * Una coincidencia floja con lo que clasificó UN negocio no puede
+         * ganarle a una buena del catálogo. Medido: «Cuaderno rayado 100
+         * hojas» se parecía un 46% a un producto que un negocio clasificó como
+         * «Hoja de laurel procesada», y eso le ganaba al 62% de «Cuaderno de
+         * 25, 50 y 100 hojas» del catálogo. El error no era solo de código:
+         * el laurel paga 13% de IVA y el cuaderno escolar paga 1%.
+         */
+        if (otros.parecido >= 0.35) {
+          const m = mejorDelCatalogo(tokens);
+          /**
+           * Para desplazar al corpus, al catálogo no le alcanza con puntuar
+           * más: tiene que explicar la MAYORÍA del nombre.
+           *
+           * Sin esa segunda condición ganaba compartiendo una sola palabra
+           * genérica, y el resultado era peor que lo que reemplazaba —medido—:
+           *   «Llanta de moto»  → «Motos acuáticas»   (en vez de llantas de motocicleta)
+           *   «Papa en malla»   → «Malla Mersilene»   (en vez de papa fresca)
+           * En los dos casos compartía 1 de 2 palabras. El cuaderno, que sí
+           * corresponde cambiar, comparte 2 de 3.
+           */
+          const explicaLaMayoria = m ? m.compartidas.length / tokens.length >= 0.6 : false;
+          if (m && explicaLaMayoria && m.cobertura > otros.parecido) {
+            return deCatalogo(m, m.cobertura >= 0.85 ? 'alta' : 'media');
+          }
+          return resultadoCorpus('media');
+        }
+      }
+
+      // ── 2) Respaldo: el catálogo de Hacienda ──
+      const m = mejorDelCatalogo(tokens);
+      if (!m) return vacio;
+      const confianza = m.cobertura >= 0.85 ? 'alta' : m.cobertura >= 0.5 ? 'media' : 'baja';
+      /**
+       * Poca confianza: NO se pone código, pero sí se ofrecen las opciones.
+       *
+       * Antes acá se devolvía un vacío absoluto, y eso dejaba a la persona sin
+       * nada justo donde más ayuda necesita: «Tornillo galvanizado 3/8»
+       * terminaba sin código y sin pista, igual que un nombre sin sentido.
+       * Poner el código a ciegas sería peor —lo paga el negocio ante
+       * Hacienda—, pero mostrar las tres opciones más cercanas convierte una
+       * búsqueda a mano entre veinte mil filas en un clic entre tres.
+       */
+      if (confianza === 'baja') {
+        return {
+          ...vacio, name: nombre,
+          motivo: 'Ninguna opción queda lo bastante clara como para ponerla sola '
+            + `(la mejor explica apenas un ${Math.round(m.cobertura * 100)}% del nombre). Elegí vos:`,
+          alternativas: alt(null),
+        };
+      }
+      return deCatalogo(m, confianza);
     });
 
-    return ok(c, salida);
+    return salida;
+  }
+}
+
+cabys.post('/sugerir', async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const nombres: string[] = Array.isArray(body?.names) ? body.names : [];
+    if (nombres.length === 0) return ok(c, []);
+    if (nombres.length > 3000) return fail(c, 'Demasiados productos de una vez (máximo 3000)', 422);
+    return ok(c, await sugerirCabys(nombres));
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

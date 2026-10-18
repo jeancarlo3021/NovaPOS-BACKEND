@@ -26,13 +26,61 @@ async function nextPurchaseNumber(tenantId: string): Promise<string> {
 }
 
 // Líneas de un recibido: usa raw.lines / items; si faltan pero hay XML, re-parsea.
+/**
+ * LA MONEDA DE UN COMPROBANTE RECIBIDO, y a cuánto convertirlo.
+ *
+ * Devuelve `null` en el tipo de cambio cuando el comprobante viene en moneda
+ * extranjera y no declara a cuánto. Ese `null` es deliberado y no debe
+ * reemplazarse por 1 «para que no falle»: un 1 haría pasar dólares por colones
+ * en silencio, que es exactamente el error que esto viene a corregir. Quien lo
+ * recibe tiene que decidir qué hacer, y la pantalla lo pide.
+ */
+export function monedaDe(d: any): { currency: string; tasa: number | null } {
+  const currency = String(d?.currency ?? 'CRC').toUpperCase() || 'CRC';
+  if (currency === 'CRC') return { currency, tasa: 1 };
+  const t = Number(d?.exchange_rate ?? 0);
+  return { currency, tasa: t > 0 ? t : null };
+}
+
+/**
+ * Las líneas del comprobante, YA EN COLONES.
+ *
+ * Es el único lugar donde se convierte, y por eso se convierte acá: río abajo
+ * estas líneas se vuelven precio de costo de un producto y monto de una orden
+ * de compra, y todo el sistema guarda eso en colones. Una factura de ALANUBE
+ * de US$56,50 entraba como una compra de ₡56,50 y nadie se enteraba.
+ *
+ * Se conserva el monto original en `_orig_*`: si el proveedor reclama una
+ * diferencia, el número que él tiene en el papel son los dólares, no los
+ * colones que calculamos nosotros.
+ *
+ * Si el comprobante está en moneda extranjera sin tipo de cambio, las líneas
+ * salen SIN convertir y marcadas con `_sin_tasa`. Los endpoints que crean
+ * compras se niegan a seguir con eso.
+ */
 function linesFromDoc(d: any): any[] {
   let lines = Array.isArray(d.raw?.lines) ? d.raw.lines : (Array.isArray(d.items) ? d.items : []);
   if ((!lines || lines.length === 0) && d.xml) {
     const parsed = parseHaciendaXml(String(d.xml));
     if (parsed?.lines?.length) lines = parsed.lines;
   }
-  return lines ?? [];
+  lines = lines ?? [];
+
+  const { currency, tasa } = monedaDe(d);
+  if (currency === 'CRC') return lines;
+  if (!tasa) return lines.map((l: any) => ({ ...l, _moneda: currency, _sin_tasa: true }));
+
+  const aColones = (v: any) => Math.round((Number(v) || 0) * tasa * 100) / 100;
+  return lines.map((l: any) => ({
+    ...l,
+    unit_price: aColones(l.unit_price),
+    subtotal: aColones(l.subtotal),
+    tax: aColones(l.tax),
+    _moneda: currency,
+    _tasa: tasa,
+    _orig_unit_price: Number(l.unit_price) || 0,
+    _orig_subtotal: Number(l.subtotal) || 0,
+  }));
 }
 
 // Empareja líneas del comprobante con productos del tenant (por CABYS, código/SKU
@@ -1561,6 +1609,23 @@ hacienda.get('/received', async (c) => {
       document_type: d.document_type, date: d.doc_date, total: Number(d.total ?? 0),
       tax: Number(d.tax ?? 0), ack_status: d.ack_status,
       /**
+       * EN QUÉ MONEDA ESTÁ ESTE COMPROBANTE.
+       *
+       * `total` viene en la moneda del emisor, no en colones — eso no cambió,
+       * a propósito: el monto original es el que el proveedor va a reclamar si
+       * hay diferencia. Lo que se agrega es con qué leerlo. `total_crc` es el
+       * equivalente ya calculado, y es `null` cuando el comprobante viene en
+       * moneda extranjera sin declarar tipo de cambio: ahí no hay conversión
+       * posible y poner el mismo número haría pasar dólares por colones.
+       */
+      currency: String(d.currency ?? 'CRC').toUpperCase(),
+      exchange_rate: Number(d.exchange_rate ?? 1) || null,
+      total_crc: (() => {
+        const { currency, tasa } = monedaDe(d);
+        if (currency === 'CRC') return Number(d.total ?? 0);
+        return tasa ? Math.round(Number(d.total ?? 0) * tasa * 100) / 100 : null;
+      })(),
+      /**
        * `ack_id` es el comprobante de que el Mensaje Receptor SÍ salió a
        * Hacienda. No se devolvía, así que la pantalla no tenía cómo saberlo y
        * marcaba «Aceptado · sin enviar» incluso cuando se había enviado.
@@ -1939,6 +2004,42 @@ hacienda.post('/received/to-purchase', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+/**
+ * PUT /received/:id/moneda  { currency?, exchange_rate }
+ *
+ * Para los comprobantes que vienen en moneda extranjera sin declarar el tipo
+ * de cambio, o cuando el emisor lo declaró mal. Es la salida del callejón: sin
+ * esto, un comprobante así queda trabado sin forma de registrarlo.
+ *
+ * NO se toma el tipo de cambio del día automáticamente. El del comprobante es
+ * el que el emisor usó para calcular los impuestos de ESE documento; el de hoy
+ * daría un total distinto al del papel que mandó el proveedor, y la diferencia
+ * aparecería recién cuando alguien concilie el pago.
+ */
+hacienda.put('/received/:id/moneda', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { id } = c.req.param();
+    const body = await c.req.json().catch(() => ({}));
+    const tasa = Number(body?.exchange_rate);
+    if (!Number.isFinite(tasa) || tasa <= 0) {
+      return fail(c, 'El tipo de cambio tiene que ser un número mayor que cero', 422);
+    }
+    const parche: any = { exchange_rate: tasa, updated_at: new Date().toISOString() };
+    if (body?.currency) parche.currency = String(body.currency).toUpperCase().slice(0, 3);
+
+    const { data, error } = await db.from('received_documents')
+      .update(parche).eq('id', id).eq('tenant_id', tenantId).select('id, total, currency, exchange_rate').maybeSingle();
+    if (error) throw new Error(error.message);
+    if (!data) return fail(c, 'Comprobante no encontrado', 404);
+    const d: any = data;
+    return ok(c, {
+      ...d,
+      total_crc: Math.round(Number(d.total ?? 0) * Number(d.exchange_rate ?? 1) * 100) / 100,
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // GET /received/:id/match — para el modal de "Compra": trae el comprobante con
 // sus líneas ya emparejadas a productos existentes (por CABYS o por nombre), más
 // las órdenes de compra PENDIENTES del proveedor para poder relacionarlas.
@@ -1975,9 +2076,15 @@ hacienda.get('/received/:id/match', async (c) => {
       orders = (os ?? []) as any[];
     }
 
+    const { currency, tasa } = monedaDe(d);
     return ok(c, {
       id: d.id, clave: d.clave, issuer_name: d.issuer_name, issuer_id: d.issuer_id,
       total: Number(d.total ?? 0), supplier_id: supplierId,
+      // Las líneas ya vienen en colones (ver `linesFromDoc`); el total de acá
+      // también, porque es contra el que se arma la orden de compra.
+      currency,
+      exchange_rate: tasa,
+      total_crc: tasa ? Math.round(Number(d.total ?? 0) * tasa * 100) / 100 : null,
       lines: matchedLines, orders,
       linked_purchase_id: d.purchase_id ?? null,
     });
@@ -2012,6 +2119,26 @@ hacienda.post('/received/reconcile', async (c) => {
       no_products?: boolean;
     };
     if (!id) return fail(c, 'Falta el id', 422);
+
+    /**
+     * SIN TIPO DE CAMBIO NO SE CREA LA COMPRA.
+     *
+     * Un comprobante en moneda extranjera que no declara a cuánto está no se
+     * puede convertir, y seguir igual significaría registrar los dólares como
+     * si fueran colones: una factura de US$3.390 entrando como ₡3.390. Es
+     * preferible parar acá y pedir el dato, porque el error no avisa —queda
+     * como una compra barata y descuadra el mes sin que nada se rompa—.
+     */
+    {
+      const { data: docMoneda } = await db.from('received_documents')
+        .select('currency, exchange_rate').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+      const { currency, tasa } = monedaDe(docMoneda);
+      if (currency !== 'CRC' && !tasa) {
+        return fail(c,
+          `Este comprobante está en ${currency} y no trae el tipo de cambio, así que no se puede `
+          + 'convertir a colones. Indicá el tipo de cambio del comprobante y volvé a intentar.', 422);
+      }
+    }
 
     // ── Conciliación POR LOTES ────────────────────────────────────────────
     // Cada línea del XML es una consulta a la base. Un comprobante de 250
