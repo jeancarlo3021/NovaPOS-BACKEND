@@ -3222,6 +3222,8 @@ admin.post('/tenants/:id/products-import', async (c) => {
      */
     const CHUNK = 200;
     let updated = 0;
+    /** Cuántos traían existencias que no se aplicaron, para poder decirlo. */
+    let stockOmitido = 0;
 
     /**
      * Se consulta qué SKU ya existen en vez de usar `upsert`.
@@ -3262,6 +3264,24 @@ admin.post('/tenants/:id/products-import', async (c) => {
       const tanda = existentes.slice(i, i + CONCURRENCIA);
       const res = await Promise.all(tanda.map(row => {
         const { tenant_id: _t, sku: _s, ...patch } = row;
+        /**
+         * EL STOCK NO SE PISA AL ACTUALIZAR.
+         *
+         * El uso normal de esta importación es traer el archivo del proveedor
+         * para actualizar precios. Si el archivo trae una columna de
+         * existencias —y casi siempre trae alguna—, cada reimportación
+         * sobrescribía el inventario real con el del Excel, sin dejar
+         * registro de qué había antes. Para alguien que acaba de contar su
+         * bodega, eso es perder el conteo sin enterarse.
+         *
+         * En los productos NUEVOS sí entra: ahí es la carga inicial. En los
+         * que ya existen, la existencia se cambia con un ajuste, que pide el
+         * motivo y deja historial.
+         */
+        if ('stock_quantity' in patch) {
+          delete (patch as any).stock_quantity;
+          stockOmitido += 1;
+        }
         return db.from('products')
           .update(patch).eq('id', idPorSku.get(String(row.sku))!).eq('tenant_id', id);
       }));
@@ -3282,7 +3302,7 @@ admin.post('/tenants/:id/products-import', async (c) => {
       }
     }
 
-    return ok(c, { created, updated, errors, error_detail: firstError });
+    return ok(c, { created, updated, errors, error_detail: firstError, stock_omitido: stockOmitido });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
@@ -6747,6 +6767,43 @@ admin.put('/planes-costos/ingreso', async (c) => {
     }
     cachePlanes = null;          // el cálculo cambió: que se vuelva a hacer
     return ok(c, { guardado: true, declarado: cfg[planId] ?? null });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/**
+ * PUT /costos-fijos  { fe_usd?, fe_incluidos?, fe_extra_crc?, vercel_usd?, supabase_usd? }
+ *
+ * Lo que se paga por mes. Son datos de TUS suscripciones: el sistema puede
+ * medir cuánto se consume, pero no tiene forma de saber qué plan contrataste
+ * ni cuánto te cuesta. Deducirlo del consumo fue justamente el error que
+ * tenía esto antes: calculaba Supabase en cero porque el uso cabía en el plan
+ * gratuito, cuando en realidad se estaba pagando Pro.
+ */
+admin.put('/costos-fijos', async (c) => {
+  try {
+    const b = await c.req.json().catch(() => ({} as any));
+    const num = (v: any) => (Number.isFinite(Number(v)) && Number(v) >= 0 ? Number(v) : undefined);
+
+    const fijos: any = (await leerGlobal<any>('costos-fijos')) ?? {};
+    if (num(b?.vercel_usd) !== undefined) fijos.vercel_usd = num(b.vercel_usd);
+    if (num(b?.supabase_usd) !== undefined) fijos.supabase_usd = num(b.supabase_usd);
+    if (!(await guardarGlobal('costos-fijos', fijos))) {
+      return fail(c, 'No se pudo guardar. ¿Corriste la migración 121?', 500);
+    }
+
+    // El proveedor de FE vive en su propia clave porque además de precio
+    // tiene bolsa y costo por documento.
+    const fe: any = (await leerGlobal<any>('costo-fe')) ?? {};
+    let tocoFE = false;
+    if (num(b?.fe_usd) !== undefined) { fe.mensual_usd = num(b.fe_usd); tocoFE = true; }
+    if (num(b?.fe_incluidos) !== undefined) { fe.incluidos = num(b.fe_incluidos); tocoFE = true; }
+    if (num(b?.fe_extra_crc) !== undefined) { fe.extra_crc = num(b.fe_extra_crc); tocoFE = true; }
+    if (tocoFE && !(await guardarGlobal('costo-fe', fe))) {
+      return fail(c, 'No se pudo guardar el costo de facturación electrónica', 500);
+    }
+
+    cachePlanes = null;   // el cálculo cambió
+    return ok(c, { guardado: true, fijos, fe });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

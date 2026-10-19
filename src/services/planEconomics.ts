@@ -1,6 +1,7 @@
 import { db } from '../db/client.js';
 import { medirInfraestructura } from './infraUsage.js';
 import { costoFE, documentosFE } from './costoFE.js';
+import { costosFijos } from './costosFijos.js';
 import { leerGlobal } from './globalSettings.js';
 
 /**
@@ -165,9 +166,18 @@ export async function economiaDeLosPlanes() {
   const extrasFE = Math.max(0, docsFE.total - cFE.incluidos);
   const costoExtraFECrc = Math.round(extrasFE * cFE.extra_crc);
 
-  const costoServidoresUsd = dentroDelGratis ? 0 : 25;    // Supabase Pro
-  const costoUsdHoy = costoServidoresUsd + cFE.mensual_usd;
-  const costoUsdSiPaga = 25 + 20 + cFE.mensual_usd;       // + Vercel Pro
+  /**
+   * El costo de los servidores es el que SE PAGA, no el que el consumo
+   * sugeriría. Acá se deducía del uso —«cabe en el gratuito, cuesta cero»— y
+   * eso subestimaba la factura real: el plan contratado se paga aunque sobre
+   * capacidad. Los montos salen de la configuración (editable en el panel).
+   */
+  const fijos = await costosFijos();
+  const costoServidoresUsd = fijos.conceptos
+    .filter(x => !/facturaci/i.test(x.concepto))
+    .reduce((s2, x) => s2 + x.usd, 0);
+  const costoUsdHoy = fijos.total_usd;
+  const costoUsdSiPaga = fijos.total_usd;
   /**
    * Dólares a colones. Cero es cero en las dos monedas: sin esta salida
    * temprana, un costo de US$0 se mostraba como «—» cuando no hay tipo de

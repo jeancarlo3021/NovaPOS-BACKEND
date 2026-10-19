@@ -1,6 +1,7 @@
 import { db } from '../db/client.js';
 import { economiaDeLosPlanes } from './planEconomics.js';
 import { costoFE, documentosFE, costoDeAgregar } from './costoFE.js';
+import { costosFijos } from './costosFijos.js';
 
 /**
  * ANALIZAR UN PLAN QUE TODAVÍA NO EXISTE.
@@ -19,8 +20,42 @@ import { costoFE, documentosFE, costoDeAgregar } from './costoFE.js';
  * acá.
  */
 
+/**
+ * LA CUENTA, separada del resto del análisis.
+ *
+ * Estaba desparramada entre los puntos a favor y en contra, y ahí se lee como
+ * un comentario más. Cuánto cuesta y cuánto queda es LA pregunta: va aparte y
+ * siempre, aunque la respuesta sea «no cuesta nada todavía».
+ */
+export interface Economia {
+  precio_mensual: number;
+  /**
+   * Lo que se paga todos los meses haya o no un cliente más.
+   *
+   * No se reparte entre los clientes: el costo de uno MÁS es su variable.
+   * Los fijos van aparte, con cuántos clientes hacen falta para cubrirlos,
+   * que es la pregunta que de verdad decide si el plan se sostiene.
+   */
+  fijos?: {
+    total_usd: number; total_crc: number | null;
+    conceptos: Array<{ concepto: string; usd: number; nota: string }>;
+    tipo_cambio: number | null; tipo_cambio_fuente: string;
+    clientes_para_cubrirlos: number | null;
+  };
+  /** Lo que cuesta atender UN cliente más de este plan. */
+  costo_por_cliente: number;
+  costo_detalle: Array<{ concepto: string; monto: number; nota?: string }>;
+  ganancia_por_cliente: number;
+  margen_pct: number | null;
+  /** Qué pasa con 5, 10 y 25 clientes: la bolsa de FE se va llenando. */
+  escenarios: Array<{
+    clientes: number; ingreso: number; costo: number; ganancia: number; nota?: string;
+  }>;
+}
+
 export interface Analisis {
   entendido: { precio: number | null; ciclo: 'mensual' | 'anual'; modulos: string[] };
+  economia?: Economia;
   numeros: Record<string, any>;
   bueno: string[];
   malo: string[];
@@ -262,6 +297,83 @@ export async function analizarPlan(texto: string): Promise<Analisis> {
   noPuedo.push('Cuántos clientes nuevos traería. Lo de arriba dice qué pasa con los que YA '
     + 'tenés; lo que entra depende del mercado.');
 
+  /**
+   * LA CUENTA: cuánto cuesta y cuánto queda.
+   *
+   * El costo de un cliente MÁS es el marginal, no una porción de los fijos.
+   * Los US$56 del proveedor ya se pagan todos los meses: sumar un cliente no
+   * los aumenta hasta que se acaba la bolsa de documentos. Repartir el fijo
+   * entre los clientes daría un «costo por cliente» que baja solo con crecer,
+   * y con eso cualquier precio parece rentable.
+   *
+   * Los escenarios sí muestran el efecto acumulado: con cada cliente la bolsa
+   * se llena un poco más, y en algún punto el documento siguiente ya se paga.
+   * Ese salto es lo que no se ve mirando un cliente aislado.
+   */
+  const fijos = await costosFijos();
+  /** Cuántos clientes de este plan pagarían TODOS los costos fijos del mes. */
+  const equilibrio = (aporte: number) =>
+    fijos.total_crc != null && aporte > 0 ? Math.ceil(fijos.total_crc / aporte) : null;
+
+  let economia: any = undefined;
+  if (esPlanFE && esperadas > 0) {
+    const costoUno = costoDeAgregar(esperadas, docs.total, cFE);
+    const detalle: any[] = [{
+      concepto: 'Facturación electrónica',
+      monto: costoUno,
+      nota: costoUno === 0
+        ? `Entra en la bolsa ya pagada (quedan ${libres} documentos)`
+        : `${esperadas} documentos × ₡${cFE.extra_crc}`,
+    }];
+    const escenarios = [5, 10, 25].map(n => {
+      // Cada cliente empuja al siguiente más cerca del borde de la bolsa.
+      const docsTotales = esperadas * n;
+      const costo = costoDeAgregar(docsTotales, docs.total, cFE);
+      const ingreso = mensualPropuesto * n;
+      const seLlena = docs.total + docsTotales > cFE.incluidos;
+      return {
+        clientes: n, ingreso, costo, ganancia: ingreso - costo,
+        nota: seLlena
+          ? `La bolsa se llena: ${docs.total + docsTotales - cFE.incluidos} documentos se pagan aparte`
+          : 'Todo entra en la bolsa ya pagada',
+      };
+    });
+    economia = {
+      precio_mensual: mensualPropuesto,
+      costo_por_cliente: costoUno,
+      costo_detalle: detalle,
+      ganancia_por_cliente: mensualPropuesto - costoUno,
+      margen_pct: mensualPropuesto > 0
+        ? Math.round(((mensualPropuesto - costoUno) / mensualPropuesto) * 1000) / 10 : null,
+      escenarios,
+      fijos: { ...fijos, clientes_para_cubrirlos: equilibrio(mensualPropuesto - costoUno) },
+    };
+  } else {
+    /** Sin facturación electrónica no hay costo variable: el margen es el precio. */
+    /**
+     * Sin facturación electrónica no hay costo VARIABLE: un cliente más no
+     * mueve la factura de nadie. Pero eso no es «margen del 100%», que era lo
+     * que decía antes: los costos fijos existen igual y hay que cubrirlos.
+     * Por eso van al lado, con cuántos clientes hacen falta.
+     */
+    economia = {
+      precio_mensual: mensualPropuesto,
+      costo_por_cliente: 0,
+      costo_detalle: [{
+        concepto: 'Costo variable',
+        monto: 0,
+        nota: 'Sin facturación electrónica, un cliente más no aumenta ninguna factura',
+      }],
+      ganancia_por_cliente: mensualPropuesto,
+      margen_pct: 100,
+      escenarios: [5, 10, 25].map(n => ({
+        clientes: n, ingreso: mensualPropuesto * n, costo: 0,
+        ganancia: mensualPropuesto * n, nota: 'Sin costo variable',
+      })),
+      fijos: { ...fijos, clientes_para_cubrirlos: equilibrio(mensualPropuesto) },
+    };
+  }
+
   const veredicto = negociosEnRiesgo === 0
     ? `A ${money(mensualPropuesto)} no te quita clientes actuales y el costo de atenderlo es casi `
       + 'cero. El riesgo no está en los números sino en el soporte.'
@@ -273,6 +385,7 @@ export async function analizarPlan(texto: string): Promise<Analisis> {
 
   return {
     entendido: { precio: precio!, ciclo: anual ? 'anual' : 'mensual', modulos },
+    economia,
     numeros, bueno, malo, veredicto, no_puedo_saber: noPuedo,
   };
 }

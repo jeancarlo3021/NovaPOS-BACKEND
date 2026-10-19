@@ -162,6 +162,34 @@ products.put('/:id', requirePermission('inventory', 'edit'), async (c) => {
 
     const patch: any = { ...parsed.data };
 
+    /**
+     * ── EL STOCK NO SE EDITA DESDE EL PRODUCTO ─────────────────────────────
+     *
+     * Cambiar la existencia acá deja la cantidad nueva y NINGÚN rastro de por
+     * qué cambió: ni quién, ni cuándo, ni si fue una merma, una devolución o
+     * un error de conteo. Medido en esta base: `stock_movements` tiene 14
+     * filas contra 16.084 facturas, o sea que el historial prácticamente no
+     * existe — y sin historial no hay costo de ventas ni inventario valuado
+     * que se sostenga.
+     *
+     * Todos los caminos legítimos escriben el stock DIRECTO desde su propia
+     * ruta, y cada uno deja su registro: ajustes (`stockAdjustments`),
+     * devoluciones (`returns`), traslados (`transfers`) y recepción de
+     * compras (`purchases`). Esta ruta era la única puerta sin registro.
+     *
+     * No se rechaza la petición entera: el formulario de producto manda el
+     * objeto completo, y fallar por un campo que el usuario ni tocó sería
+     * impedirle corregir un nombre. Se ignora el stock y se avisa.
+     */
+    let stockIgnorado = false;
+    if ('stock_quantity' in patch) {
+      const { data: actual } = await db.from('products')
+        .select('stock_quantity').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+      const antes = Number((actual as any)?.stock_quantity ?? 0);
+      if (Number(patch.stock_quantity) !== antes) stockIgnorado = true;
+      delete patch.stock_quantity;
+    }
+
     // ── El CABYS no se borra por accidente ──────────────────────────────────
     // Un producto que YA tiene CABYS no puede perderlo porque una pantalla
     // mandó el campo vacío (formulario a medio cargar, importación sin esa
@@ -189,7 +217,13 @@ products.put('/:id', requirePermission('inventory', 'edit'), async (c) => {
       .select().single();
     if (error) throw new Error(error.message);
     if (!data) return fail(c, 'Producto no encontrado', 404);
-    return ok(c, data);
+    // Se avisa que el stock no se tocó, para que la pantalla pueda decirlo.
+    // Guardar «sin avisar» haría creer que el cambio se aplicó.
+    return ok(c, stockIgnorado
+      ? { ...data, stock_no_modificado: true,
+          aviso: 'El resto se guardó, pero la existencia no se cambia desde acá: se cambia en '
+            + 'Inventario → Stock, para que quede registrado el motivo y el movimiento.' }
+      : data);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

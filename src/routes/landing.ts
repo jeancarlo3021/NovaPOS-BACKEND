@@ -69,6 +69,38 @@ const POR_OMISION = {
    * propia sección porque mezclar un accesorio de ₡30.000 entre los planes
    * mensuales confunde la decisión principal, que es elegir plan.
    */
+  /**
+   * PAQUETES DE FACTURAS ELECTRÓNICAS.
+   *
+   * Van en su propia sección porque se compran distinto: no es una
+   * mensualidad del sistema sino una bolsa de comprobantes que se consume.
+   * Mezclarlos entre los planes obligaría al visitante a comparar peras con
+   * manzanas justo cuando está decidiendo.
+   */
+  paquetes_titulo: 'Paquetes de facturas',
+  paquetes_bajada: 'Comprobantes electrónicos para emitir a Hacienda. Elegí según cuánto facturás.',
+  paquetes: [] as Array<{
+    nombre: string; cantidad: string; precio: string;
+    /** Precio del mismo paquete cobrado por año. Opcional. */
+    precio_anual?: string; ahorro?: string;
+    /**
+     * Cada cuánto son los comprobantes de `cantidad`. Es del paquete, no del
+     * conmutador de precios de la página: en la misma lista puede haber
+     * bolsas anuales y una mensual. Vacío se muestra como anual.
+     */
+    periodo_cantidad?: 'mes' | 'anio';
+    descripcion?: string; destacado?: boolean;
+  }>,
+  /**
+   * En qué orden se muestran: 'manual' respeta el de la lista.
+   *
+   * Importa más de lo que parece. De menor a mayor, el visitante empieza por
+   * el más barato y decide desde ahí; de mayor a menor, el primero que ve es
+   * el grande y el resto le parecen baratos en comparación. Las dos formas
+   * sirven para cosas distintas y por eso se elige, en vez de dejarlo fijo.
+   */
+  paquetes_orden: 'manual' as 'manual' | 'menor' | 'mayor',
+  productos_orden: 'manual' as 'manual' | 'menor' | 'mayor',
   catalogo_titulo: 'Catálogo',
   catalogo_bajada: 'Equipo y servicios que se compran una vez.',
   catalogo: [] as Array<{ nombre: string; precio: string; descripcion: string; imagen?: string }>,
@@ -340,6 +372,62 @@ landingAdmin.get('/logos', async (c) => {
       salida.push({ tenant_id: car.name, nombre: t.name, logo: data.publicUrl });
     }
     return ok(c, { logos: salida.sort((a, b) => a.nombre.localeCompare(b.nombre)) });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/**
+ * GET /paquetes-fe — los paquetes que YA existen en el sistema.
+ *
+ * Para no escribirlos a mano en la página: las cantidades y los precios ya
+ * están configurados en `fe_plans`, y copiarlos a mano garantiza que algún
+ * día la página diga un precio y el sistema cobre otro.
+ */
+landingAdmin.get('/paquetes-fe', async (c) => {
+  try {
+    const { data, error } = await db.from('fe_plans')
+      .select('code, name, monthly_quota, monthly_price, active')
+      .eq('active', true).order('monthly_quota', { ascending: true });
+    if (error) {
+      if (/fe_plans/.test(error.message)) return ok(c, { sin_tabla: true, paquetes: [] });
+      throw new Error(error.message);
+    }
+    return ok(c, {
+      paquetes: ((data ?? []) as any[]).map(p => {
+        const mensual = Number(p.monthly_price) || 0;
+        /*
+         * Miles con punto, a mano. `toLocaleString('es-CR')` devuelve un
+         * espacio fino según la versión de ICU del servidor —«₡5 000»—, y el
+         * borrador terminaba con números escritos distinto a los que ya están
+         * en la página.
+         */
+        const miles = (n: number) => Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+        const fmt = (n: number) => `₡${miles(n)}`;
+        /*
+         * Solo se copia lo que está configurado: el nombre, la cantidad y el
+         * precio. Nada se deriva.
+         *
+         * Antes esto proponía el anual como el mensual × 10 y calculaba el
+         * «ahorro». Era inventar: el precio de una bolsa de comprobantes es
+         * una decisión comercial, no doce veces otra cifra, y un borrador que
+         * llega con números inventados es un número inventado a un clic de
+         * publicarse. El precio anual y el ahorro quedan vacíos para que los
+         * escriba quien los cobra.
+         *
+         * Por lo mismo el precio va sin «/mes» pegado: el período de lo que
+         * se cobra se decide en el panel, y la columna `monthly_price` del
+         * plan no alcanza para afirmarlo en la página.
+         */
+        return {
+          nombre: p.name,
+          cantidad: `${miles(Number(p.monthly_quota))} comprobantes`,
+          precio: mensual > 0 ? fmt(mensual) : '',
+          precio_anual: '',
+          ahorro: '',
+          descripcion: '',
+          destacado: false,
+        };
+      }),
+    });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
