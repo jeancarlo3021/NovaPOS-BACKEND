@@ -155,6 +155,47 @@ productKits.get('/', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+// GET /search?q=... — busca productos vendidos como kit (por nombre o SKU).
+// Pensado para elegir un sub-kit al armar la composición de otro.
+productKits.get('/search', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const q = (c.req.query('q') ?? '').trim();
+    const excludeId = c.req.query('exclude_id');
+    const limit = Math.min(Number(c.req.query('limit') ?? 20) || 20, 50);
+
+    let query = db.from('products')
+      .select('id, name, sku, unit_price, cost_price, image_url')
+      .eq('tenant_id', tenantId).eq('is_kit', true)
+      .is('deleted_at', null);
+
+    if (q) {
+      const safe = q.replace(/[%,]/g, ' ');
+      query = query.or(`name.ilike.%${safe}%,sku.ilike.%${safe}%`);
+    }
+    if (excludeId) query = query.neq('id', excludeId);
+
+    const { data, error } = await query.order('name').limit(limit);
+    if (error && /is_kit/i.test(error.message)) return ok(c, []);
+    if (error && /deleted_at/i.test(error.message)) {
+      let retry = db.from('products')
+        .select('id, name, sku, unit_price, cost_price, image_url')
+        .eq('tenant_id', tenantId).eq('is_kit', true);
+      if (q) {
+        const safe = q.replace(/[%,]/g, ' ');
+        retry = retry.or(`name.ilike.%${safe}%,sku.ilike.%${safe}%`);
+      }
+      if (excludeId) retry = retry.neq('id', excludeId);
+      const r = await retry.order('name').limit(limit);
+      if (r.error) throw new Error(r.error.message);
+      return ok(c, (r.data ?? []).map((k: any) => ({ ...k, price: Number(k.unit_price ?? 0) })));
+    }
+    if (error) throw new Error(error.message);
+
+    return ok(c, (data ?? []).map((k: any) => ({ ...k, price: Number(k.unit_price ?? 0) })));
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // GET /:id — un kit con su composición.
 productKits.get('/:id', async (c) => {
   try {
