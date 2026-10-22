@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
+import { cargarComposicion, expandir, expandirConCambios } from '../services/kits.js';
 import { endOfDay } from '../utils/dateRange.js';
 import { createReceivable } from './accountsReceivable.js';
 import {
@@ -21,6 +22,18 @@ const ItemSchema = z.object({
   discount_percent: z.number().nonnegative().optional().default(0),
   discount_amount:  z.number().nonnegative().optional().default(0),
   subtotal:         z.number().nonnegative(),
+  /**
+   * Cambios hechos al kit EN ESTA VENTA: «en vez de la galleta de chocolate
+   * salió la de vainilla». No modifican la receta del kit; solo dicen qué
+   * bajar del inventario y qué devolver si la factura se anula.
+   */
+  kit_substitutions: z.array(z.object({
+    from: z.string().uuid(),
+    to: z.string().uuid(),
+    /** Para poder mostrarlo después sin volver a consultar el catálogo. */
+    from_name: z.string().optional().nullable(),
+    to_name: z.string().optional().nullable(),
+  })).optional().nullable(),
 }).passthrough(); // ignore extra fields like 'product', 'promo'
 
 /**
@@ -449,11 +462,20 @@ invoices.post('/', async (c) => {
       subtotal:         item.subtotal,
       // Nota de la línea (comidas: "sin cebolla", "para llevar"…).
       notes:            item.notes?.trim() ? String(item.notes).trim() : null,
+      // Lo que se cambió del kit en esta venta. Se guarda para que una
+      // anulación devuelva al inventario lo que de verdad salió.
+      kit_substitutions: item.kit_substitutions?.length ? item.kit_substitutions : null,
     }));
     let { error: itemErr } = await db.from('invoice_items').insert(itemRows);
     // Si la columna product_name aún no existe (migración 70 sin correr), reintentar sin ella.
     if (itemErr && /product_name/i.test(itemErr.message)) {
       const stripped = itemRows.map(({ product_name, ...r }: any) => r);
+      ({ error: itemErr } = await db.from('invoice_items').insert(stripped));
+    }
+    // Idem con `kit_substitutions` (migración 124 sin correr): la venta no se
+    // cae por eso; lo único que se pierde es el detalle del cambio.
+    if (itemErr && /kit_substitutions/i.test(itemErr.message)) {
+      const stripped = itemRows.map(({ kit_substitutions, ...r }: any) => r);
       ({ error: itemErr } = await db.from('invoice_items').insert(stripped));
     }
     // Idem con `notes` (migración 74 sin correr).
@@ -487,19 +509,28 @@ invoices.post('/', async (c) => {
     // las recetas, y también sin poder tumbar la venta si algo falla.
     const kitProductIds = new Set<string>();
     try {
-      const ids = (items as any[]).map(i => i.product_id).filter(Boolean);
+      const ids = (items as any[]).map(i => i.product_id).filter(Boolean).map(String);
       if (ids.length) {
-        const { data: kitRows } = await db.from('product_kit_items')
-          .select('kit_id, component_id, quantity')
-          .eq('tenant_id', tenantId).in('kit_id', ids);
-        if (kitRows?.length) {
-          // Cuánto hay que bajar de cada componente, sumando kits repetidos.
+        const comp = await cargarComposicion(tenantId);
+        const vendidos = ids.filter(id => comp.esKit.has(id) && (comp.directos.get(id)?.length ?? 0) > 0);
+        if (vendidos.length) {
+          /*
+           * Se baja por TODA la cadena, no por el primer nivel.
+           *
+           * Con sub-kits, descontar los componentes directos dejaría el
+           * inventario mintiendo: vender un «Combo familiar» que lleva tres
+           * «Combo chico» no mueve nada, porque un kit no tiene existencias;
+           * lo que tiene que bajar son los refrescos del final. `expandir`
+           * devuelve justo eso, ya multiplicado por la cadena.
+           */
           const need = new Map<string, number>();
           for (const item of items as any[]) {
-            for (const k of (kitRows as any[]).filter(r => String(r.kit_id) === String(item.product_id))) {
-              kitProductIds.add(String(item.product_id));
-              const q = Number(k.quantity) * Number(item.quantity);
-              need.set(String(k.component_id), (need.get(String(k.component_id)) ?? 0) + q);
+            const id = String(item.product_id ?? '');
+            if (!vendidos.includes(id)) continue;
+            kitProductIds.add(id);
+            for (const [hoja, qty] of expandirConCambios(
+              id, Number(item.quantity), comp, item.kit_substitutions ?? [])) {
+              need.set(hoja, (need.get(hoja) ?? 0) + qty);
             }
           }
           // Una sola lectura para todos los componentes, y las bajas en paralelo.
@@ -646,24 +677,33 @@ invoices.post('/:id/void', async (c) => {
       }
     } catch (e: any) { console.warn('[void] consumo de recetas:', e?.message); }
 
-    const { data: items } = await db.from('invoice_items')
-      .select('product_id, quantity').eq('invoice_id', id);
+    let { data: items } = await db.from('invoice_items')
+      .select('product_id, quantity, kit_substitutions').eq('invoice_id', id);
+    // Sin la migración 124 la columna no existe: se vuelve a pedir sin ella y
+    // la devolución se hace con la receta original del kit.
+    if (!items) {
+      const r = await db.from('invoice_items').select('product_id, quantity').eq('invoice_id', id);
+      items = r.data as any;
+    }
 
     // Los kits devuelven sus COMPONENTES: el kit nunca se descontó.
     const kitReturned = new Set<string>();
     try {
-      const ids = (items ?? []).map((i: any) => i.product_id).filter(Boolean);
+      const ids = (items ?? []).map((i: any) => String(i.product_id)).filter(Boolean);
       if (ids.length) {
-        const { data: kitRows } = await db.from('product_kit_items')
-          .select('kit_id, component_id, quantity')
-          .eq('tenant_id', tenantId).in('kit_id', ids);
-        if (kitRows?.length) {
+        const comp = await cargarComposicion(tenantId);
+        const devueltos = ids.filter(id => comp.esKit.has(id) && (comp.directos.get(id)?.length ?? 0) > 0);
+        if (devueltos.length) {
+          // Se devuelve por la MISMA cadena por la que se descontó: si la
+          // venta bajó los refrescos del sub-kit, la anulación los sube.
           const back = new Map<string, number>();
           for (const it of (items ?? []) as any[]) {
-            for (const k of (kitRows as any[]).filter(r => String(r.kit_id) === String(it.product_id))) {
-              kitReturned.add(String(it.product_id));
-              const q = Number(k.quantity) * Number(it.quantity);
-              back.set(String(k.component_id), (back.get(String(k.component_id)) ?? 0) + q);
+            const id = String(it.product_id ?? '');
+            if (!devueltos.includes(id)) continue;
+            kitReturned.add(id);
+            for (const [hoja, qty] of expandirConCambios(
+              id, Number(it.quantity), comp, (it as any).kit_substitutions ?? [])) {
+              back.set(hoja, (back.get(hoja) ?? 0) + qty);
             }
           }
           for (const [componentId, qty] of back) {

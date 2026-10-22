@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
+import { cargarComposicion, expandir, buscarCiclo, profundidadDe, PROFUNDIDAD_MAX } from '../services/kits.js';
 
 /**
  * Kits de productos (combos / paquetes). Ver migrations/93_product_kits.sql
@@ -25,7 +26,7 @@ async function itemsOf(tenantId: string, kitIds: string[]) {
   const compIds = [...new Set((data ?? []).map((r: any) => r.component_id))];
   const { data: comps } = compIds.length
     ? await db.from('products')
-        .select('id, name, sku, unit_price, cost_price, stock_quantity, tracks_stock')
+        .select('id, name, sku, unit_price, cost_price, stock_quantity, tracks_stock, is_kit')
         .eq('tenant_id', tenantId).in('id', compIds)
     : { data: [] as any[] };
   const byId = new Map((comps ?? []).map((p: any) => [String(p.id), p]));
@@ -39,17 +40,55 @@ async function itemsOf(tenantId: string, kitIds: string[]) {
       price: Number(p?.unit_price ?? 0), cost_price: Number(p?.cost_price ?? 0),
       stock_quantity: Number(p?.stock_quantity ?? 0),
       tracks_stock: p?.tracks_stock !== false,
+      // Un componente puede ser OTRO KIT. La pantalla lo marca para que se vea
+      // que ahí abajo todavía hay más, y el stock del sub-kit no significa
+      // nada: lo que manda es lo que él lleva adentro.
+      is_kit: (p as any)?.is_kit === true,
     });
     out.set(String(r.kit_id), list);
   }
   return out;
 }
 
-/** Cuántos kits se pueden armar con el stock que hay hoy. */
-function buildable(items: any[]): number | null {
-  const limited = items.filter(i => i.tracks_stock);
-  if (!limited.length) return null;                 // todo stock infinito
-  return Math.floor(Math.min(...limited.map(i => i.stock_quantity / i.quantity)));
+/**
+ * Cuántos kits se pueden armar con el stock de hoy, mirando TODA la cadena.
+ *
+ * Con sub-kits, contar solo los componentes directos daría un número inventado:
+ * un «Combo familiar» que lleva tres «Combo chico» no se limita por el stock
+ * del combo chico —que no existe, un kit no tiene existencias— sino por los
+ * refrescos que hay al final de la cadena.
+ */
+function armables(hojas: Map<string, number>, stockPorId: Map<string, { stock: number; rastrea: boolean }>): number | null {
+  const limitados = [...hojas.entries()].filter(([id]) => stockPorId.get(id)?.rastrea !== false);
+  if (!limitados.length) return null;               // todo stock infinito
+  return Math.floor(Math.min(...limitados.map(([id, qty]) =>
+    (stockPorId.get(id)?.stock ?? 0) / (qty || 1))));
+}
+
+/**
+ * Stock, costo y nombre de todo lo que puede ser hoja de algún kit.
+ *
+ * Una sola consulta para toda la pantalla: con sub-kits, cada kit puede tocar
+ * productos que no son suyos y preguntarlos uno por uno multiplicaría los
+ * viajes a la base por la profundidad de la cadena.
+ */
+async function stockDeHojas(tenantId: string, kitIds: string[], comp: any) {
+  const necesarios = new Set<string>();
+  for (const id of kitIds) for (const hoja of expandir(id, 1, comp).keys()) necesarios.add(hoja);
+  const mapa = new Map<string, { stock: number; rastrea: boolean; costo: number; nombre: string }>();
+  if (!necesarios.size) return mapa;
+  const { data } = await db.from('products')
+    .select('id, name, cost_price, stock_quantity, tracks_stock')
+    .eq('tenant_id', tenantId).in('id', [...necesarios]);
+  for (const p of (data ?? []) as any[]) {
+    mapa.set(String(p.id), {
+      stock: Number(p.stock_quantity ?? 0),
+      rastrea: p.tracks_stock !== false,
+      costo: Number(p.cost_price ?? 0),
+      nombre: p.name,
+    });
+  }
+  return mapa;
 }
 
 // GET / — kits del negocio, con su composición, costo y cuántos se pueden armar.
@@ -76,21 +115,41 @@ productKits.get('/', async (c) => {
 
     const ids = (kits ?? []).map((k: any) => String(k.id));
     const items = await itemsOf(tenantId, ids);
+    const comp = await cargarComposicion(tenantId);
+    const stockPorId = await stockDeHojas(tenantId, ids, comp);
+
     return ok(c, (kits ?? []).map((k: any) => {
       const its = items.get(String(k.id)) ?? [];
-      const cost = its.reduce((s, i) => s + i.cost_price * i.quantity, 0);
+      const hojas = expandir(String(k.id), 1, comp);
+      /*
+       * El COSTO sale de las hojas, no de los componentes directos.
+       *
+       * Un sub-kit no tiene costo propio —su `cost_price` suele estar en cero,
+       * porque nunca se compra: se arma—. Sumando el directo, un kit hecho de
+       * kits costaba ₡0 y el margen salía del 100%.
+       */
+      const cost = [...hojas.entries()].reduce(
+        (s, [id, qty]) => s + (stockPorId.get(id)?.costo ?? 0) * qty, 0);
+      // El suelto SÍ es por componente directo: es lo que pagaría el cliente
+      // comprando cada cosa por separado, y un sub-kit se vende como tal.
       const loose = its.reduce((s, i) => s + i.price * i.quantity, 0);
       return {
         ...k,
         // El front trabaja con `price`; en la tabla la columna es `unit_price`.
         price: Number((k as any).unit_price ?? 0),
         items: its,
-        // Costo real del kit = suma de costos de lo que lleva dentro.
         components_cost: Math.round(cost * 100) / 100,
-        // Lo que costaría comprando cada cosa por aparte: sirve para mostrar el
-        // ahorro y para no poner el kit más caro que sus partes por descuido.
         loose_price: Math.round(loose * 100) / 100,
-        buildable: buildable(its),
+        buildable: armables(hojas, stockPorId),
+        /** Niveles de kit dentro de kit: 1 = solo productos sueltos. */
+        depth: profundidadDe(String(k.id), comp),
+        /** Lo que de verdad se descuenta al vender uno. */
+        leaves: [...hojas.entries()].map(([id, qty]) => ({
+          product_id: id, quantity: Math.round(qty * 1000) / 1000,
+          name: stockPorId.get(id)?.nombre ?? 'Producto eliminado',
+          stock_quantity: stockPorId.get(id)?.stock ?? 0,
+          tracks_stock: stockPorId.get(id)?.rastrea !== false,
+        })),
       };
     }));
   } catch (err: any) { return fail(c, err.message, 500); }
@@ -105,9 +164,20 @@ productKits.get('/:id', async (c) => {
       .select('*').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
     if (!kit) return fail(c, 'Kit no encontrado', 404);
     const items = (await itemsOf(tenantId, [id])).get(id) ?? [];
+    const comp = await cargarComposicion(tenantId);
+    const hojas = expandir(id, 1, comp);
+    const stockPorId = await stockDeHojas(tenantId, [id], comp);
     return ok(c, {
       ...(kit as any), price: Number((kit as any).unit_price ?? 0),
-      items, buildable: buildable(items),
+      items,
+      buildable: armables(hojas, stockPorId),
+      depth: profundidadDe(id, comp),
+      leaves: [...hojas.entries()].map(([pid, qty]) => ({
+        product_id: pid, quantity: Math.round(qty * 1000) / 1000,
+        name: stockPorId.get(pid)?.nombre ?? 'Producto eliminado',
+        stock_quantity: stockPorId.get(pid)?.stock ?? 0,
+        tracks_stock: stockPorId.get(pid)?.rastrea !== false,
+      })),
     });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
@@ -125,17 +195,40 @@ productKits.put('/:id/items', async (c) => {
       .select('id').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
     if (!kit) return fail(c, 'Kit no encontrado', 404);
 
-    // Un kit dentro de sí mismo se descontaría en ciclo al vender.
-    if (parsed.data.some(i => i.component_id === id)) {
-      return fail(c, 'Un kit no puede contenerse a sí mismo', 422);
+    /*
+     * SUB-KITS: un componente puede ser otro kit.
+     *
+     * Antes estaba prohibido porque al vender se descontaba un solo nivel y el
+     * inventario quedaba mintiendo. Ahora la venta baja por toda la cadena
+     * (`services/kits.ts`), así que lo único que hay que impedir es lo que no
+     * tiene sentido físico: que un kit termine conteniéndose a sí mismo, en
+     * forma directa o dando la vuelta por otros.
+     */
+    const comp = await cargarComposicion(tenantId);
+    const ciclo = buscarCiclo(id, parsed.data, comp);
+    if (ciclo) {
+      const { data: nombres } = await db.from('products')
+        .select('id, name').eq('tenant_id', tenantId).in('id', ciclo);
+      const porId = new Map((nombres ?? []).map((p: any) => [String(p.id), p.name]));
+      const ruta = ciclo.map(x => porId.get(String(x)) ?? 'kit').join(' → ');
+      return fail(c, ciclo.length <= 2
+        ? 'Un kit no puede contenerse a sí mismo'
+        : `Eso arma un círculo sin fin: ${ruta}`, 422);
     }
-    // Y un kit dentro de otro kit tampoco: el descuento en cadena no está
-    // soportado y dejaría el inventario mintiendo.
-    const { data: nested } = await db.from('products')
-      .select('id, name').eq('tenant_id', tenantId).eq('is_kit', true)
-      .in('id', parsed.data.map(i => i.component_id));
-    if (nested?.length) {
-      return fail(c, `No se puede meter un kit dentro de otro: ${(nested as any[]).map(n => n.name).join(', ')}`, 422);
+    /*
+     * Y un límite de profundidad: seis niveles de kit dentro de kit es más de
+     * lo que cualquier combo real necesita, y más abajo lo normal es que sea un
+     * error de carga que nadie va a poder desenredar después.
+     */
+    const futura = {
+      ...comp,
+      directos: new Map(comp.directos).set(id, parsed.data.map(i => ({
+        component_id: String(i.component_id), quantity: i.quantity,
+      }))),
+      esKit: new Set(comp.esKit).add(id),
+    };
+    if (profundidadDe(id, futura) > PROFUNDIDAD_MAX) {
+      return fail(c, `Demasiados kits encadenados (máximo ${PROFUNDIDAD_MAX} niveles).`, 422);
     }
 
     const { error: delErr } = await db.from('product_kit_items').delete()
@@ -150,7 +243,9 @@ productKits.put('/:id/items', async (c) => {
       .eq('id', id).eq('tenant_id', tenantId);
 
     const items = (await itemsOf(tenantId, [id])).get(id) ?? [];
-    return ok(c, { id, items, buildable: buildable(items) });
+    const tras = await cargarComposicion(tenantId);
+    const hojas = expandir(id, 1, tras);
+    return ok(c, { id, items, buildable: armables(hojas, await stockDeHojas(tenantId, [id], tras)) });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

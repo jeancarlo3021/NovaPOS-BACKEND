@@ -32,27 +32,191 @@ const ExpenseSchema = z.object({
   notes: z.string().optional().nullable(),
 });
 
-// GET / — list expenses (?from=, ?to=, ?category=)
+/**
+ * LAS SALIDAS DE CAJA TAMBIÉN SON GASTOS.
+ *
+ * Cuando en la caja se saca plata para pagar el pescado, las bolsas o un Uber,
+ * eso queda en `cash_movements` y nunca llegaba al módulo de Gastos: el negocio
+ * veía un total de gastos que no incluía la plata que de verdad salió del
+ * cajón. Medido en la base: 572 salidas por ₡4.169.590 en cuatro meses, de seis
+ * negocios, ninguna visible en Gastos.
+ *
+ * Se MUESTRAN, no se copian. Crear un gasto de verdad por cada salida dejaría
+ * dos registros del mismo dinero —uno editable y otro no— y bastaría con que
+ * alguien anotara el gasto a mano para contarlo dos veces. Acá se leen de donde
+ * ya están y se marcan con `origen: 'caja'`.
+ *
+ * Qué entra: SOLO las salidas que el cajero registró a mano, que son las que el
+ * modal de caja escribe con el prefijo «Salida: ». Quedan fuera a propósito:
+ *  - el cierre de caja (es el efectivo que se retira al cuadrar, no un gasto),
+ *  - las anulaciones y devoluciones (es plata que se le devuelve al cliente:
+ *    menos venta, no más gasto).
+ */
+const PREFIJO_SALIDA = 'Salida:';
+
+/** La categoría que se les pone. No existe en la base: es una etiqueta. */
+const CATEGORIA_CAJA = {
+  id: 'caja',
+  name: 'Salidas de caja',
+  color: '#0ea5e9',
+  icon: '💵',
+};
+
+/**
+ * El día en que ocurrió, en hora de Costa Rica.
+ *
+ * `created_at` viene en UTC: una salida de las 6 p.m. del lunes es «martes» si
+ * se corta el texto sin convertir, y cae fuera del día que el dueño está
+ * mirando.
+ */
+function diaCR(ts: any): string {
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return String(ts ?? '').slice(0, 10);
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Costa_Rica', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(d);
+}
+
+/**
+ * Trae TODAS las filas, no las primeras mil.
+ *
+ * PostgREST devuelve como máximo 1.000 por consulta y no avisa de las que
+ * dejó fuera. Hoy el negocio con más gastos tiene 384, así que nadie lo había
+ * notado; el día que uno pase de mil, el total del reporte empezaría a dar de
+ * menos sin ningún error a la vista. Peor que un número equivocado es un
+ * número equivocado que parece bueno.
+ */
+const PAGINA = 1000;
+async function todasLasFilas(construir: (desde: number, hasta: number) => any): Promise<any[]> {
+  const acumulado: any[] = [];
+  for (let i = 0; i < 50; i++) {        // tope de seguridad: 50.000 filas
+    const { data, error } = await construir(i * PAGINA, i * PAGINA + PAGINA - 1);
+    if (error) throw new Error(error.message);
+    const lote = data ?? [];
+    acumulado.push(...lote);
+    if (lote.length < PAGINA) break;
+  }
+  return acumulado;
+}
+
+async function salidasDeCaja(tenantId: string, from?: string, to?: string, buscar?: string) {
+  // Las sesiones del tenant: `cash_movements` no guarda tenant_id.
+  // Paginadas: un negocio con años de cajas pasa de mil sesiones, y con la
+  // lista cortada sus salidas más viejas desaparecían del reporte.
+  const sesiones = await todasLasFilas((d, h) => db.from('cash_sessions')
+    .select('id').eq('tenant_id', tenantId).order('id').range(d, h));
+  const ids = sesiones.map((s: any) => s.id);
+  if (!ids.length) return [];
+
+  let data: any[];
+  try {
+    data = await todasLasFilas((d, h) => {
+      let q = db.from('cash_movements')
+        .select('id, cash_session_id, amount, description, created_at')
+        .in('cash_session_id', ids)
+        .eq('type', 'expense')
+        .ilike('description', `${PREFIJO_SALIDA}%`)
+        .order('created_at', { ascending: false }).range(d, h);
+      // El rango viene por día; `created_at` es un instante, así que el «hasta»
+      // tiene que cubrir todo el día o se pierden las salidas de la tarde.
+      if (from) q = q.gte('created_at', `${from}T00:00:00`);
+      if (to)   q = q.lte('created_at', `${to}T23:59:59.999`);
+      // El buscador de la pantalla de Gastos también tiene que encontrarlas:
+      // si la lista filtra los gastos y deja todas las salidas, el resultado
+      // es una búsqueda que devuelve más de lo que se buscó.
+      if (buscar) q = q.ilike('description', `%${buscar}%`);
+      return q;
+    });
+  } catch (e: any) { console.warn('[expenses] salidas de caja:', e?.message); return []; }
+
+  return data.map((m: any) => ({
+    // Prefijo en el id: si alguna pantalla intenta editarla o borrarla, falla
+    // con un «no encontrado» en vez de tocar un gasto ajeno por casualidad.
+    id: `caja:${m.id}`,
+    tenant_id: tenantId,
+    category_id: null,
+    category: CATEGORIA_CAJA,
+    amount: Math.abs(Number(m.amount) || 0),   // en caja se guardan en negativo
+    description: String(m.description ?? '').replace(/^Salida:\s*/i, '') || 'Salida de caja',
+    date: diaCR(m.created_at),
+    payment_method: 'cash',
+    type: 'variable',
+    reference: null,
+    notes: null,
+    created_at: m.created_at,
+    updated_at: m.created_at,
+    /** La marca: la interfaz la usa para no ofrecer editar ni borrar. */
+    origen: 'caja' as const,
+    cash_movement_id: m.id,
+  }));
+}
+
+// GET / — lista de gastos.
+//   ?from= ?to= ?category= ?type= ?search= ?caja=0 (excluir las salidas de caja)
 expenses.get('/', async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const from = c.req.query('from');
     const to = c.req.query('to');
     const category = c.req.query('category');
+    const type = c.req.query('type');
+    const search = (c.req.query('search') ?? '').trim();
 
-    let query = db
-      .from('expenses')
-      .select('*')
-      .eq('tenant_id', tenantId)
-      .order('date', { ascending: false });
+    const data = await todasLasFilas((desde, hasta) => {
+      /*
+       * La CATEGORÍA viaja con el gasto.
+       *
+       * Antes era `select('*')` y la categoría nunca llegaba: la pantalla
+       * mostraba la columna vacía y el reporte metía TODO en una porción
+       * llamada «Sin categoría» —384 de 384 gastos medidos—, con el gráfico
+       * y el porcentaje diciendo que el negocio gasta el 100% en nada.
+       */
+      let query = db
+        .from('expenses')
+        .select('*, category:expense_categories(id, name, color, icon)')
+        .eq('tenant_id', tenantId)
+        .order('date', { ascending: false })
+        .range(desde, hasta);
 
-    if (from) query = query.gte('date', from);
-    if (to) query = query.lte('date', to);
-    if (category) query = query.eq('category', category);
+      if (from) query = query.gte('date', from);
+      if (to) query = query.lte('date', to);
+      /*
+       * La columna es `category_id`. Con `category` PostgREST responde «column
+       * expenses.category does not exist» y el módulo devolvía 500: el filtro
+       * por categoría de la pantalla de Gastos nunca funcionó.
+       */
+      if (category && category !== CATEGORIA_CAJA.id) query = query.eq('category_id', category);
+      // El tipo (fijo / variable / ocasional) y el buscador: la pantalla los
+      // mandaba desde siempre y acá se ignoraban, así que el selector y la
+      // caja de búsqueda no hacían absolutamente nada.
+      if (type) query = query.eq('type', type);
+      if (search) {
+        const t = search.replace(/[%,()]/g, ' ');
+        query = query.or(`description.ilike.%${t}%,reference.ilike.%${t}%,notes.ilike.%${t}%`);
+      }
+      return query;
+    });
 
-    const { data, error } = await query;
-    if (error) throw new Error(error.message);
-    return ok(c, data);
+    /**
+     * Las salidas de caja se suman salvo que se pidan aparte.
+     *
+     * Con un filtro de categoría puesto NO entran: no tienen categoría propia
+     * —el cajero escribe un motivo, no elige de la lista—, y colarlas en una
+     * categoría que el dueño eligió sería mentirle sobre qué está mirando. La
+     * excepción es cuando el filtro ES la etiqueta de caja.
+     *
+     * Con un filtro de TIPO distinto de «variable» tampoco: una salida de caja
+     * no es un gasto fijo ni ocasional, es plata que salió del cajón ese día.
+     */
+    const quiereCaja = c.req.query('caja') !== '0';
+    const filtroDeOtraCategoria = !!category && category !== CATEGORIA_CAJA.id;
+    const filtroDeOtroTipo = !!type && type !== 'variable';
+    if (!quiereCaja || filtroDeOtraCategoria || filtroDeOtroTipo) return ok(c, data);
+
+    const caja = await salidasDeCaja(tenantId, from, to, search || undefined);
+    const todo = category === CATEGORIA_CAJA.id ? caja : [...data, ...caja];
+    todo.sort((a: any, b: any) => String(b.date).localeCompare(String(a.date)));
+    return ok(c, todo);
   } catch (err: any) {
     return fail(c, err.message, 500);
   }
