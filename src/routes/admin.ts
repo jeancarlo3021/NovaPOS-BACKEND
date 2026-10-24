@@ -2119,9 +2119,18 @@ export function buildAlanubeCompanyPayload(cfg: Record<string, any>, p12Base64: 
   // pruebas de Hacienda son distintas.
   const prod = env === 'production';
   const atvUser = String((prod ? cfg.atv_username_production : cfg.atv_username_sandbox) || cfg.atv_username || '').trim();
-  // La contraseña ATV es su PROPIO valor (NO el PIN del certificado — eran cosas
-  // distintas y el fallback anterior causaba "Invalid credentials").
-  const atvPass = String((prod ? cfg.atv_password_production : cfg.atv_password_sandbox) || cfg.atv_password || '');
+  /*
+   * La contraseña ATV es su PROPIO valor (NO el PIN del certificado — eran cosas
+   * distintas y el fallback anterior causaba "Invalid credentials").
+   *
+   * Y va RECORTADA. El usuario sí se recortaba y la contraseña no: estas
+   * credenciales se copian y pegan del portal de ATV, y un espacio o un salto
+   * de línea invisible al final viajaba dentro de la contraseña. Hacienda
+   * responde exactamente lo mismo que con una contraseña equivocada —«Invalid
+   * credentials»— así que el dueño revisa el dato, lo ve bien, y no hay forma
+   * de darse cuenta. Las contraseñas que genera ATV no llevan espacios.
+   */
+  const atvPass = String((prod ? cfg.atv_password_production : cfg.atv_password_sandbox) || cfg.atv_password || '').trim();
   const p12Pass = String(
     (prod ? cfg.p12_password_production : cfg.p12_password_sandbox)
     || (prod ? cfg.hacienda_pin_production : cfg.hacienda_pin_sandbox)
@@ -2384,10 +2393,69 @@ export function validateEmisorForAlanube(cfg: Record<string, any>, env: 'sandbox
   if (!atvUser) p.push(`Usuario de API de ATV (${prod ? 'Producción' : 'Sandbox'}): vacío.`);
   if (!atvPass) p.push(`Contraseña de API de ATV (${prod ? 'Producción' : 'Sandbox'}): vacía.`);
 
+  /*
+   * EL USUARIO DE ATV TIENE QUE SER DEL MISMO AMBIENTE.
+   *
+   * ATV entrega dos usuarios distintos: uno de pruebas (@stag.…) y uno de
+   * producción (@prod.…). Cruzarlos es el error más común al dar de alta un
+   * emisor, y Hacienda contesta «Invalid credentials» sin decir que el problema
+   * es el ambiente: el dueño revisa la contraseña una y otra vez buscando algo
+   * que no está mal.
+   */
+  if (atvUser) {
+    const esStag = /@stag\./i.test(atvUser);
+    const esProd = /@prod\./i.test(atvUser);
+    if (prod && esStag) {
+      p.push(`El usuario de ATV "${atvUser}" es de PRUEBAS (@stag.) y se está emitiendo en PRODUCCIÓN. `
+        + 'Generá en ATV el usuario de producción (@prod.) y cargá su contraseña.');
+    }
+    if (!prod && esProd) {
+      p.push(`El usuario de ATV "${atvUser}" es de PRODUCCIÓN (@prod.) y el ambiente activo es PRUEBAS. `
+        + 'Usá el usuario @stag. o cambiá el ambiente a producción.');
+    }
+    /*
+     * ...y tiene que ser el de ESTA cédula: ATV lo arma como
+     * cpf-01-XXXX-XXXX (física) o cpj-3-101-XXXXXX (jurídica), con los mismos
+     * dígitos de la identificación del emisor.
+     */
+    const digitosUsuario = (atvUser.split('@')[0] ?? '').replace(/\D/g, '');
+    if (ced && digitosUsuario && !digitosUsuario.endsWith(ced.replace(/^0+/, ''))
+        && !digitosUsuario.includes(ced)) {
+      p.push(`El usuario de ATV "${atvUser}" no corresponde a la cédula ${ced} del emisor. `
+        + 'Las credenciales de ATV son por contribuyente.');
+    }
+  }
+
   const p12Pass = String((prod ? cfg.p12_password_production : cfg.p12_password_sandbox)
     || (prod ? cfg.hacienda_pin_production : cfg.hacienda_pin_sandbox)
     || cfg.p12_password || cfg.hacienda_pin || '');
   if (!p12Pass) p.push(`PIN/contraseña del certificado .p12 (${prod ? 'Producción' : 'Sandbox'}): vacío.`);
+  /*
+   * El otro clásico: pegar el PIN del certificado como contraseña de ATV. Son
+   * dos cosas distintas —el PIN abre el archivo .p12, la contraseña de ATV
+   * entra al portal de Hacienda— y el síntoma vuelve a ser «Invalid
+   * credentials».
+   */
+  /*
+   * UNA CONTRASEÑA DE ATV NO LLEVA ESPACIOS.
+   *
+   * ATV genera una cadena larga y aleatoria, sin espacios ni puntos finales.
+   * Cuando el campo trae varias palabras, lo que se pegó ahí es otra cosa —una
+   * nota, una frase, el texto de un correo— y Hacienda responde «Invalid
+   * credentials», igual que con una contraseña equivocada. Visto en producción:
+   * un emisor con 68 caracteres repartidos en diez palabras terminadas en
+   * punto, y nadie podía saber por qué fallaba.
+   */
+  if (atvPass && /\s/.test(atvPass)) {
+    const palabras = atvPass.trim().split(/\s+/).length;
+    p.push(`La contraseña de API de ATV (${prod ? 'Producción' : 'Sandbox'}) tiene espacios `
+      + `(${palabras} palabras). ATV genera una clave larga SIN espacios: parece que en ese campo `
+      + 'quedó pegado otro texto. Volvé a copiarla del portal de ATV.');
+  }
+  if (atvPass && p12Pass && atvPass === p12Pass) {
+    p.push('La contraseña de API de ATV es idéntica al PIN del certificado .p12. '
+      + 'Son dos claves distintas: la de ATV la da el portal al generar el usuario de API.');
+  }
 
   return p;
 }

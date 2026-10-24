@@ -123,6 +123,24 @@ settings.put('/:type', async (c) => {
       config = guardado;
     }
 
+    /*
+     * LAS CREDENCIALES SE GUARDAN SIN ESPACIOS DE SOBRA.
+     *
+     * El usuario y la contraseña de ATV se copian y pegan del portal de
+     * Hacienda, y el pegado arrastra espacios o un salto de línea al final.
+     * Invisibles en la pantalla, viajaban dentro de la credencial y Hacienda
+     * contestaba «Invalid credentials»: el mismo mensaje que si la contraseña
+     * estuviera mal, así que el dueño miraba el dato, lo veía correcto y no
+     * tenía por dónde seguir. Ninguna de estas credenciales lleva espacios.
+     */
+    if (type === 'electronic-invoice' && config && typeof config === 'object') {
+      for (const k of ['atv_username', 'atv_username_production', 'atv_username_sandbox',
+                       'atv_password', 'atv_password_production', 'atv_password_sandbox']) {
+        const v = (config as any)[k];
+        if (typeof v === 'string' && v !== v.trim()) (config as any)[k] = v.trim();
+      }
+    }
+
     let data: any;
     // Lo que había ANTES, para saber qué actividades se agregaron en este guardado.
     let anterior: Record<string, any> = {};

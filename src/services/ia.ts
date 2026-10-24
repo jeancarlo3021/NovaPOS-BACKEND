@@ -61,21 +61,74 @@ export function respuesta<T>(datos: T): RespuestaIA<T> {
 }
 
 /**
- * Punto único por donde pasaría una llamada al modelo.
+ * QUIÉN PUEDE GASTAR.
  *
- * Hoy devuelve null siempre: el modo demostración ni siquiera construye el
- * cliente. Está acá para que encender la IA sea cambiar ESTE archivo y nada
- * más —si cada función llamara al modelo por su cuenta, encenderla sería tocar
- * cinco lugares y apagarla, otros cinco—.
+ * Encender la IA cuesta plata por consulta, así que no alcanza con que el
+ * servidor la tenga encendida: cada llamada tiene que decir que está
+ * autorizada. Sin este permiso explícito, `pedirAlModelo` se comporta como en
+ * modo demostración y devuelve null, que es lo que ya saben manejar todos los
+ * que lo llaman.
+ *
+ * Hoy el único lugar autorizado es la carga masiva de productos hecha por el
+ * super-administrador. Un cajero clasificando un producto suelto, o cualquier
+ * otro negocio, siguen resolviendo con el buscador local y sin costo.
  */
-export async function pedirAlModelo(_opts: {
+export interface PermisoIA {
+  /** Para qué se está pidiendo. Sirve para el registro y para auditar el gasto. */
+  motivo: string;
+  /** Lo decide la ruta: dueño de la cuenta + pantalla habilitada. */
+  autorizado: boolean;
+}
+
+/** Cliente del SDK, construido una sola vez y solo si hace falta. */
+let cliente: any = null;
+async function clienteIA() {
+  if (cliente) return cliente;
+  const { default: Anthropic } = await import('@anthropic-ai/sdk');
+  cliente = new Anthropic();   // lee ANTHROPIC_API_KEY del entorno
+  return cliente;
+}
+
+/**
+ * Punto único por donde pasa una llamada al modelo.
+ *
+ * Está centralizado a propósito: encender o apagar la IA es tocar ESTE
+ * archivo y nada más. Si cada función llamara al modelo por su cuenta,
+ * encenderla sería tocar cinco lugares y apagarla, otros cinco.
+ *
+ * Nunca lanza: una falla del modelo no puede tumbar una importación de
+ * quinientos productos. Devuelve null y quien llama sigue con lo que tenía,
+ * que es exactamente lo que pasa en modo demostración.
+ */
+export async function pedirAlModelo(opts: {
   sistema: string;
   mensaje: string;
   maxTokens?: number;
+  permiso?: PermisoIA;
 }): Promise<string | null> {
   if (modoIA() === 'demo') return null;
-  throw new Error(
-    'La IA está en modo real pero todavía no está conectada. '
-    + 'Instalá @anthropic-ai/sdk y completá `pedirAlModelo` en services/ia.ts.',
-  );
+  if (!opts.permiso?.autorizado) return null;
+
+  try {
+    const anthropic = await clienteIA();
+    const r = await anthropic.messages.create({
+      model: MODELO_IA,
+      max_tokens: opts.maxTokens ?? 256,
+      // Esfuerzo bajo: esto es elegir entre tres opciones dadas, no razonar un
+      // problema. Es la diferencia entre centavos y dólares al mes.
+      output_config: { effort: 'low' },
+      system: opts.sistema,
+      messages: [{ role: 'user', content: opts.mensaje }],
+    });
+    const texto = (r.content ?? [])
+      .filter((b: any) => b.type === 'text')
+      .map((b: any) => b.text)
+      .join('')
+      .trim();
+    return texto || null;
+  } catch (e: any) {
+    // Se registra con el motivo para poder ver DESDE DÓNDE se gastó o falló.
+    console.warn(`[ia] falló la consulta al modelo (${opts.permiso?.motivo ?? 'sin motivo'}):`, e?.message);
+    return null;
+  }
 }

@@ -484,15 +484,45 @@ ia.post('/descripciones', async (c) => {
  * diferencia con el modelo encendido es la calidad de la elección entre
  * candidatos, no que aparezcan códigos nuevos.
  */
+/**
+ * ¿Es el dueño del sistema? (su plan trae `admin_dashboard`).
+ *
+ * Mismo criterio que usa la configuración de FE. Se repite acá en vez de
+ * exportarlo para no atar dos rutas por una función de cuatro líneas.
+ */
+async function esSuperAdmin(userId: string): Promise<boolean> {
+  try {
+    const { data: u } = await db.from('users').select('tenant_id').eq('id', userId).maybeSingle();
+    if (!u?.tenant_id) return false;
+    const { data: t } = await db.from('tenants').select('plan_id').eq('id', (u as any).tenant_id).maybeSingle();
+    if (!(t as any)?.plan_id) return false;
+    const { data: p } = await db.from('subscription_plans').select('features').eq('id', (t as any).plan_id).maybeSingle();
+    return ((p as any)?.features)?.admin_dashboard === true;
+  } catch { return false; }
+}
+
 ia.post('/cabys', async (c) => {
   try {
     const body = await c.req.json().catch(() => ({}));
-    const nombres: string[] = (Array.isArray(body?.nombres) ? body.nombres : body?.names ?? [])
-      .map((x: any) => String(x ?? '').trim()).filter(Boolean);
+    /*
+     * Cada producto puede venir como texto o como { nombre, contexto }.
+     *
+     * El contexto es el DEPARTAMENTO del archivo que se está importando
+     * (LIMPIEZA, FERRETERÍA…). Se usa solo cuando el nombre por sí solo no
+     * alcanza para decidir, y es lo que evita que «Guantes de latex» de un
+     * negocio de limpieza terminen clasificados como repuesto de motocicleta.
+     */
+    const crudos: any[] = Array.isArray(body?.nombres) ? body.nombres : (body?.names ?? []);
+    const items = crudos
+      .map((x: any) => typeof x === 'string'
+        ? { nombre: String(x ?? '').trim(), contexto: '' }
+        : { nombre: String(x?.nombre ?? x?.name ?? '').trim(), contexto: String(x?.contexto ?? x?.categoria ?? '').trim() })
+      .filter((x: any) => x.nombre);
+    const nombres: string[] = items.map((x: any) => x.nombre);
     if (nombres.length === 0) return fail(c, 'Mandá al menos un nombre de producto', 422);
     if (nombres.length > 200) return fail(c, 'Máximo 200 productos por consulta', 422);
 
-    const base = await sugerirCabys(nombres, { alternativas: true });
+    const base = await sugerirCabys(items, { alternativas: true });
 
     /**
      * Los que quedaron flojos son los que valen la pena repasar.
@@ -505,13 +535,49 @@ ia.post('/cabys', async (c) => {
     const dudosos = base.filter((x: any) => !x.code || x.confianza !== 'alta');
 
     let revisados = 0;
-    if (modoIA() === 'real' && dudosos.length > 0) {
-      for (const item of dudosos) {
+    /**
+     * EL MODELO SOLO SE USA EN LA CARGA MASIVA, Y SOLO PARA EL DUEÑO.
+     *
+     * Cada consulta cuesta. El buscador local sigue atendiendo a todos los
+     * negocios sin costo; el modelo entra únicamente cuando el dueño del
+     * sistema está importando un catálogo, que es donde hay cientos de
+     * productos que clasificar de una vez y donde vale la pena pagarlo.
+     *
+     * Las dos condiciones se verifican en el SERVIDOR: el `origen` que manda
+     * la pantalla no alcanza por sí solo —cualquiera puede mandarlo— y por eso
+     * va junto con el permiso del usuario.
+     */
+    const origen = String(body?.origen ?? '').trim();
+    const permiso = {
+      motivo: `cabys:${origen || 'sin-origen'}`,
+      autorizado: origen === 'importacion' && await esSuperAdmin(c.get('userId')),
+    };
+
+    if (modoIA() === 'real' && permiso.autorizado && dudosos.length > 0) {
+      /**
+       * EN PARALELO Y CON TOPE.
+       *
+       * Una consulta al modelo tarda un segundo y pico. De a una, un lote con
+       * treinta dudosos se pasa de los treinta segundos que aguanta la función
+       * en Vercel y el importador recibe un error en vez de las sugerencias
+       * que SÍ se resolvieron solas.
+       *
+       * De a cinco a la vez, treinta dudosos son unos diez segundos. Y el tope
+       * de 40 por lote es un freno de mano para el gasto: un archivo con
+       * quinientos nombres raros no puede convertirse en quinientas consultas
+       * sin que nadie lo haya decidido. Lo que no alcanzó a revisarse queda
+       * con su sugerencia local y sus alternativas, que es lo de siempre.
+       */
+      const A_LA_VEZ = 5;
+      const TOPE_POR_LOTE = 40;
+      const cola = dudosos.slice(0, TOPE_POR_LOTE);
+
+      const revisarUno = async (item: any) => {
         const candidatos = [
           ...(item.code ? [{ code: item.code, description: item.description }] : []),
           ...((item.alternativas ?? []) as any[]).map(a => ({ code: a.code, description: a.description })),
         ];
-        if (candidatos.length < 2) continue;
+        if (candidatos.length < 2) return;
         const elegido = await pedirAlModelo({
           sistema: 'Sos un clasificador de productos para el catálogo CABYS de Costa Rica. '
             + 'Elegí el código que mejor describe el producto ENTRE LOS CANDIDATOS DADOS. '
@@ -520,18 +586,23 @@ ia.post('/cabys', async (c) => {
           mensaje: `Producto: ${item.name}\nCandidatos:\n`
             + candidatos.map(x => `${x.code} — ${x.description}`).join('\n'),
           maxTokens: 120,
+          permiso,
         });
-        if (!elegido) continue;
+        if (!elegido) return;
         const [codigo, razon] = String(elegido).split('|').map(x => x.trim());
         // La defensa real: se acepta únicamente si el código está en la lista
         // que nosotros armamos. Si el modelo devolvió otra cosa, se ignora.
         const valido = candidatos.find(x => x.code === codigo);
-        if (!valido) continue;
+        if (!valido) return;
         item.code = valido.code;
         item.description = valido.description;
         item.fuente = 'ia';
         item.motivo = razon || item.motivo;
         revisados += 1;
+      };
+
+      for (let i = 0; i < cola.length; i += A_LA_VEZ) {
+        await Promise.all(cola.slice(i, i + A_LA_VEZ).map(revisarUno));
       }
     }
 

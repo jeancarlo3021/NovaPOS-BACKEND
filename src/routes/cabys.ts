@@ -219,10 +219,33 @@ async function cargarCatalogo(): Promise<Catalogo> {
  * según por dónde se entró. Para Hacienda esa inconsistencia es del negocio,
  * no del sistema.
  */
+/** Un producto a clasificar. El contexto es opcional: el departamento o la
+ *  categoría con la que viene en el archivo del negocio. */
+export type ItemCabys = string | { nombre: string; contexto?: string | null };
+
 export async function sugerirCabys(
-  nombres: string[],
+  entradas: ItemCabys[],
   opciones: { alternativas?: boolean } = {},
 ): Promise<any[]> {
+  /*
+   * EL DEPARTAMENTO DEL ARCHIVO AYUDA A DECIDIR.
+   *
+   * Los catálogos que manda el cliente traen una columna «Departamento»
+   * —LIMPIEZA, FERRETERÍA, ABARROTES— que hasta ahora se tiraba a la basura
+   * para esto. Con el nombre solo, «Guantes de latex talla M» caía en «Partes
+   * y accesorios de motocicletas» con un 45% de parecido: un disparate que
+   * nadie habría elegido sabiendo que el producto es de limpieza.
+   *
+   * El contexto se usa SOLO como segundo intento, cuando el nombre por sí
+   * mismo no alcanzó para decidir. Lo que ya resolvía bien no cambia: un
+   * nombre que coincide exacto con el de otro negocio sigue ganando, y
+   * mezclarle el departamento solo lo habría ensuciado.
+   */
+  const items = entradas.map(e =>
+    typeof e === 'string' ? { nombre: String(e ?? ''), contexto: '' }
+      : { nombre: String(e?.nombre ?? ''), contexto: String(e?.contexto ?? '') });
+  const nombres = items.map(i => i.nombre);
+  const contextoDe = new Map(items.map(i => [i.nombre, i.contexto]));
   {
     const cat = await cargarCatalogo();
     const total = cat.filas.length || 1;
@@ -241,12 +264,18 @@ export async function sugerirCabys(
      * mismo código de comidas preparadas. Sumar por CÓDIGO y no quedarse con un
      * solo nombre parecido es lo que lo vuelve estable.
      */
-    const porOtrosNegocios = (nombre: string) => {
+    const porOtrosNegocios = (nombre: string, tokensLimpios?: string[]) => {
       const clave = norm(nombre).replace(/\s+/g, ' ').trim();
       const ex = corp.exacto.get(clave);
       if (ex) return { code: ex.code, parecido: 1, negocios: ex.negocios, exacto: true, margen: 1 };
 
-      const tokens = [...new Set(palabras(nombre))];
+      /*
+       * Para el parecido se usan los tokens YA LIMPIOS (sin tallas ni medidas).
+       * El nombre completo sigue mandando en la coincidencia exacta de arriba:
+       * si otro negocio vende «Guantes de latex talla M» con ese mismo nombre,
+       * su código es la mejor respuesta y no hay nada que limpiar.
+       */
+      const tokens = tokensLimpios?.length ? tokensLimpios : [...new Set(palabras(nombre))];
       if (tokens.length === 0) return null;
       const pesoW = (w: string) => {
         const n = corp.frecuencia.get(w) ?? 0;
@@ -341,7 +370,37 @@ export async function sugerirCabys(
      * coincidencia floja con lo que clasificó un negocio no debería ganarle a
      * una buena del catálogo oficial.
      */
-    const mejorDelCatalogo = (tokens: string[]) => {
+    const SINONIMOS: Record<string, string[]> = {
+      lapicero: ['boligrafo'], lapiceros: ['boligrafo'], birome: ['boligrafo'],
+      audifono: ['auricular'], audifonos: ['auricular'], auriculares: ['auricular'],
+      shampoo: ['champu'], champu: ['champu'],
+      celular: ['telefono', 'movil'], cel: ['telefono', 'movil'],
+      compu: ['computadora'], laptop: ['portatil', 'computadora'],
+      tenis: ['calzado', 'deportivo'], zapatilla: ['calzado'], zapatillas: ['calzado'],
+      gaseosa: ['bebida', 'gaseosa'], refresco: ['bebida'],
+      pano: ['pano', 'trapo'], panos: ['pano', 'trapo'],
+      microfibra: ['limpieza'],
+      pila: ['pila', 'bateria'], pilas: ['pila', 'bateria'],
+      foco: ['lampara', 'bombilla'], bombillo: ['lampara', 'bombilla'],
+      mascarilla: ['mascarilla', 'proteccion'],
+      cuaderno: ['cuaderno'], lapiz: ['lapiz'],
+      jabon: ['jabon'], detergente: ['detergente'],
+    };
+    const conSinonimos = (ts: string[]) => {
+      const extra: string[] = [];
+      for (const t of ts) for (const syn of SINONIMOS[t] ?? []) if (!ts.includes(syn)) extra.push(syn);
+      return extra.length ? [...new Set([...ts, ...extra])] : ts;
+    };
+
+    /**
+     * @param tokens  Palabras con las que se BUSCA (incluye sinónimos).
+     * @param base    Palabras del nombre real, contra las que se mide cuánto
+     *                quedó explicado. Sin esto, agregar sinónimos bajaba la
+     *                cobertura —más palabras que explicar— y un nombre que
+     *                antes resolvía terminaba sin código: «Foco LED» encontraba
+     *                la lámpara correcta y la descartaba por puntaje.
+     */
+    const mejorDelCatalogo = (tokens: string[], base?: string[]) => {
       /**
        * Peso de una palabra: cuanto más rara, más distingue.
        *
@@ -355,7 +414,7 @@ export async function sugerirCabys(
         const n = cat.indice.get(w)?.length ?? 0;
         return n === 0 ? pesoMaximo : Math.log(total / n);
       };
-      const pesoTotal = tokens.reduce((s2, w) => s2 + peso(w), 0);
+      const pesoTotal = (base?.length ? base : tokens).reduce((s2, w) => s2 + peso(w), 0);
       if (pesoTotal <= 0) return null;
 
       // Solo se puntean las filas que comparten AL MENOS una palabra: recorrer
@@ -370,26 +429,136 @@ export async function sugerirCabys(
       }
       if (puntos.size === 0) return null;
 
+      /**
+       * CASTIGOS: coincidir en las palabras no es decir lo mismo.
+       *
+       * Tres errores medidos en catálogos reales, todos por puro solape de
+       * palabras contra una descripción que significa otra cosa:
+       *
+       *   «Aceite de cocina»  → «Utensilios de COCINA de bambú»
+       *   «Cargador tipo C»   → «PARTES Y ACCESORIOS de motocicletas»
+       *   «Salsa de tomate»   → «Salsas picantes, SIN TOMATE»
+       *
+       * Son tres patrones concretos y se castigan como tales. No se descarta
+       * la fila: se le baja el puntaje, así gana igual si de verdad no hay
+       * nada mejor en veinte mil filas.
+       */
+      /*
+       * La palabra que nombra al producto, CON sus sinónimos.
+       *
+       * Si solo se mira la palabra literal, agregarle sinónimos al nombre lo
+       * empeora: «Foco LED» busca también «lámpara», encuentra la fila
+       * correcta… y la castiga porque no dice «foco». La cabeza se da por
+       * cumplida si aparece cualquiera de sus formas.
+       */
+      const cabeza = tokens[0] ?? '';
+      const cabezas = [cabeza, ...(SINONIMOS[cabeza] ?? [])].filter(Boolean);
+      const pideParte = tokens.some(t => /^(parte|parts|accesorio|repuesto|kit)/.test(t));
+      const castigo = (i: number): number => {
+        const f = cat.filas[i];
+        let factor = 1;
+        // 1) La CABEZA del nombre no aparece: «aceite» no está en «utensilios
+        //    de cocina». Casi siempre significa que es otra cosa.
+        if (cabezas.length && !cabezas.some(c => f.tokens.includes(c))) factor *= 0.45;
+        // 2) La descripción es de PARTES y el producto no lo es.
+        if (!pideParte && /\b(partes|accesorios)\b/i.test(f.description)) factor *= 0.4;
+        // 3) La descripción EXCLUYE justo lo que el nombre pide: «sin tomate».
+        const excluidas = String(f.description).toLowerCase().match(/\bsin ([a-záéíóúñ]+)/g) ?? [];
+        for (const e of excluidas) {
+          const palabra = e.replace(/^sin /, '');
+          if (tokens.some(t => palabra.startsWith(t.slice(0, 4)))) { factor *= 0.3; break; }
+        }
+        return factor;
+      };
+
       let mejor = -1, mejorPunto = 0;
       for (const [i, pt] of puntos) {
+        const ajustado = pt * castigo(i);
         // A igual puntaje gana la descripción MÁS CORTA: es la más específica,
         // y las largas suelen ser cajones de sastre que mencionan de todo.
-        if (pt > mejorPunto || (pt === mejorPunto && mejor >= 0
+        if (ajustado > mejorPunto || (ajustado === mejorPunto && mejor >= 0
             && cat.filas[i].tokens.length < cat.filas[mejor].tokens.length)) {
-          mejor = i; mejorPunto = pt;
+          mejor = i; mejorPunto = ajustado;
         }
       }
       if (mejor < 0) return null;
       const f = cat.filas[mejor];
       return {
         code: f.code, description: f.description, iva_rate: f.iva_rate,
-        cobertura: mejorPunto / pesoTotal,              // cuánto del nombre quedó explicado
+        // Cuánto del nombre quedó explicado. Se topa en 1: con sinónimos, lo
+        // encontrado puede pesar más que el nombre original.
+        cobertura: Math.min(1, mejorPunto / pesoTotal),
         compartidas: tokens.filter(w => f.tokens.includes(w)),
       };
     };
 
+    /**
+     * Segundo intento sumándole el DEPARTAMENTO al nombre.
+     *
+     * Solo se llama cuando el nombre solo no alcanzó. Pide una cobertura más
+     * alta que la normal (0,6) porque las palabras del departamento son
+     * genéricas y es fácil que arrastren una coincidencia floja.
+     */
+    const conContexto = (nombre: string, tokensBase: string[], alt: (e: string | null) => any) => {
+      const ctx = String(contextoDe.get(nombre) ?? '').trim();
+      if (!ctx) return null;
+      const tokens = sinRuido([...new Set([...tokensBase, ...palabras(ctx)])]);
+      if (tokens.length === tokensBase.length) return null;   // el contexto no aportó nada
+      const m = mejorDelCatalogo(tokens);
+      if (!m || m.cobertura < 0.6) return null;
+      return {
+        name: nombre, code: m.code, description: m.description, iva_rate: m.iva_rate,
+        confianza: 'media' as const, fuente: 'catalogo' as const,
+        cobertura: m.cobertura, con_contexto: ctx,
+        alternativas: alt(m.code),
+      };
+    };
+
+    /**
+     * SACA EL RUIDO DEL NOMBRE ANTES DE BUSCAR.
+     *
+     * Los nombres de un catálogo real llevan la presentación pegada: «Guantes
+     * de latex talla M», «Cloro 1 litro», «Bolsa 30x40». Esas palabras no
+     * dicen QUÉ es el producto, pero pesan igual que las que sí: medido, «talla
+     * M» mandaba «Guantes de latex» a «Mármol y travertinos DE TALLA», y sin la
+     * talla el mismo nombre se clasificaba correcto a la primera.
+     *
+     * Solo se quitan medidas, tallas y envases. Si al final no queda nada —un
+     * producto que se llama «250 ml»— se usan los tokens originales: mejor una
+     * búsqueda ruidosa que ninguna.
+     */
+    const RUIDO = new Set([
+      'talla', 'tallas', 'tamano', 'medida', 'medidas', 'nro', 'num', 'numero',
+      'unidad', 'unidades', 'und', 'uds', 'pqt', 'paq', 'paquete', 'pack',
+      'aprox', 'aproximado', 'surtido', 'varios', 'colores', 'color',
+    ]);
+    const esMedida = (t: string) =>
+      /^\d+([.,]\d+)?$/.test(t)                                   // 250, 1,5
+      || /^\d+([.,]\d+)?(ml|l|lt|lts|cc|g|gr|kg|mg|oz|lb|mm|cm|mt|mts|m|pulg|in)$/.test(t)
+      || /^\d+x\d+(x\d+)?$/.test(t)                               // 30x40
+      || /^(x?s|m|l|x?xl|xxxl)$/.test(t);                           // tallas sueltas
+    const sinRuido = (ts: string[]) => {
+      const limpio = ts.filter(t => !RUIDO.has(t) && !esMedida(t));
+      return limpio.length ? limpio : ts;
+    };
+
+    /**
+     * CÓMO LE DICE LA TIENDA ↔ CÓMO LE DICE EL CATÁLOGO.
+     *
+     * Los errores que quedaban después de limpiar el ruido no eran de
+     * puntaje: eran de vocabulario. El catálogo de Hacienda dice «bolígrafo»
+     * y la papelería escribe «lapicero»; dice «auriculares» y la tienda
+     * escribe «audífonos». Sin una palabra en común, el buscador no tiene con
+     * qué trabajar y termina en cualquier parte o sin código.
+     *
+     * La palabra de la tienda NO se reemplaza: se AGREGA la del catálogo, así
+     * un nombre que ya funcionaba sigue funcionando igual.
+     */
     const salida = nombres.map((nombre) => {
-      const tokens = [...new Set(palabras(String(nombre ?? '')))];
+      /** Las palabras del nombre, sin ruido. Es contra esto que se mide. */
+      const tokensBase = sinRuido([...new Set(palabras(String(nombre ?? '')))]);
+      /** Lo mismo, más los sinónimos del catálogo: con esto se BUSCA. */
+      const tokens = conSinonimos(tokensBase);
       const vacio = { name: nombre, code: null, description: null, iva_rate: null, confianza: 'baja' as const, fuente: null as string | null };
       if (tokens.length === 0) return vacio;
 
@@ -409,7 +578,7 @@ export async function sugerirCabys(
       });
 
       // ── 1) Lo que ya clasificaron otros negocios ──
-      const otros = porOtrosNegocios(String(nombre));
+      const otros = porOtrosNegocios(String(nombre), tokens);
       if (otros) {
         const f = infoDe.get(otros.code);
         const resultadoCorpus = (conf: 'alta' | 'media') => ({
@@ -427,9 +596,42 @@ export async function sugerirCabys(
           alternativas: alt(otros.code),
         });
 
+        /**
+         * REVISIÓN DE CORDURA de lo que trae el corpus.
+         *
+         * El parecido se mide contra el NOMBRE que le puso otro negocio, no
+         * contra lo que significa el código. Medido: «Cargador tipo C» se
+         * parecía un 45% a algo que alguien clasificó como «Partes y
+         * accesorios de motocicletas», y así se lo llevaba. Un código cuya
+         * descripción habla de otra cosa no puede ganar por un parecido
+         * flojo de nombres.
+         *
+         * Solo aplica a las coincidencias FLOJAS: con nombre exacto o parecido
+         * alto, lo que otro negocio ya resolvió sigue mandando.
+         */
+        const descripcionCalza = (() => {
+          if (!f?.description) return true;            // sin descripción no hay nada que revisar
+          const dtokens = palabras(f.description);
+          const cabeza = tokens[0] ?? '';
+          const pideParte = tokens.some(t => /^(parte|accesorio|repuesto|kit)/.test(t));
+          if (!pideParte && /\b(partes|accesorios)\b/i.test(f.description)) return false;
+          return !cabeza || dtokens.includes(cabeza);
+        })();
+
         // El nombre EXACTO es la señal más fuerte que existe: otro negocio
         // vende literalmente esto y ya resolvió el código.
         if (otros.exacto || otros.parecido >= 0.6) return resultadoCorpus('alta');
+        if (!descripcionCalza) {
+          // Se ignora el corpus y se resuelve con el catálogo (abajo).
+          const m2 = mejorDelCatalogo(tokens, tokensBase);
+          if (m2 && m2.cobertura >= 0.5) return deCatalogo(m2, m2.cobertura >= 0.85 ? 'alta' : 'media');
+          const porDepto = conContexto(nombre, tokens, alt);
+          if (porDepto) return porDepto;
+          return { ...vacio, name: nombre,
+            motivo: 'Lo más parecido que clasificó otro negocio no calza con este producto, '
+              + 'y el catálogo no da nada claro. Elegí vos:',
+            alternativas: alt(null) };
+        }
 
         /**
          * Zona dudosa: se le pregunta también al catálogo oficial.
@@ -442,7 +644,7 @@ export async function sugerirCabys(
          * el laurel paga 13% de IVA y el cuaderno escolar paga 1%.
          */
         if (otros.parecido >= 0.35) {
-          const m = mejorDelCatalogo(tokens);
+          const m = mejorDelCatalogo(tokens, tokensBase);
           /**
            * Para desplazar al corpus, al catálogo no le alcanza con puntuar
            * más: tiene que explicar la MAYORÍA del nombre.
@@ -463,8 +665,8 @@ export async function sugerirCabys(
       }
 
       // ── 2) Respaldo: el catálogo de Hacienda ──
-      const m = mejorDelCatalogo(tokens);
-      if (!m) return vacio;
+      const m = mejorDelCatalogo(tokens, tokensBase);
+      if (!m) return conContexto(nombre, tokens, alt) ?? vacio;
       const confianza = m.cobertura >= 0.85 ? 'alta' : m.cobertura >= 0.5 ? 'media' : 'baja';
       /**
        * Poca confianza: NO se pone código, pero sí se ofrecen las opciones.
@@ -477,6 +679,9 @@ export async function sugerirCabys(
        * búsqueda a mano entre veinte mil filas en un clic entre tres.
        */
       if (confianza === 'baja') {
+        // Antes de rendirse: ¿el departamento del archivo lo aclara?
+        const conDepto = conContexto(nombre, tokens, alt);
+        if (conDepto) return conDepto;
         return {
           ...vacio, name: nombre,
           motivo: 'Ninguna opción queda lo bastante clara como para ponerla sola '
