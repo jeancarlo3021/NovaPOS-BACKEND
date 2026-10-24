@@ -84,7 +84,20 @@ export interface PermisoIA {
 let cliente: any = null;
 async function clienteIA() {
   if (cliente) return cliente;
-  const { default: Anthropic } = await import('@anthropic-ai/sdk');
+  /*
+   * Se usa la exportación CON NOMBRE, no la `default`.
+   *
+   * El paquete es CommonJS y lo cargamos con `import()` dinámico: según la
+   * configuración de módulos, TypeScript tipa `.default` como el módulo
+   * entero y no como la clase. Compilaba acá y reventaba en Vercel con
+   * «This expression is not constructable». `Anthropic` sale exportado con
+   * nombre desde el mismo archivo, y así se construye igual en los dos lados.
+   */
+  const mod: any = await import('@anthropic-ai/sdk');
+  // Según cómo compile cada lado, la clase llega en `Anthropic`, en
+  // `default.Anthropic` o directamente en `default`. Se prueban las tres en
+  // vez de atar el despliegue a una configuración de módulos concreta.
+  const Anthropic = mod.Anthropic ?? mod.default?.Anthropic ?? mod.default;
   cliente = new Anthropic();   // lee ANTHROPIC_API_KEY del entorno
   return cliente;
 }

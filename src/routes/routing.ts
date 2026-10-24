@@ -1168,6 +1168,12 @@ routing.post('/:id/close', async (c) => {
     if ((route as any).status === 'closed') return fail(c, 'La ruta ya está cerrada', 409);
 
     const truckId = (route as any).warehouse_id;
+    // El nombre del camión, para que el resumen diga de qué ruta es.
+    let nombreCamion: string | undefined;
+    if (truckId) {
+      const { data: wh } = await db.from('warehouses').select('name').eq('id', truckId).maybeSingle();
+      nombreCamion = (wh as any)?.name ?? undefined;
+    }
 
     // 1) Devolver el sobrante del camión al INVENTARIO DEL SISTEMA (products.stock_quantity).
     let returnedItems: Array<{ product_id: string; quantity: number }> = [];
@@ -1316,6 +1322,17 @@ routing.post('/:id/close', async (c) => {
       // Abonos de CxC del día (repartidor) y gastos del día.
       ar_payments: { by_method: { cash: abonos.cash, card: abonos.card, sinpe: abonos.sinpe }, total: abonos.total, list: abonosList },
       expenses: { total: gastosTotal, list: gastosList },
+      /*
+       * QUÉ RUTA ES ESTE CIERRE.
+       *
+       * El camión y la fecha iban vacíos en el resumen guardado: el nombre lo
+       * ponía la pantalla al imprimir. Alcanzó para que, con tres rutas
+       * abiertas el mismo día, se imprimiera un cierre sin decir de cuál era
+       * —o peor, el de otra—. Yendo adentro del resumen, el tiquete, la
+       * reimpresión y el correo lo dicen siempre, los arme quien los arme.
+       */
+      truck: nombreCamion,
+      route_date: (route as any).route_date,
     };
 
     // 3) Cerrar la ruta y GUARDAR el resumen para poder reimprimirlo luego.
