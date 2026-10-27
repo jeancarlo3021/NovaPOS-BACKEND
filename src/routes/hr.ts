@@ -2,6 +2,10 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
+import { hashPin, empleadoPorPin, marcar, hoyCR } from '../services/fichaje.js';
+import {
+  opcionesRegistro, verificarRegistro, opcionesFichaje, verificarFichaje,
+} from '../services/fichajeBiometria.js';
 
 const hr = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
@@ -786,6 +790,145 @@ hr.delete('/payroll/:id', async (c) => {
  * el contrato que se acaba son cosas que se descubren tarde, cuando ya hay una
  * multa o un empleado trabajando sin papeles al día.
  */
+/* ───────────────────────── FICHAJE ─────────────────────────────────────── */
+
+/**
+ * POST /attendance/mark — marcar con CÓDIGO.
+ *
+ * El código identifica a la persona en el servidor. El endpoint viejo
+ * (`/attendance/clock-in`) recibía el `employee_id` en el cuerpo y marcaba sin
+ * preguntar: con la pantalla abierta en la entrada del local, cualquiera podía
+ * marcarle la hora a un compañero que todavía no llegaba. Se deja andando por
+ * compatibilidad, pero lo que usa la pantalla nueva es esto.
+ */
+hr.post('/attendance/mark', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const body = await c.req.json().catch(() => ({} as any));
+    const pin = String(body?.pin ?? '').trim();
+    if (!/^\d{4,8}$/.test(pin)) return fail(c, 'El código es de 4 a 8 dígitos', 422);
+
+    const empleado = await empleadoPorPin(tenantId, pin);
+    // Mismo mensaje para «no existe» y «está inactivo»: decir cuál de las dos
+    // es ayuda a quien está probando códigos ajenos.
+    if (!empleado) return fail(c, 'Código no reconocido', 404);
+
+    const r = await marcar({
+      tenantId,
+      empleado: { id: empleado.id, full_name: empleado.full_name, position: empleado.position },
+      metodo: 'pin',
+      device: String(body?.device ?? '').slice(0, 80) || null,
+    });
+    return ok(c, r, 201);
+  } catch (err: any) { return fail(c, err.message, 400); }
+});
+
+/** PUT /employees/:id/pin — poner o cambiar el código de un empleado. */
+hr.put('/employees/:id/pin', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { id } = c.req.param();
+    const body = await c.req.json().catch(() => ({} as any));
+    const pin = String(body?.pin ?? '').trim();
+    if (!/^\d{4,8}$/.test(pin)) return fail(c, 'El código es de 4 a 8 dígitos', 422);
+
+    // Dos empleados con el mismo código harían que el fichaje marcara al que
+    // apareciera primero en la lista. Se revisa antes de guardar.
+    const yaEs = await empleadoPorPin(tenantId, pin);
+    if (yaEs && String(yaEs.id) !== String(id)) {
+      return fail(c, `Ese código ya lo usa ${yaEs.full_name}. Elegí otro.`, 409);
+    }
+
+    const { error } = await db.from('employees')
+      .update({ attendance_pin_hash: hashPin(pin), attendance_pin_set_at: new Date().toISOString() })
+      .eq('id', id).eq('tenant_id', tenantId);
+    if (error) {
+      if (/attendance_pin_hash/i.test(error.message)) {
+        return fail(c, 'Falta correr la migración 125 (fichaje) en la base.', 400);
+      }
+      throw new Error(error.message);
+    }
+    return ok(c, { ok: true });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/* ── Huella / FaceID ──────────────────────────────────────────────────────
+ * Cuatro pasos: el empleado REGISTRA su aparato (una vez, identificándose con
+ * su código) y después FICHA con el dedo. El navegador exige HTTPS.
+ */
+
+/** POST /attendance/biometria/registro/opciones — body: { pin } */
+hr.post('/attendance/biometria/registro/opciones', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { pin } = await c.req.json().catch(() => ({} as any));
+    // Se registra el aparato CON EL CÓDIGO: si bastara con estar logueado,
+    // cualquiera registraría su dedo a nombre de otro empleado.
+    const empleado = await empleadoPorPin(tenantId, String(pin ?? ''));
+    if (!empleado) return fail(c, 'Código no reconocido', 404);
+    const options = await opcionesRegistro(c, tenantId, empleado);
+    return ok(c, { options, employee_id: empleado.id, nombre: empleado.full_name });
+  } catch (err: any) { return fail(c, err.message, 400); }
+});
+
+/** POST /attendance/biometria/registro — body: { employee_id, respuesta, etiqueta } */
+hr.post('/attendance/biometria/registro', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const b = await c.req.json().catch(() => ({} as any));
+    await verificarRegistro(c, tenantId, String(b?.employee_id ?? ''), b?.respuesta, b?.etiqueta);
+    return ok(c, { ok: true });
+  } catch (err: any) { return fail(c, err.message, 400); }
+});
+
+/** POST /attendance/biometria/opciones — desafío para fichar. */
+hr.post('/attendance/biometria/opciones', async (c) => {
+  try {
+    return ok(c, await opcionesFichaje(c, c.get('tenantId')));
+  } catch (err: any) { return fail(c, err.message, 400); }
+});
+
+/** POST /attendance/biometria/marcar — body: { respuesta } */
+hr.post('/attendance/biometria/marcar', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const b = await c.req.json().catch(() => ({} as any));
+    const empleado = await verificarFichaje(c, tenantId, b?.respuesta);
+    const r = await marcar({
+      tenantId,
+      empleado: { id: empleado.id, full_name: empleado.full_name, position: empleado.position },
+      metodo: 'biometria',
+      device: String(b?.device ?? '').slice(0, 80) || null,
+    });
+    return ok(c, r, 201);
+  } catch (err: any) { return fail(c, err.message, 400); }
+});
+
+/** GET /attendance/today — quién marcó hoy, para la pantalla del tablero. */
+hr.get('/attendance/today', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const dia = hoyCR();
+    const { data: regs } = await db.from('attendance_records')
+      .select('employee_id, clock_in, clock_out, hours_worked')
+      .eq('tenant_id', tenantId).eq('date', dia);
+    const ids = (regs ?? []).map((r: any) => r.employee_id);
+    const { data: emps } = ids.length
+      ? await db.from('employees').select('id, full_name, position').in('id', ids)
+      : { data: [] as any[] };
+    const porId = new Map((emps ?? []).map((e: any) => [String(e.id), e]));
+    return ok(c, {
+      date: dia,
+      marcajes: (regs ?? []).map((r: any) => ({
+        employee_id: r.employee_id,
+        nombre: porId.get(String(r.employee_id))?.full_name ?? 'Empleado',
+        puesto: porId.get(String(r.employee_id))?.position ?? null,
+        entrada: r.clock_in, salida: r.clock_out, horas: r.hours_worked,
+      })).sort((a: any, b: any) => String(a.entrada).localeCompare(String(b.entrada))),
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 hr.get('/alerts', async (c) => {
   try {
     const tenantId = c.get('tenantId');

@@ -383,6 +383,92 @@ routing.get('/', async (c) => {
 // GET /central-stock — stock del INVENTARIO DEL SISTEMA (products), para "Cargar".
 // IMPORTANTE: debe ir ANTES de /:id, si no '/:id' captura 'central-stock'.
 // Valor -1 = stock infinito (producto sin control de inventario).
+/**
+ * GET /load-from-orders?date=&zone= — QUÉ CARGAR SEGÚN LA PREVENTA.
+ *
+ * El distribuidor que trabaja con preventa vende hoy y entrega mañana: el
+ * camión no tiene que salir con un promedio histórico, tiene que salir con lo
+ * que YA SE VENDIÓ. Hasta ahora la única sugerencia era el promedio de los
+ * últimos treinta días —útil para autoventa, inútil acá—, así que la carga de
+ * la preventa se armaba sumando pedidos a mano, con el riesgo obvio: sale
+ * corto y el cliente que ya compró se queda sin producto.
+ *
+ * Suma los pedidos PENDIENTES de esa fecha de entrega. Los ya cobrados no
+ * entran: esos ya salieron del inventario.
+ */
+routing.get('/load-from-orders', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const fecha = (c.req.query('date') ?? '').trim();
+    const zona = (c.req.query('zone') ?? '').trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(fecha)) return fail(c, 'Indicá la fecha de entrega (AAAA-MM-DD)', 422);
+
+    let q = db.from('agent_orders')
+      .select('id, number, customer_name, customer_zone, total, status, assigned_name')
+      .eq('tenant_id', tenantId)
+      .eq('scheduled_date', fecha)
+      .in('status', ['pending', 'taken', 'assigned']);
+    if (zona) q = q.eq('customer_zone', zona);
+    const { data: pedidos, error } = await q;
+    if (error) {
+      // Sin el módulo de preventa instalado no es un error: no hay nada que sumar.
+      if (/agent_orders/i.test(error.message)) return ok(c, { date: fecha, orders: [], suggestion: {}, products: [] });
+      throw new Error(error.message);
+    }
+    const ids = (pedidos ?? []).map((o: any) => o.id);
+    if (!ids.length) return ok(c, { date: fecha, orders: [], suggestion: {}, products: [] });
+
+    const { data: items } = await db.from('agent_order_items')
+      .select('order_id, product_id, product_name, quantity').in('order_id', ids);
+
+    /*
+     * Se suma por producto. Las líneas SIN `product_id` —el producto rápido que
+     * el agente escribió a mano— no se pueden cargar al camión, pero tampoco se
+     * esconden: van aparte para que quien arma la carga sepa que ese pedido
+     * lleva algo que tiene que resolver por su cuenta.
+     */
+    const porProducto: Record<string, number> = {};
+    const sueltos: Array<{ name: string; quantity: number }> = [];
+    for (const it of (items ?? []) as any[]) {
+      if (it.product_id) porProducto[it.product_id] = (porProducto[it.product_id] ?? 0) + Number(it.quantity ?? 0);
+      else sueltos.push({ name: it.product_name, quantity: Number(it.quantity ?? 0) });
+    }
+
+    // Nombre, existencias y si alcanza: cargar lo que no hay es la otra forma
+    // de dejar al cliente sin producto, y conviene verlo ANTES de salir.
+    const pids = Object.keys(porProducto);
+    const { data: prods } = pids.length
+      ? await db.from('products').select('id, name, sku, stock_quantity, tracks_stock')
+          .eq('tenant_id', tenantId).in('id', pids)
+      : { data: [] as any[] };
+
+    const productos = (prods ?? []).map((p: any) => {
+      const pedido = porProducto[String(p.id)] ?? 0;
+      const hay = Number(p.stock_quantity ?? 0);
+      return {
+        product_id: p.id, name: p.name, sku: p.sku,
+        quantity: pedido,
+        stock_available: hay,
+        tracks_stock: p.tracks_stock !== false,
+        falta: p.tracks_stock !== false ? Math.max(0, pedido - hay) : 0,
+      };
+    }).sort((a, b) => b.falta - a.falta || a.name.localeCompare(b.name));
+
+    return ok(c, {
+      date: fecha,
+      orders: (pedidos ?? []).map((o: any) => ({
+        id: o.id, number: o.number, customer_name: o.customer_name,
+        zone: o.customer_zone, total: Number(o.total ?? 0), status: o.status,
+        assigned_name: o.assigned_name,
+      })),
+      suggestion: porProducto,
+      products: productos,
+      /** Líneas que no son del catálogo: hay que resolverlas aparte. */
+      sin_producto: sueltos,
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // GET /load-suggestion?warehouse_id=&days=30 — sugerencia de carga por histórico:
 // cantidad promedio vendida por producto en las rutas de ese camión/bodega en los
 // últimos N días. Sirve para pre-llenar la carga y no salir corto ni sobrado.

@@ -1085,7 +1085,7 @@ groups.get('/my/tenant-plan/:tenantId', async (c) => {
     // la última fila no estaba activa). Devuelve también fecha/valor del plan.
     const activeSubOf = async (tid: string) => {
       const { data } = await db.from('subscriptions')
-        .select('ends_at, subscription_plans(name, features, price, billing_cycle, description)')
+        .select('ends_at, custom_price, subscription_plans(name, features, price, billing_cycle, description)')
         .eq('tenant_id', tid).eq('status', 'active')
         .order('created_at', { ascending: false }).limit(1).maybeSingle();
       return (data as any) ?? null;
@@ -1127,7 +1127,16 @@ groups.get('/my/tenant-plan/:tenantId', async (c) => {
       name: plan.name ?? 'demo',
       features: plan.features ?? null,
       ends_at: (sub as any)?.ends_at ?? null,
-      price: plan.price ?? null,
+      /**
+       * El precio es EL QUE SE LE COBRA A ESTE NEGOCIO.
+       *
+       * `custom_price` es el monto pactado con el cliente; el del plan es solo
+       * la lista. Devolver la lista hacía que el dueño al que se le rebajó
+       * leyera en su pantalla una cifra que no es la que paga.
+       */
+      price: (sub as any)?.custom_price ?? plan.price ?? null,
+      /** La lista, aparte, para no perder el dato de referencia. */
+      plan_price: plan.price ?? null,
       billing_cycle: plan.billing_cycle ?? null,
       description: plan.description ?? null,
     });
