@@ -49,6 +49,7 @@ import warrantiesRoute  from './routes/warranties.js';
 import leadsRoute       from './routes/leads.js';
 import demoRequestsRoute from './routes/demoRequests.js';
 import { digitalMenu, publicMenu } from './routes/digitalMenu.js';
+import { mesaDigital, mesaPublic } from './routes/mesaDigital.js';
 import { landingPublic, landingAdmin } from './routes/landing.js';
 import contabilidad from './routes/contabilidad.js';
 import { ia } from './routes/ia.js';
@@ -138,6 +139,15 @@ app.route('/fe-external', feExternal);
 app.route('/public-menu', publicMenu);
 
 /**
+ * MESA DIGITAL pública — lo que abre el QR pegado en la mesa.
+ *
+ * Igual que el menú: sin sesión, porque el comensal no va a registrarse para
+ * avisar que está listo para ordenar. Cada petición va atada al token secreto
+ * de UNA mesa, que la base vuelve a validar (ver routes/mesaDigital.ts).
+ */
+app.route('/mesa', mesaPublic);
+
+/**
  * La PÁGINA PÚBLICA de presentación, también sin sesión.
  *
  * Va junto al menú digital y fuera del grupo con `auth` por el mismo motivo:
@@ -194,6 +204,7 @@ api.route('/warranties',         warrantiesRoute);
 api.route('/leads',              leadsRoute);
 api.route('/demo-requests',      demoRequestsRoute);
 api.route('/digital-menu',      digitalMenu);
+api.route('/mesa-digital',       mesaDigital);
 api.route('/ia',                ia);
 api.route('/window-orders',     windowOrders);
 api.route('/table-orders',       tableOrders);

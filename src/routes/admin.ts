@@ -1591,23 +1591,47 @@ admin.put('/global-fe', async (c) => {
 });
 
 // ── Planes de Facturación Electrónica (tabla fe_plans) ───────────────────────
+/**
+ * Cómo funciona la cuota del plan. 'bolsa' es lo de siempre —N comprobantes
+ * hasta agotarse—; 'mes' se reinicia cada mes y 'unico' vence a los
+ * `vigencia_meses` meses. Ver migración 128 y `computeFeQuota`.
+ */
+const PERIODOS_FE = ['bolsa', 'mes', 'unico'] as const;
+const periodoFe = (v: any): 'bolsa' | 'mes' | 'unico' =>
+  (PERIODOS_FE as readonly string[]).includes(String(v)) ? v : 'bolsa';
+
 const feOut = (r: any) => ({
   id: r.id, name: r.name, description: r.description ?? '',
   price: Number(r.price ?? 0),
   docsPerMonth: r.docs_per_month == null ? null : Number(r.docs_per_month),
   extraDocPrice: Number(r.extra_doc_price ?? 0),
+  periodo: periodoFe(r.periodo),
+  vigenciaMeses: r.vigencia_meses == null ? null : Number(r.vigencia_meses),
   features: Array.isArray(r.features) ? r.features : [],
   is_active: r.is_active !== false,
 });
-const feIn = (p: any) => ({
-  id: p.id, name: p.name ?? '', description: p.description ?? '',
-  price: Number(p.price ?? 0),
-  docs_per_month: p.docsPerMonth == null || p.docsPerMonth === '' ? null : Number(p.docsPerMonth),
-  extra_doc_price: Number(p.extraDocPrice ?? 0),
-  features: Array.isArray(p.features) ? p.features : [],
-  is_active: p.is_active !== false,
-  updated_at: new Date().toISOString(),
-});
+const feIn = (p: any) => {
+  const periodo = periodoFe(p.periodo);
+  return {
+    id: p.id, name: p.name ?? '', description: p.description ?? '',
+    price: Number(p.price ?? 0),
+    docs_per_month: p.docsPerMonth == null || p.docsPerMonth === '' ? null : Number(p.docsPerMonth),
+    extra_doc_price: Number(p.extraDocPrice ?? 0),
+    periodo,
+    // La vigencia solo significa algo en 'unico': en los otros queda nula para
+    // que no aparezca un vencimiento donde no hay ninguno.
+    vigencia_meses: periodo === 'unico'
+      ? Math.max(1, Number(p.vigenciaMeses ?? 1) || 1) : null,
+    features: Array.isArray(p.features) ? p.features : [],
+    is_active: p.is_active !== false,
+    updated_at: new Date().toISOString(),
+  };
+};
+/** Las columnas de la migración 128, para guardar sin ellas si no se corrió. */
+const sinPeriodo = (row: any) => {
+  const { periodo, vigencia_meses, ...resto } = row;
+  return resto;
+};
 
 admin.get('/fe-plans', async (c) => {
   try {
@@ -1627,11 +1651,21 @@ admin.put('/fe-plans', async (c) => {
     for (const row of (existing ?? []) as any[]) {
       if (!keep.has(row.id)) await db.from('fe_plan_catalog').delete().eq('id', row.id);
     }
+    let faltanColumnas = false;
     for (const p of plans) {
-      const { error } = await db.from('fe_plan_catalog').upsert(feIn(p), { onConflict: 'id' });
+      const fila = feIn(p);
+      let { error } = await db.from('fe_plan_catalog').upsert(fila, { onConflict: 'id' });
+      /* Sin la migración 128 se guarda el resto del plan en vez de perder lo que
+         el usuario acaba de escribir. Queda como bolsa —el comportamiento de
+         siempre— y la respuesta lo dice para poder avisarlo en pantalla. */
+      if (error && /periodo|vigencia_meses/.test(error.message ?? '')) {
+        faltanColumnas = true;
+        ({ error } = await db.from('fe_plan_catalog')
+          .upsert(sinPeriodo(fila), { onConflict: 'id' }));
+      }
       if (error) throw new Error(error.message);
     }
-    return ok(c, plans);
+    return ok(c, { plans, falta_migracion_128: faltanColumnas });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
@@ -1656,6 +1690,16 @@ admin.put('/tenants/:id/fe-plan', async (c) => {
       cfg.fe_included_docs = (plan as any).docs_per_month == null ? 0 : Number((plan as any).docs_per_month);
       cfg.fe_included_nc = cfg.fe_included_nc ?? 0;
       cfg.fe_extra_fee = Number((plan as any).extra_doc_price ?? 0);
+      /* El período viaja con la asignación: `computeFeQuota` lo lee de la config
+         del negocio, no del catálogo, para que cambiarle el plan al catálogo no
+         le mueva la cuota a quien ya pagó la anterior. */
+      cfg.fe_periodo = periodoFe((plan as any).periodo);
+      cfg.fe_vigencia_meses = cfg.fe_periodo === 'unico'
+        ? Math.max(1, Number((plan as any).vigencia_meses ?? 1) || 1) : null;
+      /* Una cuota que vence o se reinicia arranca HOY: sin esto heredaría el
+         `fe_quota_start` de la bolsa anterior y el mes que se acaba de pagar
+         podría aparecer vencido el mismo día. */
+      if (cfg.fe_periodo === 'unico') cfg.fe_quota_start = new Date().toISOString();
       cfg.enabled = true;
     }
 

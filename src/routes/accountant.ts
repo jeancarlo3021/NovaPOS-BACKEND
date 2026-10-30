@@ -542,6 +542,149 @@ accountant.get('/clients/:id/invoices', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+/**
+ * GET /consolidado — LOS COMPROBANTES DE TODA LA CARTERA, de un viaje.
+ *
+ * Es lo que el contador hace cada mes: juntar lo que emitieron sus clientes
+ * para declarar. Antes había que entrar negocio por negocio, bajar su lista y
+ * pegarlas a mano en Excel; con quince clientes eso es media mañana y un error
+ * de copiado que no se nota hasta la declaración.
+ *
+ * Devuelve un bloque por cliente —con sus comprobantes y sus totales— para que
+ * el navegador arme un archivo con UNA PESTAÑA POR CLIENTE más la hoja
+ * consolidada.
+ *
+ * Las NOTAS DE CRÉDITO se cuentan aparte y RESTAN del total declarable: una
+ * factura anulada por NC que siga sumando infla las ventas del mes.
+ */
+accountant.get('/consolidado', async (c) => {
+  try {
+    const userId = c.get('userId');
+    const { data: links } = await db.from('user_tenants')
+      .select('tenant_id').eq('user_id', userId);
+    const { data: owned } = await db.from('tenants').select('id').eq('owner_id', userId);
+    const ids = [...new Set([
+      ...(links ?? []).map((r: any) => r.tenant_id),
+      ...(owned ?? []).map((r: any) => r.id),
+    ])];
+    if (ids.length === 0) return ok(c, { desde: null, hasta: null, clientes: [] });
+
+    const desde = c.req.query('from') || null;
+    const hasta = c.req.query('to') || null;
+    /* 'todos' trae también los comprobantes corrientes (sin clave de Hacienda):
+       un negocio en simplificado no emite FE y su contador igual lo declara. */
+    const soloFe = String(c.req.query('solo_fe') ?? 'si') !== 'no';
+
+    const [{ data: tenants }, { data: generales }, { data: fes }] = await Promise.all([
+      db.from('tenants').select('id, name').in('id', ids),
+      db.from('settings').select('tenant_id, config').eq('type', 'general').in('tenant_id', ids),
+      db.from('settings').select('tenant_id, config').eq('type', 'electronic-invoice').in('tenant_id', ids),
+    ]);
+    const nombre = new Map<string, string>();
+    for (const t of (tenants ?? []) as any[]) nombre.set(t.id, t.name);
+
+    /**
+     * LA CÉDULA SALE DE LA CONFIGURACIÓN DE FE.
+     *
+     * Ahí está la de verdad —`emisor_identification`, la que va en cada
+     * comprobante—. En `settings.general` hay un campo `cedula`, pero está vacío
+     * en la práctica: leyendo de ahí, el consolidado salía con la columna de
+     * cédula en blanco para todos los clientes, que es justo el dato con el que
+     * el contador identifica a quién le declara.
+     */
+    const cedula = new Map<string, string>();
+    for (const g of (generales ?? []) as any[]) {
+      const cfg: any = g.config ?? {};
+      const c = String(cfg.cedula ?? cfg.identification ?? cfg.ruc ?? cfg.taxId ?? '').trim();
+      if (c) cedula.set(g.tenant_id, c);
+    }
+    for (const g of (fes ?? []) as any[]) {
+      const cfg: any = g.config ?? {};
+      const c = String(cfg.emisor_identification ?? '').trim();
+      if (c) cedula.set(g.tenant_id, c);
+    }
+
+    /**
+     * TODAS las filas, no las primeras mil.
+     *
+     * La base corta cada respuesta en 1000 filas. Un contador con diez clientes
+     * que facturan a diario pasa de mil en un mes, y el consolidado saldría
+     * corto justo en los negocios que más facturan —sin avisar—.
+     */
+    const PAGINA = 1000;
+    const filas: any[] = [];
+    for (let desdeFila = 0; ; desdeFila += PAGINA) {
+      let q = db.from('invoices')
+        .select('tenant_id, invoice_number, customer_name, customer_id, subtotal, tax_amount, '
+          + 'total, issued_at, document_type, status, payment_method, currency, '
+          + 'fe_clave, fe_consecutivo, fe_status, fe_error, fe_nc_clave, fe_nc_status')
+        .in('tenant_id', ids)
+        .order('issued_at', { ascending: true })
+        .range(desdeFila, desdeFila + PAGINA - 1);
+      if (desde) q = q.gte('issued_at', desde);
+      if (hasta) q = q.lte('issued_at', hasta);
+      if (soloFe) q = q.not('fe_clave', 'is', null);
+      const { data, error } = await q;
+      if (error) throw new Error(error.message);
+      const lote = (data as any[]) ?? [];
+      filas.push(...lote);
+      if (lote.length < PAGINA) break;
+      if (desdeFila > 50 * PAGINA) break;   // 50.000 comprobantes: tope de cordura
+    }
+
+    const porCliente = new Map<string, any[]>();
+    for (const r of filas) {
+      if (!porCliente.has(r.tenant_id)) porCliente.set(r.tenant_id, []);
+      porCliente.get(r.tenant_id)!.push(r);
+    }
+
+    const anulada = (r: any) => !!r.fe_nc_clave || r.status === 'voided' || r.status === 'cancelled';
+    const rechazada = (r: any) => r.fe_status === 'rejected' || r.fe_status === 'error';
+
+    const clientes = ids.map(id => {
+      const docs = porCliente.get(id) ?? [];
+      const validas = docs.filter(r => !rechazada(r) && !anulada(r));
+      const suma = (f: (r: any) => number) => validas.reduce((t, r) => t + (Number(f(r)) || 0), 0);
+      return {
+        tenant_id: id,
+        nombre: nombre.get(id) ?? '(sin nombre)',
+        cedula: cedula.get(id) ?? '',
+        comprobantes: docs.map(r => ({
+          fecha: r.issued_at,
+          numero: r.invoice_number,
+          consecutivo_fe: r.fe_consecutivo ?? '',
+          clave: r.fe_clave ?? '',
+          tipo: r.document_type ?? '',
+          cliente: r.customer_name ?? '',
+          cliente_id: r.customer_id ?? '',
+          subtotal: Number(r.subtotal ?? 0),
+          impuesto: Number(r.tax_amount ?? 0),
+          total: Number(r.total ?? 0),
+          moneda: r.currency ?? 'CRC',
+          medio_pago: r.payment_method ?? '',
+          estado_fe: r.fe_status ?? '',
+          anulada: anulada(r),
+          nota_credito: r.fe_nc_clave ?? '',
+          error_fe: r.fe_error ?? '',
+        })),
+        totales: {
+          comprobantes: docs.length,
+          validos: validas.length,
+          aceptados: docs.filter(r => r.fe_status === 'accepted').length,
+          rechazados: docs.filter(r => rechazada(r)).length,
+          pendientes: docs.filter(r => r.fe_clave && !r.fe_status).length,
+          anulados: docs.filter(r => anulada(r)).length,
+          subtotal: Math.round(suma(r => r.subtotal) * 100) / 100,
+          impuesto: Math.round(suma(r => r.tax_amount) * 100) / 100,
+          total: Math.round(suma(r => r.total) * 100) / 100,
+        },
+      };
+    }).sort((a, b) => b.totales.total - a.totales.total);
+
+    return ok(c, { desde, hasta, solo_fe: soloFe, clientes });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // ── Cartera del contador (solo super-admin) ─────────────────────────────────
 // Se escribe en `user_tenants`, igual que al dar acceso a una sucursal: el
 // contador pasa a ver ese negocio en el selector de empresa y puede trabajarlo.

@@ -244,6 +244,20 @@ export async function computeFeQuota(tenantId: string) {
   let included = Number(cfg.fe_included_docs ?? 0);         // comprobantes por bolsa (0 = ilimitado)
   let extraFee = Number(cfg.fe_extra_fee ?? 0);             // ₡ por comprobante extra
 
+  /**
+   * CÓMO FUNCIONA LA CUOTA DE ESTE PLAN.
+   *
+   *   'bolsa' — lo de siempre: N comprobantes hasta agotarse, sin vencimiento.
+   *   'mes'   — N comprobantes POR MES: el contador vuelve a cero el día 1.
+   *   'unico' — N comprobantes que VENCEN a los `vigencia_meses` meses.
+   *
+   * Por defecto 'bolsa', para que los planes y los negocios que ya existían se
+   * comporten exactamente igual que antes.
+   */
+  const periodo: 'bolsa' | 'mes' | 'unico' =
+    cfg.fe_periodo === 'mes' || cfg.fe_periodo === 'unico' ? cfg.fe_periodo : 'bolsa';
+  const vigenciaMeses = Math.max(1, Number(cfg.fe_vigencia_meses ?? 1) || 1);
+
   // Inicio de la bolsa vigente: fe_quota_start (se reinicia al renovar/pagar);
   // si no existe, cae al inicio de la suscripción o creación del tenant.
   let startISO: string = cfg.fe_quota_start ?? '';
@@ -267,6 +281,35 @@ export async function computeFeQuota(tenantId: string) {
       .select('created_at, subscription:subscriptions!tenants_subscription_id_fkey(started_at)')
       .eq('id', titular).maybeSingle();
     startISO = (t as any)?.subscription?.started_at ?? (t as any)?.created_at ?? new Date().toISOString();
+  }
+
+  /**
+   * LA VENTANA QUE SE CUENTA.
+   *
+   * Con 'mes' se cuenta desde el PRIMER DÍA DEL MES en hora de Costa Rica, no
+   * desde que se asignó el plan: «25 por mes» tiene que volver a 25 el día 1,
+   * y con la fecha de asignación el corte caería, por ejemplo, cada día 17.
+   *
+   * Con 'unico' la ventana arranca igual que la bolsa, pero tiene FIN: pasada
+   * la vigencia no quedan comprobantes, aunque no se hayan usado todos. Es lo
+   * que se vendió —«100 por un mes»— y lo que el cliente tiene que ver venir.
+   */
+  let vencEl: string | null = null;
+  let vencida = false;
+  if (periodo === 'mes') {
+    const hoyCR = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/Costa_Rica', year: 'numeric', month: '2-digit', day: '2-digit',
+    }).format(new Date());                       // AAAA-MM-DD
+    const [a, m] = hoyCR.split('-').map(Number);
+    startISO = new Date(Date.UTC(a, m - 1, 1, 6, 0, 0)).toISOString();   // día 1, 00:00 CR
+    const siguiente = m === 12 ? Date.UTC(a + 1, 0, 1, 6) : Date.UTC(a, m, 1, 6);
+    vencEl = new Date(siguiente).toISOString();
+  } else if (periodo === 'unico') {
+    const ini = new Date(startISO);
+    const fin = new Date(ini);
+    fin.setMonth(fin.getMonth() + vigenciaMeses);
+    vencEl = fin.toISOString();
+    vencida = Date.now() >= fin.getTime();
   }
 
   // Comprobantes emitidos DESDE el inicio de la bolsa. Cada CLAVE cuenta 1:
@@ -294,10 +337,17 @@ export async function computeFeQuota(tenantId: string) {
   // Al renovar, lo que no se usó NO se pierde: se guarda en `fe_quota_carryover`
   // y se suma a la bolsa nueva. Son comprobantes ya pagados; hacerlos caducar
   // cobraría dos veces por lo mismo.
-  const carryover = Math.max(0, Number(cfg.fe_quota_carryover ?? 0));
+  /* El arrastre es de las BOLSAS: lo que no se gastó ya estaba pagado. En una
+     cuota mensual no se arrastra nada —«25 por mes» es 25, no 25 más los que
+     sobraron—, y en una cuota que venció tampoco queda nada que arrastrar. */
+  const carryover = periodo === 'mes' ? 0 : Math.max(0, Number(cfg.fe_quota_carryover ?? 0));
   const totalIncluded = included > 0 ? included + carryover : included;
 
-  const available = totalIncluded > 0 ? totalIncluded - used : null;  // null = ilimitado
+  /* Vencida, no queda ninguno: aunque sobraran comprobantes sin usar, el mes
+     que se pagó ya pasó. Se devuelve 0 —no null— porque null significa
+     «ilimitado» y dejaría facturando a un negocio con el plan vencido. */
+  const available = vencida ? 0
+    : totalIncluded > 0 ? totalIncluded - used : null;  // null = ilimitado
   const overage = totalIncluded > 0 ? Math.max(0, used - totalIncluded) : 0;
 
   return {
@@ -309,6 +359,11 @@ export async function computeFeQuota(tenantId: string) {
     /** Comprobantes que sobraron de la bolsa anterior. */
     carryover,
     extra_fee: extraFee, quota_start: startISO, months_elapsed: 1,
+    /** Cómo funciona la cuota: 'bolsa' | 'mes' | 'unico'. */
+    periodo,
+    /** Cuándo se reinicia (mes) o cuándo vence (unico). null = no vence. */
+    vence_el: vencEl,
+    vencida,
     used, used_docs: usedDocs, used_nc: usedNc, used_nd: usedNd,
     available,
     overage,
