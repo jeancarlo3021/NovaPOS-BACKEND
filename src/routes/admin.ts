@@ -302,6 +302,149 @@ admin.get('/tenants/:id/products/count', async (c) => {
 });
 
 /**
+ * GET /tenants/:id/stock/summary — qué hay en existencias antes de ponerlo en 0.
+ *
+ * Se pregunta ANTES de borrar, igual que en el borrado de productos: una
+ * confirmación que no dice el número no alcanza para algo que no se deshace.
+ * «1.240 productos con existencias, 18.650 unidades» se lee muy distinto de
+ * «3 productos».
+ */
+admin.get('/tenants/:id/stock/summary', async (c) => {
+  try {
+    const { id } = c.req.param();
+
+    /* Las existencias viven en DOS lados: `products.stock_quantity` (la del
+       negocio) y `warehouse_stock` (la de cada bodega, cuando usa bodegas).
+       Dejar una de las dos sin tocar es lo que deja un inventario que se
+       contradice consigo mismo según qué pantalla se mire. */
+    const PAGINA = 1000;
+    let productos = 0, conExistencias = 0, unidades = 0;
+    for (let desde = 0; ; desde += PAGINA) {
+      const { data, error } = await db.from('products')
+        .select('stock_quantity, tracks_stock')
+        .eq('tenant_id', id).is('deleted_at', null)
+        .range(desde, desde + PAGINA - 1);
+      if (error) throw new Error(error.message);
+      const lote = (data as any[]) ?? [];
+      productos += lote.length;
+      for (const p of lote) {
+        const q = Number(p.stock_quantity ?? 0);
+        if (q !== 0) { conExistencias++; unidades += q; }
+      }
+      if (lote.length < PAGINA) break;
+    }
+
+    const { data: bodegas } = await db.from('warehouses').select('id').eq('tenant_id', id);
+    const idsBodega = ((bodegas as any[]) ?? []).map(b => b.id);
+    let enBodegas = 0;
+    if (idsBodega.length) {
+      const { count } = await db.from('warehouse_stock')
+        .select('id', { count: 'exact', head: true })
+        .in('warehouse_id', idsBodega).neq('quantity', 0);
+      enBodegas = count ?? 0;
+    }
+
+    const cuenta = async (tabla: string) => {
+      const { count, error } = await db.from(tabla)
+        .select('id', { count: 'exact', head: true }).eq('tenant_id', id);
+      return error ? 0 : (count ?? 0);
+    };
+    const [movimientos, ajustes] = await Promise.all([
+      cuenta('stock_movements'), cuenta('stock_adjustments'),
+    ]);
+
+    return ok(c, {
+      productos, con_existencias: conExistencias,
+      unidades: Math.round(unidades * 1000) / 1000,
+      bodegas: idsBodega.length, en_bodegas: enBodegas,
+      movimientos, ajustes,
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/**
+ * POST /tenants/:id/stock/reset — pone TODAS las existencias en 0.
+ *
+ * Es para la toma física: el cliente va a contar lo que tiene de verdad y las
+ * cantidades que arrastra del sistema viejo —o de una importación mal armada—
+ * no sirven de punto de partida. Borrar los productos no es lo mismo: acá se
+ * conservan nombre, precio, costo, CABYS y categoría; solo se va la cantidad.
+ *
+ * El HISTORIAL de movimientos y ajustes NO se borra salvo que se pida: es la
+ * trazabilidad de por qué el stock llegó a donde estaba, y perderla por defecto
+ * en una herramienta que ya es destructiva no es una decisión que deba tomar el
+ * programa. El reinicio queda anotado en la bitácora del negocio.
+ */
+admin.post('/tenants/:id/stock/reset', async (c) => {
+  try {
+    const { id } = c.req.param();
+    const body = await c.req.json().catch(() => ({} as any));
+    const borrarHistorial = body?.borrar_historial === true;
+
+    const { data: t } = await db.from('tenants').select('id, name').eq('id', id).maybeSingle();
+    if (!t) return fail(c, 'Negocio no encontrado', 404);
+
+    // Solo las que NO están ya en 0: así el número que se devuelve es lo que de
+    // verdad cambió, y no «se reiniciaron 21.000 productos» cuando había 12.
+    const { data: tocados, error: eProd } = await db.from('products')
+      .update({ stock_quantity: 0, updated_at: new Date().toISOString() })
+      .eq('tenant_id', id).is('deleted_at', null).neq('stock_quantity', 0)
+      .select('id');
+    if (eProd) throw new Error(eProd.message);
+    const productos = ((tocados as any[]) ?? []).length;
+
+    const { data: bodegas } = await db.from('warehouses').select('id').eq('tenant_id', id);
+    const idsBodega = ((bodegas as any[]) ?? []).map(b => b.id);
+    let enBodegas = 0;
+    if (idsBodega.length) {
+      const { data: wb, error: eW } = await db.from('warehouse_stock')
+        .update({ quantity: 0, updated_at: new Date().toISOString() })
+        .in('warehouse_id', idsBodega).neq('quantity', 0)
+        .select('id');
+      if (eW) throw new Error(eW.message);
+      enBodegas = ((wb as any[]) ?? []).length;
+    }
+
+    let movimientos = 0, ajustes = 0;
+    if (borrarHistorial) {
+      const borrar = async (tabla: string) => {
+        const { data, error } = await db.from(tabla).delete().eq('tenant_id', id).select('id');
+        if (error) return 0;                       // tabla sin migrar: no es motivo de fallo
+        return ((data as any[]) ?? []).length;
+      };
+      movimientos = await borrar('stock_movements');
+      ajustes = await borrar('stock_adjustments');
+    }
+
+    /* Queda anotado en la bitácora DEL NEGOCIO: el día que el dueño pregunte por
+       qué su inventario está en cero, la respuesta tiene que estar en su propio
+       registro de actividad y no solo en la memoria de quien lo hizo. */
+    try {
+      await db.from('user_activity_log').insert({
+        tenant_id: id,
+        user_id: c.get('userId') ?? null,
+        user_name: 'Panel Admin',
+        action: 'stock_reset',
+        entity_type: 'inventory',
+        details: {
+          productos, bodegas: enBodegas,
+          historial_borrado: borrarHistorial, movimientos, ajustes,
+        },
+      });
+    } catch { /* sin bitácora no se detiene el reinicio */ }
+
+    console.log(`[STOCK RESET] ${(t as any).name}: ${productos} productos, ${enBodegas} filas de bodega`
+      + (borrarHistorial ? `, historial borrado (${movimientos} mov., ${ajustes} ajustes)` : ''));
+
+    return ok(c, {
+      ok: true, negocio: (t as any).name,
+      productos, en_bodegas: enBodegas,
+      historial_borrado: borrarHistorial, movimientos, ajustes,
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/**
  * POST /tenants/:id/products/purge — borra el catálogo de un negocio, POR TANDAS.
  *
  * Se usa cuando un catálogo entró mal: la importación equivocada, el archivo del
