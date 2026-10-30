@@ -3075,7 +3075,10 @@ admin.get('/tenants/:id/products', async (c) => {
      * modal puede decir «101-200 de 5.065» y no mentir. La búsqueda va al
      * servidor por lo mismo: filtrar en pantalla solo filtraría lo que ya bajó.
      */
-    const pageSize = Math.min(200, Math.max(20, parseInt(c.req.query('page_size') ?? '100', 10) || 100));
+    /* Hasta 1000 por página: es el tope que devuelve la base de una sola vez,
+       y es lo que hace posible EXPORTAR el catálogo completo sin hacer 25
+       viajes para 5.000 productos. El modal sigue pidiendo 100 para navegar. */
+    const pageSize = Math.min(1000, Math.max(20, parseInt(c.req.query('page_size') ?? '100', 10) || 100));
     const page = Math.max(1, parseInt(c.req.query('page') ?? '1', 10) || 1);
     const search = String(c.req.query('search') ?? '').trim();
     const desde = (page - 1) * pageSize;

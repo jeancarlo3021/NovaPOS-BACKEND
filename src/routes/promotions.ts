@@ -8,13 +8,15 @@ const promotions = new Hono<{ Variables: { userId: string; tenantId: string; rol
 const PromotionSchema = z.object({
   name: z.string().min(1),
   description: z.string().optional().nullable(),
-  type: z.enum(['percentage', 'fixed', 'bogo', 'bundle', '2x1', 'combo', 'qty_bundle'])
+  type: z.enum(['percentage', 'fixed', 'bogo', 'bundle', '2x1', 'combo', 'qty_bundle', 'second_half'])
     .optional().default('percentage'),
   value: z.number().nonnegative(),
   /** Promo por cantidad: cuántas unidades/kg forman el paquete (`value` = su precio). */
   bundle_qty: z.number().positive().optional().nullable(),
   // Combo/bundle: 'price' = precio fijo del combo · 'percent' = % de descuento sobre el combo.
   combo_mode: z.enum(['price', 'percent']).optional().nullable(),
+  /** Segunda unidad: a cuál del par se le descuenta ('barato' = al más barato). */
+  second_rule: z.enum(['barato', 'caro']).optional().nullable(),
   min_purchase: z.number().nonnegative().optional().nullable(),
   applies_to: z.enum(['all', 'category', 'products']).optional().default('all'),
   category_id: z.string().uuid().optional().nullable(),
@@ -89,6 +91,10 @@ promotions.post('/', async (c) => {
       value: parsed.data.value,
       bundle_qty: parsed.data.bundle_qty ?? null,
       combo_mode: parsed.data.combo_mode ?? null,
+      /* La promo de segunda unidad guarda a cuál del par se le descuenta. Por
+         defecto al más barato, que es lo que el cliente espera ver. */
+      second_rule: parsed.data.type === 'second_half'
+        ? (parsed.data.second_rule ?? 'barato') : null,
       min_purchase: parsed.data.min_purchase || null,
       applies_to: parsed.data.applies_to || 'all',
       category_id: parsed.data.category_id || null,
@@ -101,11 +107,23 @@ promotions.post('/', async (c) => {
     };
 
     console.log('[PROMOTION] Creating:', payload);
-    const { data, error } = await db
+    let { data, error } = await db
       .from('promotions')
       .insert(payload)
       .select()
       .single();
+
+    /**
+     * Si `second_rule` todavía no existe en la base (migración 126 sin correr),
+     * se guarda la promo SIN esa columna en vez de perder lo que el usuario
+     * acabó de escribir. Queda con la regla por defecto —al más barato— y se
+     * puede corregir cuando la columna exista.
+     */
+    if (error && /second_rule/.test(error.message ?? '')) {
+      console.warn('[PROMOTION] sin columna second_rule: guardando sin ella');
+      const { second_rule, ...sinRegla } = payload as any;
+      ({ data, error } = await db.from('promotions').insert(sinRegla).select().single());
+    }
 
     if (error) {
       console.error('[PROMOTION] Insert error:', error);
@@ -137,13 +155,20 @@ promotions.put('/:id', async (c) => {
     const patch: Record<string, any> = { ...parsed.data };
     if ('ends_at' in patch && !patch.ends_at) patch.ends_at = null;
 
-    const { data, error } = await db
+    let { data, error } = await db
       .from('promotions')
       .update(patch)
       .eq('id', id)
       .eq('tenant_id', tenantId)
       .select()
       .single();
+
+    // Igual que al crear: sin la columna 126, se guarda el resto.
+    if (error && /second_rule/.test(error.message ?? '')) {
+      const { second_rule, ...sinRegla } = patch;
+      ({ data, error } = await db.from('promotions').update(sinRegla)
+        .eq('id', id).eq('tenant_id', tenantId).select().single());
+    }
 
     if (error) throw new Error(error.message);
     if (!data) return fail(c, 'Promoción no encontrada', 404);
