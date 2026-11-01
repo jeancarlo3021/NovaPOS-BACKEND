@@ -128,6 +128,87 @@ mesaPublic.get('/:token', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+/**
+ * GET /:token/cuenta — lo que lleva consumido la mesa, para el cliente.
+ *
+ * Es la pregunta que más se hace en una mesa y la que peor se responde: «¿cómo
+ * vamos?». Hoy hay que llamar al mesero, que va a la caja, imprime y vuelve.
+ * Acá el cliente lo ve desde su teléfono, y cuando pide la cuenta ya sabe de
+ * cuánto es.
+ *
+ * El enlace entre la mesa del QR (numerada 1, 2, 3…) y la cuenta abierta se
+ * hace por el MAPA DEL SALÓN: la mesa del mapa que se llama «Mesa 4» es la
+ * mesa 4 del QR. Es el mismo criterio que usa la pantalla del salón para
+ * pintar los avisos, así que o funcionan las dos cosas o ninguna.
+ *
+ * No lleva sesión: va por el token de la mesa y SOLO devuelve montos —ni
+ * clientes, ni meseros, ni nada de otra mesa—.
+ */
+mesaPublic.get('/:token/cuenta', async (c) => {
+  try {
+    const mesa = await mesaDeToken(String(c.req.param('token') ?? ''));
+    if (!mesa) return fail(c, 'Mesa no encontrada', 404);
+    const tenantId = mesa.tenant_id as string;
+
+    const cfg = await leerConfig(tenantId);
+    // Si el negocio apagó el botón de la cuenta, tampoco se muestra el monto.
+    if (!cfg.activo || !cfg.ver_cuenta) return ok(c, { abierta: false, motivo: 'apagado' });
+
+    // 1) Las mesas del mapa que corresponden a este número.
+    const { data: mapa } = await db.from('settings').select('config')
+      .eq('tenant_id', tenantId).eq('type', 'tables-map').maybeSingle();
+    const items: any[] = ((mapa as any)?.config?.items ?? []) as any[];
+    const ids = items
+      .filter(i => ['table', 'freeTable', 'seat'].includes(i?.kind))
+      .filter(i => {
+        const m = String(i?.label ?? '').match(/(\d+)/);
+        return m ? Number(m[1]) === Number(mesa.numero) : false;
+      })
+      .map(i => String(i.id));
+    if (ids.length === 0) return ok(c, { abierta: false, motivo: 'sin-mapa' });
+
+    // 2) La cuenta abierta que esté sobre alguna de esas mesas.
+    const { data: ordenes } = await db.from('table_orders')
+      .select('id, spots, table_id, is_delivery, opened_at, updated_at, table_order_items(*)')
+      .eq('tenant_id', tenantId).eq('status', 'open')
+      .order('opened_at', { ascending: false }).limit(50);
+    const orden = ((ordenes ?? []) as any[]).find(o => {
+      const spots = (o.spots ?? []).map((sp: any) => String(sp?.id));
+      return ids.includes(String(o.table_id)) || spots.some((sp: string) => ids.includes(sp));
+    });
+    if (!orden) return ok(c, { abierta: false, motivo: 'sin-cuenta' });
+
+    // 3) Los montos. Mismo cálculo que la pantalla del salón, para que el
+    //    cliente no vea un número y después le cobren otro.
+    const lineas = ((orden.table_order_items ?? []) as any[]).map(it => ({
+      nombre: String(it.product_name ?? ''),
+      cantidad: Number(it.quantity ?? 0),
+      total: Number(it.subtotal ?? 0),
+      // Si ya salió de cocina o todavía no: el cliente pregunta por eso.
+      pedido: Number(it.course ?? 0) > 0,
+    })).filter(l => l.nombre);
+
+    const subtotal = Math.round(lineas.reduce((t, l) => t + l.total, 0));
+    const servicio = orden.is_delivery ? 0 : Math.round(subtotal * 0.10);
+
+    const { data: gen } = await db.from('settings').select('config')
+      .eq('tenant_id', tenantId).eq('type', 'general').maybeSingle();
+    const g: any = (gen as any)?.config ?? {};
+    const ivaPct = g?.taxEnabled === false ? 0 : Number(g?.taxPercentage ?? 13);
+    const iva = Math.round(subtotal * (ivaPct / 100));
+
+    return ok(c, {
+      abierta: true,
+      desde: orden.opened_at ?? null,
+      lineas,
+      subtotal, servicio, iva, iva_pct: ivaPct,
+      total: subtotal + servicio + iva,
+      // Para que la pantalla pueda decir «al corte de las 7:42 p. m.».
+      actualizado: new Date().toISOString(),
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 const LlamadaSchema = z.object({
   tipo: z.enum(TIPOS),
   personas: z.number().int().min(1).max(100).optional().nullable(),

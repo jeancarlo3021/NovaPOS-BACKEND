@@ -375,6 +375,38 @@ admin.get('/tenants/:id/stock/summary', async (c) => {
  * en una herramienta que ya es destructiva no es una decisión que deba tomar el
  * programa. El reinicio queda anotado en la bitácora del negocio.
  */
+/**
+ * POST /tenants/:id/demo-restaurante — carga el menú de demostración.
+ *
+ * Enseñar el módulo de restaurante con el catálogo vacío no demuestra nada: el
+ * mapa sin mesas, el menú sin platos y las comandas sin a dónde ir. Armarlo a
+ * mano antes de cada demostración toma media hora y siempre falta algo.
+ *
+ * Deja el negocio listo para mostrar: categorías, doce platos con su precio y
+ * su estación de cocina, diez insumos con existencias, dos preparaciones base
+ * y el salón con ocho mesas. Se puede correr dos veces: no duplica nada.
+ */
+admin.post('/tenants/:id/demo-restaurante', async (c) => {
+  try {
+    const id = c.req.param('id');
+    const { data: t } = await db.from('tenants').select('id, name').eq('id', id).maybeSingle();
+    if (!t) return fail(c, 'Negocio no encontrado', 404);
+
+    const { sembrarRestaurante } = await import('../services/demoRestaurante.js');
+    const r = await sembrarRestaurante(id);
+
+    try {
+      await db.from('user_activity_log').insert({
+        tenant_id: id, user_id: c.get('userId'),
+        action: 'demo_restaurante_cargada',
+        details: { ...r },
+      });
+    } catch { /* el registro es deseable, no obligatorio */ }
+
+    return ok(c, { negocio: (t as any).name, ...r });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 admin.post('/tenants/:id/stock/reset', async (c) => {
   try {
     const { id } = c.req.param();

@@ -1,7 +1,8 @@
 import { Hono } from 'hono';
 import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
-import { respuesta, modoIA, pedirAlModelo } from '../services/ia.js';
+import { respuesta, modoIA, pedirAlModelo, proveedorIA } from '../services/ia.js';
+import { estadoCreditos, tomarCredito, devolverCredito } from '../services/creditosIA.js';
 import { sugerirCabys } from './cabys.js';
 import { planFeatureLabels } from '../services/emailService.js';
 
@@ -24,7 +25,14 @@ const norm = (s: string) => String(s ?? '').toLowerCase().normalize('NFD').repla
 // ══════════════════════════════════════════════════════════════════════════
 // GET /estado — ¿en qué modo está?
 // ══════════════════════════════════════════════════════════════════════════
-ia.get('/estado', (c) => ok(c, { modo: modoIA() }));
+ia.get('/estado', async (c) => ok(c, {
+  modo: modoIA(),
+  // La pantalla lo muestra: quien pregunta tiene derecho a saber si le
+  // contestó el sistema con sus datos o un modelo, y cuál.
+  proveedor: modoIA() === 'real' ? proveedorIA() : null,
+  // Y cuántas consultas al modelo le quedan este mes.
+  creditos: await estadoCreditos(c.get('tenantId')),
+}));
 
 // ══════════════════════════════════════════════════════════════════════════
 // PASO 4 — PREGUNTAR EN ESPAÑOL
@@ -102,6 +110,64 @@ async function ventasDe(tenantId: string, desde: string, hasta: string) {
 }
 
 /**
+ * Lo que el modelo necesita saber del negocio para contestar algo suelto.
+ *
+ * Tres datos y nada más. La tentación es mandarle el catálogo, los clientes y
+ * las ventas del mes «por si acaso»: eso se paga en CADA pregunta y multiplica
+ * la cuenta por diez sin mejorar casi nada, porque lo que de verdad necesita
+ * datos ya lo contesta la base con números exactos.
+ */
+async function contextoDelNegocio(tenantId: string): Promise<string> {
+  try {
+    const { data: t } = await db.from('tenants').select('name').eq('id', tenantId).maybeSingle();
+    const { count } = await db.from('products')
+      .select('id', { count: 'exact', head: true }).eq('tenant_id', tenantId);
+    return [
+      `Negocio: ${(t as any)?.name ?? 'sin nombre'}.`,
+      `Productos en el catálogo: ${count ?? 0}.`,
+      'País: Costa Rica (colones, IVA 13%, facturación electrónica de Hacienda).',
+    ].join(' ');
+  } catch { return 'Negocio en Costa Rica (colones, IVA 13%).'; }
+}
+
+/**
+ * La pregunta que las reglas no supieron contestar, al modelo.
+ *
+ * Instrucciones cortas y tope de salida bajo: esto es un asistente de un punto
+ * de venta, no un ensayista. Y se le PROHÍBE inventar cifras: los números del
+ * negocio los da la base, no él; si se los inventa, alguien va a tomar una
+ * decisión con un número falso.
+ */
+async function preguntarAlModelo(
+  tenantId: string, pregunta: string, historial: Array<{ rol: string; texto: string }>,
+): Promise<string | null> {
+  const contexto = await contextoDelNegocio(tenantId);
+  const charla = historial.length
+    ? `\n\nConversación previa:\n${historial.map(m => `${m.rol === 'asistente' ? 'Vos' : 'Usuario'}: ${m.texto}`).join('\n')}`
+    : '';
+  return pedirAlModelo({
+    sistema: [
+      'Sos el asistente de NovaPOS, un sistema de punto de venta y facturación de Costa Rica.',
+      'Contestás en español de Costa Rica, en dos o tres oraciones, sin rodeos y sin saludar.',
+      'NUNCA inventes cifras del negocio (ventas, deudas, existencias): si te piden un número que no',
+      'tenés, decí que lo pregunten así: «¿cuánto vendí este mes?», «¿qué se está acabando?»,',
+      '«¿cuánto me deben?» — esas las contesta el sistema con datos reales.',
+      'Si la pregunta no tiene que ver con el negocio ni con el sistema, decilo en una línea.',
+      contexto,
+    ].join(' '),
+    mensaje: `${pregunta}${charla}`,
+    // Respuesta corta: se paga por lo que sale. Dos o tres oraciones entran acá.
+    maxTokens: 320,
+    permiso: { motivo: 'chat del asistente', autorizado: true },
+    /* Diez minutos de caché por negocio: alcanza para que «¿cómo hago una nota
+       de crédito?» —que se pregunta en tandas— se pague una sola vez, y es
+       poco como para no servir algo viejo si los datos cambiaron. */
+    cacheMin: 10,
+    cacheAmbito: tenantId,
+  });
+}
+
+/**
  * POST /preguntar  { pregunta }
  *
  * En modo demostración NO interviene ningún modelo: se reconoce de qué habla
@@ -113,9 +179,18 @@ async function ventasDe(tenantId: string, desde: string, hasta: string) {
 ia.post('/preguntar', async (c) => {
   try {
     const tenantId = c.get('tenantId');
-    const { pregunta } = await c.req.json().catch(() => ({ pregunta: '' }));
-    const texto = String(pregunta ?? '').trim();
+    const cuerpo: any = await c.req.json().catch(() => ({}));
+    const texto = String(cuerpo?.pregunta ?? '').trim();
     if (!texto) return fail(c, 'Escribí una pregunta', 422);
+    /* Las últimas vueltas de la conversación, para que el chat entienda un
+       «¿y el mes pasado?». Se recortan: mandar la charla entera se paga en
+       cada mensaje y a la cuarta pregunta ya cuesta más que la respuesta. */
+    const historial: Array<{ rol: string; texto: string }> = Array.isArray(cuerpo?.historial)
+      ? cuerpo.historial.slice(-6).map((m: any) => ({
+          rol: m?.rol === 'asistente' ? 'asistente' : 'usuario',
+          texto: String(m?.texto ?? '').slice(0, 500),
+        })).filter((m: any) => m.texto)
+      : [];
 
     const p = norm(texto);
     const { desde, hasta, etiqueta } = periodoDe(texto);
@@ -359,6 +434,51 @@ ia.post('/preguntar', async (c) => {
     for (const t of TEMAS) {
       const n = t.claves.split(' ').filter(w => tokensPregunta.has(w)).length;
       if (n > 0 && (!mejorTema || n > mejorTema.n)) mejorTema = { pregunta: t.pregunta, n };
+    }
+
+    /**
+     * Lo que las reglas no reconocen, se lo lleva el MODELO —si está encendido.
+     *
+     * Este es el único punto donde el chat gasta: las preguntas de siempre
+     * («cuánto vendí», «qué se está acabando») las contesta la base, gratis y
+     * con números exactos. Solo lo que nadie supo entender llega acá, con un
+     * resumen chiquito del negocio como contexto.
+     *
+     * El contexto se mantiene CORTO a propósito. Mandarle el catálogo entero
+     * en cada pregunta es lo que convierte centavos en dólares; si algún día
+     * hiciera falta, va con caché de contexto del proveedor, no pegado al
+     * mensaje.
+     */
+    if (modoIA() === 'real') {
+      /* El crédito se toma ANTES de preguntar: si se tomara después, dos
+         pestañas preguntando a la vez pasarían las dos el control. Si la
+         consulta falla, se devuelve. */
+      const credito = await tomarCredito(tenantId);
+      if (!credito.ok) {
+        return ok(c, respuesta({
+          respuesta: credito.estado.incluidos <= 0
+            ? 'Tu plan no incluye consultas al asistente inteligente. Lo que sí puedo contestarte con tus datos está acá abajo.'
+            : `Se acabaron las ${credito.estado.incluidos} consultas al asistente de este mes. Se reinician el ${credito.estado.reinicia}.`,
+          detalle: null,
+          fuente: null,
+          no_entendida: true,
+          sin_creditos: true,
+          creditos: credito.estado,
+          sugerencias: TEMAS.slice(0, 4).map(t => t.pregunta),
+        }));
+      }
+      const delModelo = await preguntarAlModelo(tenantId, texto, historial);
+      if (!delModelo) await devolverCredito(tenantId);
+      if (delModelo) {
+        return ok(c, respuesta({
+          respuesta: delModelo,
+          detalle: null,
+          fuente: `Respondido por ${proveedorIA() === 'gemini' ? 'Gemini Flash' : 'Claude'}`,
+          no_entendida: false,
+          creditos: credito.estado,
+          sugerencias: [],
+        }));
+      }
     }
 
     return ok(c, respuesta({

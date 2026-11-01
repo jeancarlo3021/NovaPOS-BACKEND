@@ -486,6 +486,119 @@ async function createTenantForRequest(req: any, opts: {
   return { tenantId, authId: authData.user.id, email, user, password: pass };
 }
 
+/**
+ * POST /:id/modulos — CAMBIA lo que la demo tiene, con la demo ya entregada.
+ *
+ * Hasta ahora los módulos se elegían una sola vez, antes de armarla: después,
+ * editar la solicitud cambiaba el papel pero no el negocio de prueba. Y es
+ * justamente ahí cuando se sabe qué falta —el cliente la está usando y pide ver
+ * facturación electrónica, o resulta que no es restaurante—. La salida era
+ * borrar la demo y rehacerla, perdiendo todo lo que el cliente ya había cargado.
+ *
+ * Toca SOLO el plan propio de esta demo. Un plan compartido no se toca nunca:
+ * cambiarlo le movería los módulos a otros negocios, incluidos clientes que
+ * pagan.
+ */
+demoRequests.post('/:id/modulos', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const id = c.req.param('id');
+    if (!(await isManager(c))) {
+      return fail(c, 'Solo el administrador o el gerente pueden cambiar una demo entregada', 403);
+    }
+
+    const body = await c.req.json().catch(() => ({} as any));
+    const modules = Array.isArray(body?.modules) ? body.modules.map(String).filter(Boolean) : null;
+    const dias = body?.days != null ? Number(body.days) : null;
+    if (!modules?.length && dias == null) return fail(c, 'Nada que cambiar', 422);
+    if (modules && modules.length === 0) return fail(c, 'La demo tiene que tener al menos un módulo', 422);
+    if (dias != null && (!Number.isFinite(dias) || dias < 1 || dias > 180)) {
+      return fail(c, 'Los días tienen que ir entre 1 y 180', 422);
+    }
+
+    const { data: r } = await db.from('demo_requests')
+      .select('*').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+    if (!r) return fail(c, 'Solicitud no encontrada', 404);
+    const req = r as any;
+    if (!req.demo_tenant_id) {
+      return fail(c, 'Esta demo todavía no está armada: cambiá la solicitud y después armala.', 409);
+    }
+    if (req.status === 'convertida') {
+      return fail(c, 'Esta demo ya es un cliente. Cambiale el plan desde el panel de negocios.', 409);
+    }
+
+    const { data: t } = await db.from('tenants')
+      .select('id, plan_id, is_demo, subscription_id').eq('id', req.demo_tenant_id).maybeSingle();
+    if (!t) return fail(c, 'El negocio de prueba ya no existe', 404);
+    const planId = (t as any).plan_id as string | null;
+    if (!planId) return fail(c, 'La demo no tiene plan asignado', 409);
+
+    const { data: plan } = await db.from('subscription_plans')
+      .select('id, name, price, features').eq('id', planId).maybeSingle();
+    if (!plan) return fail(c, 'No se encontró el plan de la demo', 404);
+
+    /* Candado: solo se toca el plan NACIDO para esta demo. El nombre lo dice y,
+       por si alguien lo renombró, se comprueba además que no lo use nadie más. */
+    const esDeLaDemo = /^demo\s*[·:.\-]/i.test(String((plan as any).name ?? ''));
+    const { data: otros } = await db.from('tenants')
+      .select('id').eq('plan_id', planId).neq('id', req.demo_tenant_id).limit(1);
+    if (!esDeLaDemo || (otros ?? []).length > 0) {
+      return fail(c,
+        'Ese plan lo usan otros negocios, así que no se puede tocar desde acá. '
+        + 'Cambiale los módulos al negocio desde el panel de negocios.', 409);
+    }
+
+    const cambios: string[] = [];
+
+    if (modules) {
+      const features: Record<string, boolean> = {};
+      for (const m of modules) features[m] = true;
+      const antes = Object.keys(((plan as any).features ?? {}) as Record<string, boolean>)
+        .filter(k => ((plan as any).features ?? {})[k]);
+      const { error } = await db.from('subscription_plans')
+        .update({ features, updated_at: new Date().toISOString() }).eq('id', planId);
+      if (error) throw new Error(error.message);
+      const sumados = modules.filter((m: string) => !antes.includes(m));
+      const quitados = antes.filter(m => !modules.includes(m));
+      if (sumados.length) cambios.push(`+${sumados.length}`);
+      if (quitados.length) cambios.push(`-${quitados.length}`);
+      await db.from('demo_requests').update({ modules, updated_at: new Date().toISOString() })
+        .eq('id', id).eq('tenant_id', tenantId);
+    }
+
+    if (dias != null) {
+      /* Los días se cuentan desde HOY, no desde que se entregó: lo que se pide
+         en este momento es «dale una semana más», no recalcular el pasado. */
+      const vence = new Date(Date.now() + dias * 86400000);
+      const purge = new Date(vence.getTime() + DEMO_PURGE_DAYS * 86400000);
+      await db.from('demo_requests').update({
+        days: dias,
+        expires_on: vence.toISOString().slice(0, 10),
+        purge_on: purge.toISOString().slice(0, 10),
+        updated_at: new Date().toISOString(),
+      }).eq('id', id).eq('tenant_id', tenantId);
+      await db.from('subscriptions').update({ ends_at: vence.toISOString() })
+        .eq('tenant_id', req.demo_tenant_id).eq('status', 'active');
+      cambios.push(`vence ${vence.toISOString().slice(0, 10)}`);
+    }
+
+    const { data: fresco } = await db.from('demo_requests')
+      .select('*').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+
+    /* Queda anotado: una demo que cambia de módulos a mitad de la prueba es
+       justo lo que después nadie recuerda cuando el cliente reclama. */
+    try {
+      await db.from('user_activity_log').insert({
+        tenant_id: tenantId, user_id: c.get('userId'),
+        action: 'demo_modules_changed',
+        details: { demo: req.business_name, demo_tenant_id: req.demo_tenant_id, cambios },
+      });
+    } catch { /* el registro es deseable, no obligatorio */ }
+
+    return ok(c, fresco ?? req);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // POST /:id/provision — ARMA la demo de verdad.
 //
 // Hasta acá las credenciales eran solo texto: nadie podía entrar con ellas. Esto

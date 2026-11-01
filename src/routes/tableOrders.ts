@@ -75,6 +75,17 @@ const BillItemSchema = z.object({
     group: z.string(), name: z.string(), price_delta: z.number(),
   })).optional().nullable(),
   notes:        z.string().optional().nullable(),
+  /** Estación de producción de la receta. No se guarda: se re-resuelve al mandar. */
+  station:      z.string().optional().nullable(),
+  /**
+   * RONDA en la que se mandó la línea a cocina. 0 = todavía sin mandar.
+   *
+   * Es lo que impide que la segunda tanda reimprima el pedido entero: cocina
+   * recibía otra vez lo que ya había preparado. Se guarda en la columna
+   * `course`, que es exactamente eso —la ronda— y hasta ahora se llenaba con el
+   * número de línea, que no le servía a nadie.
+   */
+  ronda:        z.number().int().min(0).optional().nullable(),
 });
 
 const BillSchema = z.object({
@@ -110,6 +121,7 @@ function rowToBill(o: any) {
     quantity: Number(it.quantity ?? 0),
     modifiers: it.modifiers ?? undefined,
     notes: it.notes ?? undefined,
+    ronda: Number(it.course ?? 0) || 0,
   }));
   return {
     id: o.id,
@@ -189,7 +201,7 @@ tableOrders.put('/bills/:id', async (c) => {
     // completo (una línea borrada en el cliente desaparece acá también).
     await db.from('table_order_items').delete().eq('order_id', id);
     if (b.items.length > 0) {
-      const rows = b.items.map((it, i) => ({
+      const rows = b.items.map((it) => ({
         order_id: id,
         client_id: it.id ?? null,
         product_id: it.product_id ?? null,
@@ -200,7 +212,7 @@ tableOrders.put('/bills/:id', async (c) => {
         subtotal: lineTotal(it),
         modifiers: it.modifiers ?? null,
         notes: it.notes ?? null,
-        course: i + 1,
+        course: Number(it.ronda ?? 0) || 0,
       }));
       const { error } = await db.from('table_order_items').insert(rows);
       if (error) throw new Error(error.message);

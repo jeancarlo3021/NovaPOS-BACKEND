@@ -128,10 +128,44 @@ purchases.get('/:id', async (c) => {
       return fail(c, 'Error al obtener items: ' + iErr.message, 500);
     }
 
+    /**
+     * EL NOMBRE DEL PRODUCTO DE CADA LÍNEA.
+     *
+     * `purchase_items` guarda solo `product_id`, y esta respuesta salía con
+     * `select('*')`: sin el nombre. El resultado era que TODAS las líneas de una
+     * orden se leían «Producto» —el texto de respaldo del front—, tanto al
+     * recibir la mercadería como en la orden impresa que se le manda al
+     * proveedor. Una orden de compra donde no se sabe qué se está pidiendo no
+     * sirve para nada.
+     *
+     * Se resuelve con UNA consulta a `products` por los ids de las líneas, y se
+     * devuelve de las dos formas que el front ya busca: `product.name` y
+     * `product_name`.
+     */
+    const filas = (purchaseItems ?? []) as any[];
+    try {
+      const ids = [...new Set(filas.map(it => it.product_id).filter(Boolean))];
+      if (ids.length) {
+        const { data: prods } = await db.from('products')
+          .select('id, name, sku, unit_type_id').in('id', ids);
+        const porId = new Map(((prods ?? []) as any[]).map(p => [p.id, p]));
+        for (const it of filas) {
+          const p: any = porId.get(it.product_id);
+          /* El producto puede haber sido BORRADO después de la compra: en ese
+             caso se dice eso, que es información, y no «Producto» a secas. */
+          it.product = p ? { id: p.id, name: p.name, sku: p.sku } : null;
+          it.product_name = p?.name ?? p?.sku ?? '(producto eliminado)';
+        }
+      }
+    } catch (e: any) {
+      console.warn('[purchases] no se pudieron resolver los nombres:', e?.message);
+    }
+
     return ok(c, {
       ...purchase,
       suppliers: supplier ? { name: supplier.name } : null,
-      purchase_items: purchaseItems || []
+      supplier: supplier ? { name: supplier.name } : null,
+      purchase_items: filas,
     });
   } catch (err: any) { return fail(c, err.message, 500); }
 });

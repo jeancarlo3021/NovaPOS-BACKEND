@@ -53,15 +53,33 @@ products.get('/', async (c) => {
      */
     const since = c.req.query('since');
 
+    /**
+     * UN LOTE, cuando quien pregunta no necesita el catálogo entero.
+     *
+     * Sin esto la única forma de pedir productos era bajarlos TODOS: el
+     * formulario de órdenes de compra se traía 5.000 filas completas para
+     * llenar un desplegable, y la ventana tardaba en abrir mientras el
+     * navegador armaba cinco mil opciones que nadie va a leer.
+     *
+     * Con `limit` (y `offset`) se pide de a poco —típicamente 50, filtrados por
+     * `search`—. Sin `limit` se mantiene el comportamiento de siempre, que es
+     * lo que necesita el caché del POS para funcionar sin internet.
+     */
+    const limite = Math.max(0, Math.min(1000, Number(c.req.query('limit') ?? 0) || 0));
+    const salto  = Math.max(0, Number(c.req.query('offset') ?? 0) || 0);
+
     // Paginamos para traer TODOS los productos: Supabase corta en 1000 filas por
     // defecto, así que un catálogo grande (importado por Excel) no aparecía completo.
     const PAGE = 1000;
     // Trae todo paginado; `filterDeleted` oculta los soft-deleted (deleted_at).
     const fetchAll = async (filterDeleted: boolean): Promise<{ data?: any[]; error?: any }> => {
       const all: any[] = [];
-      for (let from = 0; ; from += PAGE) {
+      // Con `limit` se trae UN tramo y se corta: un solo viaje a la base.
+      const inicio = limite > 0 ? salto : 0;
+      const paso   = limite > 0 ? limite : PAGE;
+      for (let from = inicio; ; from += paso) {
         let query = db.from('products').select('*').eq('tenant_id', tenantId).order('name')
-          .range(from, from + PAGE - 1);
+          .range(from, from + paso - 1);
         // Con `since` se piden los cambios, borrados incluidos. `gte` y no `gt`:
         // repetir una fila que ya se tenía no molesta —se pisa con la misma—,
         // pero perderse una guardada en el mismo milisegundo sí.
@@ -73,6 +91,7 @@ products.get('/', async (c) => {
         if (error) return { error };
         const chunk = data ?? [];
         all.push(...chunk);
+        if (limite > 0) break;            // se pidió un lote: no se sigue paginando
         if (chunk.length < PAGE) break;   // última página
       }
       return { data: all };

@@ -11,6 +11,8 @@ import { comprobanteEmailHtml, comprobanteEmailAsunto, type DatosCorreoComproban
 import { parseHaciendaXml } from '../services/haciendaXml.js';
 import { notifyFeError, notifyQuotaLow } from '../services/whatsappNotify.js';
 import { configEfectiva, razonSocialDe } from '../services/feCompartida.js';
+import { descontarVenta, devolverVenta } from '../services/ventaStock.js';
+import { snapshotItemCosts } from '../services/recipeConsumption.js';
 import { esTenantDemo, marcarComprobanteDemo, AMBIENTE_DEMO, CABYS_DEMO } from '../services/feDemo.js';
 
 // Próximo consecutivo de orden de compra (mismo formato que el POS: PO-XXXX).
@@ -1400,7 +1402,60 @@ export async function emitCreditNoteCore(
           updated_at: new Date().toISOString(),
         }).eq('id', invoice_id).eq('tenant_id', tenantId);
       }
-      return ok(c, { ok: true, provider: 'alanube', nc_clave: ncClave, alanube_doc_id: ncId, response: resp });
+      /**
+       * La mercadería VUELVE al inventario.
+       *
+       * La nota de crédito anula la venta ante Hacienda; hasta ahora el
+       * inventario no se enteraba: el producto seguía descontado como si se
+       * hubiera vendido, y el negocio terminaba con existencias en el estante
+       * que el sistema daba por salidas.
+       *
+       * Se devuelve por el mismo camino por el que bajó —ingredientes de la
+       * receta, componentes del kit, o el producto— y no puede tumbar la nota:
+       * la NC ya se emitió y eso es irreversible.
+       */
+      let devueltoAlStock = 0;
+      /**
+       * UNA SOLA devolución por venta.
+       *
+       * Desde el POS, anular hace las dos cosas en fila: anula la factura
+       * —que ya devuelve la mercadería— y después emite esta nota. Si acá se
+       * devolviera otra vez, el inventario terminaría con el doble de lo que
+       * salió, que es peor que no devolver nada: nadie lo nota hasta el conteo.
+       *
+       * La factura anulada es la marca de que el stock ya volvió.
+       */
+      const yaAnulada = String((inv as any).status ?? '') === 'cancelled';
+      if (!yaAnulada) {
+        try {
+          let truckId: string | null = null;
+          if ((inv as any).route_id) {
+            const { data: route } = await db.from('routes')
+              .select('warehouse_id').eq('id', (inv as any).route_id).eq('tenant_id', tenantId).maybeSingle();
+            truckId = (route as any)?.warehouse_id ?? null;
+          }
+          const r = await devolverVenta(tenantId, invoice_id, { truckWarehouseId: truckId });
+          devueltoAlStock = r.devueltas;
+
+          /* Y la venta queda ANULADA. Una nota de crédito anula el comprobante
+             ante Hacienda; dejarla como «completada» hacía que siguiera
+             contando como ingreso en los reportes, y permitía anularla después
+             —devolviendo la mercadería por segunda vez—. */
+          await db.from('invoices').update({
+            status: 'cancelled', updated_at: new Date().toISOString(),
+          }).eq('id', invoice_id).eq('tenant_id', tenantId).neq('status', 'cancelled');
+        } catch (e: any) {
+          console.warn('[nota de crédito] no se pudo devolver el inventario:', e?.message);
+        }
+      }
+
+      return ok(c, {
+        ok: true, provider: 'alanube', nc_clave: ncClave, alanube_doc_id: ncId,
+        restocked: devueltoAlStock,
+        // Si la factura ya estaba anulada, el stock volvió en ese momento.
+        stock_ya_devuelto: yaAnulada,
+        response: resp,
+      });
     }
 
   } catch (err: any) {
@@ -3962,6 +4017,37 @@ hacienda.post('/emit-direct', async (c) => {
     if (!preview && itemRowsFe.length === 0) {
       if (inv?.id) await db.from('invoices').delete().eq('id', inv.id).eq('tenant_id', tenantId);
       return fail(c, 'Ninguna línea del carrito tiene cantidad válida: no hay nada que facturar.', 422);
+    }
+
+    /**
+     * INVENTARIO. El POS electrónico vendía SIN TOCARLO.
+     *
+     * Esta ruta crea la factura por su cuenta —no pasa por `/invoices`—, y el
+     * descuento de existencias vivía allá adentro. Resultado: un negocio que
+     * facturaba electrónicamente veía su inventario intacto después de vender
+     * todo el día, y el conteo del mes no cuadraba con nada.
+     *
+     * Se usa el mismo servicio que la caja normal, así que respeta lo mismo:
+     * recetas (bajan los ingredientes), kits (bajan los componentes), productos
+     * de stock infinito (no bajan) y los productos sueltos del carrito, que no
+     * están en el catálogo y no tienen nada que descontar.
+     *
+     * Un fallo acá no tumba la venta: el comprobante ya existe y el cliente ya
+     * pagó. Queda en el registro del servidor.
+     */
+    if (!preview && inv?.id) {
+      try {
+        const paraStock = itemRowsFe
+          .filter((r: any) => r.product_id)
+          .map((r: any) => ({ product_id: r.product_id, quantity: Number(r.quantity) }));
+        if (paraStock.length) {
+          const { costByProduct } = await descontarVenta(tenantId, inv.id, paraStock);
+          // El costo de la venta se congela acá mismo: recalcularlo después con
+          // el costo de hoy convierte el histórico de ganancias en ficción.
+          try { await snapshotItemCosts(tenantId, inv.id, paraStock as any[], costByProduct); }
+          catch (e: any) { console.warn('[fe-pos] no se pudo congelar el costo:', e?.message); }
+        }
+      } catch (e: any) { console.warn('[fe-pos] no se pudo descontar el inventario:', e?.message); }
     }
 
     // Emitir a Hacienda.
