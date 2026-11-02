@@ -32,7 +32,7 @@ import { db } from '../db/client.js';
 const TABLAS_DIRECTAS = [
   'accounts_payable', 'accounts_receivable', 'accounts_receivable_payments',
   'agenda_tasks', 'agent_orders', 'attendance_records', 'branches',
-  'cash_sessions', 'customer_prices', 'customers', 'customer_zones',
+  'cash_sessions', 'customer_links', 'customer_prices', 'customers', 'customer_zones',
   'demo_requests', 'digital_menus', 'employees', 'expense_categories', 'expenses',
   'fe_consecutivos', 'invoices', 'lead_interactions', 'leads', 'leave_requests',
   'modifier_ingredients', 'payment_receipts', 'payroll_items', 'payroll_runs',

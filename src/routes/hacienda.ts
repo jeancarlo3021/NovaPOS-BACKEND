@@ -112,16 +112,35 @@ function cleanReceptionDetail(s: any): string {
   return out;
 }
 
-async function matchLines(tenantId: string, lines: any[]): Promise<any[]> {
+export async function matchLines(tenantId: string, lines: any[]): Promise<any[]> {
   let sel: any = await db.from('products')
     .select('id, name, cabys_code, sku, tracks_stock').eq('tenant_id', tenantId).is('deleted_at', null).limit(5000);
   if (sel.error && /deleted_at/.test(sel.error.message ?? '')) {   // migración 58 sin correr
     sel = await db.from('products').select('id, name, cabys_code, sku, tracks_stock').eq('tenant_id', tenantId).limit(5000);
   }
   const products = sel.data ?? [];
-  const byCabys = new Map<string, any>(), bySku = new Map<string, any>(), byName = new Map<string, any>();
+  /**
+   * El CABYS NO identifica un producto: lo CLASIFICA para impuestos.
+   *
+   * Una tienda de repuestos de moto tiene 151 artículos distintos bajo el mismo
+   * código 4994100009900. Cuando el CABYS mandaba, las 151 líneas de la factura
+   * se resolvían al MISMO producto: la orden quedaba con 266 líneas apuntando a
+   * 11 artículos, el nombre del producto se sobrescribía con el de la última
+   * línea, y al cargar el inventario esas 266 cantidades caían sobre 11
+   * artículos. Pasó de verdad, con una factura de ₡2,5 millones.
+   *
+   * Por eso ahora el CABYS solo sirve de pista cuando es ÚNICO en el catálogo;
+   * si lo comparten dos o más productos no identifica a nadie y se ignora.
+   */
+  const bySku = new Map<string, any>(), byName = new Map<string, any>();
+  const cabysCuantos = new Map<string, number>();
+  const byCabys = new Map<string, any>();
   for (const p of products as any[]) {
-    if (p.cabys_code) byCabys.set(String(p.cabys_code), p);
+    if (p.cabys_code) {
+      const c = String(p.cabys_code);
+      cabysCuantos.set(c, (cabysCuantos.get(c) ?? 0) + 1);
+      byCabys.set(c, p);
+    }
     if (p.sku) bySku.set(String(p.sku).trim().toLowerCase(), p);
     if (p.name) byName.set(String(p.name).trim().toLowerCase(), p);
   }
@@ -129,11 +148,14 @@ async function matchLines(tenantId: string, lines: any[]): Promise<any[]> {
     const cabys = String(l.cabys ?? l.CodigoCABYS ?? '');
     const code = String(l.code ?? l.Codigo ?? '').trim();
     const detail = cleanReceptionDetail(l.detail ?? l.Detalle);
-    // Coincidencia por: 1) CABYS, 2) código comercial == SKU interno, 3) nombre.
-    const mCabys = cabys ? byCabys.get(cabys) : null;
-    const mSku = !mCabys && code ? bySku.get(code.toLowerCase()) : null;
-    const mName = !mCabys && !mSku ? byName.get(detail.trim().toLowerCase()) : null;
-    const match = mCabys || mSku || mName || null;
+    /* Orden: 1) el código comercial contra el SKU interno —eso SÍ identifica—,
+       2) el nombre exacto, 3) el CABYS, y solo si en todo el catálogo hay un
+       único producto con ese código. */
+    const mSku = code ? bySku.get(code.toLowerCase()) : null;
+    const mName = !mSku ? byName.get(detail.trim().toLowerCase()) : null;
+    const mCabys = !mSku && !mName && cabys && cabysCuantos.get(cabys) === 1
+      ? byCabys.get(cabys) : null;
+    const match = mSku || mName || mCabys || null;
     return {
       detail,
       quantity: Number(l.quantity ?? l.Cantidad ?? 1),
@@ -146,7 +168,7 @@ async function matchLines(tenantId: string, lines: any[]): Promise<any[]> {
       product_id: match?.id ?? null,
       product_name: match?.name ?? null,
       exists: !!match,
-      matched_by: mCabys ? 'cabys' : mSku ? 'sku' : mName ? 'name' : null,   // cómo coincidió
+      matched_by: mSku ? 'sku' : mName ? 'name' : mCabys ? 'cabys' : null,   // cómo coincidió
       // El producto que coincidió NO lleva control de stock (infinito). Se informa
       // para que el modal lo muestre y quede claro que la compra no lo cambia.
       infinite: match ? (match as any).tracks_stock === false : false,
@@ -2531,9 +2553,10 @@ hacienda.post('/received/credit-note', async (c) => {
     const applied: any[] = [];
 
     if (restock) {
-      // Se emparejan las líneas igual que en una compra: por CABYS, código o
-      // nombre. Lo que no calce se informa en vez de inventarse un producto —
-      // crear catálogo desde una devolución no tiene ningún sentido.
+      // Se emparejan las líneas igual que en una compra: por código comercial,
+      // nombre y —solo si es único— CABYS. Lo que no calce se informa en vez de
+      // inventarse un producto: crear catálogo desde una devolución no tiene
+      // ningún sentido, y devolverle existencias al artículo equivocado menos.
       const matched = await matchLines(tenantId, linesFromDoc(d));
       for (const m of matched as any[]) {
         const qty = Number(m.quantity) || 0;

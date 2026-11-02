@@ -50,6 +50,7 @@ import leadsRoute       from './routes/leads.js';
 import demoRequestsRoute from './routes/demoRequests.js';
 import { digitalMenu, publicMenu } from './routes/digitalMenu.js';
 import { mesaDigital, mesaPublic } from './routes/mesaDigital.js';
+import { portalCliente, portalPublico } from './routes/portalCliente.js';
 import { landingPublic, landingAdmin } from './routes/landing.js';
 import contabilidad from './routes/contabilidad.js';
 import { ia } from './routes/ia.js';
@@ -148,6 +149,16 @@ app.route('/public-menu', publicMenu);
 app.route('/mesa', mesaPublic);
 
 /**
+ * PORTAL DEL CLIENTE, también sin sesión.
+ *
+ * Lo abre el cliente del negocio con el enlace que le mandaron. Mismo criterio
+ * que el menú y la mesa: no se va a registrar para pedir una caja de
+ * refrescos. Todo cuelga del token, que la base vuelve a validar en cada
+ * petición (ver routes/portalCliente.ts).
+ */
+app.route('/cliente', portalPublico);
+
+/**
  * La PÁGINA PÚBLICA de presentación, también sin sesión.
  *
  * Va junto al menú digital y fuera del grupo con `auth` por el mismo motivo:
@@ -193,6 +204,7 @@ api.route('/stock-adjustments', stockAdjustments);
 api.route('/hr',                hr);
 api.route('/email',             email);
 api.route('/customer-prices',   customerPrices);
+api.route('/portal-cliente',    portalCliente);
 api.route('/routes',            routing);
 api.route('/cabys',             cabys);
 api.route('/exchange-rate',     exchangeRate);

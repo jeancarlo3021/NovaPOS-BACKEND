@@ -226,6 +226,101 @@ purchases.put('/:id', async (c) => {
 });
 
 /**
+ * SUMA al inventario las cantidades de una compra.
+ *
+ * Vive aparte de `aplicarRecepcion` porque hay dos momentos que suman lo mismo:
+ * recibir la orden, y volver a cargarla cuando el inventario se perdió (un
+ * «poner existencias en cero», una restauración, una recepción que se quedó a
+ * medias). Lo único que cambia es el motivo que queda escrito en el historial,
+ * para que después se pueda distinguir una cosa de la otra.
+ *
+ * Cada incremento queda en `stock_adjustments`: sin esa línea, nadie puede
+ * reconstruir después de dónde salió una existencia.
+ */
+async function sumarAlStock(params: {
+  tenantId: string;
+  userId?: string | null;
+  purchaseId: string;
+  numero: string;
+  proveedor?: string | null;
+  items: Array<{ product_id: string; quantity: number }>;
+  motivo: 'recepcion' | 'recarga';
+}): Promise<{ aplicados: number; sinStock: number; fallaron: number; unidades: number }> {
+  const { tenantId, userId, purchaseId, numero, proveedor, items, motivo } = params;
+
+  // Precio pagado por unidad, tomado de la COMPRA y no del body: quien llama
+  // manda solo producto y cantidad, y el costo tiene que salir de lo que
+  // quedó registrado.
+  const costByProduct = new Map<string, number>();
+  try {
+    const { data: pItems } = await db.from('purchase_items')
+      .select('product_id, unit_price').eq('purchase_id', purchaseId);
+    for (const pi of (pItems ?? []) as any[]) {
+      const v = Number(pi.unit_price) || 0;
+      if (pi.product_id && v > 0) costByProduct.set(String(pi.product_id), v);
+    }
+  } catch (e: any) {
+    console.warn('[STOCK] no se pudo leer el costo de la compra:', e?.message);
+  }
+
+  let aplicados = 0, sinStock = 0, fallaron = 0, unidades = 0;
+
+  for (const item of (items ?? [])) {
+    const qty = Number(item.quantity ?? 0);
+    if (!qty || qty <= 0) continue;
+
+    const { data: prod } = await db.from('products')
+      .select('stock_quantity, tracks_stock, name')
+      .eq('id', item.product_id)
+      .single();
+    if (!prod) { fallaron++; continue; }
+
+    // Producto sin control de stock → no se toca ni se loguea.
+    if ((prod as any).tracks_stock === false) { sinStock++; continue; }
+
+    const stockBefore = Number((prod as any).stock_quantity ?? 0);
+    const stockAfter  = stockBefore + qty;
+
+    // ── Costo del producto ────────────────────────────────────────────
+    // Se usa el precio de ESTA compra, no un promedio ponderado: es lo que
+    // el negocio acaba de pagar y lo que va a pagar la próxima vez. Un
+    // promedio suaviza justo la subida que hay que ver.
+    const unitCost = costByProduct.get(String(item.product_id)) ?? 0;
+    const costPatch = unitCost > 0 ? { cost_price: unitCost } : {};
+
+    const { error: upErr } = await db.from('products').update({
+      stock_quantity: stockAfter,
+      ...costPatch,
+      updated_at: new Date().toISOString(),
+    }).eq('id', item.product_id);
+    if (upErr) {
+      console.error(`[STOCK] ERROR updating stock for ${item.product_id}:`, upErr.message);
+      fallaron++;
+      continue;
+    }
+
+    const { error: adjErr } = await db.from('stock_adjustments').insert({
+      tenant_id: tenantId,
+      product_id: item.product_id,
+      user_id: userId ?? null,
+      type: 'increase',
+      quantity: qty,
+      stock_before: stockBefore,
+      stock_after: stockAfter,
+      reason: (motivo === 'recarga' ? `Recarga de compra ${numero}` : `Compra ${numero}`).trim(),
+      notes: motivo === 'recarga'
+        ? `Se volvió a cargar la orden${proveedor ? ` de ${proveedor}` : ''}`
+        : (proveedor ? `Recepción de ${proveedor}` : 'Recepción de compra'),
+    });
+    if (adjErr) console.error(`[STOCK] ERROR logging stock_adjustment for ${item.product_id}:`, adjErr.message);
+
+    aplicados++;
+    unidades += qty;
+  }
+  return { aplicados, sinStock, fallaron, unidades };
+}
+
+/**
  * APLICA LA RECEPCIÓN de una compra: marca recibida, sube el stock, actualiza
  * el costo y crea la cuenta por pagar si el proveedor es a crédito.
  *
@@ -267,75 +362,15 @@ async function aplicarRecepcion(params: {
   if (uErr) throw new Error(`Error updating purchase: ${uErr.message}`);
 
   // Incrementar stock por item, respetando tracks_stock por producto.
-  // Cada incremento queda registrado en stock_adjustments para trazabilidad.
   if (canUpdateStock) {
-    let touched = 0;
-    let skipped = 0;
-
-    // Precio pagado por unidad, tomado de la COMPRA y no del body: quien llama
-    // manda solo producto y cantidad, y el costo tiene que salir de lo que
-    // quedó registrado.
-    const costByProduct = new Map<string, number>();
-    try {
-      const { data: pItems } = await db.from('purchase_items')
-        .select('product_id, unit_price').eq('purchase_id', id);
-      for (const pi of (pItems ?? []) as any[]) {
-        const v = Number(pi.unit_price) || 0;
-        if (pi.product_id && v > 0) costByProduct.set(String(pi.product_id), v);
-      }
-    } catch (e: any) {
-      console.warn('[RECEIVE] no se pudo leer el costo de la compra:', e?.message);
-    }
-
-    for (const item of (items ?? [])) {
-      const qty = Number(item.quantity ?? 0);
-      if (!qty || qty <= 0) continue;
-
-      const { data: prod } = await db.from('products')
-        .select('stock_quantity, tracks_stock, name')
-        .eq('id', item.product_id)
-        .single();
-      if (!prod) continue;
-
-      // Producto sin control de stock → no se toca ni se loguea.
-      if (prod.tracks_stock === false) { skipped++; continue; }
-
-      const stockBefore = Number(prod.stock_quantity ?? 0);
-      const stockAfter  = stockBefore + qty;
-
-      // ── Costo del producto ────────────────────────────────────────────
-      // Se usa el precio de ESTA compra, no un promedio ponderado: es lo que
-      // el negocio acaba de pagar y lo que va a pagar la próxima vez. Un
-      // promedio suaviza justo la subida que hay que ver.
-      const unitCost = costByProduct.get(String(item.product_id)) ?? 0;
-      const costPatch = unitCost > 0 ? { cost_price: unitCost } : {};
-
-      const { error: upErr } = await db.from('products').update({
-        stock_quantity: stockAfter,
-        ...costPatch,
-        updated_at: new Date().toISOString(),
-      }).eq('id', item.product_id);
-      if (upErr) {
-        console.error(`[RECEIVE] ERROR updating stock for ${item.product_id}:`, upErr.message);
-        continue;
-      }
-
-      const { error: adjErr } = await db.from('stock_adjustments').insert({
-        tenant_id: tenantId,
-        product_id: item.product_id,
-        user_id: userId ?? null,
-        type: 'increase',
-        quantity: qty,
-        stock_before: stockBefore,
-        stock_after: stockAfter,
-        reason: `Compra ${purchase.purchase_number ?? ''}`.trim(),
-        notes: supplier?.name ? `Recepción de ${supplier.name}` : 'Recepción de compra',
-      });
-      if (adjErr) console.error(`[RECEIVE] ERROR logging stock_adjustment for ${item.product_id}:`, adjErr.message);
-
-      touched++;
-    }
-    console.log(`[RECEIVE] Stock incremented for ${touched} items, ${skipped} skipped (tracks_stock=false)`);
+    const r = await sumarAlStock({
+      tenantId, userId, purchaseId: id,
+      numero: purchase.purchase_number ?? '',
+      proveedor: supplier?.name ?? null,
+      items: items ?? [],
+      motivo: 'recepcion',
+    });
+    console.log(`[RECEIVE] Stock incremented for ${r.aplicados} items, ${r.sinStock} skipped (tracks_stock=false)`);
   }
 
   // Cuenta por pagar si el proveedor es a crédito.
@@ -367,6 +402,26 @@ purchases.post('/:id/receive', async (c) => {
     const tenantId = c.get('tenantId');
     const { id }   = c.req.param();
     const body = await c.req.json() as { items: { product_id: string; quantity: number }[]; canUpdateStock?: boolean; notes?: string };
+
+    /**
+     * UNA orden se recibe UNA vez.
+     *
+     * Sin este freno, cada reintento volvía a sumar: una recepción lenta que el
+     * cajero tocó dos veces —o que la cola de pendientes reenvió al volver la
+     * señal— entraba tres veces al inventario, y nadie lo nota hasta que el
+     * conteo físico no cuadra. Para volver a cargarla a propósito está
+     * `/:id/reload-stock`, que lo dice y lo deja escrito como recarga.
+     */
+    const { data: previa } = await db.from('purchases')
+      .select('status, purchase_number').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+    if ((previa as any)?.status === 'received') {
+      return fail(c, `La orden ${(previa as any).purchase_number ?? ''} ya estaba recibida: `
+        + 'no se vuelve a sumar sola. Si el inventario se perdió, usá «Cargar al inventario».', 409);
+    }
+    if ((previa as any)?.status === 'cancelled') {
+      return fail(c, 'La orden está cancelada: no se puede recibir.', 409);
+    }
+
     const updated = await aplicarRecepcion({
       tenantId, userId: c.get('userId'), purchaseId: id,
       items: body.items ?? [], canUpdateStock: body.canUpdateStock ?? true, notes: body.notes,
@@ -374,6 +429,160 @@ purchases.post('/:id/receive', async (c) => {
     return ok(c, updated);
   } catch (err: any) {
     console.error('[RECEIVE] ERROR:', err.message);
+    return fail(c, err.message, 500);
+  }
+});
+
+/**
+ * GET /:id/stock-status — ¿qué pasaría si cargo esta orden al inventario?
+ *
+ * Se mira ANTES de tocar nada: cuánto subiría cada producto, qué hay hoy, y
+ * —sobre todo— si esta orden ya se cargó antes. Cargar dos veces una compra no
+ * avisa: el sistema queda con el doble de existencias y el error aparece
+ * semanas después, en un conteo.
+ */
+purchases.get('/:id/stock-status', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { id } = c.req.param();
+
+    const { data: compra } = await db.from('purchases')
+      .select('id, purchase_number, status, purchase_date, total_amount, supplier_id')
+      .eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+    if (!compra) return fail(c, 'Orden no encontrada', 404);
+    const p: any = compra;
+
+    const { data: items } = await db.from('purchase_items')
+      .select('product_id, quantity, unit_price').eq('purchase_id', id);
+    const lineas = (items ?? []) as any[];
+
+    const ids = [...new Set(lineas.map(l => String(l.product_id)).filter(Boolean))];
+    const { data: prods } = ids.length
+      ? await db.from('products').select('id, name, sku, stock_quantity, tracks_stock').in('id', ids)
+      : { data: [] as any[] };
+    const porId = new Map(((prods ?? []) as any[]).map(x => [String(x.id), x]));
+
+    /* Lo que ya se le cargó a esta orden, según el historial. Es la única
+       prueba de si el inventario ya entró: el estado «recibida» no lo dice
+       —una recepción puede haberse marcado sin tocar existencias—. */
+    const numero = String(p.purchase_number ?? '').trim();
+    const { data: ajustes } = await db.from('stock_adjustments')
+      .select('product_id, quantity, created_at, reason')
+      .eq('tenant_id', tenantId)
+      .in('reason', [`Compra ${numero}`, `Recarga de compra ${numero}`])
+      .order('created_at').limit(5000);
+    const hist = (ajustes ?? []) as any[];
+    const cargas = [...new Set(hist.map(a => String(a.created_at).slice(0, 16)))];
+
+    // Cuántas líneas caen sobre el mismo producto: con la factura electrónica
+    // mal conciliada, decenas de artículos distintos terminan en uno solo.
+    const porProducto = new Map<string, { nombre: string; sku: string | null; lineas: number; cantidad: number; stock: number | null; infinito: boolean }>();
+    for (const l of lineas) {
+      const pid = String(l.product_id ?? '');
+      const prod: any = porId.get(pid);
+      const e = porProducto.get(pid) ?? {
+        nombre: prod?.name ?? '(producto eliminado)',
+        sku: prod?.sku ?? null,
+        lineas: 0, cantidad: 0,
+        stock: prod ? Number(prod.stock_quantity ?? 0) : null,
+        infinito: prod?.tracks_stock === false,
+      };
+      e.lineas += 1;
+      e.cantidad += Number(l.quantity ?? 0);
+      porProducto.set(pid, e);
+    }
+    const detalle = [...porProducto.entries()]
+      .map(([product_id, v]) => ({ product_id, ...v }))
+      .sort((a, b) => b.lineas - a.lineas);
+
+    const repetidos = detalle.filter(d => d.lineas > 1);
+    return ok(c, {
+      purchase_number: p.purchase_number,
+      status: p.status,
+      purchase_date: p.purchase_date,
+      lineas: lineas.length,
+      productos: detalle.length,
+      unidades: lineas.reduce((s2, l) => s2 + Number(l.quantity ?? 0), 0),
+      /** Veces que esta orden ya entró al inventario, con su fecha. */
+      cargas_previas: cargas,
+      unidades_ya_cargadas: hist.reduce((s2, a) => s2 + Number(a.quantity ?? 0), 0),
+      /* Señal de orden mal conciliada: muchas líneas sobre un mismo producto.
+         Cargarla así no arregla el inventario, lo empeora. */
+      lineas_repetidas: repetidos.reduce((s2, d) => s2 + d.lineas, 0),
+      sospechosa: repetidos.some(d => d.lineas >= 5),
+      detalle,
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/**
+ * POST /:id/reload-stock — vuelve a cargar la orden al inventario.
+ *
+ * Para cuando la mercadería SÍ entró pero las existencias no están: se puso el
+ * inventario en cero, se restauró un respaldo viejo, o la recepción se cortó a
+ * la mitad. No cambia el estado de la orden ni vuelve a crear la cuenta por
+ * pagar —la plata ya se registró—: solo suma existencias y lo deja escrito.
+ *
+ * Pide `confirmar: true` a propósito. Es la clase de operación que no se debe
+ * poder disparar con un toque de más.
+ */
+purchases.post('/:id/reload-stock', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { id } = c.req.param();
+    const body = await c.req.json().catch(() => ({})) as { confirmar?: boolean };
+    if (body?.confirmar !== true) {
+      return fail(c, 'Falta confirmar la recarga.', 422);
+    }
+
+    const { data: compra } = await db.from('purchases')
+      .select('id, purchase_number, status, supplier_id').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+    if (!compra) return fail(c, 'Orden no encontrada', 404);
+    const p: any = compra;
+    if (p.status === 'cancelled') {
+      return fail(c, 'La orden está cancelada: no se carga al inventario.', 409);
+    }
+
+    const { data: items } = await db.from('purchase_items')
+      .select('product_id, quantity').eq('purchase_id', id);
+    const lineas = ((items ?? []) as any[]).filter(l => l.product_id);
+    if (lineas.length === 0) {
+      return fail(c, 'La orden no tiene artículos que cargar.', 409);
+    }
+
+    const { data: prov } = p.supplier_id
+      ? await db.from('suppliers').select('name').eq('id', p.supplier_id).maybeSingle()
+      : { data: null };
+
+    const r = await sumarAlStock({
+      tenantId, userId: c.get('userId'), purchaseId: id,
+      numero: String(p.purchase_number ?? ''),
+      proveedor: (prov as any)?.name ?? null,
+      items: lineas.map(l => ({ product_id: String(l.product_id), quantity: Number(l.quantity) })),
+      motivo: 'recarga',
+    });
+
+    /* Una orden que estaba pendiente y se carga a mano queda recibida: dejarla
+       pendiente con el inventario ya adentro invita a recibirla otra vez. */
+    if (p.status !== 'received') {
+      await db.from('purchases').update({
+        status: 'received',
+        actual_delivery_date: new Date().toISOString().slice(0, 10),
+        updated_at: new Date().toISOString(),
+      }).eq('id', id).eq('tenant_id', tenantId);
+    }
+
+    try {
+      await db.from('user_activity_log').insert({
+        tenant_id: tenantId, user_id: c.get('userId'),
+        action: 'compra_recargada_a_inventario',
+        details: { orden: p.purchase_number, ...r },
+      });
+    } catch { /* el registro es deseable, no obligatorio */ }
+
+    return ok(c, { purchase_number: p.purchase_number, ...r });
+  } catch (err: any) {
+    console.error('[RELOAD-STOCK] ERROR:', err.message);
     return fail(c, err.message, 500);
   }
 });

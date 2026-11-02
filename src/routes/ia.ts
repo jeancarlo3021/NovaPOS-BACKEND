@@ -53,15 +53,28 @@ function periodoDe(pregunta: string): { desde: string; hasta: string; etiqueta: 
   if (/semana pasada/.test(p)) return { desde: menos(14), hasta: menos(7), etiqueta: 'la semana pasada' };
   if (/\bsemana\b/.test(p)) return { desde: menos(7), hasta: hoyCR, etiqueta: 'los últimos 7 días' };
   if (/mes pasado/.test(p)) {
-    const cr = new Date(Date.now() - 6 * 3_600_000);
-    const ini = new Date(Date.UTC(cr.getUTCFullYear(), cr.getUTCMonth() - 1, 1));
-    const fin = new Date(Date.UTC(cr.getUTCFullYear(), cr.getUTCMonth(), 0));
-    return { desde: diaCR(ini), hasta: diaCR(fin), etiqueta: 'el mes pasado' };
+    const [a, m] = hoyCR.split('-').map(Number);
+    const antes = m === 1 ? { a: a - 1, m: 12 } : { a, m: m - 1 };
+    const ultimo = new Date(Date.UTC(antes.a, antes.m, 0)).getUTCDate();
+    return {
+      desde: `${antes.a}-${String(antes.m).padStart(2, '0')}-01`,
+      hasta: `${antes.a}-${String(antes.m).padStart(2, '0')}-${ultimo}`,
+      etiqueta: 'el mes pasado',
+    };
   }
   if (/\baño\b|\banual\b/.test(p)) return { desde: menos(365), hasta: hoyCR, etiqueta: 'los últimos 12 meses' };
-  const cr = new Date(Date.now() - 6 * 3_600_000);
-  const ini = new Date(Date.UTC(cr.getUTCFullYear(), cr.getUTCMonth(), 1));
-  return { desde: diaCR(ini), hasta: hoyCR, etiqueta: 'este mes' };
+  /**
+   * EL MES EMPIEZA EL 1, también en Costa Rica.
+   *
+   * Se armaba un `Date` a medianoche UTC del día 1 y después se formateaba en
+   * hora de Costa Rica: a las 00:00 UTC acá son las 18:00 del día ANTERIOR, así
+   * que «este mes» arrancaba el 31 del mes pasado. El 1 de noviembre el
+   * asistente decía «del 2026-10-31 al 2026-11-01» y metía las ventas del
+   * último día del mes anterior en el mes nuevo.
+   *
+   * La fecha se arma con el año y el mes que YA vienen en hora de Costa Rica.
+   */
+  return { desde: `${hoyCR.slice(0, 7)}-01`, hasta: hoyCR, etiqueta: 'este mes' };
 }
 
 /**
@@ -204,6 +217,50 @@ ia.post('/preguntar', async (c) => {
     const esStock = /stock|existencia|acab|agotad|repon|minimo|bajo de/.test(p);
     const esClientes = /client|quien me compra|quien compra|mejor comprador/.test(p);
     const esGastos = /gast|egres|compr[eé]|cuanto sali|salida de plata/.test(p);
+    const esCabys = /\bcabys\b|\bcaby\b|codigo de hacienda|código de hacienda/.test(p);
+
+    /**
+     * CAByS — se contesta con los datos, no con un modelo.
+     *
+     * «Ayudame con lo del CAByS» caía en «todavía no sé contestar eso», que es
+     * lo más inútil posible: es la duda número uno de quien arranca con
+     * facturación electrónica, y el sistema tiene todo para responderla —cuántos
+     * productos le faltan y dónde se pone—.
+     */
+    if (esCabys) {
+      /* Los productos borrados se marcan con `deleted_at`, no con un
+         `is_active` —que en esta tabla no existe—: filtrando por él la cuenta
+         daba cero siempre y el asistente contestaba que no había nada que
+         hacer con el catálogo lleno. */
+      const [{ count: total }, { count: sinCabys }] = await Promise.all([
+        db.from('products').select('id', { count: 'exact', head: true })
+          .eq('tenant_id', tenantId).is('deleted_at', null),
+        db.from('products').select('id', { count: 'exact', head: true })
+          .eq('tenant_id', tenantId).is('deleted_at', null).or('cabys_code.is.null,cabys_code.eq.'),
+      ]);
+      const faltan = Number(sinCabys ?? 0);
+      const hay = Number(total ?? 0);
+
+      return ok(c, respuesta({
+        respuesta: hay === 0
+          ? 'Todavía no tenés productos cargados, así que no hay ningún CAByS pendiente.'
+          : faltan === 0
+            ? `Todos tus productos (${hay}) ya tienen su código CAByS. No hay nada pendiente.`
+            : faltan === 1
+              ? `Te falta 1 producto de ${hay} con código CAByS.`
+              : `Te faltan ${faltan} de ${hay} productos con código CAByS.`,
+        detalle: [
+          'El CAByS es el código con el que Hacienda identifica cada producto o servicio; sin él, el comprobante electrónico se rechaza.',
+          'Dónde se pone: Inventario → el producto → el campo CAByS. Escribí el nombre y el buscador te propone los códigos que calzan, con su IVA.',
+          faltan > 0
+            ? 'Si son muchos, pedile al administrador que los cargue en tanda desde el panel: ahí se asignan de a cientos y se pueden marcar todos los que llevan el mismo código.'
+            : '',
+        ].filter(Boolean).join('\n'),
+        fuente: `Catálogo del negocio: ${hay} producto(s).`,
+        no_entendida: false,
+        sugerencias: ['¿Qué se está acabando?', '¿Cuánto vendí este mes?'],
+      }));
+    }
 
     if (esVentas && !esProductos) {
       const ventas = await ventasDe(tenantId, desde, hasta);
@@ -481,13 +538,20 @@ ia.post('/preguntar', async (c) => {
       }
     }
 
+    /* Si el modelo está apagado se DICE. «Todavía no sé contestar eso» deja a
+       quien pregunta creyendo que el sistema es tonto, cuando en realidad hay
+       una variable de entorno sin poner y el dueño podría encenderla. */
+    const apagada = modoIA() === 'demo';
     return ok(c, respuesta({
       respuesta: mejorTema
         ? `No estoy seguro de haber entendido. ¿Querías preguntar «${mejorTema.pregunta}»?`
-        : 'Todavía no sé contestar eso.',
+        : apagada
+          ? 'Eso no lo sé contestar con los datos de tu negocio, y el asistente inteligente está apagado. Lo que sí puedo contestarte está acá abajo.'
+          : 'Todavía no sé contestar eso.',
       detalle: null,
       fuente: null,
       no_entendida: true,
+      ia_apagada: apagada,
       // La pantalla las muestra como botones: así se contesta de un toque en
       // vez de tener que reescribir la pregunta.
       sugerencias: mejorTema
