@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
-import { respuesta, modoIA, pedirAlModelo, proveedorIA } from '../services/ia.js';
+import { respuesta, modoIA, pedirAlModelo, proveedorIA, modeloIA, probarModelo } from '../services/ia.js';
 import { estadoCreditos, tomarCredito, devolverCredito } from '../services/creditosIA.js';
 import { sugerirCabys } from './cabys.js';
 import { planFeatureLabels } from '../services/emailService.js';
@@ -33,6 +33,73 @@ ia.get('/estado', async (c) => ok(c, {
   // Y cuántas consultas al modelo le quedan este mes.
   creditos: await estadoCreditos(c.get('tenantId')),
 }));
+
+// ══════════════════════════════════════════════════════════════════════════
+// GET /diagnostico — ¿ESTÁ CONECTADA LA API?
+// ══════════════════════════════════════════════════════════════════════════
+
+/**
+ * El chequeo de conexión: configuración + una llamada REAL al proveedor.
+ *
+ * Revisar las variables de entorno no alcanza. Una llave vencida, un modelo
+ * que ya no existe, la facturación sin activar o la cuota agotada se ven
+ * exactamente igual que «todo configurado», y el sistema —que por diseño
+ * nunca se cae por culpa del modelo— sigue contestando con el buscador local
+ * sin que nadie note que la IA no está haciendo nada.
+ *
+ * Por eso acá se le habla al proveedor de verdad y se devuelve lo que
+ * contestó, con el error textual si falló: «API key not valid» y «model not
+ * found» se arreglan distinto, y un «no funciona» no distingue.
+ *
+ * La llave NUNCA se devuelve, ni un pedazo: esto lo ve una pantalla, y una
+ * pantalla se comparte en una captura. Solo se dice si está y de qué largo,
+ * que es lo que hace falta para saber si quedó pegada a medias.
+ */
+ia.get('/diagnostico', async (c) => {
+  try {
+    /* Solo el dueño o un administrador. La prueba gasta —poco, pero gasta— y
+       además el detalle del error dice cómo está armado el servidor. */
+    const rol = String(c.get('role') ?? '');
+    if (!['owner', 'admin'].includes(rol)) return fail(c, 'Solo el dueño puede probar la conexión', 403);
+
+    const proveedor = proveedorIA();
+    const llave = String((proveedor === 'gemini' ? process.env.GEMINI_API_KEY : process.env.ANTHROPIC_API_KEY) ?? '').trim();
+    const pedido = String(process.env.IA_MODO ?? '').trim().toLowerCase();
+
+    /* La prueba solo se corre si hay con qué: sin llave ya se sabe que falla,
+       y con el modo en demostración una llamada de verdad sería gastar por
+       algo que el sistema no va a usar igual. */
+    const prueba = llave && pedido === 'real'
+      ? await probarModelo()
+      : { ok: false, ms: 0, respuesta: null, error: null as string | null };
+
+    /* QUÉ HAY QUE HACER, en una línea. Un diagnóstico que deja al usuario
+       interpretando cuatro banderas no sirve de nada. */
+    const queHacer = !llave
+      ? `Falta la llave ${proveedor === 'gemini' ? 'GEMINI_API_KEY' : 'ANTHROPIC_API_KEY'} en el servidor.`
+      : pedido !== 'real'
+        ? 'La llave está, pero falta IA_MODO=real en el servidor: por seguridad la IA no se enciende sola.'
+        : prueba.ok
+          ? null
+          : `El proveedor no contestó bien: ${prueba.error ?? 'sin detalle'}`;
+
+    return ok(c, {
+      conectada: modoIA() === 'real' && prueba.ok,
+      modo: modoIA(),
+      /* Lo PEDIDO y lo EFECTIVO por separado: con IA_MODO=real y sin llave,
+         el sistema queda en demostración y decir solo «demo» esconde que
+         alguien ya intentó encenderla. */
+      modo_pedido: pedido || '(sin poner)',
+      proveedor,
+      modelo: modeloIA(),
+      llave: { presente: !!llave, largo: llave.length },
+      prueba,
+      que_hacer: queHacer,
+      /* Para qué se usa hoy, así la pantalla puede decirlo sin inventar. */
+      usos: ['CAByS en la carga de productos', 'Asistente del tablero'],
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
 
 // ══════════════════════════════════════════════════════════════════════════
 // PASO 4 — PREGUNTAR EN ESPAÑOL

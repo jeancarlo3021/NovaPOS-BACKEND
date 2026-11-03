@@ -260,6 +260,44 @@ export async function pedirAlModelo(opts: {
   }
 }
 
+/**
+ * ¿ESTÁ CONECTADA LA API? — una prueba de verdad, no una revisión de variables.
+ *
+ * Mirar si la llave está puesta no sirve: una llave vencida, un modelo que ya
+ * no existe, la facturación sin activar o un cortafuegos dan exactamente el
+ * mismo «todo configurado» y después el sistema se cae en silencio al modo
+ * local sin que nadie se entere. Por eso esto HABLA con el proveedor y
+ * devuelve lo que contestó.
+ *
+ * A diferencia de `pedirAlModelo`, acá el error NO se traga: el mensaje del
+ * proveedor —«API key not valid», «model not found», «quota exceeded»— es
+ * justo lo que dice qué arreglar.
+ *
+ * Es deliberadamente barata: ocho tokens de salida y sin caché (una prueba
+ * contestada desde la caché no probaría nada).
+ */
+export async function probarModelo(): Promise<{
+  ok: boolean; ms: number; respuesta: string | null; error: string | null;
+}> {
+  const arranque = Date.now();
+  if (!llaveDe(proveedorIA())) {
+    return { ok: false, ms: 0, respuesta: null, error: `Falta la llave: ${proveedorIA() === 'gemini' ? 'GEMINI_API_KEY' : 'ANTHROPIC_API_KEY'}` };
+  }
+  try {
+    const texto = proveedorIA() === 'gemini'
+      ? await pedirAGemini('Contestá exactamente: OK', 'Decí OK', 8, modeloIA())
+      : await pedirAClaude('Contestá exactamente: OK', 'Decí OK', 8, modeloIA());
+    const ms = Date.now() - arranque;
+    /* Conectó pero no dijo nada: pasa cuando el modelo corta por filtro o por
+       tope de salida. No es un error de conexión y no se puede reportar como
+       si lo fuera, pero tampoco es un «todo bien». */
+    if (!texto) return { ok: false, ms, respuesta: null, error: 'El proveedor respondió sin texto (revisá el modelo configurado)' };
+    return { ok: true, ms, respuesta: texto.slice(0, 80), error: null };
+  } catch (e: any) {
+    return { ok: false, ms: Date.now() - arranque, respuesta: null, error: String(e?.message ?? e).slice(0, 300) };
+  }
+}
+
 async function pedirAClaude(sistema: string, mensaje: string, maxTokens: number, modelo: string): Promise<string | null> {
   const anthropic = await clienteIA();
   const r = await anthropic.messages.create({
