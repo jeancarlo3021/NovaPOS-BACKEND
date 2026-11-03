@@ -75,6 +75,16 @@ const MODELO_POR_DEFECTO: Record<ProveedorIA, string> = {
   anthropic: 'claude-haiku-5-5',
 };
 
+/**
+ * Cuánto se espera una respuesta del modelo.
+ *
+ * Veinte segundos alcanzan para estas tareas y son el techo de lo que puede
+ * esperar una pantalla. Se puede subir con `IA_ESPERA_MS` sin tocar código:
+ * en un servidor con la salida a internet lenta, el corte mata consultas que
+ * habrían llegado.
+ */
+const ESPERA_MS = Math.max(5_000, Math.min(60_000, Number(process.env.IA_ESPERA_MS) || 20_000));
+
 /** La versión mayor del modelo de Gemini: «gemini-3.8-flash» → 3. */
 function versionGemini(modelo: string): number {
   const m = /gemini-(\d+)/.exec(modelo);
@@ -286,26 +296,97 @@ export async function pedirAlModelo(opts: {
  * Es deliberadamente barata: ocho tokens de salida y sin caché (una prueba
  * contestada desde la caché no probaría nada).
  */
-export async function probarModelo(): Promise<{
+export async function probarModelo(timeoutMs = 45_000): Promise<{
   ok: boolean; ms: number; respuesta: string | null; error: string | null;
+  /** Solo funcionó con el pensamiento apagado: eso es lo que lo hace tardar. */
+  sin_pensamiento?: boolean;
 }> {
-  const arranque = Date.now();
   if (!llaveDe(proveedorIA())) {
     return { ok: false, ms: 0, respuesta: null, error: `Falta la llave: ${proveedorIA() === 'gemini' ? 'GEMINI_API_KEY' : 'ANTHROPIC_API_KEY'}` };
   }
+
+  const intentar = async (sinPensar: boolean, espera: number) => {
+    const arranque = Date.now();
+    try {
+      const texto = proveedorIA() === 'gemini'
+        ? await pedirAGemini('Contestá exactamente: OK', 'Decí OK', 8, modeloIA(), espera, sinPensar)
+        : await pedirAClaude('Contestá exactamente: OK', 'Decí OK', 8, modeloIA());
+      const ms = Date.now() - arranque;
+      /* Conectó pero no dijo nada: pasa cuando el modelo corta por filtro o
+         por tope de salida. No es un error de conexión y no se puede reportar
+         como si lo fuera, pero tampoco es un «todo bien». */
+      if (!texto) return { ok: false, ms, respuesta: null, error: 'El proveedor respondió sin texto (revisá el modelo configurado)' };
+      return { ok: true, ms, respuesta: texto.slice(0, 80), error: null };
+    } catch (e: any) {
+      return { ok: false, ms: Date.now() - arranque, respuesta: null, error: String(e?.message ?? e).slice(0, 300) };
+    }
+  };
+
+  const normal = await intentar(false, timeoutMs);
+  if (normal.ok || proveedorIA() !== 'gemini' || versionGemini(modeloIA()) < 3) return normal;
+
+  /**
+   * SI TARDÓ, SE PRUEBA SIN PENSAR.
+   *
+   * Es la pregunta que queda después de «no contestó a tiempo»: ¿tarda el
+   * modelo, o tarda la parte de razonar? Un segundo intento sin pensamiento
+   * la contesta en una prueba en vez de en dos despliegues, y si ese sí
+   * funciona ya se sabe que alcanza con `IA_SIN_PENSAR=1`.
+   */
+  const sin = await intentar(true, Math.min(timeoutMs, 20_000));
+  return sin.ok
+    ? { ...sin, sin_pensamiento: true }
+    : { ...normal, error: `${normal.error} · tampoco contestó con el pensamiento apagado (${sin.error})` };
+}
+
+/**
+ * ¿SE LLEGA AL PROVEEDOR? — sin generar nada.
+ *
+ * Es la mitad que faltaba del diagnóstico. «Se agotó la espera» tiene dos
+ * causas que se arreglan al revés: el modelo tardó más de la cuenta, o el
+ * servidor no tiene salida hacia Google y la conexión se quedó colgada hasta
+ * el corte. Desde afuera se ven idénticas.
+ *
+ * Esto pregunta por la FICHA del modelo —un GET que no genera texto, no
+ * cuesta y contesta en milisegundos—. Si esto anda y la generación no, el
+ * problema es el modelo o la lentitud; si esto tampoco anda, es la salida a
+ * internet o la llave.
+ *
+ * De paso confirma que el modelo configurado EXISTE para esta cuenta, que es
+ * exactamente lo que falló con el 2.5.
+ */
+export async function alcanzaProveedor(timeoutMs = 10_000): Promise<{
+  ok: boolean; ms: number; estado: number | null; error: string | null;
+}> {
+  const arranque = Date.now();
+  const proveedor = proveedorIA();
+  const llave = llaveDe(proveedor);
+  if (!llave) return { ok: false, ms: 0, estado: null, error: 'Sin llave' };
+
+  const ctrl = new AbortController();
+  const corte = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const texto = proveedorIA() === 'gemini'
-      ? await pedirAGemini('Contestá exactamente: OK', 'Decí OK', 8, modeloIA())
-      : await pedirAClaude('Contestá exactamente: OK', 'Decí OK', 8, modeloIA());
+    const r = proveedor === 'gemini'
+      ? await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modeloIA())}`,
+        { headers: { 'x-goog-api-key': llave }, signal: ctrl.signal })
+      : await fetch(`https://api.anthropic.com/v1/models/${encodeURIComponent(modeloIA())}`,
+        { headers: { 'x-api-key': llave, 'anthropic-version': '2023-06-01' }, signal: ctrl.signal });
     const ms = Date.now() - arranque;
-    /* Conectó pero no dijo nada: pasa cuando el modelo corta por filtro o por
-       tope de salida. No es un error de conexión y no se puede reportar como
-       si lo fuera, pero tampoco es un «todo bien». */
-    if (!texto) return { ok: false, ms, respuesta: null, error: 'El proveedor respondió sin texto (revisá el modelo configurado)' };
-    return { ok: true, ms, respuesta: texto.slice(0, 80), error: null };
+    if (r.ok) return { ok: true, ms, estado: r.status, error: null };
+    const detalle = await r.text().catch(() => '');
+    return { ok: false, ms, estado: r.status, error: `${r.status}: ${detalle.slice(0, 200)}` };
   } catch (e: any) {
-    return { ok: false, ms: Date.now() - arranque, respuesta: null, error: String(e?.message ?? e).slice(0, 300) };
-  }
+    const ms = Date.now() - arranque;
+    const corto = e?.name === 'AbortError' || /aborted/i.test(String(e?.message ?? ''));
+    return {
+      ok: false, ms, estado: null,
+      /* Que ni la consulta más barata llegue en diez segundos no es lentitud:
+         es que no hay salida hacia el proveedor. Decirlo así ahorra horas. */
+      error: corto
+        ? `No se llegó a ${proveedor} en ${Math.round(timeoutMs / 1000)} s: el servidor no parece tener salida hacia ahí`
+        : String(e?.message ?? e).slice(0, 200),
+    };
+  } finally { clearTimeout(corte); }
 }
 
 async function pedirAClaude(sistema: string, mensaje: string, maxTokens: number, modelo: string): Promise<string | null> {
@@ -335,7 +416,7 @@ async function pedirAClaude(sistema: string, mensaje: string, maxTokens: number,
  * despliegue. La llave viaja en la cabecera, nunca en la dirección: en la
  * dirección queda escrita en los registros de cualquier intermediario.
  */
-async function pedirAGemini(sistema: string, mensaje: string, maxTokens: number, modelo: string): Promise<string | null> {
+async function pedirAGemini(sistema: string, mensaje: string, maxTokens: number, modelo: string, timeoutMs = ESPERA_MS, sinPensar = false): Promise<string | null> {
   const llave = llaveDe('gemini');
   if (!llave) return null;
 
@@ -355,12 +436,17 @@ async function pedirAGemini(sistema: string, mensaje: string, maxTokens: number,
    * piso cuando el modelo es de los que piensan.
    */
   const v3 = versionGemini(modelo) >= 3;
+  /* `IA_SIN_PENSAR=1` apaga el pensamiento sin tocar código. Es la salida
+     cuando resulta ser lo que hace tardar al modelo: estas tareas no lo
+     necesitan y esperar quince segundos por un CAByS no sirve de nada. */
+  const nada = sinPensar || String(process.env.IA_SIN_PENSAR ?? '').trim() === '1';
   const generationConfig: Record<string, unknown> = v3
-    ? { maxOutputTokens: Math.max(maxTokens, 512), thinkingConfig: { thinkingLevel: 'low' } }
+    ? { maxOutputTokens: nada ? maxTokens : Math.max(maxTokens, 512),
+        ...(nada ? {} : { thinkingConfig: { thinkingLevel: 'low' } }) }
     : { maxOutputTokens: maxTokens, temperature: 0.2, ...(/2\.5/.test(modelo) ? { thinkingConfig: { thinkingBudget: 0 } } : {}) };
 
   const ctrl = new AbortController();
-  const corte = setTimeout(() => ctrl.abort(), 20_000);
+  const corte = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const llamar = async (cfg: Record<string, unknown>) => fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelo)}:generateContent`,
@@ -376,7 +462,33 @@ async function pedirAGemini(sistema: string, mensaje: string, maxTokens: number,
       },
     );
 
+    /**
+     * SATURACIÓN: SE REINTENTA, NO SE RINDE.
+     *
+     * Un 503 («high demand») o un 429 no son un error de configuración: son
+     * el proveedor pidiendo que se vuelva a intentar. Sin reintento, un pico
+     * de dos segundos deja sin IA a una importación entera y el negocio
+     * termina con el catálogo clasificado a mano sin que nadie sepa por qué.
+     *
+     * Dos reintentos cortos con espera creciente, y solo mientras quede
+     * tiempo del presupuesto: esperar más que el corte sería inventar una
+     * demora propia encima de la del proveedor.
+     */
+    const REINTENTABLES = [429, 500, 502, 503, 504];
+    const arranque = Date.now();
     let r = await llamar(generationConfig);
+    for (let intento = 1; intento <= 2 && !r.ok && REINTENTABLES.includes(r.status); intento++) {
+      /* `Retry-After` manda si viene: el proveedor sabe mejor que nosotros
+         cuánto tarda en descongestionarse. */
+      const dicho = Number(r.headers?.get?.('retry-after')) * 1000;
+      const espera = Number.isFinite(dicho) && dicho > 0
+        ? Math.min(dicho, 5_000)
+        : intento * 800 + Math.floor(Math.random() * 400);
+      if (Date.now() - arranque + espera > timeoutMs - 1_000) break;
+      console.warn(`[ia] Gemini ${r.status}: saturado, reintento ${intento} en ${espera} ms`);
+      await new Promise(res => setTimeout(res, espera));
+      r = await llamar(generationConfig);
+    }
     /*
      * SI LA PELEA ES POR EL CAMPO DE PENSAR, SE PREGUNTA SIN ÉL.
      *
@@ -396,6 +508,12 @@ async function pedirAGemini(sistema: string, mensaje: string, maxTokens: number,
     }
     if (!r.ok) {
       const detalle = await r.text().catch(() => '');
+      /* El código va por delante y en palabras: «503» a secas manda a revisar
+         la llave, que es exactamente lo que NO hay que tocar. */
+      if (REINTENTABLES.includes(r.status)) {
+        throw new Error(`El modelo está saturado del lado de ${r.status === 429 ? 'tu cuota' : 'Google'} (${r.status}). `
+          + `Se reintentó 3 veces. ${detalle.slice(0, 200)}`);
+      }
       throw new Error(`Gemini respondió ${r.status}: ${detalle.slice(0, 300)}`);
     }
     const j: any = await r.json();
@@ -410,5 +528,14 @@ async function pedirAGemini(sistema: string, mensaje: string, maxTokens: number,
       if (motivo) console.warn('[ia] Gemini no devolvió texto:', motivo);
     }
     return texto || null;
+  } catch (e: any) {
+    /* «This operation was aborted» no le dice nada a nadie: es NUESTRO corte
+       de espera, no una respuesta de Google. Hay que decir que se agotó el
+       tiempo y cuánto se esperó, porque eso se arregla distinto que una llave
+       mala —puede ser el modelo lento o el servidor sin salida a internet—. */
+    if (e?.name === 'AbortError' || /aborted/i.test(String(e?.message ?? ''))) {
+      throw new Error(`No contestó en ${Math.round(timeoutMs / 1000)} s (se agotó la espera)`);
+    }
+    throw e;
   } finally { clearTimeout(corte); }
 }

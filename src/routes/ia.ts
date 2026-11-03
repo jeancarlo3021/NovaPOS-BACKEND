@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
-import { respuesta, modoIA, pedirAlModelo, proveedorIA, modeloIA, probarModelo } from '../services/ia.js';
+import { respuesta, modoIA, pedirAlModelo, proveedorIA, modeloIA, probarModelo, alcanzaProveedor } from '../services/ia.js';
 import { estadoCreditos, tomarCredito, devolverCredito } from '../services/creditosIA.js';
 import { sugerirCabys } from './cabys.js';
 import { planFeatureLabels } from '../services/emailService.js';
@@ -69,7 +69,16 @@ ia.get('/diagnostico', async (c) => {
     /* La prueba solo se corre si hay con qué: sin llave ya se sabe que falla,
        y con el modo en demostración una llamada de verdad sería gastar por
        algo que el sistema no va a usar igual. */
-    const prueba = llave && pedido === 'real'
+    /* DOS PRUEBAS, en orden de baratura. Primero si se LLEGA al proveedor
+       (un GET a la ficha del modelo: no genera nada, no cuesta y contesta en
+       milisegundos) y después si GENERA. Con las dos se puede decir qué pasa:
+       «se agotó la espera» a secas puede ser el modelo lento o el servidor
+       sin salida a internet, y se arreglan al revés. */
+    const alcance = llave
+      ? await alcanzaProveedor()
+      : { ok: false, ms: 0, estado: null as number | null, error: 'Sin llave' };
+
+    const prueba = llave && pedido === 'real' && alcance.ok
       ? await probarModelo()
       : { ok: false, ms: 0, respuesta: null, error: null as string | null };
 
@@ -79,12 +88,37 @@ ia.get('/diagnostico', async (c) => {
       ? `Falta la llave ${proveedor === 'gemini' ? 'GEMINI_API_KEY' : 'ANTHROPIC_API_KEY'} en el servidor.`
       : pedido !== 'real'
         ? 'La llave está, pero falta IA_MODO=real en el servidor: por seguridad la IA no se enciende sola.'
-        : prueba.ok
-          ? null
-          : `El proveedor no contestó bien: ${prueba.error ?? 'sin detalle'}`;
+        /* El alcance manda sobre la generación: si no se llega, decir «el
+           modelo no contestó» mandaría a revisar el modelo cuando lo que
+           falla es la salida a internet o la llave. */
+        : !alcance.ok
+          ? (alcance.estado === 404
+              ? `El modelo «${modeloIA()}» no existe para esta cuenta. Poné otro en IA_MODELO.`
+              : alcance.estado === 401 || alcance.estado === 403
+                ? `El proveedor rechazó la llave (${alcance.estado}). Revisá que sea de la API de Gemini y que el proyecto la tenga habilitada.`
+                : `No se pudo llegar al proveedor: ${alcance.error ?? 'sin detalle'}`)
+          : prueba.ok
+            ? ((prueba as any).sin_pensamiento
+                /* Contesta, pero solo con el pensamiento apagado: el sistema
+                   no está roto, está esperando de más por algo que estas
+                   tareas no necesitan. */
+                ? 'El modelo contesta, pero la parte de «pensar» lo hace tardar demasiado. Poné IA_SIN_PENSAR=1 en el servidor: estas tareas no la necesitan.'
+                : null)
+            /* SATURADO NO ES MAL CONFIGURADO. Mandar a revisar la llave
+               cuando Google está pidiendo que se intente más tarde es hacer
+               perder la tarde tocando lo único que estaba bien. */
+            : /saturado|UNAVAILABLE|high demand|RESOURCE_EXHAUSTED/i.test(prueba.error ?? '')
+              ? 'No es tu configuración: el modelo está saturado del lado de Google y ya se reintentó solo. '
+                + 'Probá de nuevo en unos minutos; si pasa seguido, poné otro modelo en IA_MODELO o habilitá facturación en el proyecto de Google.'
+            : /espera/i.test(prueba.error ?? '')
+              /* Se llega pero no genera a tiempo: eso ya no es conexión. */
+              ? `Se llega a ${proveedor} (${alcance.ms} ms) pero la respuesta no llegó a tiempo. Probá de nuevo; si sigue, subí IA_ESPERA_MS en el servidor.`
+              : `El proveedor no contestó bien: ${prueba.error ?? 'sin detalle'}`;
 
     return ok(c, {
-      conectada: modoIA() === 'real' && prueba.ok,
+      /* Contestar solo sin pensamiento NO es estar conectada del todo: con la
+         configuración actual el sistema sigue sin recibir respuestas. */
+      conectada: modoIA() === 'real' && prueba.ok && !(prueba as any).sin_pensamiento,
       modo: modoIA(),
       /* Lo PEDIDO y lo EFECTIVO por separado: con IA_MODO=real y sin llave,
          el sistema queda en demostración y decir solo «demo» esconde que
@@ -93,6 +127,8 @@ ia.get('/diagnostico', async (c) => {
       proveedor,
       modelo: modeloIA(),
       llave: { presente: !!llave, largo: llave.length },
+      /** ¿Se LLEGA al proveedor? (sin generar nada) */
+      alcance,
       prueba,
       que_hacer: queHacer,
       /* Para qué se usa hoy, así la pantalla puede decirlo sin inventar. */
