@@ -149,6 +149,13 @@ export interface ReceiveSummary {
   restantes?: number;
   /** Qué buzones se miraron y cuántos correos había en cada uno. */
   buzones?: Array<{ buzon: string; mirados: number }>;
+  /** Correos que ya se habían examinado en corridas anteriores: se saltearon. */
+  ya_vistos?: number;
+  /**
+   * DÓNDE SE FUE EL TIEMPO. Sin esto, «solo procesó 3» no se puede explicar:
+   * puede ser el buzón lento para conectar, correos pesados, o poco plazo.
+   */
+  tiempos?: { conexion_ms: number; total_ms: number; por_correo_ms: number };
   debug?: any[];
 }
 
@@ -163,6 +170,45 @@ export interface ReceiveSummary {
  * Con `IMAP_SIN_SPAM=1` se deja de mirar, por si en alguna cuenta el spam es
  * enorme y se come el tiempo de la corrida.
  */
+/**
+ * LOS CORREOS QUE YA SE MIRARON, para no volver a bajarlos.
+ *
+ * Descargar un correo con un PDF adjunto es lo caro de todo este proceso. Sin
+ * memoria entre corridas, cada vuelta gastaba su presupuesto bajando los
+ * mismos primeros correos y el resto del buzón no se miraba NUNCA: con plazo
+ * para tres, se procesaban tres veces los mismos tres.
+ *
+ * Si la tabla todavía no existe (migración sin correr), se sigue como antes:
+ * esto es una mejora, no un requisito.
+ */
+async function uidsYaVistos(cuenta: string, buzon: string, uidvalidity: number | null): Promise<Set<number>> {
+  try {
+    const { data, error } = await db.from('recepcion_correos_vistos')
+      .select('uid, uidvalidity').eq('cuenta', cuenta).eq('buzon', buzon).limit(5000);
+    if (error) throw new Error(error.message);
+    return new Set(((data ?? []) as any[])
+      /* Si el servidor cambió la uidvalidity, los uid de ese buzón se
+         reasignaron: lo anotado ya no habla de los mismos correos. */
+      .filter(r => uidvalidity == null || r.uidvalidity == null || Number(r.uidvalidity) === uidvalidity)
+      .map(r => Number(r.uid)));
+  } catch (e: any) {
+    console.warn('[recepción] no se pudo leer lo ya visto:', e?.message);
+    return new Set();
+  }
+}
+
+/** Anota que un correo ya se examinó. Nunca rompe la corrida. */
+async function anotarVisto(cuenta: string, buzon: string, uidvalidity: number | null, uid: number, conComprobante: boolean) {
+  try {
+    await db.from('recepcion_correos_vistos').upsert({
+      cuenta, buzon, uidvalidity, uid, con_comprobante: conComprobante,
+      visto_at: new Date().toISOString(),
+    }, { onConflict: 'cuenta,buzon,uid' });
+  } catch (e: any) {
+    console.warn('[recepción] no se pudo anotar el correo visto:', e?.message);
+  }
+}
+
 export async function buzonesAMirar(client: any): Promise<string[]> {
   const pedidos = String(process.env.IMAP_MAILBOX || 'INBOX')
     .split(',').map(x => x.trim()).filter(Boolean);
@@ -240,11 +286,13 @@ export async function fetchAndProcessReceivedEmails(
   const tenantIndex = await loadTenantByReceiverIndex();
 
   /* Y el tope de afuera, por si el cliente no respeta los suyos. */
+  const antesDeConectar = Date.now();
   await Promise.race([
     client.connect(),
     new Promise((_, rechazar) => setTimeout(
       () => rechazar(new Error(`El buzón no contestó en ${Math.round(TOPE_CONEXION / 1000)} s`)), TOPE_CONEXION)),
   ]);
+  const conexionMs = Date.now() - antesDeConectar;
   try {
     /**
      * TODOS LOS BUZONES, NO SOLO LA BANDEJA DE ENTRADA.
@@ -278,6 +326,11 @@ export async function fetchAndProcessReceivedEmails(
           const days = Math.max(1, Number(process.env.RECEPTION_DAYS || 15));
           const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
           const encontrados = (await client.search({ since }, { uid: true })) || [];
+          /* Lo que ya se examinó en corridas anteriores se SALTEA sin
+             descargarlo: bajar el correo es lo caro, y volver a bajarlo es la
+             razón por la que cada corrida procesaba siempre los mismos. */
+          const uidvalidity = Number((client as any)?.mailbox?.uidValidity ?? 0) || null;
+          const vistos = await uidsYaVistos(user, buzon, uidvalidity);
 
           /**
            * Del MÁS NUEVO al más viejo, y con tiempo límite.
@@ -296,7 +349,9 @@ export async function fetchAndProcessReceivedEmails(
              los respaldos, los avisos y los anuncios, y un número fijo escrito
              acá no sabe nada de eso. */
           const LIMITE_MS = LIMITE_TOTAL;
-          const uids = [...encontrados].reverse();
+          const todos = [...encontrados].reverse();
+          const uids = todos.filter((u: any) => !vistos.has(Number(u)));
+          summary.ya_vistos = (summary.ya_vistos ?? 0) + (todos.length - uids.length);
 
           for (const uid of uids) {
             if (Date.now() - arranque > LIMITE_MS) {
@@ -347,6 +402,10 @@ export async function fetchAndProcessReceivedEmails(
               if (anyRelevant && !debug) {
                 await client.messageFlagsAdd(String(uid), ['\\Seen'], { uid: true });
               }
+              /* Queda anotado que ya se miró —con comprobante o sin él—, para
+                 que la próxima corrida AVANCE en vez de repetir los mismos.
+                 En modo prueba no: ahí se quiere poder volver a correrlo. */
+              if (!debug) await anotarVisto(user, buzon, uidvalidity, Number(uid), anyRelevant);
             } catch (e: any) {
               summary.errors++;
               console.warn('[recepción] error procesando correo:', e?.message);
@@ -367,6 +426,17 @@ export async function fetchAndProcessReceivedEmails(
   } finally {
     await client.logout().catch(() => {});
   }
+
+  /* DÓNDE SE FUE EL TIEMPO. «Solo procesó tres» tiene tres explicaciones muy
+     distintas —el buzón tardó en abrir, los correos son pesados, o el plazo
+     es corto— y sin estos números no se puede saber cuál es. */
+  const totalMs = Date.now() - arranque;
+  summary.tiempos = {
+    conexion_ms: conexionMs,
+    total_ms: totalMs,
+    por_correo_ms: summary.scanned > 0
+      ? Math.round((totalMs - conexionMs) / summary.scanned) : 0,
+  };
 
   if (debug) summary.debug = debugInfo;
   return summary;
