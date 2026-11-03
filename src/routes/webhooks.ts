@@ -65,7 +65,11 @@ webhooks.post('/alanube', async (c) => {
     const clave = d?.key ?? d?.clave ?? deepFind(body, /(clave|^key$)/i, 50);
     if (!clave) return ok(c, { ignored: true, reason: 'sin clave' });
     const claveDigits = String(clave).replace(/\D/g, '');
-    const docId = d?.id ?? deepFind(body, /(^id$|documentId)/i, 40);
+    /* El mismo error que tenía el mensaje receptor: se pedían 40 caracteres,
+       que es el largo de una CLAVE, no de un id. Los id de Alanube son ULID
+       de 26 o identificadores de 24, así que el id se descartaba por corto y
+       el webhook no podía emparejar el documento. */
+    const docId = d?.id ?? deepFind(body, /(^id$|_id$|documentId$)/i, 10);
 
     // ── Estado de EMISIÓN: si la clave/id corresponde a una factura que emitimos,
     //    actualizamos su fe_status (Aceptado/Rechazado) — llega por el webhook.
@@ -178,7 +182,7 @@ webhooks.post('/alanube', async (c) => {
 
     await db.from('received_documents').upsert({
       tenant_id: tenantId,
-      alanube_doc_id: d?.id ?? deepFind(body, /(^id$|documentId)/i, 40),
+      alanube_doc_id: docId,
       clave: String(clave).replace(/\D/g, ''),
       issuer_name: d?.issuerName ?? d?.senderName ?? deepFind(body, /(issuerName|senderName|razonSocial|nombreEmisor)/i, 120),
       issuer_id: d?.issuerIdentification ?? deepFind(body, /(issuerId|issuerIdentification|cedulaEmisor)/i, 30),

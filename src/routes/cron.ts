@@ -37,7 +37,10 @@ const handler = async (c: any) => {
     const debug = c.req.query('debug') === '1';
     /* Por omisión 25 s: debajo de los 30 que esperan tanto el cron externo
        como la función. Se ajusta con CRON_PRESUPUESTO_MS sin tocar código. */
-    const presupuestoMs = Math.max(10_000, Math.min(60_000, Number(process.env.CRON_PRESUPUESTO_MS) || 25_000));
+    /* 18 s por omisión, no 25: el cron externo corta a los 30 y antes de que
+       esto arranque ya se fue tiempo en levantar la función. El margen tiene
+       que estar de nuestro lado. */
+    const presupuestoMs = Math.max(8_000, Math.min(60_000, Number(process.env.CRON_PRESUPUESTO_MS) || 18_000));
 
     const { correrConPresupuesto } = await import('../services/cronPresupuesto.js');
     const r = await correrConPresupuesto([

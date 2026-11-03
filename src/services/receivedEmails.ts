@@ -147,7 +147,45 @@ export interface ReceiveSummary {
   cortado_por_tiempo?: boolean;
   /** Correos de la ventana que quedaron sin mirar en esta corrida. */
   restantes?: number;
+  /** Qué buzones se miraron y cuántos correos había en cada uno. */
+  buzones?: Array<{ buzon: string; mirados: number }>;
   debug?: any[];
+}
+
+/**
+ * QUÉ BUZONES HAY QUE MIRAR.
+ *
+ * La bandeja de entrada (o las que diga `IMAP_MAILBOX`, separadas por comas)
+ * y el de SPAM. El de spam se busca por la marca `\Junk` que informa el
+ * propio servidor, porque su nombre cambia con el proveedor y con el idioma;
+ * si no la informa, se prueban los nombres conocidos.
+ *
+ * Con `IMAP_SIN_SPAM=1` se deja de mirar, por si en alguna cuenta el spam es
+ * enorme y se come el tiempo de la corrida.
+ */
+export async function buzonesAMirar(client: any): Promise<string[]> {
+  const pedidos = String(process.env.IMAP_MAILBOX || 'INBOX')
+    .split(',').map(x => x.trim()).filter(Boolean);
+  const buzones = pedidos.length > 0 ? pedidos : ['INBOX'];
+  if (String(process.env.IMAP_SPAM ?? '').trim() === '0'
+    || String(process.env.IMAP_SIN_SPAM ?? '').trim() === '1') return buzones;
+
+  try {
+    const carpetas: any[] = (await client.list()) || [];
+    const porMarca = carpetas.find(f =>
+      String(f?.specialUse ?? '') === '\\Junk'
+      || (Array.isArray(f?.flags) && [...f.flags].some((x: any) => String(x) === '\\Junk')));
+    const nombres = /^(spam|junk|correo no deseado|bulk mail)$/i;
+    const porNombre = carpetas.find(f =>
+      nombres.test(String(f?.name ?? '')) || nombres.test(String(f?.path ?? '').split(/[./]/).pop() ?? ''));
+    const spam = porMarca?.path ?? porNombre?.path ?? null;
+    if (spam && !buzones.includes(spam)) buzones.push(spam);
+  } catch (e: any) {
+    /* Si no se pueden listar las carpetas se sigue con la bandeja de entrada:
+       no leer el spam es peor que hoy, pero no leer nada es mucho peor. */
+    console.warn('[recepción] no se pudieron listar las carpetas:', e?.message);
+  }
+  return buzones;
 }
 
 // ── Entrada principal: lee el buzón y procesa ────────────────────────────────
@@ -171,105 +209,160 @@ export async function fetchAndProcessReceivedEmails(
     throw new Error('Faltan credenciales IMAP (IMAP_HOST, IMAP_USER, IMAP_PASS).');
   }
 
+  /**
+   * EL PRESUPUESTO EMPIEZA EN LA CONEXIÓN, NO EN EL PRIMER CORREO.
+   *
+   * El plazo cuidaba el recorrido de los mensajes, pero conectarse al buzón
+   * no tenía ninguno: con el servidor de correo lento o caído, `connect()`
+   * se quedaba esperando y se llevaba puesto el trabajo entero —el cron
+   * externo cortaba y ni los respaldos ni los anuncios llegaban a correr—.
+   *
+   * Ahora la conexión tiene tope y, si no entra, se avisa y se sigue: un
+   * buzón que no contesta es un problema del buzón, no una razón para que no
+   * se haga nada más.
+   */
+  const LIMITE_TOTAL = Math.max(4_000, opts?.presupuestoMs ?? (Number(process.env.RECEPTION_BUDGET_MS) || 22_000));
+  const TOPE_CONEXION = Math.min(8_000, Math.max(3_000, Math.floor(LIMITE_TOTAL / 2)));
+
   const client = new ImapFlow({
     host,
     port: Number(process.env.IMAP_PORT || 993),
     secure: process.env.IMAP_TLS !== 'false',
     auth: { user, pass },
     logger: false,
+    /* Los topes del propio cliente: sin esto, un socket que se queda abierto
+       sin contestar espera para siempre. */
+    connectionTimeout: TOPE_CONEXION,
+    greetingTimeout: TOPE_CONEXION,
+    socketTimeout: LIMITE_TOTAL,
   });
 
   const tenantIndex = await loadTenantByReceiverIndex();
-  const mailbox = process.env.IMAP_MAILBOX || 'INBOX';
 
-  await client.connect();
+  /* Y el tope de afuera, por si el cliente no respeta los suyos. */
+  await Promise.race([
+    client.connect(),
+    new Promise((_, rechazar) => setTimeout(
+      () => rechazar(new Error(`El buzón no contestó en ${Math.round(TOPE_CONEXION / 1000)} s`)), TOPE_CONEXION)),
+  ]);
   try {
-    const lock = await client.getMailboxLock(mailbox);
-    try {
-      // Procesamos los correos RECIENTES (leídos o no), no solo los no leídos: si
-      // alguien abre el correo (ej. para verificar que llegó, o porque el proveedor
-      // lo manda dos veces), quedaba marcado como leído y el cron lo saltaba PARA
-      // SIEMPRE → la compra nunca cargaba. La deduplicación por clave (tenant_id +
-      // clave en received_documents) evita insertar dos veces. Ventana configurable
-      // con RECEPTION_DAYS (por defecto 15 días).
-      const days = Math.max(1, Number(process.env.RECEPTION_DAYS || 15));
-      const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
-      const encontrados = (await client.search({ since }, { uid: true })) || [];
-
-      /**
-       * Del MÁS NUEVO al más viejo, y con tiempo límite.
-       *
-       * El servidor corta la ejecución a los 30 segundos. Este proceso recorría
-       * la ventana entera —quince días de correos— en cada corrida, así que al
-       * crecer el buzón empezó a morir por tiempo agotado: se caía a mitad y no
-       * quedaba constancia de qué había alcanzado a procesar.
-       *
-       * Empezar por los más nuevos hace que cada corrida procese lo que llegó
-       * desde la anterior, que es lo urgente; los viejos ya se procesaron en
-       * corridas pasadas y la deduplicación por clave impide duplicarlos. Con el
-       * plazo, el proceso termina bien y dice cuántos quedaron sin mirar.
-       */
-      /* El plazo lo manda quien llama: este trabajo comparte el tiempo con
-         los respaldos, los avisos y los anuncios, y un número fijo escrito
-         acá no sabe nada de eso. */
-      const LIMITE_MS = Math.max(4_000, opts?.presupuestoMs ?? (Number(process.env.RECEPTION_BUDGET_MS) || 22_000));
-      const uids = [...encontrados].reverse();
-
-      for (const uid of uids) {
-        if (Date.now() - arranque > LIMITE_MS) {
-          summary.cortado_por_tiempo = true;
-          summary.restantes = uids.length - summary.scanned;
-          break;
-        }
-        summary.scanned++;
+    /**
+     * TODOS LOS BUZONES, NO SOLO LA BANDEJA DE ENTRADA.
+     *
+     * Las facturas electrónicas llegan de remitentes que el proveedor de
+     * correo no conoce, con un XML adjunto y un cuerpo casi vacío: es el
+     * retrato de un correo basura, y se van a SPAM con frecuencia. Cada una
+     * que cae ahí es una compra que no entra al sistema y un crédito fiscal
+     * que se pierde sin que nadie lo note, porque el cron decía «0 correos»
+     * con total normalidad.
+     *
+     * El de spam no se adivina por nombre —cambia con el idioma y el
+     * proveedor: «Spam», «Junk», «[Gmail]/Spam», «Correo no deseado»—: se le
+     * pregunta al servidor cuál tiene la marca \Junk, que es el dato que
+     * existe justamente para esto. Si el servidor no la informa, recién ahí
+     * se prueban los nombres de siempre.
+     */
+    let sinTiempo = false;
+    for (const buzon of await buzonesAMirar(client)) {
+      if (sinTiempo || Date.now() - arranque > LIMITE_TOTAL) break;
+      const antes = summary.scanned;
+      try {
+        const lock = await client.getMailboxLock(buzon);
         try {
-          const msg = await client.fetchOne(String(uid), { source: true }, { uid: true });
-          if (!msg || !msg.source) { summary.skipped++; continue; }
-          const parsed = await simpleParser(msg.source as Buffer);
+          // Procesamos los correos RECIENTES (leídos o no), no solo los no leídos: si
+          // alguien abre el correo (ej. para verificar que llegó, o porque el proveedor
+          // lo manda dos veces), quedaba marcado como leído y el cron lo saltaba PARA
+          // SIEMPRE → la compra nunca cargaba. La deduplicación por clave (tenant_id +
+          // clave en received_documents) evita insertar dos veces. Ventana configurable
+          // con RECEPTION_DAYS (por defecto 15 días).
+          const days = Math.max(1, Number(process.env.RECEPTION_DAYS || 15));
+          const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+          const encontrados = (await client.search({ since }, { uid: true })) || [];
 
-          // Adjuntos XML (incluye octet-stream, .zip) + cuerpo que sea XML directo.
-          const xmls: string[] = [];
-          for (const att of (parsed.attachments || [])) {
-            for (const x of xmlsFromAttachment(att)) xmls.push(x);
-          }
-          for (const body of [parsed.text, parsed.html].filter(Boolean) as string[]) {
-            if (looksLikeFE(body)) xmls.push(body);
-          }
+          /**
+           * Del MÁS NUEVO al más viejo, y con tiempo límite.
+           *
+           * El servidor corta la ejecución a los 30 segundos. Este proceso recorría
+           * la ventana entera —quince días de correos— en cada corrida, así que al
+           * crecer el buzón empezó a morir por tiempo agotado: se caía a mitad y no
+           * quedaba constancia de qué había alcanzado a procesar.
+           *
+           * Empezar por los más nuevos hace que cada corrida procese lo que llegó
+           * desde la anterior, que es lo urgente; los viejos ya se procesaron en
+           * corridas pasadas y la deduplicación por clave impide duplicarlos. Con el
+           * plazo, el proceso termina bien y dice cuántos quedaron sin mirar.
+           */
+          /* El plazo lo manda quien llama: este trabajo comparte el tiempo con
+             los respaldos, los avisos y los anuncios, y un número fijo escrito
+             acá no sabe nada de eso. */
+          const LIMITE_MS = LIMITE_TOTAL;
+          const uids = [...encontrados].reverse();
 
-          if (debug) {
-            debugInfo.push({
-              subject: parsed.subject,
-              from: parsed.from?.text,
-              attachments: (parsed.attachments || []).map(a => ({
-                filename: a.filename, contentType: a.contentType, size: a.size,
-              })),
-              xmlFound: xmls.length,
-            });
-          }
+          for (const uid of uids) {
+            if (Date.now() - arranque > LIMITE_MS) {
+              summary.cortado_por_tiempo = true;
+              summary.restantes = uids.length - summary.scanned;
+              sinTiempo = true;
+              break;
+            }
+            summary.scanned++;
+            try {
+              const msg = await client.fetchOne(String(uid), { source: true }, { uid: true });
+              if (!msg || !msg.source) { summary.skipped++; continue; }
+              const parsed = await simpleParser(msg.source as Buffer);
 
-          const emailFrom = parsed.from?.text || '';
-          let anyRelevant = false;
-          for (const xml of xmls) {
-            const r = await processXml(xml, emailFrom, tenantIndex);
-            if (r === 'ok') { summary.processed++; anyRelevant = true; }
-            else if (r === 'dup') { summary.duplicates++; anyRelevant = true; }
-            else if (r === 'no-tenant') { summary.noTenant++; anyRelevant = true; }
-            else if (r === 'error') summary.errors++;
-            else summary.skipped++;
+              // Adjuntos XML (incluye octet-stream, .zip) + cuerpo que sea XML directo.
+              const xmls: string[] = [];
+              for (const att of (parsed.attachments || [])) {
+                for (const x of xmlsFromAttachment(att)) xmls.push(x);
+              }
+              for (const body of [parsed.text, parsed.html].filter(Boolean) as string[]) {
+                if (looksLikeFE(body)) xmls.push(body);
+              }
+
+              if (debug) {
+                debugInfo.push({
+                  subject: parsed.subject,
+                  from: parsed.from?.text,
+                  attachments: (parsed.attachments || []).map(a => ({
+                    filename: a.filename, contentType: a.contentType, size: a.size,
+                  })),
+                  xmlFound: xmls.length,
+                });
+              }
+
+              const emailFrom = parsed.from?.text || '';
+              let anyRelevant = false;
+              for (const xml of xmls) {
+                const r = await processXml(xml, emailFrom, tenantIndex);
+                if (r === 'ok') { summary.processed++; anyRelevant = true; }
+                else if (r === 'dup') { summary.duplicates++; anyRelevant = true; }
+                else if (r === 'no-tenant') { summary.noTenant++; anyRelevant = true; }
+                else if (r === 'error') summary.errors++;
+                else summary.skipped++;
+              }
+              // Marcar como leído solo si el correo tenía algún comprobante relevante
+              // (así los correos sin XML se quedan sin leer por si hay que revisarlos).
+              // En modo debug NO se marca, para poder re-ejecutar la prueba.
+              if (anyRelevant && !debug) {
+                await client.messageFlagsAdd(String(uid), ['\\Seen'], { uid: true });
+              }
+            } catch (e: any) {
+              summary.errors++;
+              console.warn('[recepción] error procesando correo:', e?.message);
+            }
           }
-          // Marcar como leído solo si el correo tenía algún comprobante relevante
-          // (así los correos sin XML se quedan sin leer por si hay que revisarlos).
-          // En modo debug NO se marca, para poder re-ejecutar la prueba.
-          if (anyRelevant && !debug) {
-            await client.messageFlagsAdd(String(uid), ['\\Seen'], { uid: true });
-          }
-        } catch (e: any) {
-          summary.errors++;
-          console.warn('[recepción] error procesando correo:', e?.message);
+        } finally {
+          lock.release();
         }
+        summary.buzones = [...(summary.buzones ?? []),
+          { buzon, mirados: summary.scanned - antes }];
+      } catch (e: any) {
+        /* Un buzón que no se puede abrir no puede dejar sin leer a los
+           demás: el spam puede no existir y la bandeja de entrada sí. */
+        summary.errors++;
+        console.warn(`[recepción] no se pudo leer «${buzon}»:`, e?.message);
       }
-    } finally {
-      lock.release();
     }
   } finally {
     await client.logout().catch(() => {});

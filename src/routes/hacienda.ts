@@ -204,6 +204,39 @@ function deepFind(obj: any, re: RegExp, minLen = 1): string | null {
   return walk(obj);
 }
 
+/**
+ * EL ID DEL MENSAJE RECEPTOR QUE DEVOLVIÓ ALANUBE.
+ *
+ * Estaba buscado con dos reglas que no podían encontrarlo:
+ *
+ *  · pedía que el valor tuviera 40 caracteres o más —un número copiado de la
+ *    búsqueda de la CLAVE, que tiene 50 dígitos—. Los id de Alanube son ULID
+ *    de 26, o identificadores de 24: ninguno llegaba, así que un id presente
+ *    se descartaba por corto;
+ *  · miraba `resp.id` y claves terminadas en `_id`, pero no desenvolvía la
+ *    respuesta (`data`, `receiverMessage`…) ni aceptaba el `documentId` en
+ *    camelCase que usa el resto de la API.
+ *
+ * Resultado: «Alanube respondió sin id de mensaje receptor» aunque lo hubiera
+ * mandado. Acá se busca igual que en el envío de facturas, que sí funciona.
+ */
+export function idDeMensajeReceptor(resp: any): string | null {
+  const obj = resp?.receiverMessage ?? resp?.receptorMessage ?? resp?.message
+    ?? resp?.document ?? resp?.data ?? resp;
+  return obj?.id ?? deepFind(resp, /(^id$|_id$|documentId$|messageId$)/i, 10) ?? null;
+}
+
+/**
+ * Lo que contestó el proveedor, recortado, para poder guardarlo.
+ *
+ * Sin esto, «respondió sin id» no deja por dónde empezar: no se sabe si
+ * contestó un error, un objeto con otra forma o nada. Se guarda lo que vino.
+ */
+export function resumenRespuesta(resp: any, tope = 600): string {
+  try { return JSON.stringify(resp ?? null).slice(0, tope); }
+  catch { return String(resp).slice(0, tope); }
+}
+
 /** Carga la config de FE del tenant (settings type='electronic-invoice'). */
 export async function loadFEConfig(tenantId: string): Promise<any> {
   const { data } = await db.from('settings').select('config')
@@ -1910,6 +1943,7 @@ hacienda.post('/received/confirm', async (c) => {
     // Estructura confirmada contra el OAS de CRI (createReceiverMessage).
     let mrId: string | null = null;
     let mrError: string | null = null;
+    let mrRespuesta: string | null = null;
     const isSandboxEnv = String(cfg.environment ?? 'production') === 'sandbox';
     const senderCompanyId = (isSandboxEnv ? cfg.alanube_company_id_sandbox : cfg.alanube_company_id_production) ?? cfg.alanube_company_id;
     if (!senderCompanyId) {
@@ -1920,10 +1954,14 @@ hacienda.post('/received/confirm', async (c) => {
       try {
         const resp = await alanube.forTenant(cfg).sendReceiverMessage(
           payload, String(senderCompanyId), { asCompany: cfg.alanube_company_type === 'associated' });
-        mrId = resp?.id ?? deepFind(resp, /(^id$|_id$)/i, 40) ?? null;
+        mrId = idDeMensajeReceptor(resp);
         if (!mrId) {
-          mrError = 'Alanube respondió sin id de mensaje receptor.';
-          messages.push(`⚠️ ${mrError} Revisá el reporte de Alanube.`);
+          /* Qué contestó, textual: es lo único que permite saber si cambió la
+             forma de la respuesta o si el envío falló de verdad. */
+          mrRespuesta = resumenRespuesta(resp);
+          mrError = `Alanube respondió sin id de mensaje receptor. Contestó: ${mrRespuesta.slice(0, 200)}`;
+          console.warn('[fe] mensaje receptor sin id. Respuesta:', mrRespuesta);
+          messages.push(`⚠️ ${mrError}`);
         }
       } catch (e: any) {
         mrError = e instanceof AlanubeError ? friendlyAlanubeError(e.message) : (e?.message ?? 'error');
@@ -1934,8 +1972,10 @@ hacienda.post('/received/confirm', async (c) => {
     // Limpiar pendientes y marcar el estado. El motivo del fallo QUEDA GUARDADO:
     // si no, «aceptado · sin enviar» no dice nada y no hay por dónde empezar.
     const newRaw: Record<string, any> = { ...(d.raw ?? {}), pending_products: [] };
-    if (mrError) { newRaw.ack_error = mrError; newRaw.ack_error_at = new Date().toISOString(); }
-    else { delete newRaw.ack_error; delete newRaw.ack_error_at; }
+    if (mrError) {
+      newRaw.ack_error = mrError; newRaw.ack_error_at = new Date().toISOString();
+      if (mrRespuesta) newRaw.ack_response = mrRespuesta;
+    } else { delete newRaw.ack_error; delete newRaw.ack_error_at; delete newRaw.ack_response; }
     await db.from('received_documents').update({
       ack_status: st === '1' ? 'accepted' : 'rejected', ack_id: mrId, raw: newRaw, updated_at: new Date().toISOString(),
     }).eq('id', id).eq('tenant_id', tenantId);
@@ -2013,11 +2053,13 @@ hacienda.post('/received/:id/resend-ack', async (c) => {
       await anotarFalloMensajeReceptor(tenantId, id, (d as any).raw, motivo);
       return fail(c, motivo, 502);
     }
-    const mrId = resp?.id ?? deepFind(resp, /(^id$|_id$)/i, 40) ?? null;
+    const mrId = idDeMensajeReceptor(resp);
     if (!mrId) {
-      const motivo = 'Alanube respondió sin id de mensaje receptor.';
+      const contesto = resumenRespuesta(resp);
+      const motivo = `Alanube respondió sin id de mensaje receptor. Contestó: ${contesto.slice(0, 200)}`;
+      console.warn('[fe] reenvío de mensaje receptor sin id. Respuesta:', contesto);
       await anotarFalloMensajeReceptor(tenantId, id, (d as any).raw, motivo);
-      return fail(c, `${motivo} Revisá el reporte de Alanube.`, 502);
+      return fail(c, motivo, 502);
     }
 
     // Se envió: se limpia el motivo del fallo anterior.

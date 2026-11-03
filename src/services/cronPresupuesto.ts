@@ -29,6 +29,28 @@ export interface Tarea {
   correr: (presupuestoMs: number) => Promise<any>;
 }
 
+/**
+ * Corta una promesa que se pasó de su plazo.
+ *
+ * El presupuesto por tarea era una SUGERENCIA: se le pasaba el número y se
+ * confiaba en que lo respetara. Una tarea que se cuelga —un buzón que no
+ * contesta, una consulta trabada— lo ignoraba y se llevaba puesto el trabajo
+ * entero, que es exactamente lo que el presupuesto venía a evitar.
+ *
+ * Esto lo vuelve un límite de verdad. La tarea cortada sigue corriendo por su
+ * cuenta hasta que termine o muera con la función; lo que importa es que el
+ * trabajo pueda seguir y contestar a tiempo.
+ */
+export function conTope<T>(promesa: Promise<T>, ms: number, nombre: string): Promise<T> {
+  let reloj: any;
+  return Promise.race([
+    promesa.finally(() => clearTimeout(reloj)),
+    new Promise<T>((_, rechazar) => {
+      reloj = setTimeout(() => rechazar(new Error(`«${nombre}» se pasó de ${Math.round(ms / 1000)} s y se cortó`)), ms);
+    }),
+  ]);
+}
+
 export interface ResultadoTareas {
   /** Lo que devolvió cada tarea que corrió. */
   resultados: Record<string, any>;
@@ -74,8 +96,11 @@ export async function correrConPresupuesto(
     }
     try {
       /* Se le da lo que queda MENOS un resguardo, para que la respuesta
-         alcance a salir aunque la tarea use todo lo que le dieron. */
-      r.resultados[t.nombre] = await t.correr(Math.max(t.minimoMs, queda - 1_000));
+         alcance a salir aunque la tarea use todo lo que le dieron. Y el plazo
+         se IMPONE: pasárselo como número no alcanza, porque la tarea que se
+         cuelga es justo la que no lo mira. */
+      const dado = Math.max(t.minimoMs, queda - 1_000);
+      r.resultados[t.nombre] = await conTope(t.correr(dado), dado + 1_500, t.nombre);
     } catch (e: any) {
       r.fallidas.push({ nombre: t.nombre, error: String(e?.message ?? e).slice(0, 200) });
     }
