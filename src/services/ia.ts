@@ -296,7 +296,7 @@ export async function pedirAlModelo(opts: {
  * Es deliberadamente barata: ocho tokens de salida y sin caché (una prueba
  * contestada desde la caché no probaría nada).
  */
-export async function probarModelo(timeoutMs = 45_000): Promise<{
+export async function probarModelo(timeoutMs = PRESUPUESTO_DIAGNOSTICO.prueba): Promise<{
   ok: boolean; ms: number; respuesta: string | null; error: string | null;
   /** Solo funcionó con el pensamiento apagado: eso es lo que lo hace tardar. */
   sin_pensamiento?: boolean;
@@ -333,11 +333,34 @@ export async function probarModelo(timeoutMs = 45_000): Promise<{
    * la contesta en una prueba en vez de en dos despliegues, y si ese sí
    * funciona ya se sabe que alcanza con `IA_SIN_PENSAR=1`.
    */
-  const sin = await intentar(true, Math.min(timeoutMs, 20_000));
+  const sin = await intentar(true, Math.min(timeoutMs, PRESUPUESTO_DIAGNOSTICO.sinPensar));
   return sin.ok
     ? { ...sin, sin_pensamiento: true }
     : { ...normal, error: `${normal.error} · tampoco contestó con el pensamiento apagado (${sin.error})` };
 }
+
+/**
+ * EL PRESUPUESTO DE TIEMPO DEL DIAGNÓSTICO.
+ *
+ * Un diagnóstico que no contesta no diagnostica nada: si el servidor tarda
+ * más que lo que la pantalla espera, el usuario ve el error genérico del
+ * navegador («la consulta tardó demasiado») y se queda sin saber qué falló,
+ * que es exactamente lo contrario de para qué existe esto.
+ *
+ * Por eso los tres pasos tienen tope y la suma tiene que entrar holgada en
+ * los 30 segundos del cliente. La prueba de abajo lo verifica: si alguien
+ * sube un tope sin mirar, salta ahí y no en producción.
+ */
+export const PRESUPUESTO_DIAGNOSTICO = {
+  /** Llegar al proveedor (un GET a la ficha del modelo). */
+  alcance: 6_000,
+  /** Generar una respuesta. Incluye los reintentos por saturación. */
+  prueba: 10_000,
+  /** El segundo intento, sin pensamiento. */
+  sinPensar: 5_000,
+  /** Lo que espera la pantalla antes de rendirse. */
+  topeCliente: 30_000,
+};
 
 /**
  * ¿SE LLEGA AL PROVEEDOR? — sin generar nada.
@@ -355,7 +378,7 @@ export async function probarModelo(timeoutMs = 45_000): Promise<{
  * De paso confirma que el modelo configurado EXISTE para esta cuenta, que es
  * exactamente lo que falló con el 2.5.
  */
-export async function alcanzaProveedor(timeoutMs = 10_000): Promise<{
+export async function alcanzaProveedor(timeoutMs = PRESUPUESTO_DIAGNOSTICO.alcance): Promise<{
   ok: boolean; ms: number; estado: number | null; error: string | null;
 }> {
   const arranque = Date.now();
