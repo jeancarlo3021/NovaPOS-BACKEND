@@ -202,8 +202,18 @@ const VentaSchema = z.object({
   precio_unitario: z.number().min(0).max(100_000_000).default(0),
   medio_pago: z.enum(['efectivo', 'sinpe', 'tarjeta', 'transferencia', 'otro']).default('efectivo'),
   categoria: z.enum(['impresion', 'diseno', 'material', 'reparacion', 'otro']).default('impresion'),
+  /** De qué artículo del catálogo salió, y cuál de sus precios se usó. */
+  producto_id: z.string().uuid().optional().nullable(),
+  variante: z.string().max(100).optional().nullable(),
+  /** El envío se cobra APARTE de la pieza: ver el comentario de la migración. */
+  envio: z.number().min(0).max(100_000_000).default(0),
+  envio_etiqueta: z.string().max(100).optional().nullable(),
   notas: z.string().max(500).optional().nullable(),
 });
+
+/** El total de una venta: las piezas más el envío. En un solo lugar. */
+const totalVenta = (cantidad: number, precio: number, envio: number) =>
+  Math.round(((Number(cantidad) || 0) * (Number(precio) || 0) + (Number(envio) || 0)) * 100) / 100;
 
 taller3d.get('/ventas', async (c) => {
   try {
@@ -222,12 +232,14 @@ taller3d.post('/ventas', async (c) => {
     const p = VentaSchema.safeParse(await c.req.json().catch(() => ({})));
     if (!p.success) return fail(c, 'Faltan datos de la venta', 422);
     const v = p.data;
-    const total = Math.round(v.cantidad * v.precio_unitario * 100) / 100;
+    const total = totalVenta(v.cantidad, v.precio_unitario, v.envio);
     const { data, error } = await db.from('taller_ventas').insert({
       tenant_id: c.get('tenantId'), fecha: v.fecha || hoyCR(),
       descripcion: v.descripcion.trim(), cliente: v.cliente?.trim() || null,
       cantidad: v.cantidad, precio_unitario: v.precio_unitario, total,
       medio_pago: v.medio_pago, categoria: v.categoria,
+      producto_id: v.producto_id || null, variante: v.variante?.trim() || null,
+      envio: v.envio, envio_etiqueta: v.envio_etiqueta?.trim() || null,
       notas: v.notas?.trim() || null, created_by: c.get('userId'),
     }).select().single();
     if (error) throw new Error(error.message);
@@ -240,12 +252,14 @@ taller3d.put('/ventas/:id', async (c) => {
     const p = VentaSchema.partial().safeParse(await c.req.json().catch(() => ({})));
     if (!p.success) return fail(c, 'Datos inválidos', 422);
     const v: any = { ...p.data, updated_at: new Date().toISOString() };
-    if (v.cantidad != null || v.precio_unitario != null) {
-      const { data: prev } = await db.from('taller_ventas').select('cantidad, precio_unitario')
+    if (v.cantidad != null || v.precio_unitario != null || v.envio != null) {
+      const { data: prev } = await db.from('taller_ventas').select('cantidad, precio_unitario, envio')
         .eq('id', c.req.param('id')).eq('tenant_id', c.get('tenantId')).maybeSingle();
-      const cant = Number(v.cantidad ?? (prev as any)?.cantidad ?? 1);
-      const pu = Number(v.precio_unitario ?? (prev as any)?.precio_unitario ?? 0);
-      v.total = Math.round(cant * pu * 100) / 100;
+      v.total = totalVenta(
+        v.cantidad ?? (prev as any)?.cantidad ?? 1,
+        v.precio_unitario ?? (prev as any)?.precio_unitario ?? 0,
+        v.envio ?? (prev as any)?.envio ?? 0,
+      );
     }
     const { data, error } = await db.from('taller_ventas').update(v)
       .eq('id', c.req.param('id')).eq('tenant_id', c.get('tenantId')).select().single();
@@ -358,14 +372,26 @@ taller3d.get('/resumen', async (c) => {
     const vs = (ventas ?? []) as any[];
     const gs = (gastos ?? []) as any[];
     const totalVentas = Math.round(vs.reduce((s, v) => s + Number(v.total ?? 0), 0) * 100) / 100;
+    /* El envío se cuenta aparte de las piezas: es la respuesta a «¿cuánto
+       cobré de envíos?», que no se puede sacar del total mezclado. */
+    const totalEnvios = Math.round(vs.reduce((s, v) => s + Number(v.envio ?? 0), 0) * 100) / 100;
     const totalGastos = Math.round(gs.reduce((s, g) => s + Number(g.monto ?? 0), 0) * 100) / 100;
 
     return ok(c, {
       desde, hasta,
       ventas: {
         total: totalVentas, cuantas: vs.length,
+        /** Lo cobrado por las piezas, sin el envío. */
+        piezas: Math.round((totalVentas - totalEnvios) * 100) / 100,
+        envios: totalEnvios,
+        cuantos_envios: vs.filter(v => Number(v.envio ?? 0) > 0).length,
         por_medio: sumar(vs, 'medio_pago', v => Number(v.total ?? 0)),
         por_categoria: sumar(vs, 'categoria', v => Number(v.total ?? 0)),
+        /* Por artículo del catálogo: es lo que dice qué se vende de verdad.
+           Lo que se escribió a mano cae en «Suelto». */
+        por_producto: sumar(
+          vs.map(v => ({ ...v, _art: v.producto_id ? `${v.descripcion}${v.variante ? ` · ${v.variante}` : ''}` : 'Suelto' })),
+          '_art', v => Number(v.total ?? 0) - Number(v.envio ?? 0)),
       },
       gastos: {
         total: totalGastos, cuantos: gs.length,
@@ -377,6 +403,138 @@ taller3d.get('/resumen', async (c) => {
          llama «queda», no «utilidad». */
       queda: Math.round((totalVentas - totalGastos) * 100) / 100,
     });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// ═══════════════════════════ CATÁLOGO ═══════════════════════════
+
+const VarianteSchema = z.object({
+  nombre: z.string().min(1).max(100),
+  precio: z.number().min(0).max(100_000_000),
+});
+
+const ArticuloSchema = z.object({
+  nombre: z.string().min(1).max(200),
+  descripcion: z.string().max(500).optional().nullable(),
+  categoria: z.enum(['impresion', 'diseno', 'material', 'reparacion', 'otro']).default('impresion'),
+  precio: z.number().min(0).max(100_000_000).default(0),
+  /** Los otros precios del MISMO artículo: chico/grande, PLA/resina… */
+  variantes: z.array(VarianteSchema).max(20).default([]),
+  horas: z.number().min(0).max(500).optional().nullable(),
+  material: z.string().max(100).optional().nullable(),
+  color: z.string().max(100).optional().nullable(),
+  activo: z.boolean().default(true),
+});
+
+taller3d.get('/catalogo', async (c) => {
+  try {
+    let q = db.from('taller_catalogo').select('*').eq('tenant_id', c.get('tenantId'));
+    if (c.req.query('todos') !== '1') q = q.eq('activo', true);
+    const { data, error } = await q.order('nombre').limit(1000);
+    if (error) throw new Error(error.message);
+    return ok(c, data ?? []);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+taller3d.post('/catalogo', async (c) => {
+  try {
+    const p = ArticuloSchema.safeParse(await c.req.json().catch(() => ({})));
+    if (!p.success) return fail(c, 'Falta el nombre del artículo', 422);
+    const a = p.data;
+    const { data, error } = await db.from('taller_catalogo').insert({
+      tenant_id: c.get('tenantId'), nombre: a.nombre.trim(),
+      descripcion: a.descripcion?.trim() || null, categoria: a.categoria,
+      /* Con variantes, el precio de arriba es el de la PRIMERA: así el
+         artículo siempre tiene un precio que mostrar, incluso donde no caben
+         las variantes (una lista, un total). */
+      precio: a.variantes.length > 0 ? a.variantes[0].precio : a.precio,
+      variantes: a.variantes,
+      horas: a.horas ?? null, material: a.material?.trim() || null,
+      color: a.color?.trim() || null, activo: a.activo,
+    }).select().single();
+    if (error) throw new Error(error.message);
+    return ok(c, data, 201);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+taller3d.put('/catalogo/:id', async (c) => {
+  try {
+    const p = ArticuloSchema.partial().safeParse(await c.req.json().catch(() => ({})));
+    if (!p.success) return fail(c, 'Datos inválidos', 422);
+    const a: any = { ...p.data, updated_at: new Date().toISOString() };
+    if (Array.isArray(a.variantes) && a.variantes.length > 0) a.precio = a.variantes[0].precio;
+    const { data, error } = await db.from('taller_catalogo').update(a)
+      .eq('id', c.req.param('id')).eq('tenant_id', c.get('tenantId')).select().single();
+    if (error) throw new Error(error.message);
+    return ok(c, data);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+taller3d.delete('/catalogo/:id', async (c) => {
+  try {
+    /* Un artículo ya vendido no se borra: se desactiva. Borrarlo dejaría las
+       ventas viejas apuntando a la nada y el desglose por artículo mentiría. */
+    const { data: vendido } = await db.from('taller_ventas').select('id')
+      .eq('tenant_id', c.get('tenantId')).eq('producto_id', c.req.param('id')).limit(1);
+    if ((vendido ?? []).length > 0) {
+      const { data, error } = await db.from('taller_catalogo')
+        .update({ activo: false, updated_at: new Date().toISOString() })
+        .eq('id', c.req.param('id')).eq('tenant_id', c.get('tenantId')).select().single();
+      if (error) throw new Error(error.message);
+      return ok(c, { ...(data as any), desactivado: true });
+    }
+    const { error } = await db.from('taller_catalogo').delete()
+      .eq('id', c.req.param('id')).eq('tenant_id', c.get('tenantId'));
+    if (error) throw new Error(error.message);
+    return ok(c, { borrado: true });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// ── Tarifas de envío ───────────────────────────────────────────────────────
+
+taller3d.get('/tarifas', async (c) => {
+  try {
+    const { data, error } = await db.from('taller_envios_tarifas').select('*')
+      .eq('tenant_id', c.get('tenantId')).order('monto').limit(100);
+    if (error) throw new Error(error.message);
+    return ok(c, data ?? []);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+taller3d.post('/tarifas', async (c) => {
+  try {
+    const b = await c.req.json().catch(() => ({}));
+    const nombre = String(b?.nombre ?? '').trim();
+    if (!nombre) return fail(c, 'La tarifa necesita un nombre', 422);
+    const { data, error } = await db.from('taller_envios_tarifas').insert({
+      tenant_id: c.get('tenantId'), nombre,
+      monto: Math.max(0, Number(b?.monto) || 0), activo: b?.activo ?? true,
+    }).select().single();
+    if (error) throw new Error(error.message);
+    return ok(c, data, 201);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+taller3d.put('/tarifas/:id', async (c) => {
+  try {
+    const b = await c.req.json().catch(() => ({}));
+    const patch: any = { updated_at: new Date().toISOString() };
+    if (b?.nombre != null) patch.nombre = String(b.nombre).trim();
+    if (b?.monto != null) patch.monto = Math.max(0, Number(b.monto) || 0);
+    if (b?.activo != null) patch.activo = !!b.activo;
+    const { data, error } = await db.from('taller_envios_tarifas').update(patch)
+      .eq('id', c.req.param('id')).eq('tenant_id', c.get('tenantId')).select().single();
+    if (error) throw new Error(error.message);
+    return ok(c, data);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+taller3d.delete('/tarifas/:id', async (c) => {
+  try {
+    const { error } = await db.from('taller_envios_tarifas').delete()
+      .eq('id', c.req.param('id')).eq('tenant_id', c.get('tenantId'));
+    if (error) throw new Error(error.message);
+    return ok(c, { borrada: true });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
@@ -443,6 +601,8 @@ taller3d.delete('/impresoras/:id', async (c) => {
 
 const ImpresionSchema = z.object({
   pieza: z.string().min(1).max(300),
+  /** Si salió del catálogo, de cuál artículo. Las horas se traen de ahí. */
+  producto_id: z.string().uuid().optional().nullable(),
   cliente: z.string().max(200).optional().nullable(),
   customer_id: z.string().uuid().optional().nullable(),
   cantidad: z.number().int().positive().max(1000).default(1),
@@ -472,6 +632,7 @@ taller3d.post('/impresiones', async (c) => {
     const t = p.data;
     const { data, error } = await db.from('impresiones').insert({
       tenant_id: c.get('tenantId'), pieza: t.pieza.trim(),
+      producto_id: t.producto_id || null,
       cliente: t.cliente?.trim() || null, customer_id: t.customer_id || null,
       cantidad: t.cantidad, horas: t.horas,
       material: t.material?.trim() || null, color: t.color?.trim() || null,
