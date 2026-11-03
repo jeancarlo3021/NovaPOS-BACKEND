@@ -67,9 +67,19 @@ function llaveDe(p: ProveedorIA): string {
 
 /** Modelo por omisión de cada proveedor: el más barato que alcanza. */
 const MODELO_POR_DEFECTO: Record<ProveedorIA, string> = {
-  gemini: 'gemini-2.5-flash',
+  /* `gemini-2.5-flash` dejó de estar disponible para cuentas nuevas: Google
+     contesta 404 diciendo que hay que pasar a 3.8. Se cambió el valor por
+     omisión en vez de pedirle a cada instalación que ponga `IA_MODELO`: un
+     modelo descontinuado por omisión es una falla silenciosa esperando. */
+  gemini: 'gemini-3.8-flash',
   anthropic: 'claude-haiku-5-5',
 };
+
+/** La versión mayor del modelo de Gemini: «gemini-3.8-flash» → 3. */
+function versionGemini(modelo: string): number {
+  const m = /gemini-(\d+)/.exec(modelo);
+  return m ? Number(m[1]) : 0;
+}
 
 /** Modelo a usar cuando se encienda. El más barato alcanza para estas tareas. */
 export function modeloIA(): string {
@@ -329,18 +339,30 @@ async function pedirAGemini(sistema: string, mensaje: string, maxTokens: number,
   const llave = llaveDe('gemini');
   if (!llave) return null;
 
-  const generationConfig: Record<string, unknown> = {
-    maxOutputTokens: maxTokens,
-    temperature: 0.2,
-  };
-  /* Los «2.5» piensan antes de contestar y ESO SE PAGA. Para elegir un código
-     o redactar dos líneas no hace falta: se apaga. */
-  if (/2\.5|3\./.test(modelo)) generationConfig.thinkingConfig = { thinkingBudget: 0 };
+  /**
+   * LA CONFIGURACIÓN CAMBIÓ CON GEMINI 3.
+   *
+   *  · `thinkingBudget` (un número de tokens) se reemplazó por
+   *    `thinkingLevel`, un enum: low | medium | high. En 3.8 «minimal» ya no
+   *    existe y devuelve error, así que lo más bajo que se puede pedir es
+   *    «low» —que es justo lo que necesitan estas tareas: elegir un código
+   *    entre cuatro candidatos no requiere pensar, requiere leer—.
+   *  · `temperature`, `topP` y `topK` quedaron deprecados y hay que sacarlos.
+   *
+   * Y como ahora el modelo piensa aunque sea un poco, el tope de salida no
+   * puede ser de ocho tokens: lo que piensa sale del mismo presupuesto y la
+   * respuesta llegaría vacía con `finishReason: MAX_TOKENS`. Por eso hay un
+   * piso cuando el modelo es de los que piensan.
+   */
+  const v3 = versionGemini(modelo) >= 3;
+  const generationConfig: Record<string, unknown> = v3
+    ? { maxOutputTokens: Math.max(maxTokens, 512), thinkingConfig: { thinkingLevel: 'low' } }
+    : { maxOutputTokens: maxTokens, temperature: 0.2, ...(/2\.5/.test(modelo) ? { thinkingConfig: { thinkingBudget: 0 } } : {}) };
 
   const ctrl = new AbortController();
   const corte = setTimeout(() => ctrl.abort(), 20_000);
   try {
-    const r = await fetch(
+    const llamar = async (cfg: Record<string, unknown>) => fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelo)}:generateContent`,
       {
         method: 'POST',
@@ -349,10 +371,29 @@ async function pedirAGemini(sistema: string, mensaje: string, maxTokens: number,
         body: JSON.stringify({
           systemInstruction: { parts: [{ text: sistema }] },
           contents: [{ role: 'user', parts: [{ text: mensaje }] }],
-          generationConfig,
+          generationConfig: cfg,
         }),
       },
     );
+
+    let r = await llamar(generationConfig);
+    /*
+     * SI LA PELEA ES POR EL CAMPO DE PENSAR, SE PREGUNTA SIN ÉL.
+     *
+     * Las opciones de razonamiento vienen cambiando de nombre en cada
+     * versión, y cuál acepta cada modelo no está documentado parejo. Un 400
+     * por ese campo dejaría al sistema entero sin IA por una preferencia de
+     * costo: se reintenta una vez sin él, que es peor para la cuenta pero
+     * mejor que no contestar.
+     */
+    if (!r.ok && r.status === 400 && generationConfig.thinkingConfig) {
+      const detalle = await r.clone().text().catch(() => '');
+      if (/thinking/i.test(detalle)) {
+        const { thinkingConfig: _fuera, ...sinPensar } = generationConfig;
+        console.warn('[ia] Gemini rechazó la opción de pensamiento; se reintenta sin ella:', detalle.slice(0, 160));
+        r = await llamar(sinPensar);
+      }
+    }
     if (!r.ok) {
       const detalle = await r.text().catch(() => '');
       throw new Error(`Gemini respondió ${r.status}: ${detalle.slice(0, 300)}`);
