@@ -96,6 +96,22 @@ app.use('*', cors({
 app.get('/health', (c) => c.json({
   ok: true,
   ts: new Date().toISOString(),
+  /**
+   * QUÉ VERSIÓN ESTÁ CORRIENDO DE VERDAD.
+   *
+   * Vercel pone estas variables en cada despliegue. Sin esto, saber si un
+   * arreglo ya está arriba es adivinar: se mira el panel, se cruza con el
+   * commit y se termina probando contra código viejo —que es exactamente lo
+   * que pasó varias veces hoy—. Con esto se abre /health y se compara el
+   * `commit` con el del repositorio: listo.
+   */
+  version: {
+    commit: (process.env.VERCEL_GIT_COMMIT_SHA ?? '').slice(0, 7) || '(local)',
+    mensaje: process.env.VERCEL_GIT_COMMIT_MESSAGE ?? null,
+    rama: process.env.VERCEL_GIT_COMMIT_REF ?? null,
+    desplegado: process.env.VERCEL_DEPLOYMENT_ID ?? null,
+    entorno: process.env.VERCEL_ENV ?? 'local',
+  },
   env: {
     supabase_url:  !!process.env.SUPABASE_URL,
     service_key:   !!process.env.SUPABASE_SERVICE_ROLE_KEY,

@@ -148,7 +148,7 @@ export interface ReceiveSummary {
   /** Correos de la ventana que quedaron sin mirar en esta corrida. */
   restantes?: number;
   /** Qué buzones se miraron y cuántos correos había en cada uno. */
-  buzones?: Array<{ buzon: string; mirados: number }>;
+  buzones?: Array<{ buzon: string; mirados: number; cortado?: boolean; ms?: number }>;
   /** Correos que ya se habían examinado en corridas anteriores: se saltearon. */
   ya_vistos?: number;
   /**
@@ -310,9 +310,31 @@ export async function fetchAndProcessReceivedEmails(
      * existe justamente para esto. Si el servidor no la informa, recién ahí
      * se prueban los nombres de siempre.
      */
+    /**
+     * CADA BUZÓN TIENE SU PARTE DEL TIEMPO, Y EL ORDEN ROTA.
+     *
+     * Con un solo plazo compartido y la bandeja de entrada siempre primera,
+     * el spam no se leía NUNCA: la bandeja se llevaba los catorce segundos y
+     * el recorrido se cortaba antes de llegar. Medido en una corrida real:
+     * 36 correos mirados, todos de INBOX, y el buzón de spam ni se abrió.
+     *
+     * Ahora el tiempo se divide entre los buzones que faltan y el primero
+     * rota, así que ninguno queda postergado para siempre.
+     */
+    const buzones = await buzonesAMirar(client);
+    const giro = Math.floor(Date.now() / 900_000) % Math.max(1, buzones.length);
+    const enOrden = [...buzones.slice(giro), ...buzones.slice(0, giro)];
+
     let sinTiempo = false;
-    for (const buzon of await buzonesAMirar(client)) {
-      if (sinTiempo || Date.now() - arranque > LIMITE_TOTAL) break;
+    for (const [i, buzon] of enOrden.entries()) {
+      if (Date.now() - arranque > LIMITE_TOTAL) break;
+      /* Lo que le toca a ESTE buzón: lo que queda, repartido entre los que
+         faltan. El corte por tiempo de uno ya no frena a los demás. */
+      const quedan = enOrden.length - i;
+      const restante = LIMITE_TOTAL - (Date.now() - arranque);
+      const limiteBuzon = Math.max(3_000, Math.floor(restante / quedan));
+      const arranqueBuzon = Date.now();
+      sinTiempo = false;
       const antes = summary.scanned;
       try {
         const lock = await client.getMailboxLock(buzon);
@@ -348,15 +370,18 @@ export async function fetchAndProcessReceivedEmails(
           /* El plazo lo manda quien llama: este trabajo comparte el tiempo con
              los respaldos, los avisos y los anuncios, y un número fijo escrito
              acá no sabe nada de eso. */
-          const LIMITE_MS = LIMITE_TOTAL;
+          const LIMITE_MS = limiteBuzon;
           const todos = [...encontrados].reverse();
           const uids = todos.filter((u: any) => !vistos.has(Number(u)));
           summary.ya_vistos = (summary.ya_vistos ?? 0) + (todos.length - uids.length);
 
           for (const uid of uids) {
-            if (Date.now() - arranque > LIMITE_MS) {
+            if (Date.now() - arranqueBuzon > LIMITE_MS || Date.now() - arranque > LIMITE_TOTAL) {
               summary.cortado_por_tiempo = true;
-              summary.restantes = uids.length - summary.scanned;
+              /* Lo que falta de ESTE buzón, sumado a lo de los otros: antes
+                 se restaba el total mirado en todos los buzones contra los
+                 correos de uno solo, y el número salía mal. */
+              summary.restantes = (summary.restantes ?? 0) + (uids.length - (summary.scanned - antes));
               sinTiempo = true;
               break;
             }
@@ -415,7 +440,8 @@ export async function fetchAndProcessReceivedEmails(
           lock.release();
         }
         summary.buzones = [...(summary.buzones ?? []),
-          { buzon, mirados: summary.scanned - antes }];
+          { buzon, mirados: summary.scanned - antes, cortado: sinTiempo,
+            ms: Date.now() - arranqueBuzon }];
       } catch (e: any) {
         /* Un buzón que no se puede abrir no puede dejar sin leer a los
            demás: el spam puede no existir y la bandeja de entrada sí. */
