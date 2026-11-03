@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
-import { respuesta, modoIA, pedirAlModelo, proveedorIA, modeloIA, probarModelo, alcanzaProveedor } from '../services/ia.js';
+import { respuesta, modoIA, pedirAlModelo, proveedorIA, modeloIA, probarModelo, alcanzaProveedor, modelosDisponibles } from '../services/ia.js';
 import { estadoCreditos, tomarCredito, devolverCredito } from '../services/creditosIA.js';
 import { sugerirCabys } from './cabys.js';
 import { planFeatureLabels } from '../services/emailService.js';
@@ -82,6 +82,12 @@ ia.get('/diagnostico', async (c) => {
       ? await probarModelo()
       : { ok: false, ms: 0, respuesta: null, error: null as string | null };
 
+    /* CUANDO FALLA GENERAR, LA PREGUNTA ES «¿Y ENTONCES CUÁL PONGO?».
+       La llave ya sabe qué modelos puede usar: se le pregunta, en vez de
+       mandar a alguien a buscar en la documentación cuál existe y cuál
+       admite su plan. Solo cuando hace falta: es gratis, pero son segundos. */
+    const alternativas = llave && alcance.ok && !prueba.ok ? await modelosDisponibles() : [];
+
     /* QUÉ HAY QUE HACER, en una línea. Un diagnóstico que deja al usuario
        interpretando cuatro banderas no sirve de nada. */
     const queHacer = !llave
@@ -109,7 +115,10 @@ ia.get('/diagnostico', async (c) => {
                perder la tarde tocando lo único que estaba bien. */
             : /saturado|UNAVAILABLE|high demand|RESOURCE_EXHAUSTED/i.test(prueba.error ?? '')
               ? 'No es tu configuración: el modelo está saturado del lado de Google y ya se reintentó solo. '
-                + 'Probá de nuevo en unos minutos; si pasa seguido, poné otro modelo en IA_MODELO o habilitá facturación en el proyecto de Google.'
+                + (alternativas.length > 0
+                    ? `Poné otro en IA_MODELO —tu llave puede usar ${alternativas.length}— o habilitá facturación en el proyecto de Google. `
+                      + 'Con IA_MODELO_RESPALDO el sistema se pasa solo al segundo cuando el primero está lleno.'
+                    : 'Probá de nuevo en unos minutos, o habilitá facturación en el proyecto de Google.')
             : /espera/i.test(prueba.error ?? '')
               /* Se llega pero no genera a tiempo: eso ya no es conexión. */
               ? `Se llega a ${proveedor} (${alcance.ms} ms) pero la respuesta no llegó a tiempo. Probá de nuevo; si sigue, subí IA_ESPERA_MS en el servidor.`
@@ -129,6 +138,8 @@ ia.get('/diagnostico', async (c) => {
       llave: { presente: !!llave, largo: llave.length },
       /** ¿Se LLEGA al proveedor? (sin generar nada) */
       alcance,
+      /** Los modelos que esta llave puede usar, por si hay que cambiar. */
+      alternativas,
       prueba,
       que_hacer: queHacer,
       /* Para qué se usa hoy, así la pantalla puede decirlo sin inventar. */

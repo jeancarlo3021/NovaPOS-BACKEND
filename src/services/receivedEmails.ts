@@ -153,8 +153,14 @@ export interface ReceiveSummary {
 // ── Entrada principal: lee el buzón y procesa ────────────────────────────────
 // `debug` devuelve, por cada correo, sus adjuntos (nombre, tipo, tamaño) y si se
 // detectó XML — para diagnosticar por qué un correo no entra a la bandeja.
-export async function fetchAndProcessReceivedEmails(opts?: { debug?: boolean }): Promise<ReceiveSummary> {
+export async function fetchAndProcessReceivedEmails(
+  opts?: { debug?: boolean; presupuestoMs?: number },
+): Promise<ReceiveSummary> {
   const debug = !!opts?.debug;
+  /* El cronómetro arranca ACÁ, no al empezar a leer correos: conectarse al
+     buzón y buscar también gastan tiempo del presupuesto, y cuando el buzón
+     está lento eso es justo lo que se come la corrida. */
+  const arranque = Date.now();
   const debugInfo: any[] = [];
   const summary: ReceiveSummary = { scanned: 0, processed: 0, duplicates: 0, noTenant: 0, skipped: 0, errors: 0 };
 
@@ -203,8 +209,10 @@ export async function fetchAndProcessReceivedEmails(opts?: { debug?: boolean }):
        * corridas pasadas y la deduplicación por clave impide duplicarlos. Con el
        * plazo, el proceso termina bien y dice cuántos quedaron sin mirar.
        */
-      const LIMITE_MS = Math.max(5_000, Number(process.env.RECEPTION_BUDGET_MS || 22_000));
-      const arranque = Date.now();
+      /* El plazo lo manda quien llama: este trabajo comparte el tiempo con
+         los respaldos, los avisos y los anuncios, y un número fijo escrito
+         acá no sabe nada de eso. */
+      const LIMITE_MS = Math.max(4_000, opts?.presupuestoMs ?? (Number(process.env.RECEPTION_BUDGET_MS) || 22_000));
       const uids = [...encontrados].reverse();
 
       for (const uid of uids) {

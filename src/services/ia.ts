@@ -353,14 +353,55 @@ export async function probarModelo(timeoutMs = PRESUPUESTO_DIAGNOSTICO.prueba): 
  */
 export const PRESUPUESTO_DIAGNOSTICO = {
   /** Llegar al proveedor (un GET a la ficha del modelo). */
-  alcance: 6_000,
+  alcance: 5_000,
   /** Generar una respuesta. Incluye los reintentos por saturación. */
-  prueba: 10_000,
+  prueba: 8_000,
   /** El segundo intento, sin pensamiento. */
-  sinPensar: 5_000,
+  sinPensar: 4_000,
+  /** Listar qué modelos puede usar esta llave (solo si falló generar). */
+  lista: 4_000,
   /** Lo que espera la pantalla antes de rendirse. */
   topeCliente: 30_000,
 };
+
+/**
+ * QUÉ MODELOS PUEDE USAR ESTA LLAVE.
+ *
+ * Cuando el modelo configurado no sirve —saturado, descontinuado, sin
+ * permiso— la pregunta siguiente es siempre «¿y entonces cuál pongo?», y
+ * contestarla hoy significa salir a buscar en la documentación cuál existe,
+ * cuál está disponible en tu región y cuál admite tu plan. La llave ya sabe
+ * la respuesta: se le pregunta.
+ *
+ * Es un GET que no genera nada y no cuesta. Se filtran los que sirven para lo
+ * que hacemos —generar contenido— porque ofrecer un modelo de embeddings como
+ * alternativa sería mandar a alguien a una pared.
+ */
+export async function modelosDisponibles(timeoutMs = PRESUPUESTO_DIAGNOSTICO.lista): Promise<string[]> {
+  const proveedor = proveedorIA();
+  const llave = llaveDe(proveedor);
+  if (!llave) return [];
+  const ctrl = new AbortController();
+  const corte = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    if (proveedor === 'anthropic') {
+      const r = await fetch('https://api.anthropic.com/v1/models?limit=40',
+        { headers: { 'x-api-key': llave, 'anthropic-version': '2023-06-01' }, signal: ctrl.signal });
+      if (!r.ok) return [];
+      const j: any = await r.json();
+      return ((j?.data ?? []) as any[]).map(m => String(m?.id ?? '')).filter(Boolean);
+    }
+    const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=200',
+      { headers: { 'x-goog-api-key': llave }, signal: ctrl.signal });
+    if (!r.ok) return [];
+    const j: any = await r.json();
+    return ((j?.models ?? []) as any[])
+      .filter(m => (m?.supportedGenerationMethods ?? []).includes('generateContent'))
+      .map(m => String(m?.name ?? '').replace(/^models\//, ''))
+      .filter(Boolean);
+  } catch { return []; }
+  finally { clearTimeout(corte); }
+}
 
 /**
  * ¿SE LLEGA AL PROVEEDOR? — sin generar nada.
@@ -439,6 +480,9 @@ async function pedirAClaude(sistema: string, mensaje: string, maxTokens: number,
  * despliegue. La llave viaja en la cabecera, nunca en la dirección: en la
  * dirección queda escrita en los registros de cualquier intermediario.
  */
+/** El modelo de respaldo, para cuando el principal está saturado. */
+const modeloRespaldo = () => String(process.env.IA_MODELO_RESPALDO ?? '').trim();
+
 async function pedirAGemini(sistema: string, mensaje: string, maxTokens: number, modelo: string, timeoutMs = ESPERA_MS, sinPensar = false): Promise<string | null> {
   const llave = llaveDe('gemini');
   if (!llave) return null;
@@ -534,6 +578,21 @@ async function pedirAGemini(sistema: string, mensaje: string, maxTokens: number,
       /* El código va por delante y en palabras: «503» a secas manda a revisar
          la llave, que es exactamente lo que NO hay que tocar. */
       if (REINTENTABLES.includes(r.status)) {
+        /**
+         * EL RESPALDO: otro modelo antes que ningún modelo.
+         *
+         * Si el principal está saturado y hay uno de respaldo configurado, se
+         * pregunta ahí. Una importación de seiscientos productos no puede
+         * quedarse sin clasificar porque el modelo de moda esté lleno, y el
+         * de respaldo elige entre los mismos candidatos: lo peor que puede
+         * pasar es que elija un poco peor.
+         */
+        const respaldo = modeloRespaldo();
+        if (respaldo && respaldo !== modelo) {
+          console.warn(`[ia] ${modelo} saturado (${r.status}); se pregunta al respaldo ${respaldo}`);
+          const queda = timeoutMs - (Date.now() - arranque);
+          if (queda > 2_000) return await pedirAGemini(sistema, mensaje, maxTokens, respaldo, queda, sinPensar);
+        }
         throw new Error(`El modelo está saturado del lado de ${r.status === 429 ? 'tu cuota' : 'Google'} (${r.status}). `
           + `Se reintentó 3 veces. ${detalle.slice(0, 200)}`);
       }
