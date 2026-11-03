@@ -225,7 +225,8 @@ export type ItemCabys = string | { nombre: string; contexto?: string | null };
 
 export async function sugerirCabys(
   entradas: ItemCabys[],
-  opciones: { alternativas?: boolean } = {},
+  /** `cuantas` = cuántas alternativas devolver (3 para la pantalla, más para el modelo). */
+  opciones: { alternativas?: boolean; cuantas?: number } = {},
 ): Promise<any[]> {
   /*
    * EL DEPARTAMENTO DEL ARCHIVO AYUDA A DECIDIR.
@@ -358,7 +359,7 @@ export async function sugerirCabys(
           coincidencia: Math.round((pt / pesoTotal) * 100),
         }))
         .filter(x => x.code !== excluir)
-        .slice(0, 3);
+        .slice(0, Math.max(1, Math.min(20, opciones.cuantas ?? 3)));
     };
 
     /**

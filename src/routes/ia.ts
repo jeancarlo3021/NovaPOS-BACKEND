@@ -668,23 +668,6 @@ ia.post('/descripciones', async (c) => {
  * diferencia con el modelo encendido es la calidad de la elección entre
  * candidatos, no que aparezcan códigos nuevos.
  */
-/**
- * ¿Es el dueño del sistema? (su plan trae `admin_dashboard`).
- *
- * Mismo criterio que usa la configuración de FE. Se repite acá en vez de
- * exportarlo para no atar dos rutas por una función de cuatro líneas.
- */
-async function esSuperAdmin(userId: string): Promise<boolean> {
-  try {
-    const { data: u } = await db.from('users').select('tenant_id').eq('id', userId).maybeSingle();
-    if (!u?.tenant_id) return false;
-    const { data: t } = await db.from('tenants').select('plan_id').eq('id', (u as any).tenant_id).maybeSingle();
-    if (!(t as any)?.plan_id) return false;
-    const { data: p } = await db.from('subscription_plans').select('features').eq('id', (t as any).plan_id).maybeSingle();
-    return ((p as any)?.features)?.admin_dashboard === true;
-  } catch { return false; }
-}
-
 ia.post('/cabys', async (c) => {
   try {
     const body = await c.req.json().catch(() => ({}));
@@ -706,7 +689,11 @@ ia.post('/cabys', async (c) => {
     if (nombres.length === 0) return fail(c, 'Mandá al menos un nombre de producto', 422);
     if (nombres.length > 200) return fail(c, 'Máximo 200 productos por consulta', 422);
 
-    const base = await sugerirCabys(items, { alternativas: true });
+    /* Ocho alternativas, no tres: el modelo elige ENTRE LOS CANDIDATOS, así
+       que la calidad del resultado está limitada por cuántos candidatos
+       razonables le lleguen. La pantalla sigue mostrando las tres primeras
+       —ocho botones por fila no se revisan—, pero el modelo las ve todas. */
+    const base = await sugerirCabys(items, { alternativas: true, cuantas: 8 });
 
     /**
      * Los que quedaron flojos son los que valen la pena repasar.
@@ -720,21 +707,27 @@ ia.post('/cabys', async (c) => {
 
     let revisados = 0;
     /**
-     * EL MODELO SOLO SE USA EN LA CARGA MASIVA, Y SOLO PARA EL DUEÑO.
+     * EL MODELO SE USA EN LA CARGA DE PRODUCTOS, PARA CUALQUIER NEGOCIO.
      *
-     * Cada consulta cuesta. El buscador local sigue atendiendo a todos los
-     * negocios sin costo; el modelo entra únicamente cuando el dueño del
-     * sistema está importando un catálogo, que es donde hay cientos de
-     * productos que clasificar de una vez y donde vale la pena pagarlo.
+     * Antes estaba reservado al dueño del sistema por el costo. El costo
+     * sigue existiendo, pero poner mal un CAByS le cuesta al negocio frente a
+     * Hacienda mucho más de lo que cuesta la consulta, y el momento de
+     * ponerlo bien es cuando se carga el catálogo: después nadie vuelve a
+     * revisar mil filas.
      *
-     * Las dos condiciones se verifican en el SERVIDOR: el `origen` que manda
-     * la pantalla no alcanza por sí solo —cualquiera puede mandarlo— y por eso
-     * va junto con el permiso del usuario.
+     * Sigue acotado a la IMPORTACIÓN, que es donde hay cientos de productos
+     * que clasificar de una vez. Un producto suelto lo resuelve el buscador
+     * local, gratis y al instante.
+     *
+     * Lo que impide que esto sea una puerta abierta al modelo no es el
+     * permiso: es que la respuesta está acotada a los candidatos que armamos
+     * nosotros (ver la regla de abajo). Lo peor que puede salir de acá es un
+     * CAByS real mal elegido, nunca uno inventado ni un texto cualquiera.
      */
     const origen = String(body?.origen ?? '').trim();
     const permiso = {
       motivo: `cabys:${origen || 'sin-origen'}`,
-      autorizado: origen === 'importacion' && await esSuperAdmin(c.get('userId')),
+      autorizado: origen === 'importacion',
     };
 
     if (modoIA() === 'real' && permiso.autorizado && dudosos.length > 0) {
@@ -746,20 +739,27 @@ ia.post('/cabys', async (c) => {
        * en Vercel y el importador recibe un error en vez de las sugerencias
        * que SÍ se resolvieron solas.
        *
-       * De a cinco a la vez, treinta dudosos son unos diez segundos. Y el tope
-       * de 40 por lote es un freno de mano para el gasto: un archivo con
-       * quinientos nombres raros no puede convertirse en quinientas consultas
-       * sin que nadie lo haya decidido. Lo que no alcanzó a revisarse queda
-       * con su sugerencia local y sus alternativas, que es lo de siempre.
+       * De a diez a la vez, cien dudosos son unos doce segundos, que entra en
+       * la ventana de la función. La pantalla manda de a cien nombres por
+       * pedido, así que ese es el techo real de cada tanda.
+       *
+       * YA NO HAY TOPE DE CUÁNTOS SE REVISAN. Lo había —40 por lote— como
+       * freno de mano para el gasto, y dejaba la mitad de un catálogo largo
+       * sin repasar justo en la carga, que es la única vez que alguien mira
+       * esas filas. Lo que frena el gasto ahora es la caché: el mismo producto
+       * clasificado por otro negocio no se vuelve a preguntar.
        */
-      const A_LA_VEZ = 5;
-      const TOPE_POR_LOTE = 40;
-      const cola = dudosos.slice(0, TOPE_POR_LOTE);
+      const A_LA_VEZ = 10;
+      const cola = dudosos;
 
       const revisarUno = async (item: any) => {
+        /* El IVA viaja con cada candidato porque el código y su tarifa no se
+           pueden separar: si el modelo elige otro código y se deja el IVA del
+           anterior, el negocio termina cobrando un impuesto que no es el de
+           lo que vende. */
         const candidatos = [
-          ...(item.code ? [{ code: item.code, description: item.description }] : []),
-          ...((item.alternativas ?? []) as any[]).map(a => ({ code: a.code, description: a.description })),
+          ...(item.code ? [{ code: item.code, description: item.description, iva_rate: item.iva_rate }] : []),
+          ...((item.alternativas ?? []) as any[]).map(a => ({ code: a.code, description: a.description, iva_rate: a.iva_rate })),
         ];
         if (candidatos.length < 2) return;
         const elegido = await pedirAlModelo({
@@ -771,6 +771,12 @@ ia.post('/cabys', async (c) => {
             + candidatos.map(x => `${x.code} — ${x.description}`).join('\n'),
           maxTokens: 120,
           permiso,
+          /* GUARDADA UN MES Y MEDIO, Y COMPARTIDA ENTRE NEGOCIOS.
+             «Coca-Cola 600 ml» con los mismos candidatos se clasifica igual
+             hoy que en diciembre, y la van a importar veinte negocios. Sin
+             ámbito a propósito: que el segundo negocio no pague lo que ya
+             pagó el primero es justo lo que hace que esto sea barato. */
+          cacheMin: 60 * 24 * 45,
         });
         if (!elegido) return;
         const [codigo, razon] = String(elegido).split('|').map(x => x.trim());
@@ -780,6 +786,7 @@ ia.post('/cabys', async (c) => {
         if (!valido) return;
         item.code = valido.code;
         item.description = valido.description;
+        item.iva_rate = valido.iva_rate ?? null;
         item.fuente = 'ia';
         item.motivo = razon || item.motivo;
         revisados += 1;
@@ -800,6 +807,14 @@ ia.post('/cabys', async (c) => {
         alta: base.filter((x: any) => x.confianza === 'alta').length,
         para_revisar: dudosos.length,
         revisados_por_el_modelo: revisados,
+      },
+      /* La pantalla tiene que poder decir QUIÉN contestó: con el modelo
+         apagado las sugerencias son las del buscador local y se revisan
+         distinto. Un «no pasó nada» silencioso se lee como que la IA falló. */
+      modelo: {
+        encendido: modoIA() === 'real',
+        autorizado: permiso.autorizado,
+        revisados,
       },
     }));
   } catch (err: any) { return fail(c, err.message, 500); }

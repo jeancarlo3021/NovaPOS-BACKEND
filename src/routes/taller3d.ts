@@ -54,13 +54,59 @@ export interface ConfigTaller {
   hora_corte_entrega: string;
   /** Días en que se entrega. 0 = domingo. */
   dias_entrega: number[];
+  /** Qué porcentaje de las ventas es comisión. */
+  comision_ventas: number;
+  /** Qué porcentaje de los gastos se le descuenta a las ventas antes. */
+  comision_gastos: number;
 }
 
 const CONFIG_POR_DEFECTO: ConfigTaller = {
   margen_horas: 2,
   hora_corte_entrega: '16:00',
   dias_entrega: [1, 2, 3, 4, 5, 6],
+  comision_ventas: 30,
+  comision_gastos: 15,
 };
+
+/** Un porcentaje válido (0–100), o el que ya estaba. */
+const pct = (v: any, previo: number) => {
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 && n <= 100 ? Math.round(n * 100) / 100 : previo;
+};
+
+/**
+ * LA COMISIÓN de la semana.
+ *
+ * Es un 30 % de las ventas, pero no de las ventas brutas: antes se les
+ * descuenta un 15 % de los gastos. Los dos porcentajes se configuran, porque
+ * el trato cambia y nadie debería tener que pedir un cambio de código para
+ * eso.
+ *
+ * Se devuelve TODO el cálculo —el descuento, la base y el monto—, no solo el
+ * resultado: una comisión que uno no puede recalcular a mano es una comisión
+ * que no se discute, se pelea.
+ */
+export function calcularComision(ventas: number, gastos: number, cfg: ConfigTaller): {
+  porcentaje_ventas: number; porcentaje_gastos: number;
+  ventas: number; gastos: number;
+  /** El 15 % de los gastos, que es lo que se le resta a las ventas. */
+  gastos_descontados: number;
+  /** Ventas menos ese descuento: sobre esto se calcula la comisión. */
+  base: number;
+  monto: number;
+} {
+  const r = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
+  const v = r(ventas), g = r(gastos);
+  const descuento = r(g * (cfg.comision_gastos / 100));
+  const base = r(v - descuento);
+  return {
+    porcentaje_ventas: cfg.comision_ventas, porcentaje_gastos: cfg.comision_gastos,
+    ventas: v, gastos: g, gastos_descontados: descuento, base,
+    /* Si los gastos se comieron las ventas la comisión es cero, no negativa:
+       una comisión en rojo no es una deuda del vendedor. */
+    monto: Math.max(0, r(base * (cfg.comision_ventas / 100))),
+  };
+}
 
 export async function leerConfigTaller(tenantId: string): Promise<ConfigTaller> {
   try {
@@ -438,9 +484,10 @@ taller3d.get('/resumen', async (c) => {
     const desde = c.req.query('fecha') || hoyCR();
     const hasta = c.req.query('hasta') || desde;
 
-    const [{ data: ventas }, { data: gastos }] = await Promise.all([
+    const [{ data: ventas }, { data: gastos }, cfg] = await Promise.all([
       db.from('taller_ventas').select('*').eq('tenant_id', tenantId).gte('fecha', desde).lte('fecha', hasta),
       db.from('taller_gastos').select('*').eq('tenant_id', tenantId).gte('fecha', desde).lte('fecha', hasta),
+      leerConfigTaller(tenantId),
     ]);
 
     /* El corte por artículo sale de las LÍNEAS, no de la cabeza de la venta:
@@ -472,8 +519,25 @@ taller3d.get('/resumen', async (c) => {
     const totalEnvios = Math.round(vs.reduce((s, v) => s + Number(v.envio ?? 0), 0) * 100) / 100;
     const totalGastos = Math.round(gs.reduce((s, g) => s + Number(g.monto ?? 0), 0) * 100) / 100;
 
+    /* DÍA POR DÍA, para el reporte de la semana. Se arma acá y no en la
+       pantalla porque es la misma plata que el total de arriba: si cada uno la
+       suma por su lado, tarde o temprano dejan de coincidir. Los días sin nada
+       también salen, en cero: un lunes que falta en la lista se lee como un
+       error, no como un lunes sin ventas. */
+    const porDia: Array<{ fecha: string; ventas: number; gastos: number; queda: number }> = [];
+    for (let d = desde; d <= hasta && porDia.length < 400; d = masDias(d, 1)) {
+      const v = Math.round(vs.filter(x => String(x.fecha) === d)
+        .reduce((s2, x) => s2 + Number(x.total ?? 0), 0) * 100) / 100;
+      const g = Math.round(gs.filter(x => String(x.fecha) === d)
+        .reduce((s2, x) => s2 + Number(x.monto ?? 0), 0) * 100) / 100;
+      porDia.push({ fecha: d, ventas: v, gastos: g, queda: Math.round((v - g) * 100) / 100 });
+    }
+
     return ok(c, {
       desde, hasta,
+      por_dia: porDia,
+      /** La comisión del período, con el cálculo entero a la vista. */
+      comision: calcularComision(totalVentas, totalGastos, cfg),
       ventas: {
         total: totalVentas, cuantas: vs.length,
         /** Lo cobrado por las piezas, sin el envío. */
@@ -895,6 +959,10 @@ taller3d.put('/config', async (c) => {
       hora_corte_entrega: /^\d{2}:\d{2}$/.test(String(b?.hora_corte_entrega ?? '')) ? b.hora_corte_entrega : actual.hora_corte_entrega,
       dias_entrega: Array.isArray(b?.dias_entrega)
         ? b.dias_entrega.map(Number).filter((d: number) => d >= 0 && d <= 6) : actual.dias_entrega,
+      /* Los porcentajes se guardan como números de 0 a 100 —«30», no «0.3»—
+         porque así es como se dicen y como se escriben en la pantalla. */
+      comision_ventas: pct(b?.comision_ventas, actual.comision_ventas),
+      comision_gastos: pct(b?.comision_gastos, actual.comision_gastos),
     };
     const fila = { tenant_id: tenantId, type: 'taller-3d', config: cfg, updated_at: new Date().toISOString() };
     const { data: previo } = await db.from('settings').select('id')
@@ -907,5 +975,315 @@ taller3d.put('/config', async (c) => {
     return ok(c, cfg);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
+
+// ═══════════════════════════ ENTREGAS PENDIENTES ═══════════════════════════
+
+/**
+ * EL CALENDARIO DE LO PROMETIDO — qué hay que entregar, y quién debe cuánto.
+ *
+ * Una entrega no es una venta: es un compromiso. El cliente encargó tres
+ * piezas para el viernes y dejó la mitad adelantada; esa plata que falta no
+ * está en el corte del día y no tiene por qué estarlo, pero alguien tiene que
+ * poder verla.
+ *
+ * El pago se guarda como UN MONTO adelantado, no como un «¿adelantó? sí/no»:
+ * lo que el taller necesita saber es cuánto falta. «Pago completo» es el caso
+ * en que ese monto es igual al total.
+ */
+
+/**
+ * El estado del pago, SACADO de los montos.
+ *
+ * Nunca se escribe a mano: si `estado_pago` fuera un campo libre, tarde o
+ * temprano habría una entrega que dice «pagada» con saldo pendiente, y esa es
+ * exactamente la fila que hace perder plata.
+ *
+ * El adelanto se recorta al total: nadie adelanta más de lo que vale el
+ * encargo, y guardar un adelanto mayor daría un saldo negativo que no
+ * significa nada.
+ */
+export function estadoDelPago(total: number, adelanto: number): {
+  total: number; adelanto: number; saldo: number;
+  estado_pago: 'sin_pago' | 'adelanto' | 'pagado';
+} {
+  const centavos = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
+  const t = Math.max(0, centavos(total));
+  const a = Math.min(Math.max(0, centavos(adelanto)), t);
+  return {
+    total: t, adelanto: a, saldo: centavos(t - a),
+    estado_pago: a <= 0 ? 'sin_pago' : a >= t ? 'pagado' : 'adelanto',
+  };
+}
+
+const EntregaSchema = z.object({
+  /** El día en que se prometió. Si no viene, hoy: lo de hoy también se anota. */
+  fecha_entrega: z.string().optional(),
+  cliente: z.string().min(1).max(200),
+  customer_id: z.string().uuid().optional().nullable(),
+  telefono: z.string().max(40).optional().nullable(),
+  /** Los artículos del encargo. Igual que en la venta: una o varias líneas. */
+  items: z.array(ItemSchema).max(100).optional(),
+  /** La forma corta, para un encargo de un solo artículo. */
+  descripcion: z.string().max(300).optional(),
+  variante: z.string().max(100).optional().nullable(),
+  producto_id: z.string().uuid().optional().nullable(),
+  cantidad: z.number().positive().max(100000).optional(),
+  precio_unitario: z.number().min(0).max(100_000_000).optional(),
+  /** Cuánto dejó pagado. Con `pago_completo`, se pone el total solo. */
+  adelanto: z.number().min(0).max(100_000_000).default(0),
+  pago_completo: z.boolean().optional(),
+  medio_pago: z.enum(['efectivo', 'sinpe', 'tarjeta', 'transferencia', 'otro']).optional().nullable(),
+  notas: z.string().max(500).optional().nullable(),
+});
+
+/** Las líneas del encargo, vengan como `items` o en los campos sueltos. */
+const lineasEntrega = (e: any) => (
+  Array.isArray(e.items) && e.items.length > 0
+    ? e.items
+    : [{ producto_id: e.producto_id ?? null, descripcion: e.descripcion,
+         variante: e.variante ?? null, cantidad: e.cantidad ?? 1,
+         precio_unitario: e.precio_unitario ?? 0 }]
+).map((l: any) => ({
+  producto_id: l.producto_id || null,
+  descripcion: String(l.descripcion ?? '').trim(),
+  variante: l.variante?.trim() || null,
+  cantidad: Number(l.cantidad) || 1,
+  precio_unitario: Number(l.precio_unitario) || 0,
+  subtotal: Math.round((Number(l.cantidad) || 1) * (Number(l.precio_unitario) || 0) * 100) / 100,
+})).filter((l: any) => l.descripcion);
+
+/** Le pega a cada entrega sus líneas, en UNA consulta para todas. */
+async function conItems(filas: any[]): Promise<any[]> {
+  if (filas.length === 0) return filas;
+  const { data } = await db.from('taller_entrega_items')
+    .select('*').in('entrega_id', filas.map(f => f.id)).limit(5000);
+  const porEntrega = new Map<string, any[]>();
+  for (const it of ((data ?? []) as any[])) {
+    porEntrega.set(String(it.entrega_id), [...(porEntrega.get(String(it.entrega_id)) ?? []), it]);
+  }
+  return filas.map(f => ({
+    ...f,
+    items: porEntrega.get(String(f.id)) ?? [],
+    saldo: Math.round(((Number(f.total) || 0) - (Number(f.adelanto) || 0)) * 100) / 100,
+  }));
+}
+
+taller3d.get('/entregas', async (c) => {
+  try {
+    const estado = c.req.query('estado');
+    let q = db.from('taller_entregas').select('*').eq('tenant_id', c.get('tenantId'));
+    if (estado && estado !== 'todos') q = q.eq('estado', estado);
+    const desde = c.req.query('desde');
+    if (desde) q = q.gte('fecha_entrega', desde);
+    const hasta = c.req.query('hasta');
+    if (hasta) q = q.lte('fecha_entrega', hasta);
+    const { data, error } = await q.order('fecha_entrega').limit(500);
+    if (error) throw new Error(error.message);
+    return ok(c, await conItems((data ?? []) as any[]));
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/**
+ * GET /entregas/calendario — las entregas por día, con lo que falta cobrar.
+ *
+ * Lo ATRASADO va en su propio grupo y no se recorta por el rango: una entrega
+ * que se prometió para el martes y no salió no puede desaparecer del
+ * calendario el miércoles. Es justo la que hay que mirar primero.
+ */
+taller3d.get('/entregas/calendario', async (c) => {
+  try {
+    const hoy = hoyCR();
+    const desde = c.req.query('desde') || hoy;
+    const hasta = c.req.query('hasta') || masDias(desde, 30);
+
+    const { data, error } = await db.from('taller_entregas').select('*')
+      .eq('tenant_id', c.get('tenantId')).neq('estado', 'cancelado').limit(1000);
+    if (error) throw new Error(error.message);
+    const filas = await conItems((data ?? []) as any[]);
+
+    const dias: Record<string, any[]> = {};
+    const atrasadas: any[] = [];
+    for (const e of filas) {
+      const pendiente = e.estado === 'pendiente';
+      const fila = { ...e, atrasada: pendiente && String(e.fecha_entrega) < hoy };
+      if (fila.atrasada) { atrasadas.push(fila); continue; }
+      const d = String(e.fecha_entrega);
+      if (d < desde || d > hasta) continue;
+      (dias[d] ??= []).push(fila);
+    }
+
+    const suma = (fs: any[], campo: string) =>
+      Math.round(fs.reduce((s, f) => s + (Number(f[campo]) || 0), 0) * 100) / 100;
+    const pendientes = filas.filter(e => e.estado === 'pendiente');
+
+    return ok(c, {
+      desde, hasta,
+      dias: Object.entries(dias)
+        .map(([fecha, items]) => ({
+          fecha, items,
+          total: suma(items, 'total'), adelantos: suma(items, 'adelanto'), saldo: suma(items, 'saldo'),
+        }))
+        .sort((a, b) => a.fecha < b.fecha ? -1 : 1),
+      atrasadas: atrasadas.sort((a, b) => a.fecha_entrega < b.fecha_entrega ? -1 : 1),
+      totales: {
+        /* Solo lo pendiente: lo ya entregado no es algo que haya que hacer, y
+           sumarlo acá haría crecer el «por cobrar» para siempre. */
+        pendientes: pendientes.length,
+        atrasadas: atrasadas.length,
+        total: suma(pendientes, 'total'),
+        adelantos: suma(pendientes, 'adelanto'),
+        saldo: suma(pendientes, 'saldo'),
+      },
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+taller3d.post('/entregas', async (c) => {
+  try {
+    const p = EntregaSchema.safeParse(await c.req.json().catch(() => ({})));
+    if (!p.success) return fail(c, 'Falta el cliente de la entrega', 422);
+    const e = p.data;
+    const tenantId = c.get('tenantId');
+    const lineas = lineasEntrega(e);
+    if (lineas.length === 0) return fail(c, 'La entrega necesita al menos un artículo', 422);
+
+    /* «Pago completo» se guarda como un adelanto igual al total, no como una
+       bandera aparte: así hay un solo número del que sale el saldo. */
+    const bruto = totalVenta(lineas, 0);
+    const pago = estadoDelPago(bruto, e.pago_completo ? bruto : e.adelanto);
+
+    const { data, error } = await db.from('taller_entregas').insert({
+      tenant_id: tenantId, fecha_entrega: e.fecha_entrega || hoyCR(),
+      cliente: e.cliente.trim(), customer_id: e.customer_id || null,
+      telefono: e.telefono?.trim() || null,
+      total: pago.total, adelanto: pago.adelanto, estado_pago: pago.estado_pago,
+      /* Sin plata recibida no se guarda medio de pago: diría «efectivo» de un
+         pago que no existe. */
+      medio_pago: pago.adelanto > 0 ? (e.medio_pago ?? 'efectivo') : null,
+      estado: 'pendiente', notas: e.notas?.trim() || null, created_by: c.get('userId'),
+    }).select().single();
+    if (error) throw new Error(error.message);
+
+    const { error: eItems } = await db.from('taller_entrega_items')
+      .insert(lineas.map((l: any) => ({ ...l, tenant_id: tenantId, entrega_id: (data as any).id })));
+    if (eItems) {
+      // Sin artículos no hay encargo: se deshace en vez de dejar un total suelto.
+      await db.from('taller_entregas').delete().eq('id', (data as any).id);
+      throw new Error(eItems.message);
+    }
+    return ok(c, { ...(data as any), items: lineas, saldo: pago.saldo }, 201);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+taller3d.put('/entregas/:id', async (c) => {
+  try {
+    const b = await c.req.json().catch(() => ({}));
+    const id = c.req.param('id');
+    const tenantId = c.get('tenantId');
+    const patch: any = { updated_at: new Date().toISOString() };
+    if (b?.fecha_entrega) patch.fecha_entrega = String(b.fecha_entrega);
+    if (b?.cliente != null) patch.cliente = String(b.cliente).trim();
+    if (b?.telefono !== undefined) patch.telefono = String(b.telefono ?? '').trim() || null;
+    if (b?.notas !== undefined) patch.notas = String(b.notas ?? '').trim() || null;
+
+    /* Si cambian los artículos, se rehacen las líneas y el total, y el pago se
+       vuelve a juzgar contra el total NUEVO: un encargo que crece deja de
+       estar pagado, aunque ya hubiera recibido plata. */
+    if (Array.isArray(b?.items)) {
+      const lineas = lineasEntrega(b);
+      if (lineas.length === 0) return fail(c, 'La entrega necesita al menos un artículo', 422);
+      const { data: prev } = await db.from('taller_entregas').select('adelanto')
+        .eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+      const pago = estadoDelPago(totalVenta(lineas, 0), (prev as any)?.adelanto ?? 0);
+      patch.total = pago.total; patch.adelanto = pago.adelanto; patch.estado_pago = pago.estado_pago;
+      await db.from('taller_entrega_items').delete().eq('entrega_id', id);
+      await db.from('taller_entrega_items')
+        .insert(lineas.map((l: any) => ({ ...l, tenant_id: tenantId, entrega_id: id })));
+    }
+
+    const { data, error } = await db.from('taller_entregas').update(patch)
+      .eq('id', id).eq('tenant_id', tenantId).select().single();
+    if (error) throw new Error(error.message);
+    return ok(c, (await conItems([data]))[0]);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/**
+ * POST /entregas/:id/pago — entró plata.
+ *
+ * `monto` es lo que acaba de pagar, no el acumulado: el que recibe el billete
+ * sabe cuánto recibió, no cuánto llevaba el cliente pagado. Con
+ * `completo: true` se cierra el saldo de una.
+ */
+taller3d.post('/entregas/:id/pago', async (c) => {
+  try {
+    const b = await c.req.json().catch(() => ({}));
+    const id = c.req.param('id');
+    const tenantId = c.get('tenantId');
+    const { data: prev } = await db.from('taller_entregas').select('total, adelanto')
+      .eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+    if (!prev) return fail(c, 'Esa entrega no existe', 404);
+
+    const total = Number((prev as any).total) || 0;
+    const ya = Number((prev as any).adelanto) || 0;
+    const nuevo = b?.completo ? total : ya + (Number(b?.monto) || 0);
+    const pago = estadoDelPago(total, nuevo);
+
+    const { data, error } = await db.from('taller_entregas').update({
+      adelanto: pago.adelanto, estado_pago: pago.estado_pago,
+      medio_pago: pago.adelanto > 0 ? (b?.medio_pago ?? 'efectivo') : null,
+      updated_at: new Date().toISOString(),
+    }).eq('id', id).eq('tenant_id', tenantId).select().single();
+    if (error) throw new Error(error.message);
+    return ok(c, { ...(data as any), saldo: pago.saldo });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+const ESTADOS_ENTREGA = ['pendiente', 'entregado', 'cancelado'];
+
+/** POST /entregas/:id/estado — se entregó, se canceló, o vuelve a pendiente. */
+taller3d.post('/entregas/:id/estado', async (c) => {
+  try {
+    const b = await c.req.json().catch(() => ({}));
+    const estado = String(b?.estado ?? '');
+    if (!ESTADOS_ENTREGA.includes(estado)) return fail(c, 'Estado inválido', 422);
+
+    const patch: any = { estado, updated_at: new Date().toISOString() };
+    if (estado === 'entregado') {
+      /* Queda firmado quién la entregó y a qué hora: es el dato que hace falta
+         cuando el cliente llama a decir que nunca le llegó. */
+      const yo = await quienEsTaller(c);
+      patch.entregado_at = new Date().toISOString();
+      patch.entregado_por = yo.id; patch.entregado_nombre = yo.nombre;
+    } else {
+      patch.entregado_at = null; patch.entregado_por = null; patch.entregado_nombre = null;
+    }
+    const { data, error } = await db.from('taller_entregas').update(patch)
+      .eq('id', c.req.param('id')).eq('tenant_id', c.get('tenantId')).select().single();
+    if (error) throw new Error(error.message);
+    return ok(c, data);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+taller3d.delete('/entregas/:id', async (c) => {
+  try {
+    const id = c.req.param('id');
+    await db.from('taller_entrega_items').delete().eq('entrega_id', id);
+    const { error } = await db.from('taller_entregas').delete()
+      .eq('id', id).eq('tenant_id', c.get('tenantId'));
+    if (error) throw new Error(error.message);
+    return ok(c, { borrada: true });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/** Quién está operando, para firmar la entrega. */
+async function quienEsTaller(c: any): Promise<{ id: string; nombre: string }> {
+  const id = String(c.get('userId') ?? '');
+  try {
+    const { data } = await db.from('users').select('full_name, email').eq('id', id).maybeSingle();
+    const u: any = data;
+    return { id, nombre: u?.full_name || u?.email || 'Sin nombre' };
+  } catch { return { id, nombre: 'Sin nombre' }; }
+}
 
 export default taller3d;
