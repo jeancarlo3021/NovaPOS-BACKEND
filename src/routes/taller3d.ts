@@ -194,26 +194,41 @@ export function diaDeEntrega(fin: Date, cfg: ConfigTaller): string {
 
 // ═══════════════════════════ VENTAS ═══════════════════════════
 
-const VentaSchema = z.object({
-  fecha: z.string().optional(),
+const ItemSchema = z.object({
+  producto_id: z.string().uuid().optional().nullable(),
   descripcion: z.string().min(1).max(300),
-  cliente: z.string().max(200).optional().nullable(),
+  variante: z.string().max(100).optional().nullable(),
   cantidad: z.number().positive().max(100000).default(1),
   precio_unitario: z.number().min(0).max(100_000_000).default(0),
-  medio_pago: z.enum(['efectivo', 'sinpe', 'tarjeta', 'transferencia', 'otro']).default('efectivo'),
-  categoria: z.enum(['impresion', 'diseno', 'material', 'reparacion', 'otro']).default('impresion'),
-  /** De qué artículo del catálogo salió, y cuál de sus precios se usó. */
-  producto_id: z.string().uuid().optional().nullable(),
-  variante: z.string().max(100).optional().nullable(),
-  /** El envío se cobra APARTE de la pieza: ver el comentario de la migración. */
-  envio: z.number().min(0).max(100_000_000).default(0),
-  envio_etiqueta: z.string().max(100).optional().nullable(),
-  notas: z.string().max(500).optional().nullable(),
 });
 
-/** El total de una venta: las piezas más el envío. En un solo lugar. */
-const totalVenta = (cantidad: number, precio: number, envio: number) =>
-  Math.round(((Number(cantidad) || 0) * (Number(precio) || 0) + (Number(envio) || 0)) * 100) / 100;
+/** El total de una venta: las líneas más el envío. En un solo lugar. */
+const totalVenta = (lineas: Array<{ cantidad: number; precio_unitario: number }>, envio: number) =>
+  Math.round((lineas.reduce((s, l) => s + (Number(l.cantidad) || 0) * (Number(l.precio_unitario) || 0), 0)
+    + (Number(envio) || 0)) * 100) / 100;
+
+/**
+ * Las líneas de la venta, vengan como vengan.
+ *
+ * El formulario manda `items`. Pero una venta de UN artículo se puede seguir
+ * mandando con los campos sueltos de siempre —así no se rompe lo que ya estaba
+ * integrado, ni hay que mandar un arreglo de un elemento para anotar un
+ * llavero—. Las dos formas terminan en lo mismo: una lista de líneas.
+ */
+function lineasDe(v: any): Array<any> {
+  if (Array.isArray(v.items) && v.items.length > 0) return v.items;
+  return [{
+    producto_id: v.producto_id ?? null, descripcion: v.descripcion,
+    variante: v.variante ?? null, cantidad: v.cantidad ?? 1,
+    precio_unitario: v.precio_unitario ?? 0,
+  }];
+}
+
+/** «Llavero» · «Llavero y 2 más» — lo que se lee en la lista del día. */
+const resumirVenta = (lineas: Array<{ descripcion: string }>) =>
+  lineas.length === 1
+    ? lineas[0].descripcion
+    : `${lineas[0].descripcion} y ${lineas.length - 1} más`;
 
 taller3d.get('/ventas', async (c) => {
   try {
@@ -223,7 +238,20 @@ taller3d.get('/ventas', async (c) => {
     q = hasta ? q.gte('fecha', fecha).lte('fecha', hasta) : q.eq('fecha', fecha);
     const { data, error } = await q.order('created_at', { ascending: false });
     if (error) throw new Error(error.message);
-    return ok(c, data ?? []);
+
+    /* Las líneas se traen en UNA consulta para todas las ventas del día: una
+       por venta serían cincuenta idas y vueltas para pintar una lista. */
+    const ventas = (data ?? []) as any[];
+    if (ventas.length > 0) {
+      const { data: items } = await db.from('taller_venta_items')
+        .select('*').in('venta_id', ventas.map(v => v.id)).limit(5000);
+      const porVenta = new Map<string, any[]>();
+      for (const it of ((items ?? []) as any[])) {
+        porVenta.set(String(it.venta_id), [...(porVenta.get(String(it.venta_id)) ?? []), it]);
+      }
+      for (const v of ventas) v.items = porVenta.get(String(v.id)) ?? [];
+    }
+    return ok(c, ventas);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
@@ -232,34 +260,66 @@ taller3d.post('/ventas', async (c) => {
     const p = VentaSchema.safeParse(await c.req.json().catch(() => ({})));
     if (!p.success) return fail(c, 'Faltan datos de la venta', 422);
     const v = p.data;
-    const total = totalVenta(v.cantidad, v.precio_unitario, v.envio);
+    const tenantId = c.get('tenantId');
+    const lineas = lineasDe(v).map(l => ({
+      producto_id: l.producto_id || null,
+      descripcion: String(l.descripcion ?? '').trim(),
+      variante: l.variante?.trim() || null,
+      cantidad: Number(l.cantidad) || 1,
+      precio_unitario: Number(l.precio_unitario) || 0,
+      subtotal: Math.round((Number(l.cantidad) || 1) * (Number(l.precio_unitario) || 0) * 100) / 100,
+    })).filter(l => l.descripcion);
+    if (lineas.length === 0) return fail(c, 'La venta necesita al menos un artículo', 422);
+
+    const total = totalVenta(lineas, v.envio);
+    const unaSola = lineas.length === 1 ? lineas[0] : null;
     const { data, error } = await db.from('taller_ventas').insert({
-      tenant_id: c.get('tenantId'), fecha: v.fecha || hoyCR(),
-      descripcion: v.descripcion.trim(), cliente: v.cliente?.trim() || null,
-      cantidad: v.cantidad, precio_unitario: v.precio_unitario, total,
-      medio_pago: v.medio_pago, categoria: v.categoria,
-      producto_id: v.producto_id || null, variante: v.variante?.trim() || null,
+      tenant_id: tenantId, fecha: v.fecha || hoyCR(),
+      descripcion: resumirVenta(lineas), cliente: v.cliente?.trim() || null,
+      /* Con una sola línea, la cabeza sigue guardando cantidad y precio: hay
+         pantallas y reportes viejos que los leen de ahí. Con varias no tendría
+         sentido —¿la cantidad de cuál?—, así que queda el total y ya. */
+      cantidad: unaSola ? unaSola.cantidad : lineas.reduce((s2, l) => s2 + l.cantidad, 0),
+      precio_unitario: unaSola ? unaSola.precio_unitario : 0,
+      total, medio_pago: v.medio_pago, categoria: v.categoria,
+      producto_id: unaSola?.producto_id ?? null, variante: unaSola?.variante ?? null,
       envio: v.envio, envio_etiqueta: v.envio_etiqueta?.trim() || null,
       notas: v.notas?.trim() || null, created_by: c.get('userId'),
     }).select().single();
     if (error) throw new Error(error.message);
-    return ok(c, data, 201);
+
+    const { error: eItems } = await db.from('taller_venta_items')
+      .insert(lineas.map(l => ({ ...l, tenant_id: tenantId, venta_id: (data as any).id })));
+    if (eItems) {
+      /* Sin líneas no hay venta: se deshace en vez de dejar un total suelto
+         que nadie va a saber de qué era. */
+      await db.from('taller_ventas').delete().eq('id', (data as any).id);
+      throw new Error(eItems.message);
+    }
+    return ok(c, { ...(data as any), items: lineas }, 201);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
 taller3d.put('/ventas/:id', async (c) => {
   try {
-    const p = VentaSchema.partial().safeParse(await c.req.json().catch(() => ({})));
+    const p = VentaBase.partial().safeParse(await c.req.json().catch(() => ({})));
     if (!p.success) return fail(c, 'Datos inválidos', 422);
     const v: any = { ...p.data, updated_at: new Date().toISOString() };
+    /* El total se rehace desde las LÍNEAS, no desde la cabeza: con varios
+       artículos, cambiar el envío no se puede recalcular con «la cantidad»,
+       que ya no significa nada. */
     if (v.cantidad != null || v.precio_unitario != null || v.envio != null) {
-      const { data: prev } = await db.from('taller_ventas').select('cantidad, precio_unitario, envio')
-        .eq('id', c.req.param('id')).eq('tenant_id', c.get('tenantId')).maybeSingle();
-      v.total = totalVenta(
-        v.cantidad ?? (prev as any)?.cantidad ?? 1,
-        v.precio_unitario ?? (prev as any)?.precio_unitario ?? 0,
-        v.envio ?? (prev as any)?.envio ?? 0,
-      );
+      const id = c.req.param('id');
+      const [{ data: prev }, { data: items }] = await Promise.all([
+        db.from('taller_ventas').select('cantidad, precio_unitario, envio')
+          .eq('id', id).eq('tenant_id', c.get('tenantId')).maybeSingle(),
+        db.from('taller_venta_items').select('cantidad, precio_unitario').eq('venta_id', id),
+      ]);
+      const lineas = ((items ?? []) as any[]).length > 0
+        ? (items as any[])
+        : [{ cantidad: v.cantidad ?? (prev as any)?.cantidad ?? 1,
+             precio_unitario: v.precio_unitario ?? (prev as any)?.precio_unitario ?? 0 }];
+      v.total = totalVenta(lineas, v.envio ?? (prev as any)?.envio ?? 0);
     }
     const { data, error } = await db.from('taller_ventas').update(v)
       .eq('id', c.req.param('id')).eq('tenant_id', c.get('tenantId')).select().single();
@@ -276,6 +336,33 @@ taller3d.delete('/ventas/:id', async (c) => {
     return ok(c, { borrado: true });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
+
+const VentaBase = z.object({
+  fecha: z.string().optional(),
+  descripcion: z.string().max(300).optional(),
+  cliente: z.string().max(200).optional().nullable(),
+  cantidad: z.number().positive().max(100000).default(1),
+  precio_unitario: z.number().min(0).max(100_000_000).default(0),
+  medio_pago: z.enum(['efectivo', 'sinpe', 'tarjeta', 'transferencia', 'otro']).default('efectivo'),
+  categoria: z.enum(['impresion', 'diseno', 'material', 'reparacion', 'otro']).default('impresion'),
+  /** De qué artículo del catálogo salió, y cuál de sus precios se usó. */
+  producto_id: z.string().uuid().optional().nullable(),
+  variante: z.string().max(100).optional().nullable(),
+  /** El envío se cobra APARTE de la pieza: ver el comentario de la migración. */
+  envio: z.number().min(0).max(100_000_000).default(0),
+  envio_etiqueta: z.string().max(100).optional().nullable(),
+  /** Varios artículos en la misma venta. Si no viene, se usa el de arriba. */
+  items: z.array(ItemSchema).max(100).optional(),
+  notas: z.string().max(500).optional().nullable(),
+});
+
+/* Una venta necesita algo que vender: o la lista de artículos, o el de
+   siempre. El `refine` va aparte para que el PUT pueda seguir usando
+   `.partial()` —un cambio parcial no tiene por qué traer las líneas—. */
+const VentaSchema = VentaBase.refine(
+  v => (v.items?.length ?? 0) > 0 || !!v.descripcion?.trim(),
+  { message: 'La venta necesita al menos un artículo' },
+);
 
 // ═══════════════════════════ GASTOS ═══════════════════════════
 
@@ -356,6 +443,14 @@ taller3d.get('/resumen', async (c) => {
       db.from('taller_gastos').select('*').eq('tenant_id', tenantId).gte('fecha', desde).lte('fecha', hasta),
     ]);
 
+    /* El corte por artículo sale de las LÍNEAS, no de la cabeza de la venta:
+       con varios artículos en una misma venta, la cabeza solo tiene el
+       resumen («Llavero y 2 más») y el total. */
+    const idsVentas = ((ventas ?? []) as any[]).map(v => v.id);
+    const { data: lineas } = idsVentas.length
+      ? await db.from('taller_venta_items').select('*').in('venta_id', idsVentas).limit(5000)
+      : { data: [] as any[] };
+
     const sumar = (filas: any[], campo: string, valor: (f: any) => number) => {
       const m: Record<string, { monto: number; cuantos: number }> = {};
       for (const f of filas) {
@@ -390,8 +485,15 @@ taller3d.get('/resumen', async (c) => {
         /* Por artículo del catálogo: es lo que dice qué se vende de verdad.
            Lo que se escribió a mano cae en «Suelto». */
         por_producto: sumar(
-          vs.map(v => ({ ...v, _art: v.producto_id ? `${v.descripcion}${v.variante ? ` · ${v.variante}` : ''}` : 'Suelto' })),
-          '_art', v => Number(v.total ?? 0) - Number(v.envio ?? 0)),
+          ((lineas ?? []) as any[]).map(l => ({
+            ...l,
+            _art: l.producto_id
+              ? `${l.descripcion}${l.variante ? ` · ${l.variante}` : ''}`
+              : 'Suelto',
+          })),
+          '_art', l => Number(l.subtotal ?? 0)),
+        /** Cuántos artículos se movieron en total (sin contar el envío). */
+        articulos: ((lineas ?? []) as any[]).reduce((s2, l) => s2 + Number(l.cantidad ?? 0), 0),
       },
       gastos: {
         total: totalGastos, cuantos: gs.length,
