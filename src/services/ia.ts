@@ -315,7 +315,9 @@ export async function probarModelo(timeoutMs = PRESUPUESTO_DIAGNOSTICO.prueba): 
       /* Conectó pero no dijo nada: pasa cuando el modelo corta por filtro o
          por tope de salida. No es un error de conexión y no se puede reportar
          como si lo fuera, pero tampoco es un «todo bien». */
-      if (!texto) return { ok: false, ms, respuesta: null, error: 'El proveedor respondió sin texto (revisá el modelo configurado)' };
+      /* Gemini ya no llega acá sin texto —tira un error con el motivo—, pero
+         Claude sí puede: se deja la red por si acaso. */
+      if (!texto) return { ok: false, ms, respuesta: null, error: 'El proveedor respondió sin texto' };
       return { ok: true, ms, respuesta: texto.slice(0, 80), error: null };
     } catch (e: any) {
       return { ok: false, ms: Date.now() - arranque, respuesta: null, error: String(e?.message ?? e).slice(0, 300) };
@@ -507,8 +509,13 @@ async function pedirAGemini(sistema: string, mensaje: string, maxTokens: number,
      cuando resulta ser lo que hace tardar al modelo: estas tareas no lo
      necesitan y esperar quince segundos por un CAByS no sirve de nada. */
   const nada = sinPensar || String(process.env.IA_SIN_PENSAR ?? '').trim() === '1';
+  /* El piso sube de 512 a 2048: lo que el modelo piensa sale del MISMO
+     presupuesto que la respuesta, y con 512 un «decí OK» puede terminar sin
+     una sola palabra escrita y con `finishReason: MAX_TOKENS`. Son tokens que
+     casi nunca se gastan —el tope es un techo, no un consumo— y el riesgo de
+     quedarse corto es una IA que no contesta nunca. */
   const generationConfig: Record<string, unknown> = v3
-    ? { maxOutputTokens: nada ? maxTokens : Math.max(maxTokens, 512),
+    ? { maxOutputTokens: nada ? Math.max(maxTokens, 256) : Math.max(maxTokens, 2048),
         ...(nada ? {} : { thinkingConfig: { thinkingLevel: 'low' } }) }
     : { maxOutputTokens: maxTokens, temperature: 0.2, ...(/2\.5/.test(modelo) ? { thinkingConfig: { thinkingBudget: 0 } } : {}) };
 
@@ -603,13 +610,31 @@ async function pedirAGemini(sistema: string, mensaje: string, maxTokens: number,
       .map((p: any) => String(p?.text ?? ''))
       .join('')
       .trim();
-    /* Sin texto pero con motivo: casi siempre es que se quedó sin tokens de
-       salida o que el filtro de seguridad lo cortó. Hay que poder verlo. */
+    /**
+     * SIN TEXTO: EL MOTIVO VIENE EN LA RESPUESTA, Y HAY QUE DECIRLO.
+     *
+     * Se registraba en la consola del servidor y al usuario le llegaba
+     * «respondió sin texto (revisá el modelo configurado)», que no se puede
+     * accionar: no distingue «se quedó sin tokens porque pensó demasiado» de
+     * «el filtro de seguridad lo cortó», y se arreglan al revés.
+     *
+     * Con `MAX_TOKENS` el dato clave es cuántos tokens se fueron en pensar:
+     * si el modelo gastó 500 razonando un «decí OK», el tope de salida es el
+     * problema y se sube; si no, es otra cosa.
+     */
     if (!texto) {
-      const motivo = j?.candidates?.[0]?.finishReason ?? j?.promptFeedback?.blockReason;
-      if (motivo) console.warn('[ia] Gemini no devolvió texto:', motivo);
+      const motivo = j?.candidates?.[0]?.finishReason ?? j?.promptFeedback?.blockReason ?? 'sin motivo declarado';
+      const u = j?.usageMetadata ?? {};
+      const detalle = [
+        `motivo: ${motivo}`,
+        u.thoughtsTokenCount != null ? `pensó ${u.thoughtsTokenCount} tokens` : null,
+        u.candidatesTokenCount != null ? `escribió ${u.candidatesTokenCount}` : null,
+        `tope ${generationConfig.maxOutputTokens}`,
+      ].filter(Boolean).join(' · ');
+      console.warn('[ia] Gemini no devolvió texto:', detalle);
+      throw new Error(`El modelo no devolvió texto (${detalle})`);
     }
-    return texto || null;
+    return texto;
   } catch (e: any) {
     /* «This operation was aborted» no le dice nada a nadie: es NUESTRO corte
        de espera, no una respuesta de Google. Hay que decir que se agotó el

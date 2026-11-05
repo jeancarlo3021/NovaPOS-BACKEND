@@ -82,11 +82,24 @@ ia.get('/diagnostico', async (c) => {
       ? await probarModelo()
       : { ok: false, ms: 0, respuesta: null, error: null as string | null };
 
-    /* CUANDO FALLA GENERAR, LA PREGUNTA ES «¿Y ENTONCES CUÁL PONGO?».
-       La llave ya sabe qué modelos puede usar: se le pregunta, en vez de
-       mandar a alguien a buscar en la documentación cuál existe y cuál
-       admite su plan. Solo cuando hace falta: es gratis, pero son segundos. */
-    const alternativas = llave && alcance.ok && !prueba.ok ? await modelosDisponibles() : [];
+    /**
+     * «¿Y ENTONCES CUÁL PONGO?» — la llave ya sabe la respuesta.
+     *
+     * Se le pregunta en los dos casos en que hace falta, que al principio
+     * cubrían solo uno:
+     *
+     *  · el modelo NO EXISTE para esta cuenta (404 al buscar su ficha). Es
+     *    justo cuando más se necesita la lista, y era el caso que quedaba
+     *    afuera: se decía «poné otro en IA_MODELO» sin decir cuál, que es
+     *    mandar a alguien a adivinar nombres;
+     *  · el modelo existe pero no logra contestar (saturado, sin permiso).
+     *
+     * No se pregunta cuando no hay llave o no hay salida a internet: ahí la
+     * lista tampoco va a llegar y serían segundos tirados.
+     */
+    const noExiste = alcance.estado === 404;
+    const alternativas = llave && (noExiste || (alcance.ok && !prueba.ok))
+      ? await modelosDisponibles() : [];
 
     /* QUÉ HAY QUE HACER, en una línea. Un diagnóstico que deja al usuario
        interpretando cuatro banderas no sirve de nada. */
@@ -99,7 +112,10 @@ ia.get('/diagnostico', async (c) => {
            falla es la salida a internet o la llave. */
         : !alcance.ok
           ? (alcance.estado === 404
-              ? `El modelo «${modeloIA()}» no existe para esta cuenta. Poné otro en IA_MODELO.`
+              ? `El modelo «${modeloIA()}» no existe para esta cuenta. `
+                + (alternativas.length > 0
+                    ? `Poné en IA_MODELO uno de los ${alternativas.length} que sí podés usar (abajo), o borrá la variable para volver al de fábrica.`
+                    : 'Borrá la variable IA_MODELO para volver al modelo de fábrica.')
               : alcance.estado === 401 || alcance.estado === 403
                 ? `El proveedor rechazó la llave (${alcance.estado}). Revisá que sea de la API de Gemini y que el proyecto la tenga habilitada.`
                 : `No se pudo llegar al proveedor: ${alcance.error ?? 'sin detalle'}`)
