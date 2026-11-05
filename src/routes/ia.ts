@@ -823,7 +823,7 @@ ia.post('/cabys', async (c) => {
        que la calidad del resultado está limitada por cuántos candidatos
        razonables le lleguen. La pantalla sigue mostrando las tres primeras
        —ocho botones por fila no se revisan—, pero el modelo las ve todas. */
-    const base = await sugerirCabys(items, { alternativas: true, cuantas: 8 });
+    const base = await sugerirCabys(items, { alternativas: true, cuantas: 8, tenantId: c.get('tenantId') });
 
     /**
      * Los que quedaron flojos son los que valen la pena repasar.

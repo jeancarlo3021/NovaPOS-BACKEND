@@ -123,6 +123,68 @@ interface Corpus {
 let corpus: Corpus | null = null;
 const CORPUS_TTL = 10 * 60_000;   // los negocios clasifican productos todos los días
 
+/**
+ * EL CATÁLOGO YA CLASIFICADO DEL PROPIO NEGOCIO.
+ *
+ * Misma forma que el corpus general, pero con los productos de UN negocio.
+ * Es la mejor fuente que hay para clasificar lo que le falta: son sus
+ * palabras, sus familias de producto y códigos que ya decidió él.
+ *
+ * Se guarda poco tiempo: durante una importación el catálogo propio CRECE
+ * —cada producto que entra clasificado es una pista más para el siguiente—,
+ * así que un caché largo trabajaría con una foto vieja.
+ */
+const MIS_PRODUCTOS_TTL = 60_000;
+const misProductos = new Map<string, Corpus>();
+
+async function cargarMiCatalogo(tenantId: string): Promise<Corpus | null> {
+  const previo = misProductos.get(tenantId);
+  if (previo && Date.now() - previo.cargado < MIS_PRODUCTOS_TTL) return previo;
+  try {
+    const porNombre = new Map<string, string>();
+    const PAGE = 1000;
+    for (let from = 0; from < 20_000; from += PAGE) {
+      const { data, error } = await db.from('products')
+        .select('name, cabys_code').eq('tenant_id', tenantId)
+        .not('cabys_code', 'is', null)
+        .order('id', { ascending: true }).range(from, from + PAGE - 1);
+      if (error) throw new Error(error.message);
+      const chunk = (data ?? []) as any[];
+      for (const p of chunk) {
+        const code = String(p.cabys_code ?? '').replace(/\D/g, '');
+        const nombre = norm(String(p.name ?? '')).replace(/\s+/g, ' ').trim();
+        if (code && nombre && !porNombre.has(nombre)) porNombre.set(nombre, code);
+      }
+      if (chunk.length < PAGE) break;
+    }
+    if (porNombre.size === 0) return null;
+
+    const exacto = new Map<string, { code: string; negocios: number }>();
+    const filas: Corpus['filas'] = [];
+    const indice = new Map<string, number[]>();
+    const frecuencia = new Map<string, number>();
+    for (const [nombre, code] of porNombre) {
+      exacto.set(nombre, { code, negocios: 1 });
+      const tokens = [...new Set(palabras(nombre))];
+      if (tokens.length === 0) continue;
+      const i = filas.push({ tokens, code, negocios: 1 }) - 1;
+      for (const w of tokens) {
+        frecuencia.set(w, (frecuencia.get(w) ?? 0) + 1);
+        const l = indice.get(w);
+        if (l) l.push(i); else indice.set(w, [i]);
+      }
+    }
+    const armado: Corpus = { exacto, filas, indice, frecuencia, nombres: exacto.size, cargado: Date.now() };
+    misProductos.set(tenantId, armado);
+    return armado;
+  } catch (e: any) {
+    /* Sin el catálogo propio se sigue como antes: es una mejora, no un
+       requisito, y no puede dejar sin sugerencias a nadie. */
+    console.warn('[cabys] no se pudo leer el catálogo propio:', e?.message);
+    return null;
+  }
+}
+
 async function cargarCorpus(): Promise<Corpus> {
   if (corpus && Date.now() - corpus.cargado < CORPUS_TTL) return corpus;
 
@@ -225,8 +287,11 @@ export type ItemCabys = string | { nombre: string; contexto?: string | null };
 
 export async function sugerirCabys(
   entradas: ItemCabys[],
-  /** `cuantas` = cuántas alternativas devolver (3 para la pantalla, más para el modelo). */
-  opciones: { alternativas?: boolean; cuantas?: number } = {},
+  /**
+   * `cuantas` = cuántas alternativas devolver (3 para la pantalla, más para
+   * el modelo). `tenantId` = de quién es el catálogo que se mira primero.
+   */
+  opciones: { alternativas?: boolean; cuantas?: number; tenantId?: string } = {},
 ): Promise<any[]> {
   /*
    * EL DEPARTAMENTO DEL ARCHIVO AYUDA A DECIDIR.
@@ -251,6 +316,8 @@ export async function sugerirCabys(
     const cat = await cargarCatalogo();
     const total = cat.filas.length || 1;
     const corp = await cargarCorpus();
+    /** Lo que este negocio YA clasificó. Es la primera fuente que se mira. */
+    const mio = opciones.tenantId ? await cargarMiCatalogo(opciones.tenantId) : null;
 
     /** Descripción y tarifa de un código, para poder mostrar qué se eligió. */
     const infoDe = new Map(cat.filas.map(f => [f.code, f]));
@@ -265,7 +332,7 @@ export async function sugerirCabys(
      * mismo código de comidas preparadas. Sumar por CÓDIGO y no quedarse con un
      * solo nombre parecido es lo que lo vuelve estable.
      */
-    const porOtrosNegocios = (nombre: string, tokensLimpios?: string[]) => {
+    const buscarEn = (corp: Corpus, nombre: string, tokensLimpios?: string[]) => {
       const clave = norm(nombre).replace(/\s+/g, ' ').trim();
       const ex = corp.exacto.get(clave);
       if (ex) return { code: ex.code, parecido: 1, negocios: ex.negocios, exacto: true, margen: 1 };
@@ -328,6 +395,25 @@ export async function sugerirCabys(
         margen: mejorP > 0 ? (mejorP - segundo) / mejorP : 0,
       };
     };
+    const porOtrosNegocios = (nombre: string, tokensLimpios?: string[]) =>
+      buscarEn(corp, nombre, tokensLimpios);
+
+    /**
+     * TU PROPIO CATÁLOGO MANDA SOBRE TODO LO DEMÁS.
+     *
+     * Hasta ahora se miraban los productos de TODOS los negocios por igual, y
+     * eso deja afuera la mejor fuente que existe: la del negocio que está
+     * importando. Si ya tiene «Tornillo galvanizado 3/8» clasificado, el
+     * «Tornillo galvanizado 1/2» que entra hoy va al mismo código casi
+     * seguro —misma familia, mismas palabras, y el código lo eligió él—.
+     *
+     * Además resuelve algo que el corpus general no puede: cada negocio
+     * nombra distinto. El que escribe «ALIM. PERRO ADULTO 15KG» no se parece
+     * a lo que escribió otro, pero sí se parece muchísimo a sus propios
+     * productos.
+     */
+    const porMiCatalogo = (nombre: string, tokensLimpios?: string[]) =>
+      mio ? buscarEn(mio, nombre, tokensLimpios) : null;
 
     /**
      * Las OTRAS opciones razonables, no solo la ganadora.
@@ -578,6 +664,36 @@ export async function sugerirCabys(
         alternativas: alt(m.code),
       });
 
+      /**
+       * ── 0) TU PROPIO CATÁLOGO ──
+       *
+       * Va primero y le gana a todo: si este negocio ya clasificó un producto
+       * igual o muy parecido, ese código es la respuesta. Lo eligió él, con
+       * sus palabras y para sus productos.
+       *
+       * El umbral es más exigente que el del corpus general (0,5 contra
+       * 0,35): dentro de un mismo catálogo los nombres se parecen mucho entre
+       * sí —«Tornillo 3/8» y «Tuerca 3/8» comparten media frase— y un
+       * parecido flojo acá significa menos que allá.
+       */
+      const propio = porMiCatalogo(String(nombre), tokens);
+      if (propio && (propio.exacto || propio.parecido >= 0.5)) {
+        const fp = infoDe.get(propio.code);
+        return {
+          name: nombre, code: propio.code,
+          description: fp?.description ?? null,
+          iva_rate: fp?.iva_rate ?? null,
+          confianza: (propio.exacto || propio.parecido >= 0.7 ? 'alta' : 'media') as 'alta' | 'media',
+          fuente: 'mi_catalogo' as const,
+          exacto: propio.exacto,
+          parecido: Math.round(propio.parecido * 100),
+          motivo: propio.exacto
+            ? 'Ya tenés este mismo producto clasificado así en tu catálogo.'
+            : `Se parece un ${Math.round(propio.parecido * 100)}% a un producto que ya tenés clasificado.`,
+          alternativas: alt(propio.code),
+        };
+      }
+
       // ── 1) Lo que ya clasificaron otros negocios ──
       const otros = porOtrosNegocios(String(nombre), tokens);
       if (otros) {
@@ -703,7 +819,7 @@ cabys.post('/sugerir', async (c) => {
     const nombres: string[] = Array.isArray(body?.names) ? body.names : [];
     if (nombres.length === 0) return ok(c, []);
     if (nombres.length > 3000) return fail(c, 'Demasiados productos de una vez (máximo 3000)', 422);
-    return ok(c, await sugerirCabys(nombres));
+    return ok(c, await sugerirCabys(nombres, { tenantId: c.get('tenantId') }));
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
