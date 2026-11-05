@@ -26,14 +26,17 @@ const PurchaseSchema = z.object({
   total_amount:           z.number().nonnegative().optional().nullable(),
   items:                  z.array(ItemSchema).optional().default([]),
   /**
-   * COMPRA SIN ORDEN: la mercadería ya está acá.
+   * YA NO SE USA: toda compra nace PENDIENTE.
    *
-   * El flujo obligaba a crear una orden y después «recibirla», un paso que en
-   * la práctica es puro trámite —de las compras recibidas, 23 de 29 se crearon
-   * y recibieron el mismo día— y que además deja trampas: hay 48 compras
-   * atascadas en «pendiente», o sea mercadería que entró y un inventario que
-   * nunca se enteró. Con esto la compra entra ya recibida: sube el stock,
-   * actualiza el costo y crea la cuenta por pagar en un solo paso.
+   * Existió un atajo que creaba y recibía de un saque. Es cómodo y es justo
+   * donde se cuelan los errores caros: una línea mal copiada de la factura ya
+   * movió existencias y creó una cuenta por pagar antes de que nadie la
+   * mirara, y deshacer eso cuesta mucho más que el paso que ahorraba.
+   *
+   * El campo se sigue aceptando —sin efecto— porque la cola de compras
+   * offline puede tener pedidos viejos guardados con `receive_now: true`, y
+   * rechazarlos al sincronizar haría perder una compra ya tecleada. Entran
+   * como pendientes, que es lo que corresponde.
    */
   receive_now:            z.boolean().optional().default(false),
   /** El plan puede no permitir mover inventario. */
@@ -176,7 +179,7 @@ purchases.post('/', async (c) => {
     const parsed = PurchaseSchema.safeParse(await c.req.json());
     if (!parsed.success) return fail(c, parsed.error.message, 422);
 
-    const { items, receive_now: recibirYa, canUpdateStock, ...purchaseData } = parsed.data;
+    const { items, receive_now: _yaNoSeUsa, canUpdateStock: _tampoco, ...purchaseData } = parsed.data;
 
     // Sin número, se genera uno: ver el comentario del esquema.
     const numero = String(purchaseData.purchase_number ?? '').trim()
@@ -193,33 +196,97 @@ purchases.post('/', async (c) => {
       if (iErr) throw new Error(iErr.message);
     }
 
-    if (recibirYa) {
-      /**
-       * Se crea pendiente y se recibe acto seguido, en vez de insertarla ya
-       * «received»: así pasa por el MISMO camino que una recepción normal
-       * —stock, costo y cuenta por pagar—. Una compra directa que tomara un
-       * atajo sería la que se olvida de actualizar el costo.
-       */
-      const recibida = await aplicarRecepcion({
-        tenantId, userId: c.get('userId'), purchaseId: purchase.id,
-        items: items.map(i => ({ product_id: i.product_id, quantity: i.quantity })),
-        canUpdateStock,
-      });
-      return ok(c, recibida, 201);
-    }
-
+    /* La compra NO se recibe acá, aunque lo pidan: la mercadería entra por
+       «Revisar y Recibir», donde se confirman cantidades y precios línea por
+       línea antes de tocar el inventario. */
     return ok(c, purchase, 201);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+const EdicionSchema = z.object({
+  supplier_id:            z.string().uuid().optional(),
+  purchase_date:          z.string().optional(),
+  expected_delivery_date: z.string().optional().nullable(),
+  notes:                  z.string().optional().nullable(),
+  /** Las líneas COMPLETAS: lo que no venga en la lista deja de estar. */
+  items:                  z.array(ItemSchema).optional(),
+  /** Solo para cancelar. Recibir va por `/receive`, que mueve inventario. */
+  status:                 z.enum(['pending', 'cancelled']).optional(),
+});
+
+/**
+ * PUT /:id — CORREGIR UNA ORDEN DE COMPRA.
+ *
+ * Hasta ahora una orden mal armada no tenía arreglo: se cancelaba y se hacía
+ * de nuevo. Con veinte líneas copiadas de una factura, eso es media hora de
+ * trabajo tirada por un precio mal tecleado, así que lo que pasaba de verdad
+ * era que se recibía mal y el costo quedaba sucio para siempre.
+ *
+ * ── Dos reglas, y el motivo de cada una ──────────────────────────────────
+ *
+ * 1. SOLO MIENTRAS ESTÉ PENDIENTE. Una orden recibida ya movió existencias,
+ *    costos y —si el proveedor es a crédito— una cuenta por pagar. Cambiarle
+ *    las líneas después dejaría el inventario diciendo una cosa y la orden
+ *    otra, sin que nadie se entere. Para eso están «Cargar al inventario» y
+ *    el ajuste de existencias, que dejan rastro.
+ *
+ * 2. EL TOTAL LO CALCULA EL SERVIDOR, siempre, desde las líneas. Si el total
+ *    viniera del formulario, una orden podría terminar con líneas que suman
+ *    ₡90.000 y un total de ₡100.000, y esa diferencia después es una cuenta
+ *    por pagar equivocada.
+ *
+ * El campo `status` acá solo sirve para CANCELAR: recibir mueve inventario y
+ * crea cuentas por pagar, así que tiene su propio camino.
+ */
 purchases.put('/:id', async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const { id }   = c.req.param();
-    const body     = await c.req.json();
+    const parsed = EdicionSchema.safeParse(await c.req.json().catch(() => ({})));
+    if (!parsed.success) return fail(c, 'Datos inválidos para editar la orden', 422);
+    const { items, ...cabeza } = parsed.data;
+
+    const { data: previa } = await db.from('purchases')
+      .select('status, purchase_number').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+    if (!previa) return fail(c, 'Orden de compra no encontrada', 404);
+
+    const estado = String((previa as any).status ?? '');
+    const numero = (previa as any).purchase_number ?? '';
+    /* Cambiar solo el estado (cancelar) se permite siempre que la orden esté
+       pendiente; tocar los datos de una orden ya recibida, no. */
+    const tocaDatos = items !== undefined || Object.keys(cabeza).some(k => k !== 'status');
+    if (tocaDatos && estado !== 'pending') {
+      return fail(c, estado === 'received'
+        ? `La orden ${numero} ya se recibió: la mercadería entró al inventario y, si el proveedor es a crédito, `
+          + 'ya hay una cuenta por pagar. Cambiarle las líneas ahora dejaría el inventario diciendo otra cosa.'
+        : `La orden ${numero} está cancelada: no se puede editar.`, 409);
+    }
+    if (cabeza.status === 'cancelled' && estado === 'received') {
+      return fail(c, `La orden ${numero} ya se recibió: no se puede cancelar.`, 409);
+    }
+
+    const patch: Record<string, any> = { ...cabeza, updated_at: new Date().toISOString() };
+
+    if (items !== undefined) {
+      if (items.length === 0) return fail(c, 'La orden necesita al menos un artículo', 422);
+      /* Se reemplazan todas: emparejar línea por línea obligaría a mandar los
+         id de cada una y a adivinar qué hacer con las que no vinieron. */
+      const { error: eBorrar } = await db.from('purchase_items').delete().eq('purchase_id', id);
+      if (eBorrar) throw new Error(eBorrar.message);
+      const filas = items.map(it => ({
+        purchase_id: id,
+        product_id: it.product_id,
+        quantity: it.quantity,
+        unit_price: it.unit_price,
+        subtotal: Math.round(it.quantity * it.unit_price * 100) / 100,
+      }));
+      const { error: eItems } = await db.from('purchase_items').insert(filas);
+      if (eItems) throw new Error(eItems.message);
+      patch.total_amount = Math.round(filas.reduce((s2, f) => s2 + f.subtotal, 0) * 100) / 100;
+    }
+
     const { data, error } = await db.from('purchases')
-      .update({ ...body, updated_at: new Date().toISOString() })
-      .eq('id', id).eq('tenant_id', tenantId).select().single();
+      .update(patch).eq('id', id).eq('tenant_id', tenantId).select().single();
     if (error) throw new Error(error.message);
     return ok(c, data);
   } catch (err: any) { return fail(c, err.message, 500); }
@@ -333,7 +400,8 @@ async function aplicarRecepcion(params: {
   tenantId: string;
   userId?: string | null;
   purchaseId: string;
-  items: Array<{ product_id: string; quantity: number }>;
+  /** `unit_price` viene cuando el precio de la factura no fue el de la orden. */
+  items: Array<{ product_id: string; quantity: number; unit_price?: number }>;
   canUpdateStock?: boolean;
   notes?: string | null;
 }): Promise<any> {
@@ -350,12 +418,59 @@ async function aplicarRecepcion(params: {
     .eq('id', purchase.supplier_id)
     .maybeSingle();
 
+  /**
+   * LO QUE SE CORRIGIÓ AL REVISAR, SE GUARDA.
+   *
+   * La pantalla de «Revisar y recibir» deja arreglar cantidades y precios
+   * —llegaron 8 de 10, el proveedor subió el precio— y hasta ahora esas
+   * correcciones se usaban para sumar el stock y después se tiraban: la orden
+   * seguía diciendo 10 al precio viejo, el total no cambiaba, y la cuenta por
+   * pagar se creaba por un monto que el proveedor nunca facturó.
+   *
+   * Acá quedan escritas: `received_quantity` (que existía y nadie llenaba),
+   * el precio real, y el total recalculado desde lo que DE VERDAD entró.
+   */
+  let totalRecibido: number | null = null;
+  try {
+    const { data: lineas } = await db.from('purchase_items')
+      .select('id, product_id, quantity, unit_price').eq('purchase_id', id);
+    const recibido = new Map<string, { quantity: number; unit_price?: number }>();
+    for (const it of (items ?? [])) {
+      if (it?.product_id) recibido.set(String(it.product_id), { quantity: Number(it.quantity) || 0, unit_price: it.unit_price });
+    }
+
+    let suma = 0;
+    for (const l of ((lineas ?? []) as any[])) {
+      const r = recibido.get(String(l.product_id));
+      /* Una línea que no vino en la revisión se toma como recibida completa:
+         es lo que pasaba antes y cambiarlo en silencio daría por no recibido
+         algo que sí llegó. */
+      const cantidad = r ? r.quantity : Number(l.quantity) || 0;
+      const precio = r?.unit_price != null ? Number(r.unit_price) : Number(l.unit_price) || 0;
+      const subtotal = Math.round(cantidad * precio * 100) / 100;
+      suma += subtotal;
+      if (r && (cantidad !== Number(l.quantity) || precio !== Number(l.unit_price))) {
+        await db.from('purchase_items')
+          .update({ received_quantity: cantidad, unit_price: precio, subtotal })
+          .eq('id', l.id);
+      } else if (r) {
+        await db.from('purchase_items').update({ received_quantity: cantidad }).eq('id', l.id);
+      }
+    }
+    totalRecibido = Math.round(suma * 100) / 100;
+  } catch (e: any) {
+    console.warn('[RECEIVE] no se pudieron guardar las correcciones de la revisión:', e?.message);
+  }
+
   // Marcar recibida.
   const { data: updated, error: uErr } = await db.from('purchases')
     .update({
       status: 'received',
       actual_delivery_date: new Date().toISOString().slice(0, 10),
       ...(notes !== undefined ? { notes: notes || null } : {}),
+      /* El total pasa a ser el de lo que entró, no el de lo que se pidió: es
+         el monto que el proveedor va a cobrar. */
+      ...(totalRecibido != null ? { total_amount: totalRecibido } : {}),
       updated_at: new Date().toISOString(),
     })
     .eq('id', id).eq('tenant_id', tenantId).select().single();
@@ -383,7 +498,10 @@ async function aplicarRecepcion(params: {
       supplier_id: purchase.supplier_id,
       purchase_number: purchase.purchase_number,
       supplier_name: supplier?.name ?? 'Proveedor desconocido',
-      total_amount: purchase.total_amount ?? 0,
+      /* La cuenta por pagar, por lo recibido. Antes se creaba por lo PEDIDO:
+         si llegaban 8 de 10, el negocio quedaba debiendo dos que nunca
+         recibió. */
+      total_amount: totalRecibido ?? purchase.total_amount ?? 0,
       paid_amount: 0,
       due_date: dueDate,
       status: 'pending',
@@ -401,7 +519,10 @@ purchases.post('/:id/receive', async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const { id }   = c.req.param();
-    const body = await c.req.json() as { items: { product_id: string; quantity: number }[]; canUpdateStock?: boolean; notes?: string };
+    const body = await c.req.json() as {
+      items: { product_id: string; quantity: number; unit_price?: number }[];
+      canUpdateStock?: boolean; notes?: string;
+    };
 
     /**
      * UNA orden se recibe UNA vez.

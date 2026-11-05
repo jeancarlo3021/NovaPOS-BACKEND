@@ -28,6 +28,49 @@ const looksLikeFE = (s: string) => /<\??\s*(FacturaElectronica|TiqueteElectronic
 
 // Saca todos los XML de comprobante que haya en un adjunto: reconoce .xml,
 // application/xml, octet-stream con contenido XML, y .zip con XML adentro.
+/**
+ * LAS PARTES DEL CORREO QUE PUEDEN TRAER EL XML.
+ *
+ * Bajar el correo ENTERO es lo que hace lento todo esto: medido en
+ * producción, 2,1 segundos por correo, y la mayor parte son los PDF de
+ * representación gráfica que vienen al lado del XML —archivos de uno o dos
+ * megas que no se usan para nada—.
+ *
+ * El servidor IMAP puede entregar una parte sola si se le dice cuál. Esta
+ * función lee el árbol del mensaje y devuelve qué partes vale la pena bajar:
+ * los XML y los ZIP. Lo demás ni se toca.
+ *
+ * Es pura a propósito: el árbol de un correo real tiene anidamientos raros
+ * —multipart dentro de multipart, adjuntos sin nombre, tipos genéricos— y
+ * eso se prueba con casos, no mirando una bandeja.
+ */
+export function partesConXml(nodo: any, encontradas: Array<{ part: string; nombre: string; tipo: string }> = []) {
+  if (!nodo || typeof nodo !== 'object') return encontradas;
+  const tipo = String(nodo.type ?? '').toLowerCase();
+  const nombre = String(
+    nodo.dispositionParameters?.filename ?? nodo.parameters?.name ?? '',
+  ).toLowerCase();
+
+  const esXml = tipo.includes('xml') || nombre.endsWith('.xml');
+  const esZip = tipo.includes('zip') || nombre.endsWith('.zip');
+  /* Los proveedores mandan el XML como «application/octet-stream» con mucha
+     frecuencia: sin mirar el nombre se perdería la mitad de las facturas. */
+  const genericoConNombre = tipo.includes('octet-stream') && (nombre.endsWith('.xml') || nombre.endsWith('.zip'));
+
+  if (nodo.part && (esXml || esZip || genericoConNombre)) {
+    encontradas.push({ part: String(nodo.part), nombre, tipo });
+  }
+  for (const hijo of (nodo.childNodes ?? [])) partesConXml(hijo, encontradas);
+  return encontradas;
+}
+
+/** Junta un stream en un Buffer. */
+async function aBuffer(stream: any): Promise<Buffer> {
+  const trozos: Buffer[] = [];
+  for await (const t of stream) trozos.push(Buffer.isBuffer(t) ? t : Buffer.from(t));
+  return Buffer.concat(trozos);
+}
+
 function xmlsFromAttachment(att: any): string[] {
   const out: string[] = [];
   if (!att?.content) return out;
@@ -387,31 +430,65 @@ export async function fetchAndProcessReceivedEmails(
             }
             summary.scanned++;
             try {
-              const msg = await client.fetchOne(String(uid), { source: true }, { uid: true });
-              if (!msg || !msg.source) { summary.skipped++; continue; }
-              const parsed = await simpleParser(msg.source as Buffer);
-
-              // Adjuntos XML (incluye octet-stream, .zip) + cuerpo que sea XML directo.
+              /**
+               * PRIMERO EL ÍNDICE, DESPUÉS SOLO LO QUE SIRVE.
+               *
+               * Se pide la estructura del mensaje —que es chica— y, si trae
+               * adjuntos XML o ZIP, se bajan ESAS PARTES y nada más. El PDF
+               * de la representación gráfica, que es lo pesado y no se usa,
+               * se queda en el servidor.
+               *
+               * Si el correo no declara adjuntos útiles (el XML pegado en el
+               * cuerpo, por ejemplo) o algo sale mal, se baja entero como
+               * antes: la vuelta atrás existe porque los correos reales son
+               * más raros que cualquier especificación.
+               */
               const xmls: string[] = [];
-              for (const att of (parsed.attachments || [])) {
-                for (const x of xmlsFromAttachment(att)) xmls.push(x);
+              let emailFrom = '';
+              let asunto: string | null = null;
+              let adjuntosDebug: any[] = [];
+              let completo = false;
+
+              try {
+                /* `fetchOne` devuelve `false` cuando el correo ya no está. */
+                const cab: any = await client.fetchOne(String(uid), { bodyStructure: true, envelope: true }, { uid: true });
+                const partes = partesConXml(cab?.bodyStructure);
+                emailFrom = cab?.envelope?.from?.[0]?.address ?? '';
+                asunto = cab?.envelope?.subject ?? null;
+                adjuntosDebug = partes.map(p => ({ filename: p.nombre, contentType: p.tipo, part: p.part }));
+                for (const p of partes) {
+                  const bajada = await client.download(String(uid), p.part, { uid: true });
+                  const contenido = await aBuffer(bajada?.content);
+                  for (const x of xmlsFromAttachment({ filename: p.nombre, contentType: p.tipo, content: contenido })) {
+                    xmls.push(x);
+                  }
+                }
+                if (partes.length === 0) completo = true;
+              } catch (e: any) {
+                console.warn('[recepción] no se pudo bajar por partes, se baja entero:', e?.message);
+                completo = true;
               }
-              for (const body of [parsed.text, parsed.html].filter(Boolean) as string[]) {
-                if (looksLikeFE(body)) xmls.push(body);
+
+              if (completo) {
+                const msg = await client.fetchOne(String(uid), { source: true }, { uid: true });
+                if (!msg || !msg.source) { summary.skipped++; continue; }
+                const parsed = await simpleParser(msg.source as Buffer);
+                for (const att of (parsed.attachments || [])) {
+                  for (const x of xmlsFromAttachment(att)) xmls.push(x);
+                }
+                for (const body of [parsed.text, parsed.html].filter(Boolean) as string[]) {
+                  if (looksLikeFE(body)) xmls.push(body);
+                }
+                emailFrom = parsed.from?.text || emailFrom;
+                asunto = parsed.subject ?? asunto;
+                adjuntosDebug = (parsed.attachments || []).map(a => ({
+                  filename: a.filename, contentType: a.contentType, size: a.size,
+                }));
               }
 
               if (debug) {
-                debugInfo.push({
-                  subject: parsed.subject,
-                  from: parsed.from?.text,
-                  attachments: (parsed.attachments || []).map(a => ({
-                    filename: a.filename, contentType: a.contentType, size: a.size,
-                  })),
-                  xmlFound: xmls.length,
-                });
+                debugInfo.push({ subject: asunto, from: emailFrom, attachments: adjuntosDebug, xmlFound: xmls.length, completo });
               }
-
-              const emailFrom = parsed.from?.text || '';
               let anyRelevant = false;
               for (const xml of xmls) {
                 const r = await processXml(xml, emailFrom, tenantIndex);
