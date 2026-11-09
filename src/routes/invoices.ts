@@ -63,6 +63,9 @@ const InvoiceSchema = z.object({
   delivery_commission_pct:  z.number().nonnegative().max(100).optional().default(0),
   delivery_net:             z.number().optional().nullable(),
   delivery_platform:        z.string().optional().nullable(),
+  /** Reparto propio: quién lo llevó y a qué zona. El COBRO va como línea. */
+  delivery_person:          z.string().max(120).optional().nullable(),
+  delivery_zone:            z.string().max(120).optional().nullable(),
   notes:            z.string().optional().nullable(),
   issued_at:        z.string().optional().nullable(),
   amount_received:  z.number().optional().nullable(),

@@ -1048,12 +1048,23 @@ routing.post('/void-sale/:invoiceId', async (c) => {
     if (!inv) return fail(c, 'Factura no encontrada', 404);
     if ((inv as any).status === 'cancelled') return fail(c, 'La factura ya está anulada', 409);
 
-    // Camión de la ruta.
+    /**
+     * EL CAMIÓN, SOLO SI LA RUTA SIGUE ABIERTA.
+     *
+     * Devolver al camión una venta de una ruta YA CERRADA dejaba mercadería
+     * arriba de un camión que debería estar vacío: nadie la cargó, no figura
+     * en lo cargado de ninguna ruta, y al día siguiente el repartidor la
+     * puede vender. Es el origen de «aparecen cosas que no cargué» y de que
+     * una ruta venda más de lo que llevaba.
+     *
+     * Con la ruta cerrada, esa mercadería está de vuelta en la bodega: ahí es
+     * donde tiene que volver el stock.
+     */
     let truckId: string | null = null;
     if ((inv as any).route_id) {
       const { data: route } = await db.from('routes')
-        .select('warehouse_id').eq('id', (inv as any).route_id).eq('tenant_id', tenantId).maybeSingle();
-      truckId = (route as any)?.warehouse_id ?? null;
+        .select('warehouse_id, status').eq('id', (inv as any).route_id).eq('tenant_id', tenantId).maybeSingle();
+      if ((route as any)?.status !== 'closed') truckId = (route as any)?.warehouse_id ?? null;
     }
 
     // Devolver el stock al camión. Si la venta no quedó ligada a una ruta con
@@ -1242,6 +1253,30 @@ routing.post('/order/:orderId/deliver', async (c) => {
 
 // POST /:id/close — corte del día: devuelve el sobrante del camión a la central
 // y genera el resumen (ventas, anulaciones). Sin caja chica.
+/**
+ * Deja escrito en el historial que una devolución de ruta entró al inventario.
+ *
+ * Nunca interrumpe el cierre: que falle el registro no puede impedir que la
+ * mercadería vuelva, pero sin el registro nadie puede auditar después qué
+ * volvió de cuál camión.
+ */
+async function anotarDevolucion(
+  tenantId: string, userId: string | null | undefined, productId: string,
+  cantidad: number, antes: number, camion?: string, reconstruido = false,
+) {
+  try {
+    await db.from('stock_adjustments').insert({
+      tenant_id: tenantId, product_id: productId, user_id: userId ?? null,
+      type: 'increase', quantity: cantidad,
+      stock_before: antes, stock_after: antes + cantidad,
+      reason: `Sobrante de ruta${camion ? ` · ${camion}` : ''}`,
+      notes: reconstruido
+        ? 'Devolución calculada de lo cargado menos lo vendido: el camión figuraba vacío'
+        : 'Devolución al cerrar la ruta',
+    });
+  } catch (e: any) { console.warn('[ruta] no se pudo anotar la devolución:', e?.message); }
+}
+
 routing.post('/:id/close', async (c) => {
   try {
     const tenantId = c.get('tenantId');
@@ -1252,6 +1287,35 @@ routing.post('/:id/close', async (c) => {
       .select('id, warehouse_id, status, route_date, driver_id').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
     if (!route) return fail(c, 'Ruta no encontrada', 404);
     if ((route as any).status === 'closed') return fail(c, 'La ruta ya está cerrada', 409);
+
+    /**
+     * ── SE CIERRA PRIMERO, SE DEVUELVE DESPUÉS ──────────────────────────────
+     *
+     * Antes el orden era al revés: se leía el estado, se devolvía el sobrante
+     * al inventario, se armaba el resumen —ventas, abonos, gastos: varios
+     * segundos— y recién al final se marcaba «cerrada».
+     *
+     * En esos segundos el guardado de arriba no protege nada: dos cierres a
+     * la vez —el repartidor que toca dos veces porque la señal va lenta, o la
+     * cola offline reintentando— pasaban LOS DOS, y los dos sumaban el
+     * sobrante al inventario central. De ahí el inventario duplicado.
+     *
+     * Y peor: el segundo encontraba el camión ya vacío, así que reconstruía
+     * el sobrante de «lo cargado menos lo vendido» e imprimía como devuelto
+     * algo que ya había vuelto. De ahí las partes de la carga que aparecen y
+     * no deberían.
+     *
+     * Ahora la ruta se marca cerrada ANTES de tocar nada, con la condición de
+     * que siga abierta. La base decide quién gana: el que no actualiza
+     * ninguna fila se va con un 409 sin haber movido un solo producto.
+     */
+    const { data: tomada } = await db.from('routes')
+      .update({ status: 'closed', closed_at: new Date().toISOString() })
+      .eq('id', id).eq('tenant_id', tenantId).eq('status', 'open')
+      .select('id');
+    if (!tomada || (tomada as any[]).length === 0) {
+      return fail(c, 'La ruta ya está cerrada (o se está cerrando en este momento).', 409);
+    }
 
     const truckId = (route as any).warehouse_id;
     // El nombre del camión, para que el resumen diga de qué ruta es.
@@ -1274,10 +1338,15 @@ routing.post('/:id/close', async (c) => {
         const { data: prod } = await db.from('products')
           .select('name, stock_quantity, tracks_stock').eq('id', it.product_id).eq('tenant_id', tenantId).maybeSingle();
         if (prod && (prod as any).tracks_stock !== false) {
+          const antes = Number((prod as any).stock_quantity ?? 0);
           await db.from('products').update({
-            stock_quantity: Number((prod as any).stock_quantity ?? 0) + it.quantity,
+            stock_quantity: antes + it.quantity,
             updated_at: new Date().toISOString(),
           }).eq('id', it.product_id);
+          /* El rastro: sin esta línea nadie puede reconstruir después de dónde
+             salió una existencia, ni probar que el sobrante volvió. Las
+             compras ya lo hacían; el cierre de ruta no dejaba nada. */
+          await anotarDevolucion(tenantId, userId, it.product_id, it.quantity, antes, nombreCamion, false);
         }
         returnedDetail.push({ name: (prod as any)?.name ?? 'Producto', quantity: it.quantity });
         await db.from('warehouse_stock').upsert(
@@ -1332,13 +1401,32 @@ routing.post('/:id/close', async (c) => {
           .filter(x => x.qty > 0.0001);
         if (pend.length > 0) {
           const { data: prods } = await db.from('products')
-            .select('id, name').in('id', pend.map(x => x.pid));
+            .select('id, name, stock_quantity, tracks_stock').in('id', pend.map(x => x.pid));
           const names = new Map((prods ?? []).map((p: any) => [String(p.id), p.name]));
+          const info = new Map((prods ?? []).map((p: any) => [String(p.id), p]));
           for (const x of pend) {
-            returnedDetail.push({
-              name: names.get(x.pid) ?? 'Producto',
-              quantity: Math.round(x.qty * 1000) / 1000,
-            });
+            const cant = Math.round(x.qty * 1000) / 1000;
+            /**
+             * Y SE DEVUELVE DE VERDAD, no solo en el papel.
+             *
+             * Esto antes se imprimía en el tiquete como devuelto y nunca se
+             * sumaba al inventario: el cierre decía «volvieron 40» y el
+             * inventario no recibía nada. Es la queja de «no está tirando el
+             * inventario».
+             *
+             * Se puede hacer sin miedo a duplicar porque el cierre ahora lo
+             * gana uno solo (ver arriba): si llegamos acá, esa mercadería no
+             * volvió por ningún otro lado.
+             */
+            const p: any = info.get(x.pid);
+            if (p && p.tracks_stock !== false) {
+              const antes = Number(p.stock_quantity ?? 0);
+              await db.from('products').update({
+                stock_quantity: antes + cant, updated_at: new Date().toISOString(),
+              }).eq('id', x.pid).eq('tenant_id', tenantId);
+              await anotarDevolucion(tenantId, userId, x.pid, cant, antes, nombreCamion, true);
+            }
+            returnedDetail.push({ name: names.get(x.pid) ?? 'Producto', quantity: cant });
           }
           returnedSource = 'reconstructed';
           console.warn(`[ruta ${id}] el camión estaba vacío en warehouse_stock: `
@@ -1395,10 +1483,30 @@ routing.post('/:id/close', async (c) => {
       }
     }
 
+    /**
+     * LO QUE EL CHOFER TRAE ≠ LO QUE VENDIÓ.
+     *
+     * Una venta a crédito no trae un cinco: la mercadería salió del camión y
+     * el cliente paga después. El cierre mostraba «Total vendido» —crédito
+     * incluido— y es contra ese número que se le cuadraba la plata al
+     * chofer, así que el crédito le aparecía como un faltante que no existe
+     * (o, si alguien lo contaba del otro lado, como un sobrante).
+     *
+     * Ahora van dos números distintos y con nombre propio:
+     *  · `cobrado`: efectivo + tarjeta + SINPE. Es lo único que se le cuadra.
+     *  · `credito`: lo que quedó por cobrar. Se muestra porque hay que saberlo
+     *    —alguien tiene que ir a cobrarlo— pero NO entra en la suma del cierre.
+     */
+    const cobrado = Math.round((byMethod.cash + byMethod.card + byMethod.sinpe) * 100) / 100;
+
     const summary = {
       route_id: id,
       sales_count: sales.length,
       sales_total: salesTotal,
+      /** Lo que de verdad se cobró en la ruta. El crédito NO está acá. */
+      cobrado,
+      /** Lo que quedó a crédito: queda como cuenta por cobrar, no como plata. */
+      credito: Math.round(byMethod.credit * 100) / 100,
       voids_count: voids.length,
       returned_items: returnedDetail.length,
       returned: returnedDetail,
@@ -1421,10 +1529,8 @@ routing.post('/:id/close', async (c) => {
       route_date: (route as any).route_date,
     };
 
-    // 3) Cerrar la ruta y GUARDAR el resumen para poder reimprimirlo luego.
-    //    El update de close_summary es best-effort (por si la columna aún no existe).
-    await db.from('routes').update({ status: 'closed', closed_at: new Date().toISOString() })
-      .eq('id', id).eq('tenant_id', tenantId);
+    // 3) GUARDAR el resumen para poder reimprimirlo luego. La ruta ya quedó
+    //    cerrada arriba, antes de mover inventario.
     try {
       await db.from('routes').update({ close_summary: summary }).eq('id', id).eq('tenant_id', tenantId);
     } catch { /* columna close_summary no existe todavía */ }
@@ -1522,6 +1628,12 @@ routing.get('/:id/close-summary', async (c) => {
       returned_items: returned.length,
       returned,
       by_method: stored?.by_method ?? byMethod,
+      /* La reimpresión tiene que decir lo mismo que el original. Los cierres
+         viejos no guardaron `cobrado`, así que se calcula de los métodos: el
+         crédito nunca entra. */
+      cobrado: stored?.cobrado ?? Math.round(((stored?.by_method ?? byMethod).cash
+        + (stored?.by_method ?? byMethod).card + (stored?.by_method ?? byMethod).sinpe) * 100) / 100,
+      credito: stored?.credito ?? Math.round((stored?.by_method ?? byMethod).credit * 100) / 100,
       // Abonos de CxC y gastos del día (del resumen guardado al cerrar).
       ar_payments: stored?.ar_payments,
       expenses: stored?.expenses,

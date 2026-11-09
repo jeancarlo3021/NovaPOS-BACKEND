@@ -54,9 +54,27 @@ export interface ConversionResult {
  * Si las unidades existen pero son de dimensiones distintas (gramos → litros),
  * tampoco se inventa nada: no hay forma de saber la densidad.
  */
+/**
+ * La equivalencia que declara UN producto: «1 <unidad del producto> = qty code».
+ *
+ * Es lo que permite pasar de kilos a unidades, que de otro modo es imposible:
+ * no existe «cuántas unidades hay en un kilo», existe cuánto pesa una unidad
+ * DE ESE producto. Un pollo pesa 1,8 kg; una tajada de queso, 25 g.
+ */
+export interface Equivalencia {
+  /** La unidad propia del producto (la de su costo). */
+  unidad: string;
+  /** Cuánto mide una de esas unidades… */
+  qty: number;
+  /** …en esta otra unidad. */
+  code: string;
+}
+
 export function convert(
   qty: number, from: string | null | undefined, to: string | null | undefined,
   units: Map<string, MeasureUnit>,
+  /** La regla del producto, para poder cruzar dimensiones solo en su caso. */
+  equiv?: Equivalencia | null,
 ): ConversionResult {
   const q = Number(qty) || 0;
   if (!from || !to) return { quantity: q, converted: false, problem: 'sin unidad' };
@@ -65,13 +83,38 @@ export function convert(
   const uFrom = units.get(from);
   const uTo = units.get(to);
   if (!uFrom || !uTo) return { quantity: q, converted: false, problem: 'unidad desconocida' };
-  if (uFrom.dimension !== uTo.dimension) {
-    return {
-      quantity: q, converted: false,
-      problem: `no se puede pasar de ${uFrom.name} a ${uTo.name}`,
-    };
+  if (uFrom.dimension === uTo.dimension) {
+    return { quantity: (q * uFrom.to_base) / uTo.to_base, converted: true };
   }
-  return { quantity: (q * uFrom.to_base) / uTo.to_base, converted: true };
+
+  /**
+   * DIMENSIONES DISTINTAS: solo se puede si el producto dijo su equivalencia.
+   *
+   * «1 unidad = 1,8 kg» es un puente entre el conteo y la masa, pero vale
+   * únicamente para ESE producto. Sin él no se inventa nada: convertir kilos a
+   * unidades con un promedio daría un costo que parece correcto y no lo es,
+   * que es peor que avisar que falta el dato.
+   */
+  const puente = equiv && Number(equiv.qty) > 0 ? equiv : null;
+  const uPuente = puente ? units.get(puente.code) : null;
+  if (puente && uPuente) {
+    // De la unidad del producto hacia afuera: 2 unidades → kg.
+    if (from === puente.unidad && uTo.dimension === uPuente.dimension) {
+      const enPuente = q * Number(puente.qty);                    // 2 und → 3,6 kg
+      return { quantity: (enPuente * uPuente.to_base) / uTo.to_base, converted: true };
+    }
+    // De afuera hacia la unidad del producto: 3,6 kg → unidades.
+    if (to === puente.unidad && uFrom.dimension === uPuente.dimension) {
+      const enPuente = (q * uFrom.to_base) / uPuente.to_base;      // 3,6 kg → 3,6 kg
+      return { quantity: enPuente / Number(puente.qty), converted: true };
+    }
+  }
+
+  return {
+    quantity: q, converted: false,
+    problem: `no se puede pasar de ${uFrom.name} a ${uTo.name}`
+      + ` (poné cuánto pesa una ${uTo.dimension === 'count' ? uTo.name.toLowerCase() : uFrom.name.toLowerCase()} en el producto)`,
+  };
 }
 
 // ── Datos del negocio para costear ─────────────────────────────────────────
@@ -91,7 +134,7 @@ export async function loadContext(tenantId: string): Promise<RecipeContext> {
     loadUnits(),
     db.from('recipes').select('*').eq('tenant_id', tenantId),
     db.from('recipe_ingredients').select('*').eq('tenant_id', tenantId).order('seq'),
-    db.from('products').select('id, name, cost_price, tracks_stock, stock_quantity, recipe_unit_code')
+    db.from('products').select('id, name, cost_price, tracks_stock, stock_quantity, recipe_unit_code, equiv_qty, equiv_unit_code')
       .eq('tenant_id', tenantId),
   ]);
 
@@ -181,7 +224,12 @@ function lineFor(
   const p = ctx.products.get(productId);
   if (!p) return [];
   const target = p.recipe_unit_code ?? null;
-  const conv = convert(qty, unitCode, target, ctx.units);
+  /* La equivalencia del producto, si la declaró: es lo único que permite
+     cruzar de peso a conteo para este ingrediente. */
+  const equiv = (target && Number((p as any).equiv_qty) > 0 && (p as any).equiv_unit_code)
+    ? { unidad: target, qty: Number((p as any).equiv_qty), code: String((p as any).equiv_unit_code) }
+    : null;
+  const conv = convert(qty, unitCode, target, ctx.units, equiv);
   const unitCost = Number(p.cost_price) || 0;
   return [{
     product_id: productId,

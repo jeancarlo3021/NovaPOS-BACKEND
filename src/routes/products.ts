@@ -25,6 +25,14 @@ const ProductSchema = z.object({
   supplier_id:     z.string().uuid().optional().nullable(),
   /** Unidad en que está expresado `cost_price` (para costear recetas). */
   recipe_unit_code: z.string().optional().nullable(),
+  /**
+   * Cuánto mide/pesa UNA unidad de este producto, y en qué unidad.
+   *
+   * Es lo que permite convertir entre peso y conteo —de kilos a unidades— para
+   * este producto y solo para este: un pollo pesa 1,8 kg, una tajada 25 g.
+   */
+  equiv_qty: z.number().positive().optional().nullable(),
+  equiv_unit_code: z.string().optional().nullable(),
   is_favorite:     z.boolean().optional(),
   image_url:       z.string().url().optional().nullable(),
   tracks_stock:    z.boolean().optional(),

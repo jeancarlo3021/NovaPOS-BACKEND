@@ -275,6 +275,121 @@ reports.get('/delivery', async (c) => {
 // Devuelve cada factura con su medio de pago, comprobante (voucher), moneda,
 // clave FE, y si fue anulada (con su Nota de Crédito). El front lo separa en
 // "Pagos" y "Anulaciones".
+/**
+ * GET /reparto — EL REPARTO PROPIO: cuántos viajes, de quién y cuánto entró.
+ *
+ * Distinto de `/delivery`, que es el de plataformas (Uber y compañía, que
+ * cobran comisión y pagan después). Acá la plata entra a la caja del día: el
+ * muchacho sale, cobra el domicilio y vuelve con los billetes.
+ *
+ * El cobro se lee de la LÍNEA de la factura —el artículo «Entrega a
+ * domicilio» que se configura en Ajustes → Delivery—, no de un total aparte:
+ * una sola fuente de verdad, la misma que ve el cliente en su tiquete.
+ *
+ * Tres cortes, que son las tres preguntas que se hacen de verdad:
+ *  · por DÍA, para ver cómo se movió la semana;
+ *  · por REPARTIDOR, para saber quién hizo cuántos viajes;
+ *  · por ZONA, que es lo que explica por qué un viaje costó más que otro.
+ */
+reports.get('/reparto', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const from = c.req.query('from');
+    const to   = endOfDay(c.req.query('to'));
+
+    const { data: dcfg } = await db.from('settings').select('config')
+      .eq('tenant_id', tenantId).eq('type', 'delivery').maybeSingle();
+    const productoId = String((dcfg as any)?.config?.reparto_producto_id ?? '').trim();
+    if (!productoId) {
+      /* Sin artículo configurado no se puede distinguir qué línea es el
+         domicilio. Se dice, en vez de devolver ceros que se leen como «no
+         hubo repartos». */
+      return ok(c, {
+        sin_configurar: true,
+        aviso: 'Falta elegir el artículo con el que se cobra el domicilio, en Ajustes → Delivery.',
+        total: 0, viajes: 0, por_dia: [], por_repartidor: [], por_zona: [], ventas: [],
+      });
+    }
+
+    let q = db.from('invoices')
+      .select('id, invoice_number, customer_name, total, issued_at, delivery_person, delivery_zone, payment_method')
+      .eq('tenant_id', tenantId).neq('status', 'cancelled')
+      .order('issued_at', { ascending: false }).limit(5000);
+    if (from) q = q.gte('issued_at', from);
+    if (to)   q = q.lte('issued_at', to);
+    const { data, error } = await q;
+    if (error) throw new Error(error.message);
+    const facturas = (data ?? []) as any[];
+
+    /* Solo las que llevan la línea de domicilio. Filtrar por
+       `delivery_person` dejaría afuera los repartos sin repartidor anotado,
+       que existen y cobraron igual. */
+    const cobro = await repartoDeFacturas(tenantId, productoId, facturas.map(f => String(f.id)));
+    const conReparto = facturas
+      .map(f => ({ ...f, reparto: cobro.get(String(f.id)) ?? 0 }))
+      .filter(f => f.reparto > 0);
+
+    const dia = (iso: string) =>
+      new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Costa_Rica' }).format(new Date(iso));
+
+    const agrupar = (clave: (f: any) => string) => {
+      const m = new Map<string, { clave: string; viajes: number; reparto: number; ventas: number }>();
+      for (const f of conReparto) {
+        const k = clave(f);
+        const g = m.get(k) ?? { clave: k, viajes: 0, reparto: 0, ventas: 0 };
+        g.viajes += 1;
+        g.reparto += Number(f.reparto);
+        /* Lo vendido SIN el domicilio: mezclarlos haría parecer que el
+           repartidor vendió el domicilio. */
+        g.ventas += Number(f.total ?? 0) - Number(f.reparto);
+        m.set(k, g);
+      }
+      return [...m.values()]
+        .map(g => ({ ...g, reparto: Math.round(g.reparto * 100) / 100, ventas: Math.round(g.ventas * 100) / 100 }))
+        .sort((a, b) => b.reparto - a.reparto);
+    };
+
+    const totalReparto = Math.round(conReparto.reduce((s2, f) => s2 + Number(f.reparto), 0) * 100) / 100;
+    const totalVendido = Math.round(conReparto.reduce((s2, f) => s2 + Number(f.total ?? 0), 0) * 100) / 100;
+
+    return ok(c, {
+      viajes: conReparto.length,
+      total: totalReparto,
+      /** Lo vendido en esas facturas, domicilio incluido. */
+      total_con_ventas: totalVendido,
+      /** Lo que se cobró en promedio por viaje: con esto se revisa la tarifa. */
+      promedio: conReparto.length > 0 ? Math.round((totalReparto / conReparto.length) * 100) / 100 : 0,
+      por_dia: agrupar(f => dia(f.issued_at)).sort((a, b) => a.clave < b.clave ? -1 : 1),
+      por_repartidor: agrupar(f => f.delivery_person || '(sin anotar)'),
+      por_zona: agrupar(f => f.delivery_zone || '(sin zona)'),
+      ventas: conReparto.slice(0, 500).map(f => ({
+        id: f.id, invoice_number: f.invoice_number, customer_name: f.customer_name,
+        issued_at: f.issued_at, total: Number(f.total ?? 0), reparto: Number(f.reparto),
+        delivery_person: f.delivery_person ?? null, delivery_zone: f.delivery_zone ?? null,
+        payment_method: f.payment_method ?? null,
+      })),
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/** El cobro de domicilio de cada factura, leído de sus líneas. */
+async function repartoDeFacturas(
+  tenantId: string, productoId: string, ids: string[],
+): Promise<Map<string, number>> {
+  const salida = new Map<string, number>();
+  for (let i = 0; i < ids.length; i += 200) {
+    const { data } = await db.from('invoice_items')
+      .select('invoice_id, subtotal, quantity, unit_price')
+      .eq('product_id', productoId).in('invoice_id', ids.slice(i, i + 200));
+    for (const l of ((data ?? []) as any[])) {
+      const monto = Number(l.subtotal ?? 0) || (Number(l.quantity ?? 0) * Number(l.unit_price ?? 0));
+      salida.set(String(l.invoice_id), (salida.get(String(l.invoice_id)) ?? 0) + monto);
+    }
+  }
+  void tenantId;
+  return salida;
+}
+
 reports.get('/vouchers', async (c) => {
   try {
     const tenantId = c.get('tenantId');

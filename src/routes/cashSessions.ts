@@ -116,6 +116,57 @@ cashSessions.post('/open', async (c) => {
 // el arqueo salía en 0 con la plata en el cajón. Acá, cuando la sesión no tiene
 // facturas ligadas, se buscan las del PERÍODO de esa caja y del mismo cajero, y
 // se avisa de dónde salieron para que la pantalla lo diga.
+
+/**
+ * EL COBRO DEL REPARTO, SACADO DE LAS LÍNEAS DE LA FACTURA.
+ *
+ * El domicilio se cobra como un artículo del catálogo («Entrega a domicilio»),
+ * que es lo que lo hace funcionar con factura electrónica y lo que el cliente
+ * ve en su tiquete. Por eso el monto no vive en una columna aparte: vive en la
+ * línea, y acá se lee de ahí.
+ *
+ * Tener un total paralelo sería más cómodo de consultar y tarde o temprano
+ * diría algo distinto que las líneas; cuando eso pasa, nadie sabe cuál de los
+ * dos creer.
+ *
+ * Devuelve el monto cobrado de reparto por factura. Sin artículo configurado
+ * en Ajustes → Delivery, devuelve vacío: no hay forma de saber qué línea es el
+ * domicilio y adivinar sería peor.
+ */
+export async function repartoPorFactura(
+  tenantId: string, invoiceIds: string[],
+): Promise<Map<string, number>> {
+  const salida = new Map<string, number>();
+  if (invoiceIds.length === 0) return salida;
+  try {
+    const { data: cfg } = await db.from('settings').select('config')
+      .eq('tenant_id', tenantId).eq('type', 'delivery').maybeSingle();
+    const productoId = String((cfg as any)?.config?.reparto_producto_id ?? '').trim();
+    if (!productoId) return salida;
+
+    /* Por tandas: una caja de un día puede tener cientos de facturas y la
+       consulta con todos los ids adentro se pasa del largo de una URL. */
+    for (let i = 0; i < invoiceIds.length; i += 200) {
+      const { data } = await db.from('invoice_items')
+        .select('invoice_id, subtotal, quantity, unit_price')
+        .eq('product_id', productoId).in('invoice_id', invoiceIds.slice(i, i + 200));
+      for (const l of ((data ?? []) as any[])) {
+        const monto = Number(l.subtotal ?? 0) || (Number(l.quantity ?? 0) * Number(l.unit_price ?? 0));
+        salida.set(String(l.invoice_id), (salida.get(String(l.invoice_id)) ?? 0) + monto);
+      }
+    }
+  } catch (e: any) {
+    console.warn('[reparto] no se pudo leer el cobro de reparto:', e?.message);
+  }
+  return salida;
+}
+
+/** Le pega a cada factura cuánto cobró de reparto, para que el cierre lo separe. */
+async function marcarReparto(tenantId: string, facturas: any[]) {
+  const porFactura = await repartoPorFactura(tenantId, facturas.map(f => String(f.id)));
+  for (const f of facturas) f.reparto = porFactura.get(String(f.id)) ?? 0;
+}
+
 cashSessions.get('/:id/invoices', async (c) => {
   try {
     const tenantId = c.get('tenantId');
@@ -132,6 +183,7 @@ cashSessions.get('/:id/invoices', async (c) => {
     if (error) throw new Error(error.message);
 
     if ((ligadas ?? []).length > 0) {
+      await marcarReparto(tenantId, ligadas as any[]);
       return ok(c, { invoices: ligadas, source: 'session', session_id: id });
     }
 
@@ -152,6 +204,7 @@ cashSessions.get('/:id/invoices', async (c) => {
       return true;
     });
 
+    await marcarReparto(tenantId, candidatas);
     return ok(c, {
       invoices: candidatas,
       source: candidatas.length > 0 ? 'window' : 'empty',
