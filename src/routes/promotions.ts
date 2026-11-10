@@ -8,7 +8,7 @@ const promotions = new Hono<{ Variables: { userId: string; tenantId: string; rol
 const PromotionSchema = z.object({
   name: z.string().min(1),
   description: z.string().optional().nullable(),
-  type: z.enum(['percentage', 'fixed', 'bogo', 'bundle', '2x1', 'combo', 'qty_bundle', 'second_half'])
+  type: z.enum(['percentage', 'fixed', 'bogo', 'bundle', '2x1', 'combo', 'qty_bundle', 'second_half', 'gift'])
     .optional().default('percentage'),
   value: z.number().nonnegative(),
   /** Promo por cantidad: cuántas unidades/kg forman el paquete (`value` = su precio). */
@@ -17,6 +17,15 @@ const PromotionSchema = z.object({
   combo_mode: z.enum(['price', 'percent']).optional().nullable(),
   /** Segunda unidad: a cuál del par se le descuenta ('barato' = al más barato). */
   second_rule: z.enum(['barato', 'caro']).optional().nullable(),
+  /**
+   * REGALÍA: qué se regala al comprar lo de `product_ids`.
+   *
+   * El regalo es un producto del catálogo —no un texto— para que salga en la
+   * factura con su línea y su CAByS, descuente inventario y se pueda contar
+   * después cuántos se regalaron.
+   */
+  gift_product_id: z.string().uuid().optional().nullable(),
+  gift_qty: z.number().positive().optional().nullable(),
   min_purchase: z.number().nonnegative().optional().nullable(),
   applies_to: z.enum(['all', 'category', 'products']).optional().default('all'),
   category_id: z.string().uuid().optional().nullable(),
