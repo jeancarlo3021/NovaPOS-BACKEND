@@ -86,22 +86,38 @@ const pct = (v: any, previo: number) => {
  * resultado: una comisión que uno no puede recalcular a mano es una comisión
  * que no se discute, se pelea.
  */
-export function calcularComision(ventas: number, gastos: number, cfg: ConfigTaller): {
+export function calcularComision(
+  ventas: number, gastos: number, cfg: ConfigTaller, envios: number = 0,
+): {
   porcentaje_ventas: number; porcentaje_gastos: number;
+  /** Todo lo que entró, transporte incluido: es el número del reporte. */
   ventas: number; gastos: number;
+  /** El transporte cobrado, que NO entra en la comisión. */
+  envios: number;
+  /** Lo cobrado por las piezas: ventas menos el transporte. */
+  ventas_sin_envio: number;
   /** El 15 % de los gastos, que es lo que se le resta a las ventas. */
   gastos_descontados: number;
-  /** Ventas menos ese descuento: sobre esto se calcula la comisión. */
+  /** Piezas menos ese descuento: sobre esto se calcula la comisión. */
   base: number;
   monto: number;
 } {
   const r = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
   const v = r(ventas), g = r(gastos);
+  /* EL TRANSPORTE NO SE COMISIONA. Lo que el cliente paga por el envío no es
+     plata que el taller gane: entra por una puerta y sale por la otra hacia el
+     mensajero o la gasolina. Comisionarlo le pagaba al vendedor un porcentaje
+     de un costo ajeno, y subía la comisión cada vez que el cliente vivía más
+     lejos. Se descuenta ANTES del descuento por gastos, porque la base es «lo
+     que se cobró por las piezas», no «lo que entró a la caja». */
+  const env = Math.min(r(envios), v);
+  const piezas = r(v - env);
   const descuento = r(g * (cfg.comision_gastos / 100));
-  const base = r(v - descuento);
+  const base = r(piezas - descuento);
   return {
     porcentaje_ventas: cfg.comision_ventas, porcentaje_gastos: cfg.comision_gastos,
-    ventas: v, gastos: g, gastos_descontados: descuento, base,
+    ventas: v, gastos: g, envios: env, ventas_sin_envio: piezas,
+    gastos_descontados: descuento, base,
     /* Si los gastos se comieron las ventas la comisión es cero, no negativa:
        una comisión en rojo no es una deuda del vendedor. */
     monto: Math.max(0, r(base * (cfg.comision_ventas / 100))),
@@ -537,7 +553,7 @@ taller3d.get('/resumen', async (c) => {
       desde, hasta,
       por_dia: porDia,
       /** La comisión del período, con el cálculo entero a la vista. */
-      comision: calcularComision(totalVentas, totalGastos, cfg),
+      comision: calcularComision(totalVentas, totalGastos, cfg, totalEnvios),
       ventas: {
         total: totalVentas, cuantas: vs.length,
         /** Lo cobrado por las piezas, sin el envío. */
