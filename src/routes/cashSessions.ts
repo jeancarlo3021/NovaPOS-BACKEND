@@ -11,6 +11,19 @@ const OpenSchema  = z.object({
   opening_amount: z.number().nonnegative(),
   opening_usd: z.number().nonnegative().optional(),   // dólares contados en apertura
   notes: z.string().optional().nullable(),
+  /**
+   * LA MÁQUINA que abre la caja.
+   *
+   * Una caja es una gaveta con plata, no una persona: lo que la identifica es
+   * el equipo que la opera (el mismo número de terminal del consecutivo de
+   * Hacienda). Cuando llega, la caja es de la MÁQUINA: cualquier cajero que
+   * entre en ese equipo sigue la caja que está abierta, y dos equipos tienen
+   * dos cajas aunque los atienda la misma persona.
+   *
+   * Si no llega, todo se comporta como antes: una caja por usuario.
+   */
+  terminal: z.number().int().min(1).max(99999).optional().nullable(),
+  caja_nombre: z.string().max(60).optional().nullable(),
 });
 const CloseSchema = z.object({
   closing_amount:  z.number().nonnegative().optional(),
@@ -52,11 +65,36 @@ cashSessions.get('/active', async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const userId   = c.get('userId');
-    // Sesión de caja por USUARIO: cada cajero tiene la suya.
-    const { data, error } = await db.from('cash_sessions').select('*')
-      .eq('tenant_id', tenantId).eq('user_id', userId).eq('status', 'open')
+    /**
+     * ¿CUÁL ES LA CAJA ABIERTA ACÁ?
+     *
+     * Con `?terminal=N` la respuesta es la de ESA MÁQUINA, sin importar quién
+     * la abrió: así el relevo de turno sigue la misma gaveta en vez de abrir
+     * otra encima, y la caja de la barra no se le aparece al de la entrada.
+     *
+     * Sin el parámetro, la de este usuario — como siempre.
+     */
+    const term = Number(c.req.query('terminal'));
+    const porMaquina = Number.isFinite(term) && term >= 1;
+
+    let q = db.from('cash_sessions').select('*')
+      .eq('tenant_id', tenantId).eq('status', 'open');
+    q = porMaquina ? q.eq('terminal', term) : q.eq('user_id', userId);
+
+    const { data, error } = await q
       .order('opening_date', { ascending: false }).limit(1).maybeSingle();
     if (error) throw new Error(error.message);
+
+    /* Una máquina recién configurada puede tener su caja abierta de ANTES, sin
+       terminal anotada. Se adopta la del usuario para no obligarlo a cerrar a
+       ciegas una caja que el POS ya no encuentra. */
+    if (!data && porMaquina) {
+      const { data: suya } = await db.from('cash_sessions').select('*')
+        .eq('tenant_id', tenantId).eq('user_id', userId).eq('status', 'open')
+        .is('terminal', null)
+        .order('opening_date', { ascending: false }).limit(1).maybeSingle();
+      if (suya) return ok(c, suya);
+    }
     return ok(c, data);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
@@ -76,20 +114,28 @@ cashSessions.post('/open', async (c) => {
     // null — el guard pasaba y se abría una TERCERA. Así se acumulaban sesiones
     // fantasma: la caja "se cerraba sola" (el POS pasaba a ver otra) y después no
     // dejaba abrir.
-    const { data: abiertas } = await db.from('cash_sessions')
-      .select('*').eq('tenant_id', tenantId).eq('user_id', userId).eq('status', 'open')
+    /* Con máquina, el candado es POR MÁQUINA: lo que no puede haber es dos
+       cajas abiertas sobre la misma gaveta. Que el mismo cajero tenga una en
+       la caja 1 y otra en la caja 2 es lo normal en un local con dos cajas. */
+    const term = parsed.data.terminal ?? null;
+    let qAbiertas = db.from('cash_sessions')
+      .select('*').eq('tenant_id', tenantId).eq('status', 'open');
+    qAbiertas = term ? qAbiertas.eq('terminal', term) : qAbiertas.eq('user_id', userId);
+    const { data: abiertas } = await qAbiertas
       .order('opening_date', { ascending: false }).limit(2);
 
     if ((abiertas ?? []).length > 0) {
       const actual: any = (abiertas ?? [])[0];
       if ((abiertas ?? []).length > 1) {
-        console.warn(`[caja] el usuario ${userId} tiene ${(abiertas ?? []).length}+ cajas abiertas`);
+        console.warn(`[caja] ${term ? `la caja ${term}` : `el usuario ${userId}`} tiene ${(abiertas ?? []).length}+ cajas abiertas`);
       }
       // Se devuelve LA QUE YA ESTÁ para que el POS la adopte, en vez de dejar al
       // cajero trabado con "Ya tenés una caja abierta" sin poder hacer nada.
       return c.json({
         success: false,
-        error: 'Ya tenés una caja abierta',
+        error: term
+          ? `La ${actual.caja_nombre || `caja ${term}`} ya está abierta`
+          : 'Ya tenés una caja abierta',
         existing_session: actual,
         duplicates: (abiertas ?? []).length,
       }, 409);
@@ -103,7 +149,25 @@ cashSessions.post('/open', async (c) => {
       opening_date:   new Date().toISOString(),
       status:         'open',
       notes:          parsed.data.notes,
+      terminal:       term,
+      /* El nombre va COPIADO: si le cambian el nombre a la caja, el arqueo de
+         hace tres meses tiene que seguir diciendo cómo se llamaba. */
+      caja_nombre:    parsed.data.caja_nombre?.trim() || (term ? `Caja ${term}` : null),
     }).select().single();
+    /* Sin la migración 139 estas dos columnas no existen todavía. La caja tiene
+       que poder abrirse igual: se reintenta sin ellas y se avisa en el log. */
+    if (error && /terminal|caja_nombre/.test(error.message)) {
+      console.warn('[caja] sin la migración 139: la caja se abre sin máquina');
+      const reintento = await db.from('cash_sessions').insert({
+        tenant_id: tenantId, user_id: userId,
+        opening_amount: parsed.data.opening_amount,
+        opening_usd: parsed.data.opening_usd ?? 0,
+        opening_date: new Date().toISOString(),
+        status: 'open', notes: parsed.data.notes,
+      }).select().single();
+      if (reintento.error) throw new Error(reintento.error.message);
+      return ok(c, reintento.data, 201);
+    }
     if (error) throw new Error(error.message);
     return ok(c, data, 201);
   } catch (err: any) { return fail(c, err.message, 500); }

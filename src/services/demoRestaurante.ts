@@ -102,6 +102,108 @@ const RECETAS_PLATO = [
   },
 ];
 
+/**
+ * LOS EXTRAS, por plato.
+ *
+ * Es la mitad de la demostración del salón: el mesero toca el plato y le
+ * pregunta al cliente el término y los agregados. Con la función encendida y
+ * sin un solo grupo cargado, el vendedor abría el plato y no salía nada.
+ */
+const EXTRAS: Array<{
+  sku: string;
+  grupos: Array<{
+    nombre: string; min: number; max: number;
+    opciones: Array<{ nombre: string; delta: number }>;
+  }>;
+}> = [
+  {
+    sku: 'MEN-CASBIS',
+    grupos: [
+      { nombre: 'Término de la carne', min: 1, max: 1, opciones: [
+        { nombre: 'Tres cuartos', delta: 0 },
+        { nombre: 'Término medio', delta: 0 },
+        { nombre: 'Bien cocido', delta: 0 },
+      ] },
+      { nombre: 'Agregados', min: 0, max: 3, opciones: [
+        { nombre: 'Huevo frito', delta: 700 },
+        { nombre: 'Queso frito', delta: 1200 },
+        { nombre: 'Aguacate', delta: 900 },
+      ] },
+    ],
+  },
+  {
+    sku: 'MEN-CASPOL',
+    grupos: [
+      { nombre: 'Cómo lo quiere', min: 1, max: 1, opciones: [
+        { nombre: 'A la plancha', delta: 0 },
+        { nombre: 'Empanizado', delta: 500 },
+      ] },
+      { nombre: 'Agregados', min: 0, max: 3, opciones: [
+        { nombre: 'Huevo frito', delta: 700 },
+        { nombre: 'Doble porción de arroz', delta: 800 },
+        { nombre: 'Sin ensalada', delta: 0 },
+      ] },
+    ],
+  },
+  {
+    sku: 'MEN-REFNAT',
+    grupos: [
+      { nombre: 'Sabor', min: 1, max: 1, opciones: [
+        { nombre: 'Cas', delta: 0 },
+        { nombre: 'Mora', delta: 0 },
+        { nombre: 'Maracuyá', delta: 200 },
+      ] },
+      { nombre: 'Preparación', min: 1, max: 1, opciones: [
+        { nombre: 'En agua', delta: 0 },
+        { nombre: 'En leche', delta: 400 },
+      ] },
+    ],
+  },
+  {
+    sku: 'MEN-LOMHON',
+    grupos: [
+      { nombre: 'Término de la carne', min: 1, max: 1, opciones: [
+        { nombre: 'Término medio', delta: 0 },
+        { nombre: 'Tres cuartos', delta: 0 },
+        { nombre: 'Bien cocido', delta: 0 },
+      ] },
+      { nombre: 'Acompañamiento', min: 1, max: 1, opciones: [
+        { nombre: 'Puré de papa', delta: 0 },
+        { nombre: 'Papas fritas', delta: 0 },
+        { nombre: 'Vegetales al vapor', delta: 0 },
+      ] },
+    ],
+  },
+];
+
+/**
+ * LAS PROMOCIONES de la demo, una de cada clase que el salón sabe cobrar.
+ *
+ * El cliente pregunta siempre lo mismo —«¿y si hago 2x1 los martes?»— y hasta
+ * ahora había que explicarlo con la mano. Con esto se le muestra en la cuenta
+ * de una mesa: el descuento sale en la precuenta y la factura lo cobra igual.
+ */
+const PROMOS: Array<{
+  nombre: string; descripcion: string; tipo: string; valor: number;
+  skus: string[]; modo?: string; regalo_sku?: string; regalo_qty?: number;
+}> = [
+  { nombre: '20% en postres', descripcion: 'Descuento directo en la línea',
+    tipo: 'percentage', valor: 20, skus: ['MEN-TRELEC', 'MEN-FLACOC'] },
+  { nombre: 'Casado + fresco ₡5.000', descripcion: 'Combo: se arma solo cuando los dos están en la cuenta',
+    tipo: 'combo', valor: 5000, modo: 'price', skus: ['MEN-CASPOL', 'MEN-REFNAT'] },
+  { nombre: '2x1 en cerveza', descripcion: 'La segunda no se cobra',
+    tipo: '2x1', valor: 0, skus: ['MEN-CERVEZ'] },
+  { nombre: 'Café de regalía con el tres leches', descripcion: 'Regalía: el café sale en el tiquete en ₡0',
+    tipo: 'gift', valor: 0, skus: ['MEN-TRELEC'], regalo_sku: 'MEN-CAFCHO', regalo_qty: 1 },
+];
+
+/** Las tarifas del domicilio: lo que cambia con la distancia. */
+const ZONAS_REPARTO = [
+  { nombre: 'Centro', monto: 1000 },
+  { nombre: 'Barrio Jesús', monto: 1500 },
+  { nombre: 'Carretera', monto: 2500 },
+];
+
 /** El salón: dos zonas y ocho mesas, numeradas para que calcen con los QR. */
 function mapaDelSalon() {
   const mesa = (id: string, x: number, y: number, tipo: string, label: string) =>
@@ -129,6 +231,14 @@ export interface ResultadoSiembra {
   subrecetas: number;
   recetas: number;
   mesas: number;
+  /** Grupos de extras creados (término, agregados, sabor…). */
+  extras: number;
+  /** Promociones creadas. */
+  promos: number;
+  /** Quedó configurado ColónTab (la mesa digital). */
+  colontab: boolean;
+  /** Quedó configurado el cobro del domicilio. */
+  reparto: boolean;
   yaEstaba: boolean;
   avisos: string[];
 }
@@ -138,6 +248,7 @@ export async function sembrarRestaurante(tenantId: string): Promise<ResultadoSie
   const avisos: string[] = [];
   const r: ResultadoSiembra = {
     categorias: 0, insumos: 0, platos: 0, subrecetas: 0, recetas: 0, mesas: 0,
+    extras: 0, promos: 0, colontab: false, reparto: false,
     yaEstaba: false, avisos,
   };
 
@@ -273,6 +384,124 @@ export async function sembrarRestaurante(tenantId: string): Promise<ResultadoSie
     avisos.push('el mapa de mesas ya estaba hecho: no se tocó');
   }
 
-  r.yaEstaba = r.platos === 0 && r.recetas === 0 && r.mesas === 0;
+  // ── Los EXTRAS de cada plato ──
+  for (const e of EXTRAS) {
+    const productId = porSku.get(e.sku);
+    if (!productId) continue;
+    /* Repetible sin duplicar: si el plato ya tiene grupos, se deja como está.
+       Pisarlos borraría los que el cliente armó en la demostración. */
+    const { data: yaTiene } = await db.from('product_modifier_groups')
+      .select('id').eq('tenant_id', tenantId).eq('product_id', productId).limit(1);
+    if (((yaTiene ?? []) as any[]).length > 0) continue;
+    for (const [i, g] of e.grupos.entries()) {
+      const { data: grupo, error } = await db.from('product_modifier_groups').insert({
+        tenant_id: tenantId, product_id: productId, name: g.nombre,
+        min_select: g.min, max_select: g.max, sort_order: i,
+      }).select('id').single();
+      if (error) { avisos.push(`extras de ${e.sku}: ${error.message}`); continue; }
+      const filas = g.opciones.map((o, k) => ({
+        group_id: String((grupo as any).id), name: o.nombre,
+        price_delta: o.delta, sort_order: k,
+      }));
+      const { error: eOpc } = await db.from('product_modifiers').insert(filas);
+      if (eOpc) { avisos.push(`opciones de ${g.nombre}: ${eOpc.message}`); continue; }
+      r.extras++;
+    }
+  }
+
+  // ── Las PROMOCIONES ──
+  const { data: promosPrevias } = await db.from('promotions')
+    .select('name').eq('tenant_id', tenantId);
+  const nombresPromo = new Set(((promosPrevias ?? []) as any[]).map(p => String(p.name).toLowerCase()));
+  for (const p of PROMOS) {
+    if (nombresPromo.has(p.nombre.toLowerCase())) continue;
+    const ids = p.skus.map(sk => porSku.get(sk)).filter(Boolean) as string[];
+    if (ids.length !== p.skus.length) continue;   // falta un plato: no se inventa la promo
+    const regalo = p.regalo_sku ? porSku.get(p.regalo_sku) ?? null : null;
+    if (p.regalo_sku && !regalo) continue;
+    const { error } = await db.from('promotions').insert({
+      tenant_id: tenantId, name: p.nombre, description: p.descripcion,
+      type: p.tipo, value: p.valor,
+      applies_to: 'products', product_ids: ids,
+      combo_mode: p.modo ?? null,
+      gift_product_id: regalo, gift_qty: p.regalo_qty ?? null,
+      /* Arranca AYER y no vence: una promo que empieza hoy a las 3 de la tarde
+         y vence mañana deja la demo sin promos al día siguiente. */
+      starts_at: hace(1), ends_at: null, is_active: true,
+    });
+    if (error) { avisos.push(`promo ${p.nombre}: ${error.message}`); continue; }
+    r.promos++;
+  }
+
+  // ── ColónTab (la mesa digital) ──
+  const { data: mesaPrevia } = await db.from('settings')
+    .select('id, config').eq('tenant_id', tenantId).eq('type', 'mesa-digital').maybeSingle();
+  if (!(mesaPrevia as any)?.config) {
+    const cfg = {
+      activo: true,
+      ver_ordenar: true, ver_mesero: true, ver_cuenta: true,
+      ver_juegos: true, ver_sugerencias: true,
+      wifi_ssid: 'Soda_Clientes', wifi_password: 'buenprovecho',
+      whatsapp: '50688887777', sinpe_telefono: '88887777', sinpe_nombre: 'Soda La Demo',
+      instagram: '', tiktok: '', google_review: '', maps_url: '',
+      direccion: 'Frente al parque, local 3',
+      horario: 'Lunes a sábado de 11 a.m. a 9 p.m.\nDomingo de 11 a.m. a 4 p.m.',
+      mensaje: 'Hoy: casado con pollo a ₡4.500',
+      /* Las ocho del mapa: es lo que hace que los QR de las mesas existan. */
+      cantidad_mesas: 8,
+    };
+    const fila = {
+      tenant_id: tenantId, type: 'mesa-digital', config: cfg,
+      updated_at: new Date().toISOString(),
+    };
+    const up = (mesaPrevia as any)?.id
+      ? await db.from('settings').update(fila).eq('id', (mesaPrevia as any).id)
+      : await db.from('settings').insert(fila);
+    if (up.error) avisos.push(`ColónTab: ${up.error.message}`);
+    else r.colontab = true;
+  } else {
+    avisos.push('ColónTab ya estaba configurado: no se tocó');
+  }
+
+  // ── El cobro del DOMICILIO ──
+  // Es una línea de la factura, así que necesita su artículo en el catálogo:
+  // sin él el control de reparto no aparece en el carrito.
+  const { data: deliveryPrevio } = await db.from('settings')
+    .select('id, config').eq('tenant_id', tenantId).eq('type', 'delivery').maybeSingle();
+  const cfgDelivery: any = (deliveryPrevio as any)?.config ?? {};
+  if (!cfgDelivery.reparto_producto_id) {
+    const idDomicilio = await crearProducto({
+      name: 'Entrega a domicilio', unit_price: 1000, cost_price: 0,
+      stock_quantity: 0, tracks_stock: false, iva_rate: 13,
+    }, 'SRV-DOMICIL');
+    if (idDomicilio) {
+      const fila = {
+        tenant_id: tenantId, type: 'delivery',
+        config: {
+          ...cfgDelivery,
+          reparto_producto_id: idDomicilio,
+          reparto_tarifas: ZONAS_REPARTO,
+          reparto_repartidores: ['Kevin', 'Marvin'],
+        },
+        updated_at: new Date().toISOString(),
+      };
+      const up = (deliveryPrevio as any)?.id
+        ? await db.from('settings').update(fila).eq('id', (deliveryPrevio as any).id)
+        : await db.from('settings').insert(fila);
+      if (up.error) avisos.push(`domicilio: ${up.error.message}`);
+      else r.reparto = true;
+    }
+  } else {
+    avisos.push('el cobro del domicilio ya estaba configurado: no se tocó');
+  }
+
+  r.yaEstaba = r.platos === 0 && r.recetas === 0 && r.mesas === 0
+    && r.extras === 0 && r.promos === 0 && !r.colontab && !r.reparto;
   return r;
+}
+
+/** Una fecha de hace N días, en formato AAAA-MM-DD (hora de Costa Rica). */
+function hace(dias: number): string {
+  const d = new Date(Date.now() - dias * 86400000);
+  return d.toLocaleDateString('en-CA', { timeZone: 'America/Costa_Rica' });
 }

@@ -383,8 +383,10 @@ admin.get('/tenants/:id/stock/summary', async (c) => {
  * mano antes de cada demostración toma media hora y siempre falta algo.
  *
  * Deja el negocio listo para mostrar: categorías, doce platos con su precio y
- * su estación de cocina, diez insumos con existencias, dos preparaciones base
- * y el salón con ocho mesas. Se puede correr dos veces: no duplica nada.
+ * su estación de cocina, diez insumos con existencias, dos preparaciones base,
+ * el salón con ocho mesas, los extras de cada plato, cuatro promociones (una de
+ * cada clase que el salón cobra), ColónTab configurado y el cobro del domicilio
+ * con sus zonas. Se puede correr dos veces: no duplica nada.
  */
 admin.post('/tenants/:id/demo-restaurante', async (c) => {
   try {
