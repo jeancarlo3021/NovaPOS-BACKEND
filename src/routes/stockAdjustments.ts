@@ -15,7 +15,24 @@ const AdjustmentSchema = z.object({
   user_email: z.string().optional().nullable(),
 });
 
-// GET / — listar ajustes (con filtros opcionales)
+/**
+ * GET / — los movimientos de inventario, con filtros.
+ *
+ * ── `search`: buscar por producto ────────────────────────────────────────
+ * «¿Qué le pasó al arroz este mes?» es LA pregunta de este reporte, y no se
+ * podía hacer: había que recorrer la lista a ojo. El nombre vive en la tabla
+ * de productos, así que se resuelve en dos pasos —los ids que calzan, y los
+ * movimientos de esos ids— en vez de filtrar sobre la tabla incrustada: es más
+ * fácil de leer, no depende de la sintaxis de filtros anidados, y permite
+ * decir «ningún producto con ese nombre» en vez de devolver una lista vacía
+ * que se lee como «no hubo movimientos».
+ *
+ * ── `limit`: el tope, dicho ──────────────────────────────────────────────
+ * Esta consulta no tenía límite, y sin límite Supabase devuelve MIL filas y se
+ * calla. En un mes movido el reporte mostraba los últimos mil movimientos como
+ * si fueran todos, y los conteos de arriba salían mal sin que nada lo
+ * advirtiera. Ahora el tope es explícito y el cliente lo puede subir.
+ */
 stockAdjustments.get('/', async (c) => {
   try {
     const tenantId = c.get('tenantId');
@@ -23,14 +40,33 @@ stockAdjustments.get('/', async (c) => {
     const from = c.req.query('from');
     const to = c.req.query('to');
     const type = c.req.query('type');
+    const search = (c.req.query('search') ?? '').trim();
+    const limit = Math.min(Math.max(Number(c.req.query('limit')) || 1000, 1), 5000);
+
+    /* Los productos que calzan con lo buscado. El tope de ids es para que la
+       URL de la consulta siguiente no se pase de largo: buscar «a» calzaría
+       con el catálogo entero. */
+    let idsBuscados: string[] | null = null;
+    if (search) {
+      const { data: prods } = await db.from('products')
+        .select('id').eq('tenant_id', tenantId)
+        .or(`name.ilike.%${search}%,sku.ilike.%${search}%`)
+        .limit(300);
+      idsBuscados = ((prods ?? []) as any[]).map(p => String(p.id));
+      /* Ningún producto calza: no hay movimientos que mostrar, y se dice que
+         fue por el buscador. */
+      if (idsBuscados.length === 0) return ok(c, []);
+    }
 
     let query = db
       .from('stock_adjustments')
       .select('*, product:products(id, name, sku)')
       .eq('tenant_id', tenantId)
-      .order('created_at', { ascending: false });
+      .order('created_at', { ascending: false })
+      .limit(limit);
 
     if (productId) query = query.eq('product_id', productId);
+    if (idsBuscados) query = query.in('product_id', idsBuscados);
     if (type) query = query.eq('type', type);
     if (from) query = query.gte('created_at', `${from}T00:00:00`);
     if (to) query = query.lte('created_at', `${to}T23:59:59`);

@@ -1010,7 +1010,12 @@ purchases.post('/:id/void', async (c) => {
 
       await db.from('stock_adjustments').insert({
         tenant_id: tenantId, product_id: l.product_id, user_id: userId ?? null,
-        type: 'decrease', quantity: qty, stock_before: antes, stock_after: despues,
+        /* La cantidad va con SIGNO, como el resto de los movimientos
+           (`quantity = stock_after − stock_before`): el reporte de
+           movimientos suma entradas y salidas por el signo, así que una
+           devolución anotada en positivo se contaba como una ENTRADA y las
+           salidas del mes salían de menos. */
+        type: 'decrease', quantity: -qty, stock_before: antes, stock_after: despues,
         reason: `Anulación de compra ${numero}`.trim(),
         notes: motivo,
       });
