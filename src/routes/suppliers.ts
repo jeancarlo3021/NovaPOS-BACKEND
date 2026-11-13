@@ -76,6 +76,31 @@ suppliers.get('/', async (c) => {
   }
 });
 
+/**
+ * GET /:id — UN proveedor.
+ *
+ * Faltaba. La pantalla de editar lo pide por id para llenar el formulario, así
+ * que al tocar el lápiz la respuesta era un 404 y salía «Error al cargar el
+ * proveedor»: la modificación no fallaba al guardar, fallaba antes de empezar,
+ * y por eso no había forma de corregir un proveedor desde la pantalla.
+ */
+suppliers.get('/:id', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { id } = c.req.param();
+
+    const { data, error } = await db.from('suppliers')
+      .select('*').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+    if (error) throw new Error(error.message);
+    /* De otro negocio o inexistente es lo mismo desde afuera: 404. Distinguirlo
+       le diría a un tenant qué ids existen en otro. */
+    if (!data) return fail(c, 'Proveedor no encontrado', 404);
+    return ok(c, data);
+  } catch (err: any) {
+    return fail(c, err.message, 500);
+  }
+});
+
 // POST / — create supplier
 suppliers.post('/', async (c) => {
   try {
