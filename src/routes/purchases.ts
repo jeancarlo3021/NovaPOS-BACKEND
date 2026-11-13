@@ -730,6 +730,152 @@ purchases.delete('/:id', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+const AgregadoSchema = z.object({
+  items: z.array(z.object({
+    product_id: z.string().uuid(),
+    quantity:   z.number().positive(),
+    unit_price: z.number().nonnegative(),
+  })).min(1),
+});
+
+/**
+ * POST /:id/add-items — AGREGAR ARTÍCULOS A UNA COMPRA YA RECIBIDA.
+ *
+ * El caso es siempre el mismo: la factura del proveedor traía un artículo que
+ * no se digitó, y la orden ya se recibió. Hasta ahora eso se «arreglaba» con
+ * una orden de compra aparte por un solo renglón —que no cuadra con ninguna
+ * factura— o con un ajuste de inventario a mano, que sube la existencia pero
+ * no registra lo que se le debe al proveedor.
+ *
+ * Lo que YA está recibido NO se toca: esta ruta solo AGREGA. Cambiar una línea
+ * ya recibida significaría recalcular inventario, costo y deuda sobre algo que
+ * pudo venderse hace una semana, y nadie puede decir qué parte de la
+ * existencia de hoy vino de esa línea. Para eso está anular la compra y
+ * volverla a cargar corregida, que sí deshace todo en orden.
+ *
+ * Lo que agregar SÍ hace, porque la orden ya está recibida:
+ *  · las líneas nuevas entran al inventario ahora mismo (con su ajuste);
+ *  · actualizan el costo del producto, como cualquier recepción;
+ *  · el total de la orden se recalcula;
+ *  · la cuenta por pagar sube: es plata que el proveedor va a cobrar.
+ */
+purchases.post('/:id/add-items', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const userId   = c.get('userId');
+    const { id }   = c.req.param();
+
+    const parsed = AgregadoSchema.safeParse(await c.req.json());
+    if (!parsed.success) return fail(c, parsed.error.message, 422);
+    const nuevos = parsed.data.items;
+
+    const { data: previa } = await db.from('purchases')
+      .select('id, status, purchase_number, supplier_id')
+      .eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+    if (!previa) return fail(c, 'Orden de compra no encontrada', 404);
+
+    const p: any = previa;
+    const numero = p.purchase_number ?? '';
+    if (p.status === 'cancelled') {
+      return fail(c, `La orden ${numero} está anulada: no se le puede agregar nada.`, 409);
+    }
+    if (p.status !== 'received') {
+      return fail(c,
+        `La orden ${numero} todavía no se recibió: ahí las líneas se editan con el lápiz, `
+        + 'que no mueve inventario.', 409);
+    }
+
+    /* Un producto que ya está en la orden no se agrega otra vez: sería una
+       segunda línea del mismo artículo y nadie podría decir cuál es la buena.
+       Si de verdad llegaron más unidades, va en otra orden —con su factura—. */
+    const { data: yaEstan } = await db.from('purchase_items')
+      .select('product_id').eq('purchase_id', id);
+    const existentes = new Set(((yaEstan ?? []) as any[]).map(l => String(l.product_id)));
+    const repetidos = nuevos.filter(n => existentes.has(String(n.product_id)));
+    if (repetidos.length > 0) {
+      return fail(c,
+        `${repetidos.length} artículo(s) ya están en la orden ${numero}. `
+        + 'Para corregir una cantidad hay que anular la compra y volverla a cargar.', 409);
+    }
+
+    // ── 1) Las líneas nuevas, ya recibidas ──
+    const filas = nuevos.map(n => ({
+      purchase_id: id,
+      product_id: n.product_id,
+      quantity: n.quantity,
+      /* Entran recibidas: la orden ya lo está, y dejarlas sin
+         `received_quantity` haría que una anulación después devolviera una
+         cantidad distinta de la que subió. */
+      received_quantity: n.quantity,
+      unit_price: n.unit_price,
+      subtotal: Math.round(n.quantity * n.unit_price * 100) / 100,
+    }));
+    const { error: eItems } = await db.from('purchase_items').insert(filas);
+    if (eItems) {
+      /* Sin la columna `received_quantity` se guarda igual: la línea y su
+         inventario importan más que el detalle de la revisión. */
+      if (/received_quantity/.test(eItems.message)) {
+        const { error: e2 } = await db.from('purchase_items')
+          .insert(filas.map(({ received_quantity: _r, ...resto }) => resto));
+        if (e2) throw new Error(e2.message);
+      } else { throw new Error(eItems.message); }
+    }
+
+    // ── 2) Al inventario, con el mismo camino que la recepción ──
+    const { data: supplier } = await db.from('suppliers')
+      .select('name').eq('id', p.supplier_id).maybeSingle();
+    const stock = await sumarAlStock({
+      tenantId, userId, purchaseId: id, numero,
+      proveedor: (supplier as any)?.name ?? null,
+      items: nuevos.map(n => ({ product_id: n.product_id, quantity: n.quantity })),
+      motivo: 'recepcion',
+    });
+
+    // ── 3) El total de la orden, recalculado desde TODAS sus líneas ──
+    let total: number | null = null;
+    try {
+      const { data: todas } = await db.from('purchase_items')
+        .select('quantity, received_quantity, unit_price').eq('purchase_id', id);
+      const suma = ((todas ?? []) as any[]).reduce((t, l) => {
+        const cant = Number(l.received_quantity ?? l.quantity ?? 0) || 0;
+        return t + cant * (Number(l.unit_price) || 0);
+      }, 0);
+      total = Math.round(suma * 100) / 100;
+      await db.from('purchases')
+        .update({ total_amount: total, updated_at: new Date().toISOString() })
+        .eq('id', id).eq('tenant_id', tenantId);
+    } catch (e: any) {
+      console.warn('[add-items] no se pudo recalcular el total:', e?.message);
+    }
+
+    // ── 4) La cuenta por pagar: es plata que el proveedor va a cobrar ──
+    let cxp: 'ninguna' | 'actualizada' | 'no_se_pudo' = 'ninguna';
+    const agregado = Math.round(filas.reduce((t, f) => t + f.subtotal, 0) * 100) / 100;
+    try {
+      const { data: ap } = await db.from('accounts_payable')
+        .select('id, total_amount').eq('tenant_id', tenantId).eq('purchase_id', id)
+        .neq('status', 'cancelled').maybeSingle();
+      if (ap) {
+        const nuevoTotal = Math.round(((Number((ap as any).total_amount) || 0) + agregado) * 100) / 100;
+        const { error } = await db.from('accounts_payable')
+          .update({ total_amount: nuevoTotal, updated_at: new Date().toISOString() })
+          .eq('id', (ap as any).id);
+        cxp = error ? 'no_se_pudo' : 'actualizada';
+        if (error) console.warn('[add-items] no se pudo subir la CxP:', error.message);
+      }
+    } catch { /* este negocio no usa cuentas por pagar */ }
+
+    return ok(c, {
+      numero,
+      agregadas: filas.length,
+      monto_agregado: agregado,
+      total_orden: total,
+      stock: { aplicados: stock.aplicados, unidades: stock.unidades, sin_stock: stock.sinStock, fallaron: stock.fallaron },
+      cuenta_por_pagar: cxp,
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 /**
  * POST /:id/void — ANULAR UNA COMPRA, incluso ya recibida.
  *
