@@ -730,4 +730,162 @@ purchases.delete('/:id', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+/**
+ * POST /:id/void — ANULAR UNA COMPRA, incluso ya recibida.
+ *
+ * Cancelar una orden pendiente nunca movió nada. Anular una RECIBIDA sí: hay
+ * que deshacer lo que la recepción hizo, y hacerlo en el orden correcto.
+ *
+ * ── Qué se deshace ────────────────────────────────────────────────────────
+ *  1. EL STOCK. Se resta lo que de verdad entró (`received_quantity`, y si no
+ *     está, lo pedido), con su ajuste anotado: un inventario que cambia sin
+ *     dejar rastro es un inventario que nadie puede auditar.
+ *  2. LA CUENTA POR PAGAR. Se cancela, así deja de contar como deuda.
+ *  3. LA ORDEN, que queda `cancelled` con quién la anuló y por qué.
+ *
+ * ── Qué NO se deshace, y se dice ──────────────────────────────────────────
+ *  · El COSTO del producto. La recepción lo dejó en el precio de esta compra y
+ *    no hay dónde leer el anterior, así que se avisa cuáles productos quedaron
+ *    con ese costo para revisarlos. Inventar un costo viejo sería peor.
+ *  · Un ABONO ya hecho al proveedor. Si la cuenta por pagar tiene plata
+ *    abonada, la anulación se RECHAZA: esa plata salió de la caja y borrar la
+ *    deuda la dejaría sin explicación. Primero se revierte el abono.
+ *
+ * ── Si el inventario queda en negativo ────────────────────────────────────
+ * Pasa cuando la mercadería ya se vendió. No se corta en cero: un cero
+ * esconde el problema y el negativo lo dice —se vendió algo que no había—.
+ * Se devuelve la lista para poder avisarlo en pantalla.
+ */
+purchases.post('/:id/void', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const userId   = c.get('userId');
+    const { id }   = c.req.param();
+    const body     = await c.req.json().catch(() => ({} as any));
+    const motivo   = String(body?.motivo ?? '').trim() || 'Anulada por error en la carga';
+
+    const { data: previa } = await db.from('purchases')
+      .select('id, status, purchase_number, supplier_id, total_amount')
+      .eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+    if (!previa) return fail(c, 'Orden de compra no encontrada', 404);
+
+    const p: any = previa;
+    const numero = p.purchase_number ?? '';
+    /* El estado se guarda ANTES de tocar la fila. Más abajo hay que decidir si
+       había que devolver inventario, y leerlo después del cambio de estado es
+       preguntarle a la fila ya anulada: la respuesta sería «no estaba
+       recibida» y el stock se quedaría arriba. */
+    const estadoAnterior = String(p.status ?? '');
+    if (estadoAnterior === 'cancelled') {
+      return fail(c, `La orden ${numero} ya estaba anulada.`, 409);
+    }
+
+    /* La cuenta por pagar se revisa ANTES de tocar nada: si tiene abonos, la
+       anulación no va, y no puede quedar el stock devuelto a medias. */
+    let apId: string | null = null;
+    let apAbonado = 0;
+    try {
+      const { data: ap } = await db.from('accounts_payable')
+        .select('id, paid_amount, status').eq('tenant_id', tenantId).eq('purchase_id', id)
+        .neq('status', 'cancelled').maybeSingle();
+      if (ap) { apId = String((ap as any).id); apAbonado = Number((ap as any).paid_amount ?? 0) || 0; }
+    } catch { /* sin cuentas por pagar en este negocio */ }
+
+    if (apAbonado > 0) {
+      return fail(c,
+        `La orden ${numero} ya tiene ₡${apAbonado.toLocaleString('es-CR')} abonados al proveedor. `
+        + 'Primero hay que revertir el abono en Cuentas por pagar; si no, se borraría una deuda que ya se pagó.',
+        409);
+    }
+
+    /* El cambio de estado se TOMA primero, y de forma atómica: si dos personas
+       anulan a la vez, el stock no puede devolverse dos veces. Es la misma
+       carrera que tenía el cierre de rutas. */
+    const { data: tomada } = await db.from('purchases')
+      .update({
+        status: 'cancelled',
+        cancelled_at: new Date().toISOString(),
+        cancelled_by: userId ?? null,
+        cancel_reason: motivo,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', id).eq('tenant_id', tenantId).eq('status', estadoAnterior)
+      .select('id');
+
+    if (!tomada || (tomada as any[]).length === 0) {
+      /* Sin las columnas de la migración 140 el update falla entero. Se
+         reintenta con lo mínimo: anular una compra mal cargada no puede
+         depender de que una migración ya corrió. */
+      const { data: simple } = await db.from('purchases')
+        .update({ status: 'cancelled', updated_at: new Date().toISOString() })
+        .eq('id', id).eq('tenant_id', tenantId).eq('status', estadoAnterior)
+        .select('id');
+      if (!simple || (simple as any[]).length === 0) {
+        return fail(c, `La orden ${numero} ya fue anulada por otra sesión.`, 409);
+      }
+      console.warn('[void-compra] sin la migración 140: no se guardó el motivo');
+    }
+
+    const resumen = {
+      numero, estado_anterior: estadoAnterior, motivo,
+      stock_revertido: 0, unidades: 0, sin_stock: 0, fallaron: 0,
+      negativos: [] as Array<{ producto: string; stock: number }>,
+      costos_a_revisar: [] as string[],
+      cuenta_por_pagar: 'ninguna' as 'ninguna' | 'cancelada' | 'no_se_pudo',
+    };
+
+    /* Una orden PENDIENTE no movió inventario ni generó deuda: con marcarla
+       alcanza. Devolver stock que nunca entró sería el error contrario. */
+    if (estadoAnterior !== 'received') return ok(c, resumen);
+
+    // ── 1) El stock, de vuelta ──
+    const { data: lineas } = await db.from('purchase_items')
+      .select('product_id, quantity, received_quantity').eq('purchase_id', id);
+
+    for (const l of ((lineas ?? []) as any[])) {
+      if (!l.product_id) continue;
+      /* Lo que ENTRÓ, que no siempre es lo que se pidió: si llegaron 8 de 10,
+         se devuelven 8. Devolver 10 dejaría el inventario en menos dos. */
+      const qty = Number(l.received_quantity ?? l.quantity ?? 0) || 0;
+      if (qty <= 0) continue;
+
+      const { data: prod } = await db.from('products')
+        .select('name, stock_quantity, tracks_stock').eq('id', l.product_id).maybeSingle();
+      if (!prod) { resumen.fallaron++; continue; }
+      if ((prod as any).tracks_stock === false) { resumen.sin_stock++; continue; }
+
+      const antes = Number((prod as any).stock_quantity ?? 0);
+      const despues = Math.round((antes - qty) * 1000) / 1000;
+
+      const { error: eProd } = await db.from('products')
+        .update({ stock_quantity: despues, updated_at: new Date().toISOString() })
+        .eq('id', l.product_id);
+      if (eProd) { resumen.fallaron++; continue; }
+
+      await db.from('stock_adjustments').insert({
+        tenant_id: tenantId, product_id: l.product_id, user_id: userId ?? null,
+        type: 'decrease', quantity: qty, stock_before: antes, stock_after: despues,
+        reason: `Anulación de compra ${numero}`.trim(),
+        notes: motivo,
+      });
+
+      resumen.stock_revertido++;
+      resumen.unidades += qty;
+      if (despues < 0) resumen.negativos.push({ producto: String((prod as any).name ?? ''), stock: despues });
+      resumen.costos_a_revisar.push(String((prod as any).name ?? ''));
+    }
+
+    // ── 2) La cuenta por pagar ──
+    if (apId) {
+      const { error } = await db.from('accounts_payable')
+        .update({ status: 'cancelled', updated_at: new Date().toISOString() })
+        .eq('id', apId).eq('tenant_id', tenantId);
+      resumen.cuenta_por_pagar = error ? 'no_se_pudo' : 'cancelada';
+      if (error) console.warn('[void-compra] no se pudo cancelar la CxP:', error.message);
+    }
+
+    return ok(c, resumen);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 export default purchases;
