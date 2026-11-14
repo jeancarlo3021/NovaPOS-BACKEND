@@ -972,6 +972,7 @@ routing.post('/:id/sale', async (c) => {
     if (b.stop_id) await db.from('route_stops').update({ status: 'visited' }).eq('id', b.stop_id).eq('tenant_id', tenantId);
 
     // Venta a CRÉDITO en ruta → cuenta por cobrar.
+    let avisoCxC: string | null = null;
     if (b.payment_method === 'credit') {
       try {
         const due = new Date(); due.setDate(due.getDate() + 30);
@@ -981,10 +982,18 @@ routing.post('/:id/sale', async (c) => {
           total_amount: Number(inv.total ?? 0), due_date: due.toISOString().slice(0, 10),
           source: 'distribution',
         });
-      } catch (e: any) { console.warn('[routing sale] CxC:', e?.message); }
+      } catch (e: any) {
+        /* La venta YA está hecha —la mercadería salió del camión— así que no
+           se puede deshacer acá. Pero callarlo es lo que dejaba créditos sin
+           cuenta por cobrar: nadie los veía y nadie los cobraba. Viaja con la
+           respuesta para que la pantalla lo diga. */
+        console.error('[routing sale] CxC NO creada:', e?.message);
+        avisoCxC = `La venta quedó registrada, pero NO se pudo crear la cuenta por cobrar: ${e?.message ?? 'error'}. `
+          + 'Anotá el crédito y arreglalo desde Cuentas por cobrar → «créditos sin cuenta».';
+      }
     }
 
-    return ok(c, inv, 201);
+    return ok(c, avisoCxC ? { ...(inv as any), aviso_cxc: avisoCxC } : inv, 201);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
@@ -1234,6 +1243,7 @@ routing.post('/order/:orderId/deliver', async (c) => {
     }
 
     // Entrega a CRÉDITO → cuenta por cobrar.
+    let avisoCxC: string | null = null;
     if (paymentMethod === 'credit') {
       try {
         const due = new Date(); due.setDate(due.getDate() + 30);
@@ -1244,10 +1254,14 @@ routing.post('/order/:orderId/deliver', async (c) => {
           total_amount: Number(inv.total ?? 0), due_date: due.toISOString().slice(0, 10),
           source: 'distribution',
         });
-      } catch (e: any) { console.warn('[routing deliver] CxC:', e?.message); }
+      } catch (e: any) {
+        console.error('[routing deliver] CxC NO creada:', e?.message);
+        avisoCxC = `La entrega quedó registrada, pero NO se pudo crear la cuenta por cobrar: ${e?.message ?? 'error'}. `
+          + 'Anotá el crédito y arreglalo desde Cuentas por cobrar → «créditos sin cuenta».';
+      }
     }
 
-    return ok(c, inv);
+    return ok(c, avisoCxC ? { ...(inv as any), aviso_cxc: avisoCxC } : inv);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

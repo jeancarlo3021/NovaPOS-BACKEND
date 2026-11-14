@@ -462,6 +462,7 @@ invoices.post('/', async (c) => {
     catch (e: any) { console.warn('[recipes] no se pudo congelar el costo:', e?.message); }
 
     // Venta a CRÉDITO → generar la cuenta por cobrar (vence en 30 días).
+    let cxcWarning: string | null = null;
     if (inv.payment_method === 'credit') {
       try {
         const due = new Date(); due.setDate(due.getDate() + 30);
@@ -473,10 +474,20 @@ invoices.post('/', async (c) => {
           due_date: due.toISOString().slice(0, 10),
           source: 'pos',
         });
-      } catch (e: any) { console.warn('[invoices] crear CxC:', e?.message); }
+      } catch (e: any) {
+        /* La factura ya existe y la mercadería salió: no se deshace acá. Pero
+           el crédito sin cuenta por cobrar es plata que nadie va a ir a
+           cobrar, así que se avisa en la respuesta en vez de quedar en un log
+           que nadie lee. */
+        console.error('[invoices] CxC NO creada:', e?.message);
+        cxcWarning = `La factura se emitió, pero NO se pudo crear la cuenta por cobrar: ${e?.message ?? 'error'}. `
+          + 'Arreglalo desde Cuentas por cobrar → «créditos sin cuenta».';
+      }
     }
 
-    return ok(c, sessionWarning ? { ...(inv as any), session_warning: sessionWarning } : inv, 201);
+    return ok(c, (sessionWarning || cxcWarning)
+      ? { ...(inv as any), ...(sessionWarning ? { session_warning: sessionWarning } : {}), ...(cxcWarning ? { cxc_warning: cxcWarning } : {}) }
+      : inv, 201);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

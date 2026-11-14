@@ -85,13 +85,30 @@ const debeAlgo = (r: any) =>
   && (Number(r.total_amount ?? 0) - Number(r.paid_amount ?? 0)) > 0;
 
 // Crea una cuenta por cobrar (reutilizable desde POS / distribución).
+/**
+ * CREA LA CUENTA POR COBRAR de una venta a crédito.
+ *
+ * ── Esto TIENE que reventar cuando falla ─────────────────────────────────
+ * Antes devolvía el `{ data, error }` de Supabase tal cual, y supabase-js NO
+ * rechaza la promesa: un insert fallido volvía como un objeto con `error`
+ * adentro. Los cuatro lugares que llaman esto hacen `await createReceivable()`
+ * dentro de un `try/catch`, así que el catch no se enteraba de nada: la venta a
+ * crédito quedaba registrada y su cuenta por cobrar NO se creaba, sin error en
+ * pantalla y sin una línea en el log.
+ *
+ * Eso es lo que se veía como «los créditos no están cargando»: la mercadería
+ * salió, el cliente debe, y la deuda no existe en ninguna parte.
+ *
+ * Ahora lanza con el mensaje de la base, para que el que llama decida qué
+ * hacer —y, sobre todo, para que se sepa—.
+ */
 export async function createReceivable(tenantId: string, r: {
   customer_id?: string | null; customer_name?: string | null;
   invoice_id?: string | null; invoice_number?: string | null;
   total_amount: number; due_date?: string | null;
   source: 'pos' | 'manual' | 'distribution'; notes?: string | null;
 }) {
-  return db.from('accounts_receivable').insert({
+  const res = await db.from('accounts_receivable').insert({
     tenant_id: tenantId,
     customer_id: r.customer_id ?? null,
     customer_name: r.customer_name ?? null,
@@ -104,7 +121,118 @@ export async function createReceivable(tenantId: string, r: {
     source: r.source,
     notes: r.notes ?? null,
   }).select().single();
+
+  if (res.error) {
+    throw new Error(
+      `No se pudo crear la cuenta por cobrar de ${r.invoice_number ?? 'la venta'}: ${res.error.message}`);
+  }
+  return res;
 }
+
+/**
+ * LAS VENTAS A CRÉDITO QUE SE QUEDARON SIN CUENTA POR COBRAR.
+ *
+ * Cuando el insert de la cuenta fallaba, la venta a crédito quedaba igual y la
+ * deuda no existía en ninguna parte: nadie la ve, nadie la cobra, y el cliente
+ * aparece al día. Esas ventas están en la base —son facturas con
+ * `payment_method = 'credit'` sin fila en `accounts_receivable`— así que se
+ * pueden encontrar y rehacer.
+ *
+ * GET  /huerfanas → las lista, sin cambiar nada.
+ * POST /huerfanas/reparar → les crea la cuenta que les falta.
+ *
+ * El vencimiento se calcula desde la fecha de la VENTA (30 días), no desde hoy:
+ * una factura de hace tres semanas no vence el mes que viene.
+ */
+const huerfanasDeCredito = async (tenantId: string, from?: string, to?: string) => {
+  let q = db.from('invoices')
+    .select('id, invoice_number, customer_id, customer_name, total, issued_at, created_at, route_id')
+    .eq('tenant_id', tenantId)
+    .eq('payment_method', 'credit')
+    .neq('status', 'cancelled')
+    .order('created_at', { ascending: false })
+    .limit(2000);
+  if (from) q = q.gte('created_at', `${from}T00:00:00`);
+  if (to)   q = q.lte('created_at', `${to}T23:59:59`);
+  const { data: credito, error } = await q;
+  if (error) throw new Error(error.message);
+
+  const facturas = (credito ?? []) as any[];
+  if (facturas.length === 0) return [];
+
+  /* Las cuentas que YA existen, por tandas: con cientos de ids adentro la
+     consulta se pasa del largo de una URL. */
+  const conCuenta = new Set<string>();
+  const ids = facturas.map(f => String(f.id));
+  for (let i = 0; i < ids.length; i += 200) {
+    const { data: ars } = await db.from('accounts_receivable')
+      .select('invoice_id').eq('tenant_id', tenantId).in('invoice_id', ids.slice(i, i + 200));
+    for (const a of ((ars ?? []) as any[])) conCuenta.add(String(a.invoice_id));
+  }
+  return facturas.filter(f => !conCuenta.has(String(f.id)));
+};
+
+accountsReceivable.get('/huerfanas', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const faltan = await huerfanasDeCredito(tenantId, c.req.query('from'), c.req.query('to'));
+    return ok(c, {
+      cuantas: faltan.length,
+      total: Math.round(faltan.reduce((t, f) => t + (Number(f.total) || 0), 0) * 100) / 100,
+      /** De ruta o del punto de venta: dice dónde mirar el origen del problema. */
+      de_ruta: faltan.filter(f => f.route_id).length,
+      facturas: faltan.map(f => ({
+        id: f.id, invoice_number: f.invoice_number,
+        customer_name: f.customer_name ?? null,
+        total: Number(f.total) || 0,
+        fecha: f.issued_at ?? f.created_at,
+        de_ruta: !!f.route_id,
+      })),
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+accountsReceivable.post('/huerfanas/reparar', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const body = await c.req.json().catch(() => ({} as any));
+    const faltan = await huerfanasDeCredito(tenantId, body?.from, body?.to);
+
+    const creadas: string[] = [];
+    const fallaron: Array<{ invoice_number: string; motivo: string }> = [];
+    for (const f of faltan) {
+      /* 30 días desde la VENTA. Con `new Date()` una factura de hace tres
+         semanas vencería el mes entrante y saldría del listado de vencidas,
+         que es justo el que alguien mira para ir a cobrar. */
+      const base = new Date(f.issued_at ?? f.created_at ?? Date.now());
+      const vence = new Date(base.getTime() + 30 * 86_400_000).toISOString().slice(0, 10);
+      try {
+        await createReceivable(tenantId, {
+          customer_id: f.customer_id ?? null,
+          customer_name: f.customer_name ?? null,
+          invoice_id: f.id, invoice_number: f.invoice_number,
+          total_amount: Number(f.total ?? 0),
+          due_date: vence,
+          source: f.route_id ? 'distribution' : 'pos',
+          notes: 'Cuenta rehecha: la venta a crédito había quedado sin cuenta por cobrar',
+        });
+        creadas.push(String(f.invoice_number ?? f.id));
+      } catch (e: any) {
+        /* El motivo REAL de la base, factura por factura: es lo que dice por
+           qué fallaban —una columna que falta, un cliente borrado— en vez de
+           dejarlo en «no se pudo». */
+        fallaron.push({ invoice_number: String(f.invoice_number ?? f.id), motivo: e?.message ?? 'error' });
+      }
+    }
+
+    return ok(c, {
+      revisadas: faltan.length,
+      creadas: creadas.length,
+      lista_creadas: creadas,
+      fallaron,
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
 
 // GET /  ?status=&customer_id=
 // GET /scope — qué está viendo este usuario y por qué.
