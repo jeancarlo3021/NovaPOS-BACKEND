@@ -1291,6 +1291,38 @@ async function anotarDevolucion(
   } catch (e: any) { console.warn('[ruta] no se pudo anotar la devolución:', e?.message); }
 }
 
+/**
+ * LO VENDIDO POR PRODUCTO en una ruta, leído por TANDAS.
+ *
+ * Una sola consulta con todos los ids de factura adentro se pasa del largo que
+ * aguanta la URL: en una ruta de trescientas ventas la consulta falla, `sold`
+ * queda vacío y el cierre concluye que NO se vendió nada. Como el sobrante se
+ * reconstruye de «cargado − vendido», eso devuelve al inventario la carga
+ * COMPLETA de un camión que vendió todo el día. Es inventario inventado, y es
+ * el mismo síntoma que ya se había reportado.
+ *
+ * Por eso devuelve `completo: false` cuando alguna tanda falla: con datos a
+ * medias no se reconstruye nada. Más vale un cierre que dice «no pude calcular
+ * el sobrante» que uno que suma mercadería que se vendió.
+ */
+async function vendidoPorProducto(
+  invoiceIds: string[],
+): Promise<{ sold: Record<string, number>; completo: boolean }> {
+  const sold: Record<string, number> = {};
+  for (let i = 0; i < invoiceIds.length; i += 200) {
+    const { data, error } = await db.from('invoice_items')
+      .select('product_id, quantity').in('invoice_id', invoiceIds.slice(i, i + 200));
+    if (error) {
+      console.error('[ruta] no se pudo leer lo vendido:', error.message);
+      return { sold, completo: false };
+    }
+    for (const l of ((data ?? []) as any[])) {
+      sold[l.product_id] = Number(sold[l.product_id] ?? 0) + Number(l.quantity ?? 0);
+    }
+  }
+  return { sold, completo: true };
+}
+
 routing.post('/:id/close', async (c) => {
   try {
     const tenantId = c.get('tenantId');
@@ -1342,7 +1374,10 @@ routing.post('/:id/close', async (c) => {
     // 1) Devolver el sobrante del camión al INVENTARIO DEL SISTEMA (products.stock_quantity).
     let returnedItems: Array<{ product_id: string; quantity: number }> = [];
     const returnedDetail: Array<{ name: string; quantity: number }> = [];
-    {
+    /* Sin camión no hay sobrante que devolver. Preguntar por
+       `warehouse_id = null` no devuelve «nada»: devuelve lo que tenga el
+       almacén nulo, que no es de esta ruta. */
+    if (truckId) {
       const { data: stock } = await db.from('warehouse_stock')
         .select('product_id, quantity').eq('warehouse_id', truckId);
       returnedItems = (stock ?? []).filter((s: any) => Number(s.quantity) > 0)
@@ -1394,23 +1429,24 @@ routing.post('/:id/close', async (c) => {
     // con lo cargado menos lo vendido y se avisa de dónde salió el dato.
     let returnedSource: 'truck' | 'reconstructed' | 'none' =
       returnedDetail.length > 0 ? 'truck' : 'none';
+    /** Algo del sobrante no se pudo calcular: tiene que salir en el resumen. */
+    let avisoSobrante: string | null = null;
     if (returnedDetail.length === 0) {
       const { data: rr } = await db.from('routes')
         .select('loaded_summary').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
       const loaded: Record<string, number> = ((rr as any)?.loaded_summary ?? {});
       if (Object.keys(loaded).length > 0) {
-        const { data: invIds } = await db.from('invoices')
-          .select('id, status').eq('tenant_id', tenantId).eq('route_id', id);
-        const ids = (invIds ?? []).filter((i: any) => i.status !== 'cancelled').map((i: any) => i.id);
-        const sold: Record<string, number> = {};
-        if (ids.length > 0) {
-          const { data: lines } = await db.from('invoice_items')
-            .select('product_id, quantity').in('invoice_id', ids);
-          for (const l of (lines ?? []) as any[]) {
-            sold[l.product_id] = Number(sold[l.product_id] ?? 0) + Number(l.quantity);
-          }
+        const ids = sales.map((i: any) => i.id);
+        const { sold, completo } = await vendidoPorProducto(ids);
+        /* Sin saber qué se vendió, «cargado − vendido» es «cargado»: se
+           devolvería al inventario la carga completa del día. Mejor decir que
+           no se pudo calcular. */
+        if (!completo) {
+          console.error(`[ruta ${id}] sobrante NO reconstruido: no se pudo leer lo vendido.`);
+          avisoSobrante = 'No se pudo calcular el sobrante (falló la lectura de lo vendido). '
+            + 'La ruta quedó cerrada; revisá el camión y ajustá el inventario a mano si hacía falta.';
         }
-        const pend = Object.keys(loaded)
+        const pend = !completo ? [] : Object.keys(loaded)
           .map(pid => ({ pid, qty: Number(loaded[pid]) - Number(sold[pid] ?? 0) }))
           .filter(x => x.qty > 0.0001);
         if (pend.length > 0) {
@@ -1541,13 +1577,22 @@ routing.post('/:id/close', async (c) => {
        */
       truck: nombreCamion,
       route_date: (route as any).route_date,
+      /** Lo que no se pudo calcular, dicho. Null cuando todo salió bien. */
+      aviso: avisoSobrante,
     };
 
     // 3) GUARDAR el resumen para poder reimprimirlo luego. La ruta ya quedó
     //    cerrada arriba, antes de mover inventario.
-    try {
-      await db.from('routes').update({ close_summary: summary }).eq('id', id).eq('tenant_id', tenantId);
-    } catch { /* columna close_summary no existe todavía */ }
+    /* Sin try/catch: supabase-js NO lanza, devuelve el error adentro. El
+       `catch` vacío que había acá no se ejecutaba nunca —el resumen
+       simplemente no se guardaba y nadie se enteraba—. */
+    const guardado = await db.from('routes')
+      .update({ close_summary: summary }).eq('id', id).eq('tenant_id', tenantId);
+    if (guardado.error) {
+      /* El cierre ya está hecho y la plata cuadrada: no se cae por esto, pero
+         sin el resumen guardado la reimpresión tendrá que recalcular. */
+      console.error('[ruta] no se pudo guardar el resumen del cierre:', guardado.error.message);
+    }
 
     return ok(c, summary);
   } catch (err: any) { return fail(c, err.message, 500); }
@@ -1612,14 +1657,13 @@ routing.get('/:id/close-summary', async (c) => {
       if (Object.keys(loaded).length > 0) {
         returnedSource = 'reconstructed';
         // Vendido por producto (facturas no anuladas de la ruta).
-        const saleIds = sales.map((i: any) => i.id);
-        const sold: Record<string, number> = {};
-        if (saleIds.length > 0) {
-          const { data: lines } = await db.from('invoice_items')
-            .select('product_id, quantity, invoice_id').in('invoice_id', saleIds);
-          for (const l of (lines ?? []) as any[]) sold[l.product_id] = Number(sold[l.product_id] ?? 0) + Number(l.quantity);
-        }
-        const leftoverIds = Object.keys(loaded).filter(pid => Number(loaded[pid]) - Number(sold[pid] ?? 0) > 0.0001);
+        /* Por tandas, igual que en el cierre: con los ids de trescientas
+           ventas en una sola consulta, falla y el papel diría que volvió la
+           carga completa de un camión que vendió todo el día. */
+        const { sold, completo } = await vendidoPorProducto(sales.map((i: any) => i.id));
+        const leftoverIds = !completo ? [] : Object.keys(loaded)
+          .filter(pid => Number(loaded[pid]) - Number(sold[pid] ?? 0) > 0.0001);
+        if (!completo) returnedSource = 'none';
         const nameMap = new Map<string, string>();
         if (leftoverIds.length > 0) {
           const { data: prods } = await db.from('products').select('id, name').in('id', leftoverIds);
@@ -1645,9 +1689,14 @@ routing.get('/:id/close-summary', async (c) => {
       /* La reimpresión tiene que decir lo mismo que el original. Los cierres
          viejos no guardaron `cobrado`, así que se calcula de los métodos: el
          crédito nunca entra. */
-      cobrado: stored?.cobrado ?? Math.round(((stored?.by_method ?? byMethod).cash
-        + (stored?.by_method ?? byMethod).card + (stored?.by_method ?? byMethod).sinpe) * 100) / 100,
-      credito: stored?.credito ?? Math.round((stored?.by_method ?? byMethod).credit * 100) / 100,
+      /* `Number(... ) || 0` porque un `by_method` viejo puede no traer todas
+         las llaves: `undefined * 100` es NaN, y un cierre reimpreso con
+         «₡NaN» en lo cobrado es peor que uno sin el dato. */
+      cobrado: stored?.cobrado ?? (() => {
+        const bm: any = stored?.by_method ?? byMethod;
+        return Math.round(((Number(bm.cash) || 0) + (Number(bm.card) || 0) + (Number(bm.sinpe) || 0)) * 100) / 100;
+      })(),
+      credito: stored?.credito ?? Math.round((Number((stored?.by_method ?? byMethod).credit) || 0) * 100) / 100,
       // Abonos de CxC y gastos del día (del resumen guardado al cerrar).
       ar_payments: stored?.ar_payments,
       expenses: stored?.expenses,
