@@ -110,7 +110,10 @@ async function enlaceDe(token: string) {
   const t = String(token ?? '').trim();
   if (t.length < 20) return null;
   const { data } = await db.from('customer_links')
-    .select('*, customers(id, name, commercial_name, phone, email, credit_enabled, credit_limit, is_active)')
+    /* La ZONA viene con el cliente: es lo que después permite alistar los
+       pedidos por repartidor sin preguntarle a la tabla de clientes otra vez
+       por cada pedido. */
+    .select('*, customers(id, name, commercial_name, phone, email, zone, credit_enabled, credit_limit, is_active)')
     .eq('token', t).maybeSingle();
   if (!data) return null;
   const l = data as any;
@@ -373,12 +376,30 @@ portalPublico.post('/:token/pedido', async (c) => {
       customer_id: cliente.id,
       customer_name: cliente.commercial_name || cliente.name,
       customer_phone: cliente.phone ?? null,
+      /**
+       * LA ZONA DEL CLIENTE, COPIADA AL PEDIDO.
+       *
+       * Sin esto, los pedidos del enlace entraban sin zona y no se podían
+       * separar por repartidor: alistar «lo de Pavas» obligaba a abrir pedido
+       * por pedido a ver de quién era. Va copiada y no por referencia porque
+       * si mañana al cliente le cambian la zona, el pedido que ya se alistó y
+       * salió en la ruta de ayer tiene que seguir diciendo por dónde fue.
+       */
+      customer_zone: (cliente as any).zone ?? null,
       notes: parsed.data.notes?.trim() || null,
       document_type: 'ticket',
       total,
       editable_hasta: editableHasta,
     };
-    const { data: pedido, error } = await db.from('agent_orders').insert(fila).select('*').single();
+    let { data: pedido, error } = await db.from('agent_orders').insert(fila).select('*').single();
+    /* Si la base todavía no tiene la columna de la zona, el pedido entra
+       igual: el cliente mandándolo desde su teléfono no puede quedarse sin
+       pedir porque falte una columna para ordenar la ruta. */
+    if (error && /customer_zone/.test(error.message)) {
+      const { customer_zone: _z, ...sinZona } = fila as any;
+      ({ data: pedido, error } = await db.from('agent_orders').insert(sinZona).select('*').single());
+      if (!error) console.warn('[portal] el pedido entró sin zona: falta la columna customer_zone');
+    }
     if (error) throw new Error(error.message);
 
     const { error: eItems } = await db.from('agent_order_items')
