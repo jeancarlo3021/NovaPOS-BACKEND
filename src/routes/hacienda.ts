@@ -1027,7 +1027,16 @@ export async function emitInvoiceCore(
         unit_price: Number(it.unit_price),
         subtotal: Number(it.subtotal),
         cabys_code: (p.cabys_code ? String(p.cabys_code).replace(/\D/g, '') : '') || defaultCabys,
-        iva_rate: p.iva_rate ?? 0,
+        /**
+         * La tasa de la LÍNEA manda sobre la del producto.
+         *
+         * Una línea sin producto —el «Servicio 10%» del restaurante, un
+         * producto rápido— no tenía de dónde sacarla y se declaraba al 0 %:
+         * se cobraba el IVA y el comprobante iba exento, con su total
+         * distinto al de la factura. La línea guarda con qué tasa se cobró
+         * (migración 142) y eso es lo que se declara.
+         */
+        iva_rate: it.iva_rate != null ? Number(it.iva_rate) : (p.iva_rate ?? 0),
         unit: (p.unit_type?.abbreviation) ?? 'Unid',
       };
     }).filter((l: FELine) => Number(l.quantity) > 0 && l.product_name);

@@ -423,9 +423,25 @@ invoices.post('/', async (c) => {
       // Lo que se cambió del kit en esta venta. Se guarda para que una
       // anulación devuelva al inventario lo que de verdad salió.
       kit_substitutions: item.kit_substitutions?.length ? item.kit_substitutions : null,
+      /**
+       * EL IVA CON QUE SE COBRÓ ESTA LÍNEA.
+       *
+       * Para las líneas sin producto —el «Servicio 10%» del restaurante, un
+       * producto rápido escrito a mano— no había de dónde sacar la tasa, y el
+       * comprobante electrónico las declaraba al 0 %. El cliente pagaba el IVA
+       * y Hacienda recibía una línea exenta, con el total del comprobante
+       * distinto al de la factura.
+       */
+      iva_rate: item.iva_rate != null && item.iva_rate !== '' ? Number(item.iva_rate) : null,
     }));
     let { error: itemErr } = await db.from('invoice_items').insert(itemRows);
     // Si la columna product_name aún no existe (migración 70 sin correr), reintentar sin ella.
+    /* Sin la columna `iva_rate` (migración 142) la venta se guarda igual: la
+       factura importa más que el detalle de la tasa por línea. */
+    if (itemErr && /iva_rate/i.test(itemErr.message)) {
+      const stripped = itemRows.map(({ iva_rate, ...r }: any) => r);
+      ({ error: itemErr } = await db.from('invoice_items').insert(stripped));
+    }
     if (itemErr && /product_name/i.test(itemErr.message)) {
       const stripped = itemRows.map(({ product_name, ...r }: any) => r);
       ({ error: itemErr } = await db.from('invoice_items').insert(stripped));
