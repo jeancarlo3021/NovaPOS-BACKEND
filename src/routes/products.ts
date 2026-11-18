@@ -13,6 +13,19 @@ const ProductSchema = z.object({
   description:     z.string().optional().nullable(),
   unit_price:      z.number().nonnegative().optional().nullable(),
   delivery_price:  z.number().nonnegative().optional().nullable(),   // precio para delivery
+  /**
+   * PRECIO POR PLATAFORMA: {"Uber": 5500, "Didi": 5300}.
+   *
+   * Cada plataforma cobra una comisión distinta, así que con un solo precio
+   * delivery el negocio pierde margen en la más cara o le cobra de más al
+   * cliente en la más barata. Lo que no esté puesto cae al `delivery_price`
+   * general y, si tampoco hay, al precio normal.
+   *
+   * Se acepta cualquier nombre de plataforma —entra una nueva y no hay que
+   * tocar el servidor—, pero el valor tiene que ser un número: un precio en
+   * texto es un precio que después no suma.
+   */
+  delivery_prices: z.record(z.string(), z.number().nonnegative().nullable()).optional().nullable(),
   cost_price:      z.number().nonnegative().optional().nullable(),
   // Sin `.int()`: hay productos que se venden por PESO y su existencia son 2.5 kg,
   // no 2. Con la validación de enteros el guardado se rechazaba (o se truncaba) y
@@ -166,14 +179,22 @@ products.post('/', requirePermission('inventory', 'create'), async (c) => {
     const parsed = ProductSchema.safeParse(await c.req.json());
     if (!parsed.success) return fail(c, parsed.error.message, 422);
 
-    const { data, error } = await db.from('products')
-      .insert({
-        ...parsed.data,
-        // Default solo al CREAR: si no se especifica, rastrea stock.
-        tracks_stock: parsed.data.tracks_stock ?? true,
-        tenant_id: tenantId,
-      })
-      .select().single();
+    const fila = {
+      ...parsed.data,
+      // Default solo al CREAR: si no se especifica, rastrea stock.
+      tracks_stock: parsed.data.tracks_stock ?? true,
+      tenant_id: tenantId,
+    };
+    let { data, error } = await db.from('products').insert(fila).select().single();
+    /* Sin la migración 143 no existe `delivery_prices`: el producto se crea
+       igual, sin los precios por plataforma. Un catálogo que no se puede
+       cargar porque falta una columna de precios opcionales es peor que un
+       precio de delivery de menos. */
+    if (error && /delivery_prices/.test(error.message)) {
+      const { delivery_prices: _dp, ...sinPlataformas } = fila as any;
+      ({ data, error } = await db.from('products').insert(sinPlataformas).select().single());
+      if (!error) console.warn('[products] sin la migración 143: el producto se creó sin precios por plataforma');
+    }
     if (error) throw new Error(error.message);
     return ok(c, data, 201);
   } catch (err: any) { return fail(c, err.message, 500); }
@@ -238,10 +259,15 @@ products.put('/:id', requirePermission('inventory', 'edit'), async (c) => {
       }
     }
 
-    const { data, error } = await db.from('products')
-      .update({ ...patch, updated_at: new Date().toISOString() })
-      .eq('id', id).eq('tenant_id', tenantId)
-      .select().single();
+    const conFecha = { ...patch, updated_at: new Date().toISOString() };
+    let { data, error } = await db.from('products')
+      .update(conFecha).eq('id', id).eq('tenant_id', tenantId).select().single();
+    if (error && /delivery_prices/.test(error.message)) {
+      const { delivery_prices: _dp, ...sinPlataformas } = conFecha as any;
+      ({ data, error } = await db.from('products')
+        .update(sinPlataformas).eq('id', id).eq('tenant_id', tenantId).select().single());
+      if (!error) console.warn('[products] sin la migración 143: se guardó sin precios por plataforma');
+    }
     if (error) throw new Error(error.message);
     if (!data) return fail(c, 'Producto no encontrado', 404);
     // Se avisa que el stock no se tocó, para que la pantalla pueda decirlo.
