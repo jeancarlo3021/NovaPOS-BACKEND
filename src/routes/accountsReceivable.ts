@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
 import { getUserZone } from '../utils/userZone.js';
+import { endOfDay } from '../utils/dateRange.js';
 import { nextInvoiceNumber, consecutivoFloor } from './invoices.js';
 import { emitInvoiceCore } from './hacienda.js';
 
@@ -370,6 +371,75 @@ accountsReceivable.get('/summary', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+/**
+ * GET /payments — ABONOS COBRADOS (el dinero que entró por cuentas por cobrar).
+ *
+ * El abono es plata que entra y no es una venta: la venta a crédito ya se
+ * facturó el día que se despachó. Por eso no aparecía en ningún lado como
+ * ingreso —ni en el cierre de caja ni en los reportes—, y el único rastro era
+ * que el saldo del cliente bajaba.
+ *
+ * ?session=<id> — abonos ligados a esa caja (lo que usa el cierre). NO se
+ *   agregan por fecha: un abono se cobra muchas veces fuera del POS, y meter
+ *   por horario lo que se cobró en la oficina le haría sobrar plata al cajero.
+ *   Solo entra al arqueo lo que se cobró con esa caja abierta.
+ * ?from=&to=    — por fecha, para los reportes.
+ *
+ * Los abonos ANULADOS nunca salen: esa plata se devolvió.
+ */
+accountsReceivable.get('/payments', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const sessionId = c.req.query('session');
+    const desde = c.req.query('from');
+    const hasta = c.req.query('to');
+
+    const columnas = 'id, receivable_id, amount, method, note, created_at, user_id,'
+      + ' receivable:accounts_receivable(customer_name, invoice_number, source)';
+
+    const consulta = (conSesion: boolean, conAnulados: boolean) => {
+      let q = db.from('accounts_receivable_payments')
+        .select(conAnulados ? `${columnas}, voided_at` : columnas)
+        .eq('tenant_id', tenantId).order('created_at');
+      if (conSesion && sessionId) q = q.eq('cash_session_id', sessionId);
+      if (desde) q = q.gte('created_at', desde);
+      if (hasta) q = q.lte('created_at', endOfDay(hasta) ?? hasta);
+      return q;
+    };
+
+    // `voided_at` es de la migración 63 y `cash_session_id` de la 144: si alguna
+    // no corrió, se responde lo que sí se pueda leer en vez de dejar el cierre
+    // sin abonos. Lo que no se puede es filtrar por una caja que no existe en la
+    // tabla: eso devolvería TODOS los abonos del negocio como si fueran de este
+    // turno, así que en ese caso se responde vacío.
+    let res: any = await consulta(true, true);
+    let sinColumnaSesion = false;
+    if (res.error && /cash_session_id/.test(res.error.message ?? '')) {
+      if (sessionId) return ok(c, []);
+      sinColumnaSesion = true;
+      res = await consulta(false, true);
+    }
+    if (res.error && /voided_at/.test(res.error.message ?? '')) {
+      res = await consulta(!sinColumnaSesion, false);
+    }
+    if (res.error) throw new Error(res.error.message);
+
+    const filas = ((res.data ?? []) as any[]).filter((p) => !p.voided_at);
+    return ok(c, filas.map((p) => ({
+      id: p.id,
+      receivable_id: p.receivable_id,
+      cliente: p.receivable?.customer_name ?? null,
+      factura: p.receivable?.invoice_number ?? null,
+      origen: p.receivable?.source ?? null,
+      amount: Number(p.amount ?? 0),
+      method: p.method ?? 'cash',
+      note: p.note ?? null,
+      user_id: p.user_id ?? null,
+      created_at: p.created_at,
+    })));
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // GET /:id — con historial de abonos
 accountsReceivable.get('/:id', async (c) => {
   try {
@@ -424,10 +494,23 @@ accountsReceivable.post('/:id/pay', async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const { id } = c.req.param();
-    const { amount, method, note, created_at, batch_id } = await c.req.json() as {
+    const { amount, method, note, created_at, batch_id, cash_session_id } = await c.req.json() as {
       amount: number; method?: string; note?: string; created_at?: string;
       /** Agrupa los abonos de un mismo pago masivo. */
       batch_id?: string;
+      /**
+       * CAJA QUE RECIBIÓ EL ABONO, si se cobró en una.
+       *
+       * Sin esto el dinero del abono no aparecía en ningún cierre de caja: el
+       * cajero cobraba ₡50.000 de una cuenta, los metía a la gaveta, y al
+       * cerrar el sistema le marcaba ese mismo monto como SOBRANTE porque el
+       * esperado solo contaba ventas.
+       *
+       * Va en NULL cuando el abono no pasó por una caja —la oficina, un
+       * depósito, el repartidor en la calle—. Así ningún arqueo reclama plata
+       * que nunca estuvo en esa gaveta.
+       */
+      cash_session_id?: string | null;
     };
     if (!amount || amount <= 0) return fail(c, 'Monto inválido', 422);
 
@@ -442,6 +525,7 @@ accountsReceivable.post('/:id/pay', async (c) => {
       tenant_id: tenantId, receivable_id: id, amount, method: method ?? 'cash', note: note ?? null,
       user_id: c.get('userId') ?? null,   // quién cobró el abono (repartidor)
     };
+    if (cash_session_id) payment.cash_session_id = cash_session_id;
     // Abono registrado OFFLINE: usar el created_at real (no la hora del sync), para
     // que caiga dentro de la ventana del cierre del repartidor.
     if (typeof created_at === 'string' && !isNaN(Date.parse(created_at))) {
@@ -455,6 +539,13 @@ accountsReceivable.post('/:id/pay', async (c) => {
     // perder el abono sería un descuadre de plata.
     if (ins.error && /batch_id/.test(ins.error.message ?? '')) {
       const { batch_id: _b, ...rest } = payment;
+      ins = await db.from('accounts_receivable_payments').insert(rest);
+    }
+    // `cash_session_id` es de la migración 144: si no corrió, el abono se
+    // registra igual (sin ligarse a la caja). Perder el vínculo con el cierre
+    // es molesto; perder el abono sería un descuadre de plata.
+    if (ins.error && /cash_session_id/.test(ins.error.message ?? '')) {
+      const { cash_session_id: _s, ...rest } = payment;
       ins = await db.from('accounts_receivable_payments').insert(rest);
     }
     if (ins.error) throw new Error(ins.error.message);
