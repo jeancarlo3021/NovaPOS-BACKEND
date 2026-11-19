@@ -654,13 +654,23 @@ recipes.get('/reports/food-cost', async (c) => {
     // 2) Mermas registradas y tomas físicas, del mismo período.
     //    'count' trae la varianza ya calculada; damage/expired/theft son la
     //    merma que alguien se tomó el trabajo de justificar.
-    let aq = db.from('stock_adjustments')
-      .select('product_id, type, quantity, created_at')
-      .eq('tenant_id', tenantId)
-      .in('type', ['damage', 'expired', 'theft', 'count']).limit(50000);
-    if (from) aq = aq.gte('created_at', from);
-    if (to) aq = aq.lte('created_at', to);
-    const { data: adj } = await aq;
+    /* Las mermas ANULADAS no cuentan: su efecto en el stock se revirtió, y
+       dejarlas acá es exactamente el problema que la anulación resuelve —una
+       merma tecleada con un cero de más inflaba el food cost del mes aunque ya
+       se hubiera corregido—. Si la migración 145 no corrió, no hay anuladas. */
+    const armar = (soloVivas: boolean) => {
+      let q = db.from('stock_adjustments')
+        .select('product_id, type, quantity, created_at')
+        .eq('tenant_id', tenantId)
+        .in('type', ['damage', 'expired', 'theft', 'count']).limit(50000);
+      if (soloVivas) q = q.is('voided_at', null);
+      if (from) q = q.gte('created_at', from);
+      if (to) q = q.lte('created_at', to);
+      return q;
+    };
+    let aq: any = await armar(true);
+    if (aq.error && /voided_at/.test(aq.error.message ?? '')) aq = await armar(false);
+    const adj = aq.data;
     for (const a of (adj ?? []) as any[]) {
       const x = row(String(a.product_id));
       const qty = Number(a.quantity) || 0;

@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
 import { requirePermission } from '../middleware/permissions.js';
+import { insertarAjustes } from '../utils/stockAjustes.js';
 
 const stockAdjustments = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
 
@@ -130,10 +131,27 @@ stockAdjustments.post('/', requirePermission('inventory', 'edit'), async (c) => 
         stock_after: stockAfter,
         reason,
         notes: notes ?? null,
+        source: 'manual',
       })
       .select()
       .single();
 
+    /* Sin la migración 145 la columna `source` no existe y el insert falla
+       entero: se reintenta sin ella antes que dejar el ajuste sin registrar. */
+    if (aErr && /source/.test(aErr.message ?? '')) {
+      const r2 = await db.from('stock_adjustments')
+        .insert({
+          tenant_id: tenantId, product_id, user_id: userId, user_email: user_email ?? null,
+          type, quantity: diff, stock_before: stockBefore, stock_after: stockAfter,
+          reason, notes: notes ?? null,
+        })
+        .select().single();
+      if (r2.error) throw new Error(r2.error.message);
+      const { error: uErr2 } = await db.from('products')
+        .update({ stock_quantity: stockAfter }).eq('id', product_id).eq('tenant_id', tenantId);
+      if (uErr2) throw new Error(uErr2.message);
+      return ok(c, r2.data, 201);
+    }
     if (aErr) throw new Error(aErr.message);
 
     // 3. Actualizar stock del producto
@@ -185,6 +203,9 @@ stockAdjustments.post('/physical-count', requirePermission('inventory', 'edit'),
 
     const reason = 'Toma física';
     const noteBase = notes?.trim() || null;
+    /* Un lote por toma: si la toma se hizo con el producto equivocado, se anula
+       completa en vez de deshacer ciento veinte líneas de a una. */
+    const loteConteo = crypto.randomUUID();
     const adjRows: any[] = [];
     const items: any[] = [];
     const updates: Array<{ id: string; stock_after: number }> = [];
@@ -205,13 +226,13 @@ stockAdjustments.post('/physical-count', requirePermission('inventory', 'edit'),
       adjRows.push({
         tenant_id: tenantId, product_id, user_id: userId, user_email: user_email ?? null,
         type: 'count', quantity: diff, stock_before: stockBefore, stock_after: stockAfter,
-        reason, notes: noteBase,
+        reason, notes: noteBase, source: 'manual', batch_id: loteConteo,
       });
       updates.push({ id: product_id, stock_after: stockAfter });
     }
 
     if (adjRows.length > 0) {
-      const { error: aErr } = await db.from('stock_adjustments').insert(adjRows);
+      const { error: aErr } = await insertarAjustes(adjRows);
       if (aErr) throw new Error(aErr.message);
       // Actualiza el stock producto por producto (valores absolutos distintos).
       for (const u of updates) {
@@ -271,6 +292,9 @@ stockAdjustments.post('/waste', requirePermission('inventory', 'edit'), async (c
     const adjRows: any[] = [];
     const applied: any[] = [];
     let totalCost = 0;
+    /* Botar cinco cosas al cierre de cocina es UN acto: con el lote se anula
+       completo en vez de línea por línea. */
+    const loteMerma = crypto.randomUUID();
 
     for (const it of items) {
       const p = byId.get(it.product_id);
@@ -289,6 +313,7 @@ stockAdjustments.post('/waste', requirePermission('inventory', 'edit'), async (c
         user_email: user_email ?? null, type,
         quantity: -it.quantity, stock_before: before, stock_after: after,
         reason, notes: notes ?? null,
+        source: 'manual', batch_id: loteMerma,
       });
       applied.push({ product_id: it.product_id, name: (p as any).name, quantity: it.quantity, cost });
     }
@@ -296,7 +321,7 @@ stockAdjustments.post('/waste', requirePermission('inventory', 'edit'), async (c
     if (adjRows.length === 0) return fail(c, 'Ninguno de los productos lleva control de stock.', 422);
 
     // La bitácora primero: si no se puede registrar el porqué, no se toca el stock.
-    const { error: aErr } = await db.from('stock_adjustments').insert(adjRows);
+    const { error: aErr } = await insertarAjustes(adjRows);
     if (aErr) throw new Error(aErr.message);
 
     for (const r of adjRows) {
@@ -305,7 +330,173 @@ stockAdjustments.post('/waste', requirePermission('inventory', 'edit'), async (c
         .eq('id', r.product_id).eq('tenant_id', tenantId);
     }
 
-    return ok(c, { registered: applied.length, total_cost: totalCost, items: applied }, 201);
+    return ok(c, { registered: applied.length, total_cost: totalCost, items: applied, batch_id: loteMerma }, 201);
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/**
+ * ¿Este movimiento se puede anular desde el reporte de movimientos?
+ *
+ * No todos. La recepción de una compra se deshace ANULANDO LA COMPRA, y el
+ * sobrante de una ruta se corrige en la ruta: revertir el stock de este lado
+ * dejaría la compra diciendo «recibida» con la mercadería ya devuelta, o la
+ * ruta cerrada contra existencias que ya no están. Esos movimientos son el
+ * rastro de otro documento, no un acto suelto.
+ *
+ * `source` lo escriben los que crean el movimiento. Los movimientos VIEJOS no
+ * la tienen (NULL), así que para ellos se cae al texto del motivo, que es lo
+ * único que hay. Es una heurística y por eso solo se usa como respaldo.
+ */
+function origenDelMovimiento(a: any): string {
+  const src = String(a?.source ?? '').trim();
+  if (src) return src;
+  const motivo = String(a?.reason ?? '').toLowerCase();
+  if (/^compra |^recarga de compra |recepci[oó]n de compra/.test(motivo)) return 'purchase';
+  if (/anulaci[oó]n de compra/.test(motivo)) return 'purchase';
+  if (/sobrante de ruta|devoluci[oó]n al cerrar la ruta/.test(motivo)) return 'route';
+  if (/nota de cr[eé]dito de proveedor/.test(motivo)) return 'supplier_nc';
+  return 'manual';
+}
+
+const DONDE_SE_DESHACE: Record<string, string> = {
+  purchase: 'Este movimiento es la recepción de una compra: se deshace anulando la compra, para que la compra y el inventario no se contradigan.',
+  route: 'Este movimiento salió del cierre de una ruta: se corrige en la ruta, no acá.',
+  supplier_nc: 'Este movimiento salió de una nota de crédito de proveedor: se corrige en el documento recibido.',
+};
+
+/**
+ * Revierte el efecto en el stock de un movimiento ya aplicado.
+ *
+ * Se revierte por el DELTA (`quantity`), nunca volviendo a `stock_before`:
+ * poner el stock en el valor anterior borraría de un golpe todos los
+ * movimientos posteriores —las ventas del día incluidas—. Restar el delta deja
+ * el inventario como si ese movimiento nunca hubiera pasado y respeta todo lo
+ * que vino después.
+ */
+async function revertirMovimiento(tenantId: string, a: any): Promise<{ ok: boolean; mensaje?: string; queda?: number }> {
+  const delta = Number(a.quantity ?? 0);
+  const { data: prod } = await db.from('products')
+    .select('id, stock_quantity, name').eq('id', a.product_id).eq('tenant_id', tenantId).maybeSingle();
+  if (!prod) return { ok: false, mensaje: 'El producto del movimiento ya no existe' };
+
+  const actual = Number((prod as any).stock_quantity ?? 0);
+  const queda = actual - delta;
+  const { error } = await db.from('products')
+    .update({ stock_quantity: queda, updated_at: new Date().toISOString() })
+    .eq('id', a.product_id).eq('tenant_id', tenantId);
+  if (error) return { ok: false, mensaje: error.message };
+  return { ok: true, queda };
+}
+
+/**
+ * POST /:id/void — ANULAR un movimiento de inventario o una merma.
+ *
+ * Qué hace, en este orden:
+ *  1. Reclama el movimiento (marca `voided_at` solo si estaba sin anular). Dos
+ *     clics del mismo botón —o dos usuarios a la vez— revertirían el stock dos
+ *     veces y el inventario quedaría al doble.
+ *  2. Revierte el stock por el delta.
+ *  3. Si el stock queda NEGATIVO, no lo esconde: lo dice en la respuesta. Pasa
+ *     cuando se anula una entrada cuya mercadería ya se vendió, y es
+ *     información real que el encargado necesita, no un error a tapar.
+ *
+ * `?batch=1` anula TODO el lote de una merma registrada de una sola vez: botar
+ * cinco cosas al cierre de cocina es un solo acto y se deshace como uno solo.
+ */
+stockAdjustments.post('/:id/void', requirePermission('inventory', 'delete'), async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const userId = c.get('userId');
+    const { id } = c.req.param();
+    const enLote = ['1', 'true', 'si'].includes(String(c.req.query('batch') ?? '').toLowerCase());
+    const motivo = String((await c.req.json().catch(() => ({} as any)))?.reason ?? '').trim();
+
+    const { data: encontrado, error: eBase } = await db.from('stock_adjustments')
+      .select('*').eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+    if (eBase) throw new Error(eBase.message);
+
+    /* El id puede ser el de un LOTE y no el de una fila: es lo que devuelve la
+       merma rápida al registrarla, y así el «deshacer» de esa pantalla funciona
+       sin tener que ir a buscar el id de la primera línea. */
+    let base: any = encontrado;
+    if (!base) {
+      const { data: porLote } = await db.from('stock_adjustments')
+        .select('*').eq('tenant_id', tenantId).eq('batch_id', id).is('voided_at', null).limit(1);
+      base = (porLote ?? [])[0] ?? null;
+    }
+    if (!base) return fail(c, 'Movimiento no encontrado', 404);
+
+    const origen = origenDelMovimiento(base);
+    if (DONDE_SE_DESHACE[origen]) return fail(c, DONDE_SE_DESHACE[origen], 409);
+    if ((base as any).voided_at) return fail(c, 'Este movimiento ya estaba anulado', 409);
+
+    // Las filas a anular: una, o el lote completo de la merma.
+    let filas: any[] = [base];
+    const batchId = (base as any).batch_id;
+    if (enLote && batchId) {
+      const { data: lote } = await db.from('stock_adjustments')
+        .select('*').eq('tenant_id', tenantId).eq('batch_id', batchId).is('voided_at', null);
+      if ((lote ?? []).length > 0) filas = lote as any[];
+    }
+
+    const anulados: any[] = [];
+    const negativos: any[] = [];
+    const fallaron: any[] = [];
+
+    for (const a of filas) {
+      if (DONDE_SE_DESHACE[origenDelMovimiento(a)]) continue;
+
+      /* RECLAMO ATÓMICO: el `is('voided_at', null)` es lo que impide que dos
+         clics seguidos reviertan el mismo movimiento dos veces. Si no devuelve
+         fila, alguien más llegó primero y acá no se toca el stock. */
+      const upd = await db.from('stock_adjustments')
+        .update({
+          voided_at: new Date().toISOString(),
+          voided_by: userId ?? null,
+          void_reason: motivo || null,
+        })
+        .eq('id', a.id).eq('tenant_id', tenantId).is('voided_at', null)
+        .select();
+      if (upd.error) {
+        // La migración 145 sin correr: no se puede anular sin dónde anotarlo.
+        if (/voided_at|void_reason|voided_by/.test(upd.error.message ?? '')) {
+          return fail(c, 'Falta correr la migración 145 para poder anular movimientos', 409);
+        }
+        fallaron.push({ id: a.id, error: upd.error.message });
+        continue;
+      }
+      if ((upd.data ?? []).length === 0) continue;   // otro lo anuló primero
+
+      const r = await revertirMovimiento(tenantId, a);
+      if (!r.ok) {
+        /* No se pudo mover el stock: se DESANULA, porque un movimiento marcado
+           como anulado cuyo efecto sigue aplicado es peor que no haberlo
+           anulado —el reporte diría una cosa y el inventario otra—. */
+        await db.from('stock_adjustments')
+          .update({ voided_at: null, voided_by: null, void_reason: null })
+          .eq('id', a.id).eq('tenant_id', tenantId);
+        fallaron.push({ id: a.id, error: r.mensaje ?? 'No se pudo revertir el stock' });
+        continue;
+      }
+      anulados.push({ id: a.id, product_id: a.product_id, quantity: Number(a.quantity ?? 0), stock_queda: r.queda });
+      if ((r.queda ?? 0) < 0) negativos.push({ product_id: a.product_id, stock: r.queda });
+    }
+
+    if (anulados.length === 0) {
+      return fail(c, fallaron[0]?.error ?? 'No se pudo anular el movimiento', 409);
+    }
+
+    return ok(c, {
+      anulados: anulados.length,
+      movimientos: anulados,
+      /* El stock negativo se dice, no se acomoda: se anuló una entrada cuya
+         mercadería ya salió, y eso hay que saberlo. */
+      negativos,
+      fallaron,
+      aviso: negativos.length > 0
+        ? 'Hay productos con stock negativo: la mercadería de esa entrada ya había salido. Revisá esas existencias.'
+        : null,
+    });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
@@ -334,8 +525,18 @@ stockAdjustments.get('/kardex', async (c) => {
     const movs: Mov[] = [];
 
     // 1) Ajustes (incluye compras recibidas y tomas físicas).
-    const { data: adj } = await db.from('stock_adjustments')
-      .select('type, quantity, reason, created_at').eq('tenant_id', tenantId).eq('product_id', productId);
+    /* Los movimientos ANULADOS no van al kardex: su efecto en el stock ya se
+       revirtió, así que dejarlos descuadraría el saldo corrido contra el stock
+       real. Si la migración 145 no corrió, no hay anulados que excluir. */
+    let adjQ: any = await db.from('stock_adjustments')
+      .select('type, quantity, reason, created_at')
+      .eq('tenant_id', tenantId).eq('product_id', productId).is('voided_at', null);
+    if (adjQ.error && /voided_at/.test(adjQ.error.message ?? '')) {
+      adjQ = await db.from('stock_adjustments')
+        .select('type, quantity, reason, created_at')
+        .eq('tenant_id', tenantId).eq('product_id', productId);
+    }
+    const adj = adjQ.data;
     for (const a of (adj ?? []) as any[]) {
       movs.push({
         date: a.created_at, kind: a.type, label: a.reason || a.type,

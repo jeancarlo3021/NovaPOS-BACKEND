@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { db } from '../db/client.js';
+import { insertarAjustes } from '../utils/stockAjustes.js';
 import { ok, fail } from '../utils/response.js';
 import { createReceivable } from './accountsReceivable.js';
 
@@ -1279,15 +1280,16 @@ async function anotarDevolucion(
   cantidad: number, antes: number, camion?: string, reconstruido = false,
 ) {
   try {
-    await db.from('stock_adjustments').insert({
+    await insertarAjustes([{
       tenant_id: tenantId, product_id: productId, user_id: userId ?? null,
       type: 'increase', quantity: cantidad,
       stock_before: antes, stock_after: antes + cantidad,
+      source: 'route',
       reason: `Sobrante de ruta${camion ? ` · ${camion}` : ''}`,
       notes: reconstruido
         ? 'Devolución calculada de lo cargado menos lo vendido: el camión figuraba vacío'
         : 'Devolución al cerrar la ruta',
-    });
+    }]);
   } catch (e: any) { console.warn('[ruta] no se pudo anotar la devolución:', e?.message); }
 }
 

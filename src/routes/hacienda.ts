@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { db } from '../db/client.js';
+import { insertarAjustes } from '../utils/stockAjustes.js';
 import { ok, fail } from '../utils/response.js';
 import { tipoComprobante, type FELine } from '../services/feDocument.js';
 import { alanube, AlanubeError, tenantAlanubeToken } from '../services/alanube.js';
@@ -2628,12 +2629,13 @@ hacienda.post('/received/credit-note', async (c) => {
 
         // La bitácora primero: si no se puede registrar el porqué, no se mueve
         // el inventario. Un faltante sin motivo aparece después como varianza.
-        const { error: aErr } = await db.from('stock_adjustments').insert({
+        const { error: aErr } = await insertarAjustes([{
           tenant_id: tenantId, product_id: m.product_id, user_id: userId ?? null,
           type: 'return', quantity: -qty, stock_before: before, stock_after: after,
+          source: 'supplier_nc',
           reason: 'Nota de crédito de proveedor',
           notes: `${d.issuer_name ?? ''} · Clave ${d.clave ?? ''}`.trim(),
-        });
+        }]);
         if (aErr) { messages.push(`⚠️ No se pudo registrar ${(p as any).name}: ${aErr.message}`); continue; }
 
         await db.from('products')

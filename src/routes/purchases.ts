@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
 import { db } from '../db/client.js';
+import { insertarAjustes } from '../utils/stockAjustes.js';
 import { ok, fail } from '../utils/response.js';
 
 const purchases = new Hono<{ Variables: { userId: string; tenantId: string; role: string } }>();
@@ -366,7 +367,7 @@ async function sumarAlStock(params: {
       continue;
     }
 
-    const { error: adjErr } = await db.from('stock_adjustments').insert({
+    const { error: adjErr } = await insertarAjustes([{
       tenant_id: tenantId,
       product_id: item.product_id,
       user_id: userId ?? null,
@@ -374,11 +375,12 @@ async function sumarAlStock(params: {
       quantity: qty,
       stock_before: stockBefore,
       stock_after: stockAfter,
+      source: 'purchase',
       reason: (motivo === 'recarga' ? `Recarga de compra ${numero}` : `Compra ${numero}`).trim(),
       notes: motivo === 'recarga'
         ? `Se volvió a cargar la orden${proveedor ? ` de ${proveedor}` : ''}`
         : (proveedor ? `Recepción de ${proveedor}` : 'Recepción de compra'),
-    });
+    }]);
     if (adjErr) console.error(`[STOCK] ERROR logging stock_adjustment for ${item.product_id}:`, adjErr.message);
 
     aplicados++;
@@ -1008,7 +1010,7 @@ purchases.post('/:id/void', async (c) => {
         .eq('id', l.product_id);
       if (eProd) { resumen.fallaron++; continue; }
 
-      await db.from('stock_adjustments').insert({
+      await insertarAjustes([{
         tenant_id: tenantId, product_id: l.product_id, user_id: userId ?? null,
         /* La cantidad va con SIGNO, como el resto de los movimientos
            (`quantity = stock_after − stock_before`): el reporte de
@@ -1016,9 +1018,10 @@ purchases.post('/:id/void', async (c) => {
            devolución anotada en positivo se contaba como una ENTRADA y las
            salidas del mes salían de menos. */
         type: 'decrease', quantity: -qty, stock_before: antes, stock_after: despues,
+        source: 'purchase',
         reason: `Anulación de compra ${numero}`.trim(),
         notes: motivo,
-      });
+      }]);
 
       resumen.stock_revertido++;
       resumen.unidades += qty;
