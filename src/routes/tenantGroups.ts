@@ -258,12 +258,79 @@ groups.get('/:id', async (c) => {
       }
     }));
 
+    /**
+     * EL USUARIO PRINCIPAL DE CADA NEGOCIO DEL GRUPO.
+     *
+     * La pantalla mostraba el dueño DEL GRUPO —uno solo, arriba— y nada de
+     * cada sucursal. En una cartera de contador eso deja la lista sin el dato
+     * que de verdad se usa: con quién se habla de ese negocio y con qué correo
+     * entra. Había que salirse del grupo y buscar el negocio en otra pantalla.
+     *
+     * `tenants.owner_id` es la fuente; si está vacío —negocios viejos, creados
+     * antes de que esa columna se llenara— se cae al usuario con rol de dueño
+     * o administrador de ese negocio, que es lo que un humano llamaría «el
+     * principal». Si no hay ninguno, va `null` y la pantalla lo dice: inventar
+     * un nombre sería peor que admitir que falta.
+     */
+    const usuarioPorNegocio: Record<string, { id: string; email: string | null; full_name: string | null; role: string | null } | null> = {};
+    if (tenantIds.length > 0) {
+      try {
+        const { data: tRows } = await db.from('tenants')
+          .select('id, owner_id').in('id', tenantIds as string[]);
+        const ownerDe = new Map<string, string | null>(
+          ((tRows ?? []) as any[]).map(t => [String(t.id), t.owner_id ?? null]));
+
+        /* Una sola consulta para todos: los usuarios de esos negocios más los
+           dueños declarados. Con una consulta por sucursal, un grupo de doce
+           negocios hacía doce viajes y la pantalla tardaba en abrir. */
+        const { data: uRows } = await db.from('users')
+          .select('id, email, full_name, role, tenant_id')
+          .in('tenant_id', tenantIds as string[]);
+        const porId = new Map<string, any>(((uRows ?? []) as any[]).map(u => [String(u.id), u]));
+
+        const faltantes = [...ownerDe.values()]
+          .filter((id): id is string => !!id && !porId.has(id));
+        if (faltantes.length > 0) {
+          /* El dueño puede no tener `tenant_id` apuntando a este negocio —pasa
+             con el usuario maestro de un grupo—, así que se busca por id. */
+          const { data: extra } = await db.from('users')
+            .select('id, email, full_name, role, tenant_id').in('id', faltantes);
+          for (const u of (extra ?? []) as any[]) porId.set(String(u.id), u);
+        }
+
+        const rango = (rol: string | null) =>
+          rol === 'owner' ? 0 : rol === 'admin' ? 1 : rol === 'gerente' ? 2 : 3;
+
+        for (const tid of tenantIds as string[]) {
+          const declarado = ownerDe.get(tid);
+          let elegido: any = declarado ? porId.get(declarado) : null;
+          if (!elegido) {
+            const candidatos = ((uRows ?? []) as any[])
+              .filter(u => String(u.tenant_id) === tid)
+              .sort((a, b) => rango(a.role) - rango(b.role));
+            elegido = candidatos[0] ?? null;
+          }
+          usuarioPorNegocio[tid] = elegido
+            ? {
+                id: String(elegido.id), email: elegido.email ?? null,
+                full_name: elegido.full_name ?? null, role: elegido.role ?? null,
+              }
+            : null;
+        }
+      } catch (e: any) {
+        /* Sin el usuario el grupo se sigue viendo: es un dato de más, no el
+           motivo por el que se abre la pantalla. */
+        console.warn('[tenant-groups] usuario principal por negocio:', e?.message);
+      }
+    }
+
     // Inyectar fe en cada member (el frontend espera m.fe directamente)
     const enriched = (members ?? []).map((m: any) => ({
       ...m,
       fe: m.tenant?.id ? feByTenant[m.tenant.id] ?? null : null,
       actividad: m.tenant?.id ? actividadPorNegocio[m.tenant.id] ?? null : null,
       bolsa: m.tenant?.id ? bolsaPorNegocio[m.tenant.id] ?? null : null,
+      usuario: m.tenant?.id ? usuarioPorNegocio[m.tenant.id] ?? null : null,
     }));
 
     /**
