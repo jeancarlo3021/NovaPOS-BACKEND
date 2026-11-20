@@ -379,10 +379,19 @@ accountsReceivable.get('/summary', async (c) => {
  * ingreso —ni en el cierre de caja ni en los reportes—, y el único rastro era
  * que el saldo del cliente bajaba.
  *
- * ?session=<id> — abonos ligados a esa caja (lo que usa el cierre). NO se
- *   agregan por fecha: un abono se cobra muchas veces fuera del POS, y meter
- *   por horario lo que se cobró en la oficina le haría sobrar plata al cajero.
- *   Solo entra al arqueo lo que se cobró con esa caja abierta.
+ * ?session=<id> — abonos de esa caja (lo que usa el cierre). Entran dos cosas:
+ *   los LIGADOS a la caja, y los que no quedaron ligados pero los cobró EL
+ *   MISMO USUARIO de esa caja dentro de su turno.
+ *
+ *   Lo segundo hace falta de verdad: medido en esta base, de los abonos que
+ *   caen dentro de una caja en la última semana, el 100 % los tomó el mismo
+ *   usuario que la abrió, y ninguno quedó ligado —porque el vínculo es nuevo y
+ *   todo lo cobrado antes tiene la columna vacía—. Sin este rescate, el cajero
+ *   cobra una cuenta, guarda la plata, y el cierre no la menciona.
+ *
+ *   Por horario a secas NO: eso metería al arqueo lo que se cobró en la oficina
+ *   o por depósito y le haría sobrar plata al cajero. El usuario es lo que
+ *   separa «lo cobré yo en esta caja» de «lo cobró otro en otro lado».
  * ?from=&to=    — por fecha, para los reportes.
  *
  * Los abonos ANULADOS nunca salen: esa plata se devolvió.
@@ -424,7 +433,50 @@ accountsReceivable.get('/payments', async (c) => {
     }
     if (res.error) throw new Error(res.error.message);
 
-    const filas = ((res.data ?? []) as any[]).filter((p) => !p.voided_at);
+    let filas = ((res.data ?? []) as any[]).filter((p) => !p.voided_at);
+    const ligados = new Set(filas.map((p) => String(p.id)));
+
+    /**
+     * RESCATE POR USUARIO Y HORARIO, para la caja.
+     *
+     * Los abonos cobrados antes de que existiera el vínculo —y los que se
+     * tomaron sin conexión— tienen `cash_session_id` vacío. Se suman solo si
+     * los cobró el MISMO usuario de la caja dentro de su turno: eso es su
+     * propia plata en su propia gaveta. Un abono de otro usuario no entra, por
+     * más que caiga en el mismo horario.
+     */
+    if (sessionId && !sinColumnaSesion) {
+      const { data: ses } = await db.from('cash_sessions')
+        .select('user_id, opening_date, closing_date')
+        .eq('id', sessionId).eq('tenant_id', tenantId).maybeSingle();
+      const abre = (ses as any)?.opening_date;
+      const duenoCaja = (ses as any)?.user_id;
+      if (abre && duenoCaja) {
+        const cierra = (ses as any)?.closing_date ?? new Date().toISOString();
+        let r: any = await db.from('accounts_receivable_payments')
+          .select(`${columnas}, voided_at`)
+          .eq('tenant_id', tenantId).is('cash_session_id', null)
+          .eq('user_id', duenoCaja)
+          .gte('created_at', abre).lte('created_at', cierra)
+          .order('created_at');
+        if (r.error && /voided_at/.test(r.error.message ?? '')) {
+          r = await db.from('accounts_receivable_payments')
+            .select(columnas)
+            .eq('tenant_id', tenantId).is('cash_session_id', null)
+            .eq('user_id', duenoCaja)
+            .gte('created_at', abre).lte('created_at', cierra)
+            .order('created_at');
+        }
+        if (!r.error) {
+          const rescatados = ((r.data ?? []) as any[])
+            .filter((p) => !p.voided_at && !ligados.has(String(p.id)))
+            .map((p) => ({ ...p, __rescatado: true }));
+          filas = [...filas, ...rescatados]
+            .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+        }
+      }
+    }
+
     return ok(c, filas.map((p) => ({
       id: p.id,
       receivable_id: p.receivable_id,
@@ -436,6 +488,10 @@ accountsReceivable.get('/payments', async (c) => {
       note: p.note ?? null,
       user_id: p.user_id ?? null,
       created_at: p.created_at,
+      /* `false` = no quedó ligado a la caja; se sumó porque lo cobró el mismo
+         usuario en su turno. La pantalla lo puede decir, que es distinto de
+         esconderlo. */
+      ligado: p.__rescatado ? false : true,
     })));
   } catch (err: any) { return fail(c, err.message, 500); }
 });
