@@ -550,7 +550,7 @@ accountsReceivable.post('/:id/pay', async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const { id } = c.req.param();
-    const { amount, method, note, created_at, batch_id, cash_session_id } = await c.req.json() as {
+    const { amount, method, note, created_at, batch_id, cash_session_id, terminal } = await c.req.json() as {
       amount: number; method?: string; note?: string; created_at?: string;
       /** Agrupa los abonos de un mismo pago masivo. */
       batch_id?: string;
@@ -567,6 +567,14 @@ accountsReceivable.post('/:id/pay', async (c) => {
        * que nunca estuvo en esa gaveta.
        */
       cash_session_id?: string | null;
+      /**
+       * Número de caja de ESTA máquina, si el POS tiene caja por máquina.
+       *
+       * Con él, un cajero que entró a relevar el turno liga el abono a la
+       * gaveta del equipo donde está parado, y no a la suya —que puede no
+       * existir—. Sin él se usa la caja abierta de este usuario.
+       */
+      terminal?: number | null;
     };
     if (!amount || amount <= 0) return fail(c, 'Monto inválido', 422);
 
@@ -581,7 +589,50 @@ accountsReceivable.post('/:id/pay', async (c) => {
       tenant_id: tenantId, receivable_id: id, amount, method: method ?? 'cash', note: note ?? null,
       user_id: c.get('userId') ?? null,   // quién cobró el abono (repartidor)
     };
-    if (cash_session_id) payment.cash_session_id = cash_session_id;
+    /**
+     * LA CAJA LA RESUELVE EL SERVIDOR CUANDO EL CLIENTE NO LA MANDA.
+     *
+     * Antes dependía de que la pantalla tuviera la caja cargada en memoria. Si
+     * no la tenía —se cobró desde el celular, desde una máquina donde el hook
+     * todavía no había respondido, o el cajero no era el que abrió la gaveta—
+     * el abono se guardaba sin caja y el cierre del POS no lo mencionaba.
+     *
+     * Se liga SOLO a la caja abierta de ESTE USUARIO (o a la de la terminal que
+     * el POS declare). No «la única caja abierta del negocio», que es la regla
+     * que parece práctica y está mal: el abono que cobra un REPARTIDOR en la
+     * calle se ligaría a la caja del local, y entonces esa plata contaría dos
+     * veces —una en el cierre de ruta, que la cuenta por repartidor y fecha, y
+     * otra en el arqueo del local, donde nunca estuvo—.
+     */
+    let caja = cash_session_id ?? null;
+    if (!caja) {
+      try {
+        const term = Number(terminal);
+        let q = db.from('cash_sessions').select('id')
+          .eq('tenant_id', tenantId).eq('status', 'open');
+        q = (Number.isFinite(term) && term >= 1)
+          ? q.eq('terminal', term)
+          : q.eq('user_id', c.get('userId') ?? '');
+        const { data: abierta } = await q
+          .order('opening_date', { ascending: false }).limit(1).maybeSingle();
+        caja = (abierta as any)?.id ?? null;
+
+        /* Una máquina recién configurada puede tener su caja abierta de antes,
+           sin terminal anotada: se adopta la del usuario, igual que hace el
+           POS al buscar su caja activa. */
+        if (!caja && Number.isFinite(term) && term >= 1) {
+          const { data: suya } = await db.from('cash_sessions').select('id')
+            .eq('tenant_id', tenantId).eq('user_id', c.get('userId') ?? '')
+            .eq('status', 'open').is('terminal', null)
+            .order('opening_date', { ascending: false }).limit(1).maybeSingle();
+          caja = (suya as any)?.id ?? null;
+        }
+      } catch {
+        /* Sin caja el abono se registra igual: perder el vínculo con el cierre
+           es molesto, perder el abono sería un descuadre de plata. */
+      }
+    }
+    if (caja) payment.cash_session_id = caja;
     // Abono registrado OFFLINE: usar el created_at real (no la hora del sync), para
     // que caiga dentro de la ventana del cierre del repartidor.
     if (typeof created_at === 'string' && !isNaN(Date.parse(created_at))) {
