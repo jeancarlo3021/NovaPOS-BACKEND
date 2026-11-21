@@ -1499,30 +1499,16 @@ routing.post('/:id/close', async (c) => {
     // día siguiente) quedaba FUERA de la ventana → faltaban abonos/gastos.
     const windowEnd   = new Date().toISOString();
     const windowStart = `${routeDate}T06:00:00.000Z`; // 00:00 CR = 06:00 UTC
-    const abonos = { cash: 0, card: 0, sinpe: 0, total: 0 };
-    const abonosList: Array<{ customer: string; amount: number; method: string }> = [];
+    /* El detalle de los abonos sale de `abonosDeRuta`, que es la misma que usa
+       la reimpresión: si cada una lo armara por su cuenta, el papel del cierre
+       y el reimpreso terminarían diciendo cosas distintas del mismo día. */
+    const abonosRuta = await abonosDeRuta(tenantId, driverId, routeDate, windowEnd);
+    const abonos = abonosRuta
+      ? { ...abonosRuta.by_method, total: abonosRuta.total }
+      : { cash: 0, card: 0, sinpe: 0, total: 0 };
     const gastosList: Array<{ description: string; amount: number; payment_method?: string }> = [];
     let gastosTotal = 0;
     if (driverId) {
-      let paysRes: any = await db.from('accounts_receivable_payments')
-        .select('amount, method, voided_at, receivable:accounts_receivable(customer_name, invoice_number)')
-        .eq('tenant_id', tenantId).eq('user_id', driverId)
-        .gte('created_at', windowStart).lte('created_at', windowEnd);
-      if (paysRes.error && /voided_at|column/.test(paysRes.error.message ?? '')) {   // migración 63 sin correr
-        paysRes = await db.from('accounts_receivable_payments')
-          .select('amount, method, receivable:accounts_receivable(customer_name, invoice_number)')
-          .eq('tenant_id', tenantId).eq('user_id', driverId)
-          .gte('created_at', windowStart).lte('created_at', windowEnd);
-      }
-      for (const p of (paysRes.data ?? []) as any[]) {
-        if (p.voided_at) continue;   // los abonos ANULADOS no cuentan en el cierre
-        const m = (p.method ?? 'cash') as 'cash' | 'card' | 'sinpe';
-        const amt = Number(p.amount ?? 0);
-        if (m === 'card' || m === 'sinpe') abonos[m] += amt; else abonos.cash += amt;
-        abonos.total += amt;
-        abonosList.push({ customer: p.receivable?.customer_name ?? p.receivable?.invoice_number ?? 'Cliente', amount: amt, method: m });
-      }
-
       // Gastos del repartidor en la misma ventana (desde el cierre anterior).
       const { data: exps } = await db.from('expenses')
         .select('amount, description, payment_method')
@@ -1566,7 +1552,10 @@ routing.post('/:id/close', async (c) => {
       returned_source: returnedSource,
       by_method: byMethod,
       // Abonos de CxC del día (repartidor) y gastos del día.
-      ar_payments: { by_method: { cash: abonos.cash, card: abonos.card, sinpe: abonos.sinpe }, total: abonos.total, list: abonosList },
+      ar_payments: abonosRuta ?? {
+        by_method: { cash: 0, card: 0, sinpe: 0 },
+        total: 0, list: [], saldadas: [], saldadas_count: 0,
+      },
       expenses: { total: gastosTotal, list: gastosList },
       /*
        * QUÉ RUTA ES ESTE CIERRE.
@@ -1600,6 +1589,86 @@ routing.post('/:id/close', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+/**
+ * LOS ABONOS DE UNA RUTA, con su factura y qué pasó con la cuenta.
+ *
+ * Vive acá y no dentro del cierre porque la REIMPRESIÓN también la necesita:
+ * un cierre guardado hace semanas no tiene el detalle que el papel muestra
+ * hoy, y si el recálculo lo hiciera por su cuenta los dos papeles terminarían
+ * diciendo cosas distintas del mismo día.
+ */
+export async function abonosDeRuta(
+  tenantId: string, driverId: string | null | undefined, routeDate: string,
+  hasta?: string,
+): Promise<{
+  by_method: { cash: number; card: number; sinpe: number };
+  total: number;
+  list: Array<{ customer: string; amount: number; method: string; invoice: string | null; saldada: boolean; saldo: number }>;
+  saldadas: Array<{ customer: string; invoice: string | null; total: number }>;
+  saldadas_count: number;
+} | null> {
+  if (!driverId) return null;
+  const desde = `${routeDate}T06:00:00.000Z`;          // 00:00 CR = 06:00 UTC
+  const fin = hasta ?? new Date().toISOString();
+
+  const abonos = { cash: 0, card: 0, sinpe: 0, total: 0 };
+  const list: any[] = [];
+  const saldadas: any[] = [];
+
+  const cuenta = 'receivable:accounts_receivable(id, customer_name, invoice_number, status, total_amount, paid_amount)';
+  let res: any = await db.from('accounts_receivable_payments')
+    .select(`amount, method, voided_at, ${cuenta}`)
+    .eq('tenant_id', tenantId).eq('user_id', driverId)
+    .gte('created_at', desde).lte('created_at', fin);
+  if (res.error && /voided_at|column/.test(res.error.message ?? '')) {   // migración 63 sin correr
+    res = await db.from('accounts_receivable_payments')
+      .select(`amount, method, ${cuenta}`)
+      .eq('tenant_id', tenantId).eq('user_id', driverId)
+      .gte('created_at', desde).lte('created_at', fin);
+  }
+  if (res.error) return null;
+
+  const yaSaldada = new Set<string>();
+  for (const p of (res.data ?? []) as any[]) {
+    if (p.voided_at) continue;   // los abonos ANULADOS no cuentan en el cierre
+    const m = (p.method ?? 'cash') as 'cash' | 'card' | 'sinpe';
+    const amt = Number(p.amount ?? 0);
+    if (m === 'card' || m === 'sinpe') abonos[m] += amt; else abonos.cash += amt;
+    abonos.total += amt;
+
+    const r = p.receivable ?? {};
+    const saldo = Math.max(0, Number(r.total_amount ?? 0) - Number(r.paid_amount ?? 0));
+    /* «Saldada» = la cuenta está en cero HOY y recibió un abono en esta ruta.
+       No se mira el saldo al instante exacto del abono: si otro pago la
+       terminó de cerrar, igual quedó cerrada, y lo que el encargado necesita
+       saber es cuáles ya no hay que volver a cobrar. */
+    const saldada = String(r.status ?? '') === 'paid' || saldo < 0.005;
+
+    list.push({
+      customer: r.customer_name ?? r.invoice_number ?? 'Cliente',
+      amount: amt, method: m,
+      invoice: r.invoice_number ?? null, saldada, saldo,
+    });
+
+    /* Una cuenta con dos abonos en la misma ruta aparece UNA vez: si no, el
+       conteo diría dos cuentas cerradas donde hay una. */
+    const idCuenta = String(r.id ?? r.invoice_number ?? r.customer_name ?? '');
+    if (saldada && idCuenta && !yaSaldada.has(idCuenta)) {
+      yaSaldada.add(idCuenta);
+      saldadas.push({
+        customer: r.customer_name ?? 'Cliente',
+        invoice: r.invoice_number ?? null,
+        total: Number(r.total_amount ?? 0),
+      });
+    }
+  }
+
+  return {
+    by_method: { cash: abonos.cash, card: abonos.card, sinpe: abonos.sinpe },
+    total: abonos.total, list, saldadas, saldadas_count: saldadas.length,
+  };
+}
+
 // GET /:id/close-summary — resumen de una ruta cerrada, para REIMPRIMIR el cierre.
 // Usa el resumen guardado; si no existe, recalcula ventas por método (sin el
 // detalle de sobrante, que ya volvió al inventario al cerrar).
@@ -1608,13 +1677,45 @@ routing.get('/:id/close-summary', async (c) => {
     const tenantId = c.get('tenantId');
     const { id } = c.req.param();
 
+    /**
+     * `?recalcular=1` — REIMPRIMIR EL CIERRE AL DÍA.
+     *
+     * Por omisión la reimpresión repite EXACTAMENTE lo que se guardó al
+     * cerrar, y eso está bien: un papel de liquidación que cambia de números
+     * cada vez que se imprime no sirve para cuadrarle a nadie.
+     *
+     * Pero el resumen guardado es una foto del día: los cierres viejos no
+     * tienen el detalle que el papel muestra ahora —la factura de cada abono,
+     * cuáles cuentas quedaron saldadas—, y volver a imprimirlos sacaba el
+     * mismo papel incompleto. Con esto se vuelve a calcular con los datos de
+     * hoy, y el papel lo DICE, para que nadie confunda los dos documentos.
+     */
+    const recalcular = ['1', 'true', 'si'].includes(
+      String(c.req.query('recalcular') ?? '').toLowerCase());
+
     const { data: route } = await db.from('routes')
-      .select('id, route_date, close_summary, loaded_summary, warehouse:warehouses!routes_warehouse_id_fkey(name)')
+      .select('id, route_date, driver_id, close_summary, loaded_summary, warehouse:warehouses!routes_warehouse_id_fkey(name)')
       .eq('id', id).eq('tenant_id', tenantId).maybeSingle();
     if (!route) return fail(c, 'Ruta no encontrada', 404);
 
     const truck = (route as any).warehouse?.name;
     const stored = (route as any).close_summary;
+
+    /**
+     * Cuándo se recalculan los abonos:
+     *  · si lo pidieron con `?recalcular=1`;
+     *  · o si lo guardado es de ANTES del detalle (no trae `saldadas`), que es
+     *    justo el caso que hacía salir el papel incompleto una y otra vez.
+     * Si el recálculo falla, se usa lo guardado: una reimpresión sin abonos
+     * sería peor que una con el detalle viejo.
+     */
+    const guardadoViejo = !!stored?.ar_payments && stored.ar_payments.saldadas === undefined;
+    let abonosRecalculados: any = null;
+    if (recalcular || guardadoViejo) {
+      abonosRecalculados = await abonosDeRuta(
+        tenantId, (route as any).driver_id, String((route as any).route_date ?? '')).catch(() => null);
+    }
+    const abonosParaImprimir = abonosRecalculados ?? stored?.ar_payments;
 
     // Recomputar ventas por método desde las facturas (siempre disponibles).
     const { data: invs } = await db.from('invoices')
@@ -1700,8 +1801,11 @@ routing.get('/:id/close-summary', async (c) => {
       })(),
       credito: stored?.credito ?? Math.round((Number((stored?.by_method ?? byMethod).credit) || 0) * 100) / 100,
       // Abonos de CxC y gastos del día (del resumen guardado al cerrar).
-      ar_payments: stored?.ar_payments,
+      ar_payments: abonosParaImprimir,
       expenses: stored?.expenses,
+      /* El papel dice si fue recalculado: dos liquidaciones del mismo día con
+         números distintos y sin explicación es peor que no reimprimir. */
+      recalculado: !!abonosRecalculados,
     });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
