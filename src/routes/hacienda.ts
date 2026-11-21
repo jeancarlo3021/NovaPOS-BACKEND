@@ -746,7 +746,17 @@ export async function alanubeDocStatus(client: ReturnType<typeof alanube.forEnv>
 
 // Consulta el estatus de UNA factura en Hacienda y lo GUARDA. Reutilizable desde
 // la ruta del tenant y desde el panel admin (reintento por fila en la bitácora).
-export async function refreshInvoiceStatus(tenantId: string, invoiceId: string): Promise<{ fe_status: string; ind_estado: any; error: any }> {
+export async function refreshInvoiceStatus(
+  tenantId: string, invoiceId: string,
+  /**
+   * `enviarCorreo: false` para las COMPROBACIONES EN LOTE.
+   *
+   * Consultar el estado de doscientas facturas no puede disparar doscientos
+   * correos a clientes que ya los recibieron hace semanas. Comprobar es mirar,
+   * no reenviar.
+   */
+  opts: { enviarCorreo?: boolean } = {},
+): Promise<{ fe_status: string; ind_estado: any; error: any }> {
   const cfg = await loadFEConfig(tenantId);
   const provider = 'alanube';
   const env = cfg.environment === 'sandbox' ? 'sandbox' : 'production'; // default producción
@@ -777,7 +787,9 @@ export async function refreshInvoiceStatus(tenantId: string, invoiceId: string):
   }
   // Con await: en Vercel la función se congela al responder, y un envío
   // lanzado sin esperar quedaba a medias (sin correo y sin marcar).
-  if (fe_status === 'accepted') await autoSendComprobanteToCustomer(tenantId, invoiceId);
+  if (fe_status === 'accepted' && opts.enviarCorreo !== false) {
+    await autoSendComprobanteToCustomer(tenantId, invoiceId);
+  }
   let consecutivo_bumped: number | null = null;
   if (fe_status === 'rejected' || fe_status === 'error') {
     const docLabel = `#${(inv as any)?.invoice_number ?? invoiceId}`;

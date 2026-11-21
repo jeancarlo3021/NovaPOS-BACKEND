@@ -5533,6 +5533,113 @@ admin.put('/tenants/:id/role-permissions/:role', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+/**
+ * POST /fe-verificar — ¿ESTÁ ESTA FACTURA ACEPTADA POR HACIENDA, DE VERDAD?
+ *
+ * La bitácora muestra lo que NOSOTROS guardamos. Eso basta casi siempre, pero
+ * no sirve para la pregunta que de verdad importa cuando un cliente reclama:
+ * «¿Hacienda la tiene aceptada?». Nuestro estado puede haberse quedado viejo
+ * —el webhook no llegó, la respuesta se perdió, la factura quedó en «enviado»
+ * desde hace semanas— y nadie se entera hasta que alguien la busca una por una.
+ *
+ * Esto vuelve a preguntar POR CADA COMPROBANTE y compara con lo guardado:
+ *   · `coincide`  — lo que teníamos es lo que dice Hacienda.
+ *   · `corregido` — no coincidía; se actualizó con lo que dice Hacienda.
+ *   · `sin_consultar` — no se pudo preguntar (sin id de documento, o el
+ *     proveedor no contestó). NO se toca el estado: borrar un «aceptado» por
+ *     una consulta fallida sería peor que no haber consultado.
+ *
+ * NO manda correos. Comprobar es mirar: revisar doscientas facturas no puede
+ * disparar doscientos correos a clientes que las recibieron hace semanas.
+ *
+ * body: { tenant_id?, from?, to?, status?, limit? }
+ */
+admin.post('/fe-verificar', async (c) => {
+  const arranque = Date.now();
+  /* El servidor se corta a los 30 s. Se trabaja 22 y se avisa que quedó a
+     medias, en vez de morir sin decir nada y perder todo lo verificado. */
+  const PRESUPUESTO_MS = 22_000;
+
+  try {
+    const b = await c.req.json().catch(() => ({} as any));
+    const tenantId = b?.tenant_id ? String(b.tenant_id) : null;
+    const from = b?.from ? String(b.from) : null;
+    const to = b?.to ? String(b.to) : null;
+    const estado = b?.status ? String(b.status) : null;
+    const limite = Math.min(Math.max(Number(b?.limit) || 100, 1), 500);
+
+    let q = db.from('invoices')
+      .select('id, tenant_id, invoice_number, customer_name, total, issued_at, document_type,'
+        + ' fe_clave, fe_consecutivo, fe_status, fe_error, fe_emailed, fe_environment')
+      .not('fe_clave', 'is', null)
+      .order('issued_at', { ascending: false })
+      .limit(limite);
+    if (tenantId) q = q.eq('tenant_id', tenantId);
+    if (estado) q = q.eq('fe_status', estado);
+    if (from) q = q.gte('issued_at', from);
+    if (to) q = q.lte('issued_at', endOfDay(to));
+
+    const { data, error } = await q;
+    if (error) throw new Error(error.message);
+    const filas = (data ?? []) as any[];
+
+    const nombres = new Map<string, string>();
+    const ids = [...new Set(filas.map(r => r.tenant_id))];
+    if (ids.length) {
+      const { data: ts } = await db.from('tenants').select('id, name').in('id', ids);
+      for (const t of (ts ?? []) as any[]) nombres.set(t.id, t.name);
+    }
+
+    const resumen = {
+      revisados: 0, coinciden: 0, corregidos: 0, sin_consultar: 0,
+      aceptados: 0, rechazados: 0, pendientes: 0, con_aviso: 0,
+      cortado_por_tiempo: false, total_en_rango: filas.length,
+    };
+    const detalle: any[] = [];
+
+    for (const r of filas) {
+      if (Date.now() - arranque > PRESUPUESTO_MS) { resumen.cortado_por_tiempo = true; break; }
+      resumen.revisados++;
+
+      const antes = String(r.fe_status ?? '');
+      const fila: any = {
+        id: r.id, tenant_id: r.tenant_id, negocio: nombres.get(r.tenant_id) ?? '—',
+        invoice_number: r.invoice_number, customer_name: r.customer_name,
+        total: Number(r.total ?? 0), issued_at: r.issued_at,
+        document_type: r.document_type, fe_clave: r.fe_clave,
+        emailed: !!r.fe_emailed,
+        estado_guardado: antes,
+      };
+
+      try {
+        /* Sin correo: ver arriba. */
+        const res: any = await refreshInvoiceStatus(r.tenant_id, r.id, { enviarCorreo: false });
+        const ahora = String(res?.fe_status ?? '');
+        fila.estado_hacienda = ahora;
+        fila.aviso = res?.error ?? null;
+        fila.resultado = ahora === antes ? 'coincide' : 'corregido';
+        if (ahora === antes) resumen.coinciden++; else resumen.corregidos++;
+        if (ahora === 'accepted') resumen.aceptados++;
+        else if (ahora === 'rejected') resumen.rechazados++;
+        else resumen.pendientes++;
+        /* Aceptada CON observación: Hacienda la dio por buena y de todos modos
+           dijo algo. Es lo que nadie mira, y es lo que hay que corregir antes
+           de que se vuelva un problema. */
+        if (ahora === 'accepted' && String(res?.error ?? '').trim()) resumen.con_aviso++;
+      } catch (e: any) {
+        fila.estado_hacienda = null;
+        fila.resultado = 'sin_consultar';
+        fila.motivo = e?.message ?? 'No se pudo consultar';
+        resumen.sin_consultar++;
+      }
+
+      detalle.push(fila);
+    }
+
+    return ok(c, { resumen, detalle });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // GET /fe-log — BITÁCORA de facturas electrónicas de TODAS las empresas.
 // Para monitoreo del super-admin: ver emisiones y detectar errores rápido.
 // Filtros: ?tenant_id= (una empresa) · ?search= (cliente/consecutivo/clave/factura)
