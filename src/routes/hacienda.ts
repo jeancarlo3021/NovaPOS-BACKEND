@@ -2887,16 +2887,31 @@ async function datosParaCorreo(tenantId: string, invoiceId: string): Promise<{
 async function sendComprobanteEmail(to: string, i: {
   invoice_number: string; fe_clave: string; fe_consecutivo?: string | null;
   fe_status?: string | null; total?: number | null; customer_name?: string | null; fe_xml?: string | null;
+  fe_xml_hacienda?: string | null;
 }, attachments?: Array<{ filename: string; content: string }>,
-  ctx?: { tenantId: string; invoiceId: string }): Promise<{ hasXml: boolean }> {
+  ctx?: { tenantId: string; invoiceId: string }): Promise<{ hasXml: boolean; hasRespuesta: boolean }> {
   // Adjuntos de Alanube. Si el XML no vino, se adjunta el `fe_xml` guardado:
   // al cliente le sirve igual y es el que Hacienda reconoce. Un correo con solo
   // el PDF no es un comprobante entregado.
   const atts = [...(attachments ?? [])];
-  if (!atts.some(a => a.filename.toLowerCase().endsWith('.xml'))) {
+  const esRespuesta = (f: string) => /respuesta-hacienda\.xml$/i.test(f);
+  if (!atts.some(a => a.filename.toLowerCase().endsWith('.xml') && !esRespuesta(a.filename))) {
     // `fe_xml` puede estar en XML plano o, en filas viejas, en base64.
     const saved = await toB64(i.fe_xml);
     if (saved) atts.push({ filename: `${i.fe_clave}.xml`, content: saved });
+  }
+  /**
+   * LA ACEPTACIÓN DE HACIENDA VA SIEMPRE QUE EXISTA.
+   *
+   * Si el proveedor no la devolvió en este momento —se cayó, o todavía no la
+   * publicó— se usa la que quedó guardada en la factura. El portal del cliente
+   * no da por recibida una factura sin ella, y depender de que el proveedor
+   * esté en pie cada vez que se manda un correo es lo que hacía que llegara a
+   * medias.
+   */
+  if (!atts.some(a => esRespuesta(a.filename))) {
+    const guardada = await toB64(i.fe_xml_hacienda);
+    if (guardada) atts.push({ filename: `${i.fe_clave}-respuesta-hacienda.xml`, content: guardada });
   }
   const extra = ctx ? await datosParaCorreo(ctx.tenantId, ctx.invoiceId)
     : { negocio: { nombre: 'Comprobante electrónico' }, fecha: null, nota: null, subtotal: null, impuesto: null, lineas: [] };
@@ -2962,7 +2977,10 @@ async function sendComprobanteEmail(to: string, i: {
       ? datos.negocio.correo : undefined,
     attachments: atts.length ? atts : undefined,
   });
-  return { hasXml: atts.some(a => a.filename.toLowerCase().endsWith('.xml')) };
+  return {
+    hasXml: atts.some(a => a.filename.toLowerCase().endsWith('.xml') && !esRespuesta(a.filename)),
+    hasRespuesta: atts.some(a => esRespuesta(a.filename)),
+  };
 }
 
 /**
@@ -2975,14 +2993,48 @@ async function sendComprobanteEmail(to: string, i: {
 async function saveFeXml(
   tenantId: string, invoiceId: string, clave: string,
   attachments: Array<{ filename: string; content: string }> | undefined, current: string | null | undefined,
+  currentHacienda?: string | null,
 ): Promise<void> {
-  if (current) return;
-  const a = attachments?.find(x => x.filename === `${clave}.xml`);
-  if (!a) return;
-  const plain = Buffer.from(a.content, 'base64').toString('utf8');
-  if (!plain.replace(/^﻿/, '').trimStart().startsWith('<')) return;
-  await db.from('invoices').update({ fe_xml: plain })
-    .eq('id', invoiceId).eq('tenant_id', tenantId).then(() => {}, () => {});
+  const aTexto = (b64: string | undefined): string | null => {
+    if (!b64) return null;
+    const plain = Buffer.from(b64, 'base64').toString('utf8');
+    return plain.replace(/^\ufeff/, '').trimStart().startsWith('<') ? plain : null;
+  };
+
+  const patch: Record<string, string> = {};
+
+  if (!current) {
+    const x = aTexto(attachments?.find(x => x.filename === `${clave}.xml`)?.content);
+    if (x) patch.fe_xml = x;
+  }
+
+  /**
+   * EL XML DE RESPUESTA DE HACIENDA, guardado también.
+   *
+   * Un comprobante entregado son DOS archivos: la factura firmada y la
+   * ACEPTACIÓN. Los portales de proveedores grandes no dan por recibida una
+   * factura hasta tener la aceptación —la marcan «SIN RECIBIR» aunque Hacienda
+   * ya la haya aceptado—. Antes se le pedía al proveedor justo al mandar el
+   * correo: si Hacienda todavía no había contestado, el correo salía sin ella y
+   * el comprobante quedaba marcado como enviado para siempre.
+   */
+  if (!currentHacienda) {
+    const r = aTexto(attachments?.find(x => /respuesta-hacienda\.xml$/i.test(x.filename))?.content);
+    if (r) patch.fe_xml_hacienda = r;
+  }
+
+  if (Object.keys(patch).length === 0) return;
+  let upd = await db.from('invoices').update(patch)
+    .eq('id', invoiceId).eq('tenant_id', tenantId);
+  /* La columna es de la migración 147: sin ella se guarda al menos el XML de
+     la factura, que es lo que ya funcionaba. */
+  if (upd.error && /fe_xml_hacienda/.test(upd.error.message ?? '')) {
+    const { fe_xml_hacienda: _r, ...resto } = patch;
+    if (Object.keys(resto).length > 0) {
+      await db.from('invoices').update(resto)
+        .eq('id', invoiceId).eq('tenant_id', tenantId).then(() => {}, () => {});
+    }
+  }
 }
 
 /**
@@ -3052,7 +3104,19 @@ export async function guardarXmlDelComprobante(
 }
 
 /** Qué pasó con un envío automático: lo usa el barrido de reintentos. */
-export type ResultadoEnvio = 'enviado' | 'ya_enviado' | 'sin_correo' | 'sin_xml' | 'error';
+/**
+ * Intento a partir del cual el correo sale CON LO QUE HAYA.
+ *
+ * El barrido reintenta hasta 6 veces esperando 20 minutos: son unas dos horas
+ * de margen para que Hacienda conteste y el proveedor publique la aceptación.
+ * Pasado eso, mandar la factura sin la aceptación es mejor que no mandar nada.
+ */
+const ULTIMO_INTENTO_CORREO = 5;
+
+export type ResultadoEnvio =
+  | 'enviado' | 'ya_enviado' | 'sin_correo' | 'sin_xml' | 'error'
+  /** Aceptada, pero el XML de aceptación todavía no está: se espera y se reintenta. */
+  | 'sin_respuesta';
 
 export async function autoSendComprobanteToCustomer(
   tenantId: string, invoiceId: string,
@@ -3060,9 +3124,21 @@ export async function autoSendComprobanteToCustomer(
 ): Promise<ResultadoEnvio> {
   try {
     const cfg = await loadFEConfig(tenantId);
-    const { data: inv } = await db.from('invoices')
-      .select('invoice_number, fe_clave, fe_consecutivo, fe_status, fe_xml, total, customer_name, customer_id, customer_email, document_type, fe_emailed')
+    /* `fe_xml_hacienda` es de la migración 147. Si no corrió, PostgREST falla
+       la consulta ENTERA y la factura se leería como inexistente: dejaría de
+       salir TODO correo de comprobante hasta que alguien corra la migración.
+       Por eso se reintenta sin esa columna. */
+    const campos = 'invoice_number, fe_clave, fe_consecutivo, fe_status, fe_xml, total,'
+      + ' customer_name, customer_id, customer_email, document_type, fe_emailed, fe_email_attempts';
+    let q: any = await db.from('invoices').select(`${campos}, fe_xml_hacienda`)
       .eq('id', invoiceId).eq('tenant_id', tenantId).maybeSingle();
+    let sinColumna147 = false;
+    if (q.error && /fe_xml_hacienda/.test(q.error.message ?? '')) {
+      sinColumna147 = true;
+      q = await db.from('invoices').select(campos)
+        .eq('id', invoiceId).eq('tenant_id', tenantId).maybeSingle();
+    }
+    const inv = q.data;
     if (!inv || (inv as any).fe_emailed) return 'ya_enviado';
 
     const email = await customerEmailOf(inv as any);
@@ -3087,13 +3163,43 @@ export async function autoSendComprobanteToCustomer(
         || (atts ?? []).some((a: any) => String(a?.filename ?? '').toLowerCase().endsWith('.xml'));
       if (!hayXml) return 'sin_xml';
     }
-    await saveFeXml(tenantId, invoiceId, (inv as any).fe_clave, atts, (inv as any).fe_xml);
-    const { hasXml } = await sendComprobanteEmail(email, inv as any, atts, { tenantId, invoiceId });
+    await saveFeXml(tenantId, invoiceId, (inv as any).fe_clave, atts,
+      (inv as any).fe_xml, (inv as any).fe_xml_hacienda);
+
+    /**
+     * ACEPTADA SIN SU XML DE ACEPTACIÓN: SE ESPERA, NO SE MANDA A MEDIAS.
+     *
+     * El portal del cliente no da por recibida una factura sin la aceptación
+     * —la marca «SIN RECIBIR» aunque Hacienda ya la haya aceptado—, así que un
+     * correo sin ella no resuelve nada y además gasta el único aviso que el
+     * cliente va a leer. Hacienda suele tardar segundos; el reintento la toma
+     * más tarde con todo adjunto.
+     *
+     * Pero NO para siempre: en el último intento sale con lo que haya. Que el
+     * cliente reciba la factura tarde y sin la aceptación es malo; que no la
+     * reciba nunca es peor, y el negocio no se entera.
+     */
+    const aceptada = String((inv as any).fe_status ?? '') === 'accepted';
+    const intentos = Number((inv as any).fe_email_attempts ?? 0);
+    const hayRespuesta = !!(inv as any).fe_xml_hacienda
+      || (atts ?? []).some((a: any) => /respuesta-hacienda\.xml$/i.test(String(a?.filename ?? '')));
+    /* Sin la migración 147 no hay dónde guardar la aceptación, así que esperar
+       a tenerla sería esperar a algo que no puede llegar: el comprobante se
+       quedaría dos horas sin salir en cada venta. Se manda como antes. */
+    if (!sinColumna147 && aceptada && !hayRespuesta && intentos < ULTIMO_INTENTO_CORREO) {
+      console.log(`[FE email] la factura ${(inv as any).invoice_number} espera el XML de aceptación (intento ${intentos})`);
+      return 'sin_respuesta';
+    }
+
+    const { hasXml, hasRespuesta } = await sendComprobanteEmail(email, inv as any, atts, { tenantId, invoiceId });
     if (!hasXml) {
       // Sale lo que hay (el PDF), pero sin marcarla: en la bitácora queda como
       // no enviada para que se reenvíe cuando Alanube publique el XML.
       console.warn(`[FE email] la factura ${(inv as any).invoice_number} se envió SIN XML: no se marca como enviada`);
       return 'sin_xml';
+    }
+    if (aceptada && !hasRespuesta) {
+      console.warn(`[FE email] la factura ${(inv as any).invoice_number} se envió SIN la aceptación de Hacienda`);
     }
     await db.from('invoices').update({ fe_emailed: true }).eq('id', invoiceId).eq('tenant_id', tenantId).then(() => {}, () => {});
     return 'enviado';
@@ -3179,7 +3285,11 @@ export async function reintentarCorreosPendientes(opts: {
     const r = await autoSendComprobanteToCustomer(row.tenant_id, row.id);
     if (r === 'enviado') res.enviados++;
     else if (r === 'sin_correo') res.sin_correo++;
-    else if (r === 'sin_xml') res.sin_xml++;
+    /* «Sin la aceptación» se cuenta junto a «sin XML»: las dos son lo mismo
+       para quien mira el resumen —un comprobante que todavía no salió porque
+       le falta un archivo— y separarlas obligaría a tocar la forma que ya leen
+       las pantallas. El log sí distingue cuál de los dos falta. */
+    else if (r === 'sin_xml' || r === 'sin_respuesta') res.sin_xml++;
     else if (r === 'error') res.errores++;
   }
   return res;
@@ -3195,10 +3305,15 @@ export async function reintentarCorreosPendientes(opts: {
 export async function sendComprobanteToCustomer(
   tenantId: string, invoiceId: string, to: string,
 ): Promise<{ hasXml: boolean }> {
-  const { data: inv } = await db.from('invoices')
-    .select('invoice_number, fe_clave, fe_consecutivo, fe_status, fe_xml, total, customer_name, document_type')
+  const campos = 'invoice_number, fe_clave, fe_consecutivo, fe_status, fe_xml, total, customer_name, document_type';
+  let q: any = await db.from('invoices').select(`${campos}, fe_xml_hacienda`)
     .eq('id', invoiceId).eq('tenant_id', tenantId).maybeSingle();
-  const i = inv as any;
+  // Sin la migración 147 se reenvía igual, con lo que el proveedor devuelva.
+  if (q.error && /fe_xml_hacienda/.test(q.error.message ?? '')) {
+    q = await db.from('invoices').select(campos)
+      .eq('id', invoiceId).eq('tenant_id', tenantId).maybeSingle();
+  }
+  const i = q.data as any;
   if (!i?.fe_clave) throw new Error('La factura no fue emitida electrónicamente');
 
   const cfg = await loadFEConfig(tenantId);
@@ -3206,9 +3321,12 @@ export async function sendComprobanteToCustomer(
     ? await alanubeAttachments(cfg, i.fe_consecutivo, feKindOf(i.document_type), i.fe_clave, feCompanyId(cfg))
     : undefined;
 
-  await saveFeXml(tenantId, invoiceId, i.fe_clave, attachments, i.fe_xml);
-  const { hasXml } = await sendComprobanteEmail(to, i, attachments, { tenantId, invoiceId });
-  if (hasXml) {
+  await saveFeXml(tenantId, invoiceId, i.fe_clave, attachments, i.fe_xml, i.fe_xml_hacienda);
+  const { hasXml, hasRespuesta } = await sendComprobanteEmail(to, i, attachments, { tenantId, invoiceId });
+  /* El reenvío a mano SÍ sale siempre —lo pidió una persona, ahora— pero solo
+     se marca como entregado si llevó la aceptación: si no, el barrido lo
+     vuelve a mandar completo cuando el XML aparezca. */
+  if (hasXml && (String(i.fe_status ?? '') !== 'accepted' || hasRespuesta)) {
     await db.from('invoices').update({ fe_emailed: true })
       .eq('id', invoiceId).eq('tenant_id', tenantId).then(() => {}, () => {});
   }
