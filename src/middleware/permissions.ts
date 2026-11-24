@@ -82,6 +82,36 @@ export function requirePermission(module: string, action: Action) {
   };
 }
 
+/**
+ * ¿El rol tiene CONCEDIDO este módulo? (para permisos de LECTURA)
+ *
+ * `requirePermission` corta la petición; esto solo contesta, porque hay
+ * permisos que no bloquean una pantalla sino que RECORTAN lo que devuelve
+ * —«ve los pedidos de otros usuarios»—. Devolver 403 ahí dejaría al usuario
+ * sin bandeja en vez de con la suya.
+ *
+ * Misma regla que el resto: owner/admin siempre; sin matriz configurada,
+ * permitido; con matriz, tiene que estar concedido de forma explícita. Lo
+ * último es lo que hace que «ver lo de otros» esté APAGADO por omisión en un
+ * negocio que sí configuró sus roles, que es lo que se pidió.
+ */
+export async function tienePermiso(
+  tenantId: string, role: string, module: string,
+): Promise<boolean> {
+  if (role === 'owner' || role === 'admin') return true;
+  if (!tenantId) return false;
+  try {
+    if (!(await hasMatrix(tenantId, role))) return true;
+    const row = await permissionRow(tenantId, role, module);
+    return row?.can_access === true;
+  } catch (e: any) {
+    /* Si no se puede verificar, se asume que NO: un permiso de lectura que
+       falla abierto enseña lo que no se quería enseñar. */
+    console.warn('[permissions] lectura no verificada:', e?.message);
+    return false;
+  }
+}
+
 /** Limpia el cache (al guardar la matriz desde Usuarios → Roles). */
 export function clearPermissionCache(): void {
   cache.clear();

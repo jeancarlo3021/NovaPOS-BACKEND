@@ -117,7 +117,40 @@ agentOrders.get('/', async (c) => {
     }
     const { data, error } = await q;
     if (error) throw new Error(error.message);
-    return ok(c, (data ?? []).map((o: any) => ({
+
+    /**
+     * LOS PEDIDOS DEL ENLACE DE OTROS, SOLO CON PERMISO.
+     *
+     * El recorte se hace acá y no escondiendo botones: esconder el botón evita
+     * el error honesto, esto evita el resto. Y se aplica SOLO a los pedidos
+     * del enlace (`origen = 'cliente'`): la bandeja del cajero y la agenda
+     * usan este mismo endpoint y no tienen por qué cambiar de comportamiento.
+     *
+     * «Los suyos» = los que tiene asignados, o los de SU zona. Un vendedor que
+     * atiende una zona tiene que ver lo que entra de su zona aunque todavía no
+     * se lo hayan asignado: si no, la bandeja le sale vacía y el pedido se
+     * queda sin atender.
+     */
+    let filas = (data ?? []) as any[];
+    const hayDeEnlace = filas.some(o => String(o.origen ?? '') === 'cliente');
+    if (hayDeEnlace) {
+      const role = String(c.get('role') ?? '');
+      const userId = String(c.get('userId') ?? '');
+      const { tienePermiso } = await import('../middleware/permissions.js');
+      const veOtros = await tienePermiso(tenantId, role, 'pedidos_enlace_otros');
+      if (!veOtros) {
+        const { data: yo } = await db.from('users').select('zone').eq('id', userId).maybeSingle();
+        const miZona = String((yo as any)?.zone ?? '').trim().toLowerCase();
+        filas = filas.filter(o => {
+          if (String(o.origen ?? '') !== 'cliente') return true;   // no es del enlace
+          if (o.assigned_to && String(o.assigned_to) === userId) return true;
+          const z = String(o.customer_zone ?? '').trim().toLowerCase();
+          return !!miZona && z === miZona;
+        });
+      }
+    }
+
+    return ok(c, filas.map((o: any) => ({
       ...o, items: o.agent_order_items ?? [], item_count: (o.agent_order_items ?? []).length,
     })));
   } catch (err: any) { return fail(c, err.message, 500); }
