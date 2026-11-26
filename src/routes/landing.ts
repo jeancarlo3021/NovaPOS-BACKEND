@@ -1,6 +1,10 @@
 import { Hono } from 'hono';
 import { db } from '../db/client.js';
 import { ok, fail } from '../utils/response.js';
+import {
+  avisarInteresado, leerAjustesAviso, guardarAjustesAviso,
+} from '../services/avisoInteresado.js';
+import { emailEnabled } from '../services/emailService.js';
 
 /**
  * LA PÁGINA PÚBLICA de ColónClick: lo que ve alguien que todavía no es cliente.
@@ -174,11 +178,30 @@ const ipDe = (c: any): string =>
   String(c.req.header('x-forwarded-for') ?? '').split(',')[0].trim()
   || c.req.header('x-real-ip') || 'desconocida';
 
-/** Suma uno al contador del día. Nunca debe hacer fallar lo que la llamó. */
+/**
+ * Suma uno al contador del día. Nunca debe hacer fallar lo que la llamó.
+ *
+ * ── Por qué la suma la hace la base y no este código ─────────────────────
+ * Antes se leía la cuenta, se le sumaba uno y se escribía. Con una visita a
+ * la vez está bien; con dos al mismo tiempo las dos leen 7, las dos escriben
+ * 8, y una visita se pierde sin que nada falle. Y se pierde justo cuando la
+ * página empieza a tener tráfico, que es cuando el número importa: los
+ * informes quedan por debajo y nadie tiene forma de notarlo.
+ *
+ * `landing_contar` lo hace en una sola operación de la base. Si la función
+ * todavía no existe —migración 150 sin correr— se cae al método viejo, que
+ * cuenta de menos bajo concurrencia pero cuenta.
+ */
 async function contar(evento: string, origen = '') {
+  const dia = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Costa_Rica' });
+  const limpio = String(origen).replace(/^https?:\/\//, '').split('/')[0].slice(0, 80);
   try {
-    const dia = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Costa_Rica' });
-    const limpio = String(origen).replace(/^https?:\/\//, '').split('/')[0].slice(0, 80);
+    const { error } = await db.rpc('landing_contar', {
+      p_dia: dia, p_evento: evento, p_origen: limpio,
+    });
+    if (!error) return;
+  } catch { /* se intenta el método viejo */ }
+  try {
     const { data } = await db.from('landing_stats')
       .select('cuenta').eq('dia', dia).eq('evento', evento).eq('origen', limpio).maybeSingle();
     await db.from('landing_stats').upsert(
@@ -191,7 +214,17 @@ async function contar(evento: string, origen = '') {
 /** POST /visita  { evento?, origen? } — el contador de la fase 5. */
 landingPublic.post('/visita', async (c) => {
   const body = await c.req.json().catch(() => ({}));
-  const evento = ['visita', 'formulario', 'clic_entrar'].includes(String(body?.evento))
+  /**
+   * `login` es una estadística APARTE de `clic_entrar`, y es la que faltaba.
+   *
+   * `clic_entrar` dice que alguien tocó el botón «Entrar»: mide interés.
+   * `login` dice que de verdad llegó adentro: mide que la puerta funciona.
+   * Entre los dos está todo lo que se pierde en el camino —el que no se
+   * acordó de la contraseña, el que se equivocó de usuario, el que se topó
+   * con un error—, y con un solo contador eso era invisible: cien clics se
+   * veían igual de bien con cien ingresos que con tres.
+   */
+  const evento = ['visita', 'formulario', 'clic_entrar', 'login'].includes(String(body?.evento))
     ? String(body.evento) : 'visita';
   await contar(evento, String(body?.origen ?? ''));
   return ok(c, { ok: true });
@@ -237,7 +270,7 @@ landingPublic.post('/interesado', async (c) => {
 
     // Todo recortado: lo que escribe un desconocido entra con tope de largo,
     // o un envío con un texto de un megabyte queda guardado para siempre.
-    const { error } = await db.from('landing_leads').insert({
+    const fila = {
       business_name: String(b?.business_name ?? '').trim().slice(0, 120) || null,
       contact_name: nombre.slice(0, 120),
       phone: telefono.slice(0, 40) || null,
@@ -246,9 +279,33 @@ landingPublic.post('/interesado', async (c) => {
       notes: String(b?.notes ?? '').trim().slice(0, 1000) || null,
       origen: String(b?.origen ?? '').replace(/^https?:\/\//, '').split('/')[0].slice(0, 120) || null,
       status: 'nuevo',
-    });
+    };
+    const { data: creado, error } = await db.from('landing_leads')
+      .insert(fila).select('id').single();
     if (error) throw new Error(error.message);
     await contar('formulario', String(b?.origen ?? ''));
+
+    /**
+     * EL AVISO POR CORREO.
+     *
+     * Va DESPUÉS de guardar y nunca puede hacer fallar esta respuesta: el
+     * interesado ya está registrado. Mostrarle un error a una persona que
+     * llenó bien el formulario, porque el correo no salió, la invita a
+     * enviarlo otra vez y a duplicar el lead.
+     *
+     * Y el resultado se GUARDA. Un aviso que falla en silencio es la peor
+     * versión de esto: el panel diría que todo está bien mientras los
+     * interesados se acumulan sin que nadie los llame.
+     */
+    try {
+      const r = await avisarInteresado(fila);
+      await db.from('landing_leads').update({
+        aviso_email_at: r.enviado ? new Date().toISOString() : null,
+        aviso_email_error: r.error,
+        aviso_email_to: r.to,
+      }).eq('id', (creado as any).id);
+    } catch { /* sin la migración 150 esas columnas no existen: el lead ya quedó */ }
+
     return ok(c, { ok: true });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
@@ -442,7 +499,18 @@ landingAdmin.get('/interesados', async (c) => {
       if (/landing_leads/.test(error.message)) return ok(c, { sin_tabla: true, interesados: [] });
       throw new Error(error.message);
     }
-    return ok(c, { interesados: data ?? [] });
+    const filas = (data ?? []) as any[];
+    /* Cuántos quedaron sin aviso. Es la advertencia que la pantalla necesita
+       para que un correo caído no se descubra tres semanas después. */
+    const sinAviso = filas.filter(f =>
+      f.aviso_email_at == null && f.aviso_email_error != null).length;
+    return ok(c, {
+      interesados: filas,
+      sin_aviso: sinAviso,
+      /* Si la columna no existe todavía, no se puede afirmar que todo se
+         avisó: se dice que no se sabe, en vez de mostrar un cero tranquilo. */
+      aviso_medible: filas.length === 0 || 'aviso_email_at' in (filas[0] ?? {}),
+    });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
@@ -483,7 +551,8 @@ landingAdmin.get('/estadisticas', async (c) => {
     const origenes = new Map<string, number>();
     for (const f of filas) {
       totales[f.evento] = (totales[f.evento] ?? 0) + Number(f.cuenta ?? 0);
-      const d = porDia.get(f.dia) ?? { dia: f.dia, visita: 0, formulario: 0, clic_entrar: 0 };
+      const d = porDia.get(f.dia)
+        ?? { dia: f.dia, visita: 0, formulario: 0, clic_entrar: 0, login: 0 };
       d[f.evento] = (d[f.evento] ?? 0) + Number(f.cuenta ?? 0);
       porDia.set(f.dia, d);
       if (f.evento === 'visita' && f.origen) {
@@ -491,14 +560,97 @@ landingAdmin.get('/estadisticas', async (c) => {
       }
     }
     const visitas = totales.visita ?? 0;
+    const clics = totales.clic_entrar ?? 0;
+    const logins = totales.login ?? 0;
+    const porc = (parte: number, sobre: number) =>
+      sobre > 0 ? Math.round((parte / sobre) * 1000) / 10 : null;
+
     return ok(c, {
       dias, totales,
       // De cada cien que entran, cuántos escriben.
-      conversion: visitas > 0 ? Math.round(((totales.formulario ?? 0) / visitas) * 1000) / 10 : null,
+      conversion: porc(totales.formulario ?? 0, visitas),
+      /**
+       * EL EMBUDO, en los tres pasos que de verdad son distintos.
+       *
+       * «Tocó Entrar» y «entró» no son lo mismo, y era el número que faltaba:
+       * la diferencia entre los dos es exactamente lo que se pierde en el
+       * inicio de sesión —contraseñas olvidadas, usuario equivocado, errores
+       * de la pantalla de login—. Con un solo contador, cien clics se veían
+       * igual de bien con cien ingresos que con tres.
+       */
+      embudo: {
+        visitas,
+        escribieron: totales.formulario ?? 0,
+        tocaron_entrar: clics,
+        entraron: logins,
+        /** De los que tocaron «Entrar», cuántos lograron entrar. */
+        pct_entraron_de_los_que_tocaron: porc(logins, clics),
+        /** De todas las visitas, cuántas terminaron adentro. */
+        pct_entraron_de_las_visitas: porc(logins, visitas),
+        /** Los que tocaron y no entraron: el número a mirar si sube. */
+        se_quedaron_afuera: Math.max(0, clics - logins),
+      },
       por_dia: [...porDia.values()],
       origenes: [...origenes.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10)
         .map(([origen, n]) => ({ origen: origen || 'directo', visitas: n })),
     });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// EL AVISO POR CORREO
+// ══════════════════════════════════════════════════════════════════════════
+
+/** GET /avisos — a quiénes se les avisa cuando alguien escribe. */
+landingAdmin.get('/avisos', async (c) => {
+  try {
+    const ajustes = await leerAjustesAviso();
+    return ok(c, {
+      ...ajustes,
+      /* Si el servidor no tiene correo configurado, el resto no importa: hay
+         que decirlo acá y no dejar que el usuario configure destinatarios que
+         nunca van a recibir nada. */
+      correo_disponible: emailEnabled(),
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/** PUT /avisos */
+landingAdmin.put('/avisos', async (c) => {
+  try {
+    const b = await c.req.json().catch(() => ({}));
+    const ajustes = await guardarAjustesAviso(b);
+    return ok(c, { ...ajustes, correo_disponible: emailEnabled() });
+  } catch (err: any) { return fail(c, err.message, 422); }
+});
+
+/**
+ * POST /avisos/probar — mandarse el aviso de prueba.
+ *
+ * ── Por qué esto existe ──────────────────────────────────────────────────
+ * Un aviso por correo falla de maneras que no se ven desde acá: el dominio
+ * sin verificar, la API key vencida, el mensaje en la carpeta de spam. Sin
+ * un botón de prueba, la primera vez que uno se entera es cuando un
+ * interesado real no llegó — y ese ya se perdió.
+ *
+ * Manda un interesado de ejemplo, marcado como prueba para que nadie lo
+ * llame pensando que es un cliente.
+ */
+landingAdmin.post('/avisos/probar', async (c) => {
+  try {
+    const r = await avisarInteresado({
+      contact_name: 'PRUEBA — no es un cliente real',
+      business_name: 'Negocio de ejemplo',
+      business_type: 'Prueba del aviso',
+      phone: '8888-8888',
+      email: null,
+      notes: 'Este es el correo de prueba del aviso de interesados. Si te llegó, el aviso '
+        + 'está funcionando y los interesados de verdad te van a llegar igual.\n\n'
+        + 'Si no te llegó, revisá la carpeta de spam antes de cambiar nada.',
+      origen: 'prueba',
+    }, { timeoutMs: 15_000 });
+    if (!r.enviado) return fail(c, r.error ?? 'No se pudo enviar', 422);
+    return ok(c, { enviado: true, to: r.to });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 

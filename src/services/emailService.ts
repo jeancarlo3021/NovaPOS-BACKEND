@@ -159,6 +159,25 @@ export function welcomeEmailHtml(opts: { fullName: string; businessName: string;
 }
 
 // Tabla de "etiqueta: valor" reutilizable.
+/**
+ * ESCAPAR HTML.
+ *
+ * Las demás plantillas de este archivo arman el correo con datos del propio
+ * sistema: el nombre de un plan, el total de una factura. El aviso de un
+ * interesado NO: lleva texto que escribió un desconocido desde la página
+ * pública.
+ *
+ * Sin escapar, alguien puede mandar en el campo de notas un enlace con
+ * aspecto de botón del sistema y el correo llega con él adentro, en un mensaje
+ * que viene del dominio propio y por eso se lee con confianza. Los clientes
+ * de correo bloquean los scripts, pero no eso.
+ */
+export function escHtml(v: unknown): string {
+  return String(v ?? '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 function detailRows(rows: Array<[string, string | undefined | null]>): string {
   return `<table style="width:100%;border-collapse:collapse;font-size:14px;margin:8px 0;">` +
     rows.filter(([, v]) => v != null && v !== '').map(([k, v]) => `
@@ -333,4 +352,69 @@ export function newBusinessEmailHtml(opts: {
       </table>` : ''}
     <p style="color:#6b7280;font-size:14px;">¡Gracias por elegirnos! Cualquier duda, respondé este correo.</p>`;
   return layout('Comprobante de alta', body, opts.businessName);
+}
+
+// ─── 6) Aviso de un interesado de la página pública ─────────────────────────
+
+/**
+ * EL AVISO DE UN INTERESADO.
+ *
+ * Todo lo que escribió la persona va ESCAPADO: es el único correo del sistema
+ * cuyo contenido lo redacta un desconocido.
+ *
+ * El asunto lleva el nombre y el negocio a propósito. Un asunto genérico
+ * («Nuevo interesado») obliga a abrir el correo para saber si vale la pena
+ * llamar ya o puede esperar, y en el celular eso es la diferencia entre
+ * contestar en cinco minutos y contestar mañana.
+ */
+export function leadEmailHtml(opts: {
+  contactName: string;
+  businessName?: string | null;
+  phone?: string | null;
+  email?: string | null;
+  businessType?: string | null;
+  notes?: string | null;
+  origen?: string | null;
+  cuando?: string | null;
+  brand?: string;
+}): string {
+  const tel = String(opts.phone ?? '').trim();
+  /* El teléfono va como enlace: en el celular se toca y marca. Solo los
+     dígitos, porque un «8888-1234» con guion no siempre marca bien. */
+  const soloDigitos = tel.replace(/\D/g, '');
+  const wa = soloDigitos.length >= 8
+    ? `https://wa.me/${soloDigitos.length === 8 ? '506' : ''}${soloDigitos}` : null;
+
+  const body = `
+    <p style="margin:0 0 12px;">Alguien escribió desde la página.</p>
+    ${detailRows([
+      ['Nombre', escHtml(opts.contactName)],
+      ['Negocio', opts.businessName ? escHtml(opts.businessName) : undefined],
+      ['Tipo de negocio', opts.businessType ? escHtml(opts.businessType) : undefined],
+      ['Teléfono', tel ? escHtml(tel) : undefined],
+      ['Correo', opts.email ? escHtml(opts.email) : undefined],
+      ['Llegó desde', opts.origen ? escHtml(opts.origen) : 'directo'],
+      ['Cuándo', opts.cuando ? escHtml(opts.cuando) : undefined],
+    ])}
+    ${opts.notes ? `
+      <p style="margin:14px 0 4px;font-weight:700;">Lo que escribió</p>
+      <div style="background:#f9fafb;border-left:3px solid #2563eb;padding:10px 12px;
+                  font-size:14px;color:#374151;white-space:pre-wrap;">${escHtml(opts.notes)}</div>` : ''}
+    <div style="margin:18px 0 6px;">
+      ${wa ? `<a href="${wa}" style="display:inline-block;background:#16a34a;color:#fff;
+          text-decoration:none;font-weight:700;font-size:14px;padding:10px 16px;
+          border-radius:8px;margin-right:8px;">Escribirle por WhatsApp</a>` : ''}
+      ${tel ? `<a href="tel:${escHtml(soloDigitos)}" style="display:inline-block;background:#2563eb;
+          color:#fff;text-decoration:none;font-weight:700;font-size:14px;padding:10px 16px;
+          border-radius:8px;">Llamar</a>` : ''}
+    </div>
+    <p style="color:#6b7280;font-size:13px;margin-top:14px;">
+      ${opts.email
+        ? 'Si respondés este correo, la respuesta le llega directo a la persona.'
+        : 'No dejó correo, así que respondiendo este mensaje no le llega: hay que llamarla o escribirle.'}
+    </p>`;
+  return layout(
+    `Nuevo interesado: ${escHtml(opts.contactName)}`,
+    body, opts.brand ?? 'ColónClick',
+  );
 }
