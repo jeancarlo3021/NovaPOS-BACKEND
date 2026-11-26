@@ -261,7 +261,12 @@ export async function asentarPendientes(opts: {
   tenantId: string; desde: string; hasta: string; presupuestoMs?: number; userId?: string;
 }) {
   const hasta = Date.now() + (opts.presupuestoMs ?? 18_000);
-  const salida = { ventas: 0, gastos: 0, compras: 0, saltados: 0, errores: [] as string[], faltan: 0 };
+  const salida = {
+    ventas: 0, gastos: 0, compras: 0, saltados: 0, errores: [] as string[], faltan: 0,
+    /** Documentos de un mes ya cerrado. No son errores: el candado del cierre
+     *  funcionando. Contarlos aparte evita diez mensajes idénticos. */
+    cerrados: 0,
+  };
 
   const yaHecho = async (tipo: string) => {
     const { data } = await db.from('journal_entries')
@@ -294,6 +299,7 @@ export async function asentarPendientes(opts: {
       try { await fn(f.id); (salida[clave] as number) += 1; }
       catch (e: any) {
         if (/ya tiene asiento/.test(e?.message ?? '')) { salida.saltados += 1; continue; }
+        if (/periodo .* está cerrado/.test(e?.message ?? '')) { salida.cerrados += 1; continue; }
         if (salida.errores.length < 10) salida.errores.push(`${tipo} ${f.id.slice(0, 8)}: ${e?.message}`);
       }
     }

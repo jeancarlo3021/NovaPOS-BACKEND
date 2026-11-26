@@ -4,6 +4,11 @@ import { ok, fail } from '../utils/response.js';
 import { asegurarCatalogo, crearAsiento, anularAsiento, CATALOGO_BASE } from '../services/contabilidad.js';
 import { asentarVenta, asentarGasto, asentarCompra, asentarPendientes } from '../services/contabilidadAuto.js';
 import { crearCuentaBancaria, asentarDeposito, asentarLiquidacion, cerrarCajaContable } from '../services/bancos.js';
+import {
+  resumenIva, antiguedad, flujoCaja,
+  listaActivos, crearActivo, darDeBajaActivo, depreciarMes,
+  listaPeriodos, previoCierre, cerrarPeriodo, reabrirPeriodo,
+} from '../services/contabilidadRamas.js';
 
 /**
  * EL MÓDULO CONTABLE.
@@ -168,15 +173,31 @@ contabilidad.post('/contabilizar/:tipo/:id', async (c) => {
  * el balance de comprobación, el estado de resultados y el balance general
  * son tres formas de mirar esta misma suma.
  */
-async function saldos(tenantId: string, desde?: string, hasta?: string) {
+async function saldos(
+  tenantId: string, desde?: string, hasta?: string,
+  opts: { sinCierre?: boolean } = {},
+) {
   const { data: cuentas } = await db.from('chart_accounts')
     .select('code, name, type, postable').eq('tenant_id', tenantId).order('code');
 
-  let q = db.from('journal_entries').select('id, fecha').eq('tenant_id', tenantId).eq('anulado', false);
+  let q = db.from('journal_entries').select('id, fecha, source_type')
+    .eq('tenant_id', tenantId).eq('anulado', false);
   if (desde) q = q.gte('fecha', desde);
   if (hasta) q = q.lte('fecha', hasta);
   const { data: asientos } = await q;
-  const ids = ((asientos ?? []) as any[]).map(a => a.id);
+  /**
+   * El estado de resultados pide los saldos SIN los asientos de cierre.
+   *
+   * El cierre cancela las cuentas de ingreso y gasto contra resultados
+   * acumulados, con fecha dentro del mes cerrado. Si entraran acá, el estado
+   * de resultados de un mes cerrado daría cero y el informe que se presentó
+   * no se podría volver a sacar. En el balance de comprobación sí entran:
+   * ahí lo que se prueba es que los asientos cuadran, y el de cierre es uno
+   * de ellos.
+   */
+  const ids = ((asientos ?? []) as any[])
+    .filter(a => !(opts.sinCierre && a.source_type === 'cierre'))
+    .map(a => a.id);
 
   const acum = new Map<string, { debe: number; haber: number }>();
   for (let i = 0; i < ids.length; i += 200) {
@@ -220,7 +241,7 @@ contabilidad.get('/balance', async (c) => {
 contabilidad.get('/resultados', async (c) => {
   try {
     const tenantId = c.get('tenantId');
-    const filas = await saldos(tenantId, c.req.query('desde'), c.req.query('hasta'));
+    const filas = await saldos(tenantId, c.req.query('desde'), c.req.query('hasta'), { sinCierre: true });
     const ingresos = filas.filter(f => f.type === 'ingreso' && f.saldo !== 0);
     const gastos = filas.filter(f => f.type === 'gasto' && f.saldo !== 0);
     const totalIngresos = c2(ingresos.reduce((s, f) => s + f.saldo, 0));
@@ -504,6 +525,109 @@ contabilidad.post('/conciliacion', async (c) => {
     if (error) throw new Error(error.message);
     return ok(c, { actualizadas: ids.length, conciliado: marcar });
   } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+
+// ══════════════════════════════════════════════════════════════════════════
+// IMPUESTOS — EL IVA DEL PERIODO (D-104)
+// ══════════════════════════════════════════════════════════════════════════
+
+contabilidad.get('/impuestos', async (c) => {
+  try {
+    const hoy = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Costa_Rica' });
+    const desde = c.req.query('desde') ?? hoy.slice(0, 8) + '01';
+    const hasta = c.req.query('hasta') ?? hoy;
+    return ok(c, await resumenIva(c.get('tenantId'), desde, hasta));
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// ANTIGÜEDAD DE SALDOS
+// ══════════════════════════════════════════════════════════════════════════
+
+contabilidad.get('/antiguedad', async (c) => {
+  try {
+    return ok(c, await antiguedad(c.get('tenantId'), c.req.query('hasta')));
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// FLUJO DE CAJA
+// ══════════════════════════════════════════════════════════════════════════
+
+contabilidad.get('/flujo', async (c) => {
+  try {
+    const hoy = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Costa_Rica' });
+    const desde = c.req.query('desde') ?? hoy.slice(0, 8) + '01';
+    const hasta = c.req.query('hasta') ?? hoy;
+    return ok(c, await flujoCaja(c.get('tenantId'), desde, hasta));
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// ACTIVOS FIJOS
+// ══════════════════════════════════════════════════════════════════════════
+
+contabilidad.get('/activos', async (c) => {
+  try {
+    return ok(c, await listaActivos(c.get('tenantId')));
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+contabilidad.post('/activos', async (c) => {
+  try {
+    const b = await c.req.json().catch(() => ({} as any));
+    await asegurarCatalogo(c.get('tenantId'));
+    return ok(c, await crearActivo(c.get('tenantId'), c.get('userId'), b));
+  } catch (err: any) { return fail(c, err.message, 422); }
+});
+
+contabilidad.post('/activos/:id/baja', async (c) => {
+  try {
+    const b = await c.req.json().catch(() => ({} as any));
+    return ok(c, await darDeBajaActivo(c.get('tenantId'), c.req.param('id'), b));
+  } catch (err: any) { return fail(c, err.message, 422); }
+});
+
+contabilidad.post('/activos/depreciar', async (c) => {
+  try {
+    const b = await c.req.json().catch(() => ({} as any));
+    const hoy = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Costa_Rica' });
+    const periodo = String(b?.periodo ?? '').slice(0, 7) || hoy.slice(0, 7);
+    await asegurarCatalogo(c.get('tenantId'));
+    return ok(c, await depreciarMes(c.get('tenantId'), periodo, c.get('userId')));
+  } catch (err: any) { return fail(c, err.message, 422); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// CIERRE DE PERIODO
+// ══════════════════════════════════════════════════════════════════════════
+
+contabilidad.get('/cierre', async (c) => {
+  try {
+    return ok(c, await listaPeriodos(c.get('tenantId')));
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/** Qué se va a asentar si se cierra: se muestra antes de apretar el botón. */
+contabilidad.get('/cierre/:periodo/previo', async (c) => {
+  try {
+    return ok(c, await previoCierre(c.get('tenantId'), c.req.param('periodo')));
+  } catch (err: any) { return fail(c, err.message, 422); }
+});
+
+contabilidad.post('/cierre', async (c) => {
+  try {
+    const b = await c.req.json().catch(() => ({} as any));
+    await asegurarCatalogo(c.get('tenantId'));
+    return ok(c, await cerrarPeriodo(c.get('tenantId'), String(b?.periodo ?? ''), c.get('userId')));
+  } catch (err: any) { return fail(c, err.message, 422); }
+});
+
+contabilidad.post('/cierre/:periodo/reabrir', async (c) => {
+  try {
+    return ok(c, await reabrirPeriodo(c.get('tenantId'), c.req.param('periodo')));
+  } catch (err: any) { return fail(c, err.message, 422); }
 });
 
 export default contabilidad;

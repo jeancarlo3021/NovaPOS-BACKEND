@@ -45,11 +45,25 @@ export const CATALOGO_BASE: Array<{ code: string; name: string; type: string; po
    * desde la venta hasta el depósito.
    */
   { code: '1106', name: 'Tarjetas por liquidar',         type: 'activo' },
+  /**
+   * ACTIVO FIJO y su depreciación acumulada.
+   *
+   * La acumulada es de tipo `activo` a propósito, aunque su saldo sea de
+   * haber: así resta dentro del activo y el balance muestra el valor en
+   * libros sin inventar un tipo de cuenta nuevo.
+   */
+  { code: '12',   name: 'Activo fijo',                   type: 'activo',     postable: false },
+  { code: '1201', name: 'Mobiliario y equipo',           type: 'activo' },
+  { code: '1202', name: 'Equipo de cómputo',             type: 'activo' },
+  { code: '1203', name: 'Vehículos',                     type: 'activo' },
+  { code: '1204', name: 'Maquinaria',                    type: 'activo' },
+  { code: '1290', name: 'Depreciación acumulada',        type: 'activo' },
   { code: '2',    name: 'PASIVO',                        type: 'pasivo',     postable: false },
   { code: '21',   name: 'Pasivo circulante',             type: 'pasivo',     postable: false },
   { code: '2101', name: 'Cuentas por pagar',             type: 'pasivo' },
   { code: '2102', name: 'IVA cobrado (débito fiscal)',   type: 'pasivo' },
   { code: '2103', name: 'Impuestos por pagar',           type: 'pasivo' },
+  { code: '2104', name: 'Retenciones por pagar',         type: 'pasivo' },
   { code: '3',    name: 'PATRIMONIO',                    type: 'patrimonio', postable: false },
   { code: '3101', name: 'Capital',                       type: 'patrimonio' },
   { code: '3102', name: 'Resultados acumulados',         type: 'patrimonio' },
@@ -65,6 +79,7 @@ export const CATALOGO_BASE: Array<{ code: string; name: string; type: string; po
   { code: '5205', name: 'Combustible y transporte',      type: 'gasto' },
   { code: '5206', name: 'Comisiones bancarias',          type: 'gasto' },
   { code: '5207', name: 'Faltantes y sobrantes de caja',  type: 'gasto' },
+  { code: '5208', name: 'Depreciación',                  type: 'gasto' },
   { code: '5299', name: 'Otros gastos',                  type: 'gasto' },
 ];
 
@@ -83,6 +98,47 @@ export async function asegurarCatalogo(tenantId: string): Promise<number> {
 }
 
 /**
+ * COMPLETAR EL CATÁLOGO con cuentas que antes no existían.
+ *
+ * `asegurarCatalogo` solo actúa cuando el negocio no tiene ninguna cuenta,
+ * así que a quien ya lo tenía armado no le llegan las cuentas nuevas. Esto
+ * agrega únicamente las que faltan, por código, y nunca toca una existente:
+ * si el contador le cambió el nombre a la 1201, se lo respeta.
+ */
+export async function asegurarCuentas(tenantId: string, codigos: string[]): Promise<string[]> {
+  if (!codigos.length) return [];
+  const { data: hay } = await db.from('chart_accounts')
+    .select('code').eq('tenant_id', tenantId).in('code', codigos);
+  const ya = new Set(((hay ?? []) as any[]).map(x => x.code));
+  const faltan = CATALOGO_BASE.filter(x => codigos.includes(x.code) && !ya.has(x.code));
+  if (!faltan.length) return [];
+  const { error } = await db.from('chart_accounts').insert(faltan.map(x => ({
+    tenant_id: tenantId, code: x.code, name: x.name, type: x.type,
+    postable: x.postable !== false,
+  })));
+  // Si otra petición las creó en el mismo instante, el único de (tenant,code)
+  // lo dice y no es un error: el catálogo quedó como se quería.
+  if (error && !/duplicate|unique/i.test(error.message)) throw new Error(error.message);
+  return faltan.map(x => x.code);
+}
+
+/**
+ * ¿EL MES DE ESTA FECHA ESTÁ CERRADO?
+ *
+ * Devuelve el periodo si lo está. Si la tabla de cierres todavía no existe
+ * (migración 148 sin correr), devuelve null: el módulo sigue funcionando sin
+ * el candado, que es lo que hacía antes.
+ */
+export async function periodoCerrado(tenantId: string, fecha: string): Promise<string | null> {
+  const periodo = String(fecha ?? '').slice(0, 7);
+  if (periodo.length !== 7) return null;
+  const { data, error } = await db.from('accounting_periods')
+    .select('periodo').eq('tenant_id', tenantId).eq('periodo', periodo).maybeSingle();
+  if (error) return null;
+  return (data as any)?.periodo ?? null;
+}
+
+/**
  * GUARDAR UN ASIENTO.
  *
  * Valida, numera y escribe. Devuelve el asiento o lanza con un motivo que se
@@ -97,7 +153,17 @@ export async function crearAsiento(opts: {
   sourceType?: string;
   sourceId?: string;
   userId?: string;
+  /** Solo para el propio asiento de cierre, que por definición cae dentro
+   *  del mes que está cerrando. */
+  ignorarCierre?: boolean;
 }): Promise<{ id: string; numero: number }> {
+  if (!opts.ignorarCierre) {
+    const cerrado = await periodoCerrado(opts.tenantId, opts.fecha);
+    if (cerrado) {
+      throw new Error(`El periodo ${cerrado} está cerrado: no acepta asientos nuevos. `
+        + 'Para corregir algo de ese mes hay que reabrirlo desde Contabilidad → Cierre de periodo.');
+    }
+  }
   const lineas = opts.lineas
     .map(l => ({ ...l, debe: c2(l.debe ?? 0), haber: c2(l.haber ?? 0) }))
     .filter(l => l.debe > 0 || l.haber > 0);
