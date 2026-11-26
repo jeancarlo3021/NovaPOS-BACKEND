@@ -145,7 +145,19 @@ export async function createReceivable(tenantId: string, r: {
  * El vencimiento se calcula desde la fecha de la VENTA (30 días), no desde hoy:
  * una factura de hace tres semanas no vence el mes que viene.
  */
-const huerfanasDeCredito = async (tenantId: string, from?: string, to?: string) => {
+const huerfanasDeCredito = async (
+  tenantId: string, from?: string, to?: string,
+  /**
+   * SOLO ESTAS FACTURAS.
+   *
+   * Lo usa el cierre de caja: ahí hay que revisar los créditos de ESTE turno,
+   * no los del día entero. Con el rango de fechas, el cajero que cierra a las
+   * 6 p.m. repararía también los créditos del turno de la mañana —que son de
+   * otro cajero y pueden estar a medio arreglar—.
+   */
+  ids?: string[],
+) => {
+  if (ids && ids.length === 0) return [];
   let q = db.from('invoices')
     .select('id, invoice_number, customer_id, customer_name, total, issued_at, created_at, route_id')
     .eq('tenant_id', tenantId)
@@ -153,6 +165,7 @@ const huerfanasDeCredito = async (tenantId: string, from?: string, to?: string) 
     .neq('status', 'cancelled')
     .order('created_at', { ascending: false })
     .limit(2000);
+  if (ids && ids.length > 0) q = q.in('id', ids.slice(0, 500));
   if (from) q = q.gte('created_at', `${from}T00:00:00`);
   if (to)   q = q.lte('created_at', `${to}T23:59:59`);
   const { data: credito, error } = await q;
@@ -164,10 +177,10 @@ const huerfanasDeCredito = async (tenantId: string, from?: string, to?: string) 
   /* Las cuentas que YA existen, por tandas: con cientos de ids adentro la
      consulta se pasa del largo de una URL. */
   const conCuenta = new Set<string>();
-  const ids = facturas.map(f => String(f.id));
-  for (let i = 0; i < ids.length; i += 200) {
+  const facturaIds = facturas.map(f => String(f.id));
+  for (let i = 0; i < facturaIds.length; i += 200) {
     const { data: ars } = await db.from('accounts_receivable')
-      .select('invoice_id').eq('tenant_id', tenantId).in('invoice_id', ids.slice(i, i + 200));
+      .select('invoice_id').eq('tenant_id', tenantId).in('invoice_id', facturaIds.slice(i, i + 200));
     for (const a of ((ars ?? []) as any[])) conCuenta.add(String(a.invoice_id));
   }
   return facturas.filter(f => !conCuenta.has(String(f.id)));
@@ -197,7 +210,9 @@ accountsReceivable.post('/huerfanas/reparar', async (c) => {
   try {
     const tenantId = c.get('tenantId');
     const body = await c.req.json().catch(() => ({} as any));
-    const faltan = await huerfanasDeCredito(tenantId, body?.from, body?.to);
+    const ids = Array.isArray(body?.invoice_ids)
+      ? body.invoice_ids.map((x: any) => String(x)).filter(Boolean) : undefined;
+    const faltan = await huerfanasDeCredito(tenantId, body?.from, body?.to, ids);
 
     const creadas: string[] = [];
     const fallaron: Array<{ invoice_number: string; motivo: string }> = [];
@@ -232,6 +247,48 @@ accountsReceivable.post('/huerfanas/reparar', async (c) => {
       lista_creadas: creadas,
       fallaron,
     });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
+/**
+ * ¿ESTOS CRÉDITOS QUEDARON COMO CUENTA POR COBRAR?
+ *
+ * GET /credito-estado?invoice_ids=a,b,c
+ *
+ * Lo pregunta el CIERRE DE CAJA. Hasta ahora el cierre listaba las ventas a
+ * crédito del turno y ahí terminaba: decía a quién se le dio crédito, pero no
+ * si la deuda existe en alguna parte. Cuando el insert de la cuenta falla —y
+ * falla en silencio: la venta se cobra igual— el crédito queda sin cuenta, el
+ * cliente aparece al día, y nadie lo descubre hasta que pasan meses.
+ *
+ * El cierre es el único momento del día en que alguien está mirando
+ * exactamente esas ventas, así que es donde conviene avisar.
+ */
+accountsReceivable.get('/credito-estado', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const ids = String(c.req.query('invoice_ids') ?? '')
+      .split(',').map(x => x.trim()).filter(Boolean).slice(0, 500);
+    if (ids.length === 0) return ok(c, { cuentas: {}, sin_cuenta: [] });
+
+    const cuentas: Record<string, any> = {};
+    // Por tandas: con cientos de ids la consulta se pasa del largo de una URL.
+    for (let i = 0; i < ids.length; i += 200) {
+      const { data, error } = await db.from('accounts_receivable')
+        .select('id, invoice_id, total_amount, paid_amount, status, due_date')
+        .eq('tenant_id', tenantId).in('invoice_id', ids.slice(i, i + 200));
+      if (error) throw new Error(error.message);
+      for (const a of ((data ?? []) as any[])) {
+        const total = Number(a.total_amount ?? 0), pagado = Number(a.paid_amount ?? 0);
+        cuentas[String(a.invoice_id)] = {
+          id: a.id, total, pagado,
+          saldo: Math.round((total - pagado) * 100) / 100,
+          status: a.status ?? 'pending',
+          due_date: a.due_date ?? null,
+        };
+      }
+    }
+    return ok(c, { cuentas, sin_cuenta: ids.filter(id => !cuentas[id]) });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
@@ -513,7 +570,15 @@ accountsReceivable.get('/:id', async (c) => {
     }
     const { data: payments } = await db.from('accounts_receivable_payments')
       .select('*').eq('receivable_id', id).order('created_at', { ascending: false });
-    return ok(c, { ...withDerivedStatus(row), payments: payments ?? [] });
+    /* Cada abono dice si su caja ya está cerrada: la pantalla lo avisa ANTES
+       de que alguien toque «Anular», no después. */
+    const cajas = await estadoDeCajas(
+      tenantId, ((payments ?? []) as any[]).map(p => String(p.cash_session_id ?? '')));
+    const conCaja = ((payments ?? []) as any[]).map(p => {
+      const c0 = cajas.get(String(p.cash_session_id ?? ''));
+      return { ...p, caja_cerrada: c0?.cerrada ?? false, caja_fecha: c0?.fecha ?? null };
+    });
+    return ok(c, { ...withDerivedStatus(row), payments: conCaja });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
@@ -677,6 +742,33 @@ accountsReceivable.post('/:id/pay', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+/**
+ * ¿LA CAJA QUE RECIBIÓ ESTOS ABONOS YA ESTÁ CERRADA?
+ *
+ * Anular un abono de una caja CERRADA mueve plata de un arqueo que ya se
+ * firmó: ese turno queda con el monto del abono de más, y el cajero —que
+ * contó bien— aparece con un sobrante que no cometió. No se prohíbe (el abono
+ * mal puesto hay que poder quitarlo), pero tiene que decirse antes.
+ */
+async function estadoDeCajas(tenantId: string, ids: string[]) {
+  const mapa = new Map<string, { cerrada: boolean; fecha: string | null }>();
+  const limpios = [...new Set(ids.filter(Boolean))];
+  if (limpios.length === 0) return mapa;
+  for (let i = 0; i < limpios.length; i += 200) {
+    const { data, error } = await db.from('cash_sessions')
+      .select('id, status, closing_date')
+      .eq('tenant_id', tenantId).in('id', limpios.slice(i, i + 200));
+    if (error) break;   // sin el dato se sigue: el aviso es de más, no de menos
+    for (const s of ((data ?? []) as any[])) {
+      mapa.set(String(s.id), {
+        cerrada: String(s.status ?? '') !== 'open',
+        fecha: s.closing_date ?? null,
+      });
+    }
+  }
+  return mapa;
+}
+
 // POST /payments/:paymentId/void — ANULAR un abono. Solo administrador, gerente,
 // contador o propietario. Borra el abono y recalcula el saldo de la cuenta.
 const VOID_ROLES = new Set(['owner', 'admin', 'gerente', 'contador']);
@@ -688,17 +780,69 @@ accountsReceivable.post('/payments/:paymentId/void', async (c) => {
       return fail(c, 'Solo el administrador, gerente o contador pueden anular abonos.', 403);
     }
     const { paymentId } = c.req.param();
-    const { data: pay } = await db.from('accounts_receivable_payments')
-      .select('id, receivable_id, amount, voided_at').eq('id', paymentId).eq('tenant_id', tenantId).maybeSingle();
+    const body = await c.req.json().catch(() => ({} as any));
+    /**
+     * EL MOTIVO ES OBLIGATORIO.
+     *
+     * Anular mueve el saldo de un cliente y, si el abono entró por una caja,
+     * también la plata de un arqueo. Sin motivo, al mes siguiente nadie puede
+     * decir si fue un error de digitación, un cheque devuelto o un cobro que
+     * nunca entró —y para el cliente las tres cosas significan algo distinto—.
+     */
+    const motivo = String(body?.reason ?? '').trim();
+    if (motivo.length < 4) {
+      return fail(c, 'Escribí por qué se anula el abono (ej: «error de digitación», «cheque devuelto»).', 422);
+    }
+
+    let pq: any = await db.from('accounts_receivable_payments')
+      .select('id, receivable_id, amount, voided_at, cash_session_id')
+      .eq('id', paymentId).eq('tenant_id', tenantId).maybeSingle();
+    // `cash_session_id` es de la migración 144: sin ella se anula igual, solo
+    // que no se puede avisar de la caja.
+    if (pq.error && /cash_session_id/.test(pq.error.message ?? '')) {
+      pq = await db.from('accounts_receivable_payments')
+        .select('id, receivable_id, amount, voided_at')
+        .eq('id', paymentId).eq('tenant_id', tenantId).maybeSingle();
+    }
+    const pay = pq.data;
     if (!pay) return fail(c, 'Abono no encontrado', 404);
     if ((pay as any).voided_at) return fail(c, 'El abono ya estaba anulado', 409);
+
+    /* Caja ya cerrada: se avisa y se pide confirmar. Prohibirlo dejaría el
+       abono mal puesto adentro para siempre; hacerlo callado descuadra el
+       arqueo de otra persona sin que nadie se entere. */
+    const caja = String((pay as any).cash_session_id ?? '');
+    const estado = caja ? (await estadoDeCajas(tenantId, [caja])).get(caja) : undefined;
+    const cajaCerrada = !!estado?.cerrada;
+    if (cajaCerrada && !body?.force) {
+      return c.json({
+        success: false,
+        error: 'Este abono entró por una caja que YA está cerrada. Al anularlo, ese arqueo '
+          + `queda con ₡${Number((pay as any).amount || 0).toLocaleString('es-CR')} de más.`,
+        caja_cerrada: true,
+        caja_fecha: estado?.fecha ?? null,
+        monto: Number((pay as any).amount || 0),
+      }, 409);
+    }
 
     const receivableId = (pay as any).receivable_id;
     // Borrado LÓGICO: se marca como anulado (con quién y cuándo). Si las columnas
     // aún no existen (migración 63 sin correr), cae a borrado físico.
-    const vUpd = await db.from('accounts_receivable_payments')
-      .update({ voided_at: new Date().toISOString(), voided_by: c.get('userId') ?? null })
-      .eq('id', paymentId).eq('tenant_id', tenantId);
+    const marca: Record<string, any> = {
+      voided_at: new Date().toISOString(),
+      voided_by: c.get('userId') ?? null,
+      void_reason: motivo,
+    };
+    let vUpd = await db.from('accounts_receivable_payments')
+      .update(marca).eq('id', paymentId).eq('tenant_id', tenantId);
+    // `void_reason` es de la migración 151: sin ella el abono se anula igual y
+    // el motivo queda en la nota. Perder el motivo es malo; no poder anular un
+    // abono mal puesto es peor.
+    if (vUpd.error && /void_reason/.test(vUpd.error.message ?? '')) {
+      const { void_reason: _r, ...rest } = marca;
+      vUpd = await db.from('accounts_receivable_payments')
+        .update(rest).eq('id', paymentId).eq('tenant_id', tenantId);
+    }
     if (vUpd.error) {
       if (/voided_at|voided_by|column/.test(vUpd.error.message)) {
         await db.from('accounts_receivable_payments').delete().eq('id', paymentId).eq('tenant_id', tenantId);
@@ -735,7 +879,12 @@ accountsReceivable.post('/payments/:paymentId/void', async (c) => {
         .eq('id', receivableId).eq('tenant_id', tenantId);
     }
 
-    return ok(c, { voided: true, amount: (pay as any).amount, new_paid: newPaid });
+    return ok(c, {
+      voided: true, amount: (pay as any).amount, new_paid: newPaid,
+      /** La pantalla lo dice: si la caja estaba cerrada, ese arqueo cambió. */
+      caja_cerrada: cajaCerrada,
+      caja_fecha: estado?.fecha ?? null,
+    });
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
