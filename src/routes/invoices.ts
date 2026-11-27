@@ -573,11 +573,44 @@ invoices.post('/:id/void', async (c) => {
       return fail(c, `Solo se pueden anular facturas completadas (estado actual: ${current.status})`, 409);
     }
 
+    /**
+     * EL MOTIVO DE LA ANULACIÓN.
+     *
+     * La pantalla lo pide desde siempre, pero solo se usaba como razón de la
+     * Nota de Crédito: de una venta corriente no quedaba nada escrito. Las
+     * anulaciones son el agujero clásico de un POS —anular y quedarse con la
+     * plata no deja rastro si nadie anotó por qué—, así que ahora el motivo,
+     * quién y cuándo quedan en la factura.
+     *
+     * NO es obligatorio en el servidor a propósito: las anulaciones encoladas
+     * sin conexión por una versión anterior de la app no lo traen, y
+     * rechazarlas dejaría facturas que el cajero ya anuló en la tablet sin
+     * poder anularse nunca en el servidor.
+     */
+    const body = await c.req.json().catch(() => ({} as any));
+    const motivo = String(body?.reason ?? '').trim().slice(0, 300);
+
     // 2) Marcar como anulada de forma idempotente: solo actualiza si sigue en 'completed'.
-    const { data, error } = await db.from('invoices')
-      .update({ status: 'cancelled', updated_at: new Date().toISOString() })
+    const marca: Record<string, any> = {
+      status: 'cancelled', updated_at: new Date().toISOString(),
+      voided_at: new Date().toISOString(),
+      voided_by: c.get('userId') ?? null,
+      ...(motivo ? { void_reason: motivo } : {}),
+    };
+    let res: any = await db.from('invoices')
+      .update(marca)
       .eq('id', id).eq('tenant_id', tenantId).eq('status', 'completed')
       .select().single();
+    /* Las tres columnas son de la migración 153: sin ella la factura se anula
+       igual (sin el motivo). Perder el motivo es malo; no poder anular una
+       venta mal hecha deja al negocio con una factura falsa adentro. */
+    if (res.error && /void_reason|voided_at|voided_by/.test(res.error.message ?? '')) {
+      res = await db.from('invoices')
+        .update({ status: 'cancelled', updated_at: new Date().toISOString() })
+        .eq('id', id).eq('tenant_id', tenantId).eq('status', 'completed')
+        .select().single();
+    }
+    const { data, error } = res;
     if (error) throw new Error(error.message);
     if (!data) {
       // Otro request ganó la carrera y la anuló primero.

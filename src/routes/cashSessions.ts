@@ -39,6 +39,16 @@ const CloseSchema = z.object({
    * sentido.
    */
   closed_at: z.string().optional().nullable(),
+  /**
+   * EL DETALLE DEL CIERRE, tal como se imprimió.
+   *
+   * Lo manda la pantalla del cierre: el mismo objeto que va a la impresora
+   * (conteo por denominación, contado por método, abonos del turno,
+   * movimientos del fondo, ventas a crédito). Sin esto, del arqueo quedaba
+   * solo el monto: si el tiquete se perdía, ese turno no se podía volver a
+   * sacar nunca. Con esto se reimprime idéntico desde Reportes.
+   */
+  cierre_detalle: z.any().optional().nullable(),
 }).transform(d => ({
   ...d,
   closing_amount: d.closing_amount ?? d.closing_balance ?? 0,
@@ -278,6 +288,188 @@ cashSessions.get('/:id/invoices', async (c) => {
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
+/**
+ * EL CIERRE DE UNA CAJA, PARA REIMPRIMIRLO.
+ *
+ * GET /:id/cierre
+ *
+ * Dos caminos, y la respuesta dice cuál se usó:
+ *
+ * 1. `cierre_detalle` guardado (migración 152): se devuelve el MISMO objeto
+ *    que se imprimió. La reimpresión sale idéntica al original, con el conteo
+ *    por denominación y todo.
+ * 2. Cajas cerradas antes de esa columna: se REARMA desde las ventas del
+ *    turno. Lo que el sistema registró se recupera completo; lo que el cajero
+ *    contó por método no se guardó nunca, así que de eso queda solo el total
+ *    —y el papel lo dice, en vez de imprimir ceros que parecen un arqueo—.
+ */
+cashSessions.get('/:id/cierre', async (c) => {
+  try {
+    const tenantId = c.get('tenantId');
+    const { id } = c.req.param();
+
+    let sq: any = await db.from('cash_sessions')
+      .select('id, user_id, opening_date, closing_date, status, opening_amount, closing_amount, closing_usd, opening_usd, notes, cierre_detalle')
+      .eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+    if (sq.error && /cierre_detalle/.test(sq.error.message ?? '')) {
+      sq = await db.from('cash_sessions')
+        .select('id, user_id, opening_date, closing_date, status, opening_amount, closing_amount, closing_usd, opening_usd, notes')
+        .eq('id', id).eq('tenant_id', tenantId).maybeSingle();
+    }
+    const ses = sq.data as any;
+    if (!ses) return fail(c, 'Caja no encontrada', 404);
+    if (ses.status !== 'closed') {
+      return fail(c, 'Esa caja todavía está abierta: el cierre no existe hasta que se cierre.', 409);
+    }
+
+    if (ses.cierre_detalle) {
+      return ok(c, { detalle: ses.cierre_detalle, reconstruido: false });
+    }
+
+    // ── Rearmar desde las ventas del turno ──────────────────────────────────
+    const COLS_FACT = 'total, payment_method, payments, status, is_delivery, exclude_from_close, currency, invoice_number, customer_name';
+    let fq: any = await db.from('invoices')
+      .select(`${COLS_FACT}, void_reason`)
+      .eq('tenant_id', tenantId).eq('cash_session_id', id).limit(2000);
+    /* `void_reason` es de la migración 153: sin ella el cierre se rearma
+       igual, solo que las anulaciones salen sin motivo. */
+    if (fq.error && /void_reason/.test(fq.error.message ?? '')) {
+      fq = await db.from('invoices').select(COLS_FACT)
+        .eq('tenant_id', tenantId).eq('cash_session_id', id).limit(2000);
+    }
+    const todas = (fq.data ?? []) as any[];
+    const vivas = todas.filter(i => i.status !== 'cancelled' && !i.exclude_from_close && !i.is_delivery);
+    const anuladas = todas.filter(i => i.status === 'cancelled');
+
+    const porMetodo: Record<string, number> = {
+      cash: 0, card: 0, sinpe: 0, credit: 0, transfer: 0, other: 0,
+    };
+    for (const inv of vivas) {
+      const pays = Array.isArray(inv.payments) && inv.payments.length ? inv.payments : null;
+      const sumar = (m: string, a: number) => {
+        const k = m === 'bank_transfer' || m === 'transferencia' ? 'transfer' : m;
+        if (Object.prototype.hasOwnProperty.call(porMetodo, k)) porMetodo[k] += a;
+        else porMetodo.other += a;
+      };
+      if (pays) for (const p of pays) sumar(String(p.method ?? ''), Number(p.amount || 0));
+      else sumar(String(inv.payment_method ?? ''), Number(inv.total || 0));
+    }
+
+    const { data: movs } = await db.from('cash_movements')
+      .select('type, amount, description')
+      .eq('cash_session_id', id).neq('type', 'sale');
+    const movimientos = ((movs ?? []) as any[])
+      .filter(m => ['income', 'expense', 'cash_in', 'cash_out'].includes(String(m.type)))
+      .map(m => ({
+        type: (m.type === 'income' || m.type === 'cash_in') ? 'in' as const : 'out' as const,
+        amount: Math.abs(Number(m.amount || 0)),
+        reason: m.description ?? '',
+      }));
+    const entradas = movimientos.filter(m => m.type === 'in').reduce((t, m) => t + m.amount, 0);
+    const salidas = movimientos.filter(m => m.type === 'out').reduce((t, m) => t + m.amount, 0);
+
+    /* Los abonos del turno: de apartados y de cuentas por cobrar. Son plata
+       que entró al cajón sin una venta detrás, así que sin ellos el esperado
+       sale corto justo por lo abonado. */
+    const abonos: Array<{ tipo: 'apartado' | 'credito'; numero: string | null; cliente: string | null; method: string; amount: number }> = [];
+    try {
+      const { data } = await db.from('reservation_payments')
+        .select('amount, method, reservation:reservations(number, customer_name)')
+        .eq('tenant_id', tenantId).eq('cash_session_id', id);
+      for (const p of ((data ?? []) as any[])) {
+        abonos.push({
+          tipo: 'apartado', numero: p.reservation?.number ?? null,
+          cliente: p.reservation?.customer_name ?? null,
+          method: String(p.method ?? 'cash'), amount: Number(p.amount || 0),
+        });
+      }
+    } catch { /* sin apartados */ }
+    try {
+      let r: any = await db.from('accounts_receivable_payments')
+        .select('amount, method, voided_at, receivable:accounts_receivable(customer_name, invoice_number)')
+        .eq('tenant_id', tenantId).eq('cash_session_id', id);
+      if (r.error && /voided_at/.test(r.error.message ?? '')) {
+        r = await db.from('accounts_receivable_payments')
+          .select('amount, method, receivable:accounts_receivable(customer_name, invoice_number)')
+          .eq('tenant_id', tenantId).eq('cash_session_id', id);
+      }
+      for (const p of ((r.data ?? []) as any[])) {
+        if (p.voided_at) continue;   // un abono anulado no es plata del turno
+        abonos.push({
+          tipo: 'credito', numero: p.receivable?.invoice_number ?? null,
+          cliente: p.receivable?.customer_name ?? null,
+          method: String(p.method ?? 'cash'), amount: Number(p.amount || 0),
+        });
+      }
+    } catch { /* sin cuentas por cobrar */ }
+
+    for (const a of abonos) {
+      const k = a.method === 'bank_transfer' ? 'transfer' : a.method;
+      if (Object.prototype.hasOwnProperty.call(porMetodo, k)) porMetodo[k] += a.amount;
+      else porMetodo.other += a.amount;
+    }
+    const porMedio: Record<string, { method: string; amount: number; count: number }> = {};
+    for (const a of abonos) {
+      porMedio[a.method] ??= { method: a.method, amount: 0, count: 0 };
+      porMedio[a.method].amount += a.amount;
+      porMedio[a.method].count += 1;
+    }
+
+    let cajero = 'Sin vendedor';
+    if (ses.user_id) {
+      const { data: u } = await db.from('users')
+        .select('ticket_alias, full_name, email').eq('id', ses.user_id).maybeSingle();
+      cajero = (u as any)?.ticket_alias || (u as any)?.full_name
+        || String((u as any)?.email ?? '').split('@')[0] || 'Vendedor';
+    }
+
+    /* El ESPERADO con el mismo criterio del cierre: fondo + lo que entró en
+       efectivo + entradas − salidas. El crédito y las transferencias no dejan
+       plata en la gaveta. */
+    const esperado = Number(ses.opening_amount || 0) + porMetodo.cash + entradas - salidas;
+    const contado = Number(ses.closing_amount ?? 0);
+
+    return ok(c, {
+      reconstruido: true,
+      detalle: {
+        session_id: id,
+        opened_at: ses.opening_date,
+        closed_at: ses.closing_date,
+        cashier_name: cajero,
+        opening_amount: Number(ses.opening_amount || 0),
+        system_cash: porMetodo.cash, system_card: porMetodo.card, system_sinpe: porMetodo.sinpe,
+        system_credit: porMetodo.credit, system_transfer: porMetodo.transfer, system_other: porMetodo.other,
+        /* Lo que el cajero contó POR MÉTODO no se guardó nunca en estas cajas.
+           Van en 0 y el papel lo dice: inventar el reparto sería escribir un
+           arqueo que nadie hizo. */
+        cash_total: 0, card_total: 0, sinpe_total: 0,
+        closing_amount: contado,
+        expected_amount: esperado,
+        difference: contado - esperado,
+        non_countable_sales: porMetodo.credit + porMetodo.transfer + porMetodo.other,
+        invoices_count: vivas.length,
+        invoices_total: vivas.reduce((t, i) => t + Number(i.total || 0), 0),
+        voids_count: anuladas.length,
+        voids_total: anuladas.reduce((t, i) => t + Number(i.total || 0), 0),
+        voids: anuladas.map(i => ({
+          numero: i.invoice_number ?? null,
+          cliente: i.customer_name ?? null,
+          amount: Number(i.total || 0),
+          motivo: i.void_reason ?? null,
+        })),
+        reservations_total: abonos.reduce((t, a) => t + a.amount, 0),
+        reservations_count: abonos.length,
+        reservations_by_method: Object.values(porMedio).sort((x, y) => y.amount - x.amount),
+        reservations: abonos,
+        cash_movements: movimientos,
+        opening_usd: Number(ses.opening_usd ?? 0),
+        closing_usd: Number(ses.closing_usd ?? 0),
+        notes: ses.notes ?? null,
+      },
+    });
+  } catch (err: any) { return fail(c, err.message, 500); }
+});
+
 // PATCH /:id/opening — corrige el FONDO de una caja que ya está abierta.
 //
 // Hace falta porque la caja puede haberse abierto sola en ₡0 (negocios con "no
@@ -360,16 +552,28 @@ cashSessions.post('/:id/close', async (c) => {
       }
     }
 
-    const { data, error } = await db.from('cash_sessions').update({
+    const cambios: Record<string, any> = {
       closing_amount: parsed.data.closing_amount,
       closing_usd:    parsed.data.closing_usd ?? null,
       closing_date:   parsed.data.closed_at ?? new Date().toISOString(),
       status:         'closed',
       notes:          parsed.data.notes,
       updated_at:     new Date().toISOString(),
-    }).eq('id', id).eq('tenant_id', tenantId).select().single();
-    if (error) throw new Error(error.message);
-    return ok(c, data);
+    };
+    if (parsed.data.cierre_detalle) cambios.cierre_detalle = parsed.data.cierre_detalle;
+
+    let res = await db.from('cash_sessions').update(cambios)
+      .eq('id', id).eq('tenant_id', tenantId).select().single();
+    /* `cierre_detalle` es de la migración 152: si no corrió, la caja se cierra
+       igual (sin poder reimprimir el detalle después). Perder el detalle es
+       molesto; no poder CERRAR la caja deja al negocio sin poder trabajar. */
+    if (res.error && /cierre_detalle/.test(res.error.message ?? '')) {
+      const { cierre_detalle: _d, ...resto } = cambios;
+      res = await db.from('cash_sessions').update(resto)
+        .eq('id', id).eq('tenant_id', tenantId).select().single();
+    }
+    if (res.error) throw new Error(res.error.message);
+    return ok(c, res.data);
   } catch (err: any) { return fail(c, err.message, 500); }
 });
 
