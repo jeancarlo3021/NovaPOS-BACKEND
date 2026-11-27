@@ -327,7 +327,7 @@ cashSessions.get('/:id/cierre', async (c) => {
     }
 
     // ── Rearmar desde las ventas del turno ──────────────────────────────────
-    const COLS_FACT = 'total, payment_method, payments, status, is_delivery, exclude_from_close, currency, invoice_number, customer_name';
+    const COLS_FACT = 'total, payment_method, payments, status, is_delivery, exclude_from_close, currency, invoice_number, customer_name, issued_at, document_type';
     let fq: any = await db.from('invoices')
       .select(`${COLS_FACT}, void_reason`)
       .eq('tenant_id', tenantId).eq('cash_session_id', id).limit(2000);
@@ -423,11 +423,60 @@ cashSessions.get('/:id/cierre', async (c) => {
         || String((u as any)?.email ?? '').split('@')[0] || 'Vendedor';
     }
 
-    /* El ESPERADO con el mismo criterio del cierre: fondo + lo que entró en
-       efectivo + entradas − salidas. El crédito y las transferencias no dejan
-       plata en la gaveta. */
-    const esperado = Number(ses.opening_amount || 0) + porMetodo.cash + entradas - salidas;
+    /**
+     * EL DESGLOSE QUE SÍ ESTABA GUARDADO.
+     *
+     * El cierre viene escribiendo en `notes` una línea «Desglose: {…}» con lo
+     * que el cajero contó por método, el esperado y la diferencia, desde mucho
+     * antes de la columna `cierre_detalle`. Estaba ahí todo el tiempo: el
+     * rearmado lo ignoraba y ponía ceros, así que el reimpreso de una caja
+     * vieja salía sin arqueo por método aunque el dato existiera.
+     *
+     * Lo que NO está es el conteo por denominación (cuántos billetes de cada
+     * uno): eso vive solo en `cierre_detalle`, y de un cierre viejo no se puede
+     * recuperar. Esa sigue siendo la única parte que el papel declara perdida.
+     */
+    const desglose = (() => {
+      const txt = String(ses.notes ?? '');
+      const i = txt.indexOf('Desglose:');
+      if (i < 0) return null;
+      const j = txt.indexOf('{', i);
+      if (j < 0) return null;
+      try { return JSON.parse(txt.slice(j)); } catch { return null; }
+    })();
+    /** La nota que de verdad escribió el cajero, sin el JSON del desglose. */
+    const notaHumana = (() => {
+      const txt = String(ses.notes ?? '');
+      const i = txt.indexOf('Desglose:');
+      const limpio = (i < 0 ? txt : txt.slice(0, i)).trim();
+      return limpio.length > 0 ? limpio : null;
+    })();
+
+    /**
+     * EL ESPERADO, con el mismo criterio del cierre.
+     *
+     * Decía `fondo + efectivo + entradas − salidas`, pero lo compara contra
+     * `closing_amount`, que es TODO lo contado —efectivo, tarjeta y SINPE
+     * juntos—. Un turno con ₡125.800 de SINPE reimprimía un SOBRANTE de
+     * ₡17.800 donde el original decía un FALTANTE de ₡116.000: el reimpreso
+     * contradecía al papel que estaba reemplazando, que es la peor forma de
+     * fallar que tiene un arqueo.
+     *
+     * Si el desglose guardado trae su esperado, manda ese: una reimpresión es
+     * una COPIA del arqueo que se hizo, no un recálculo de hoy.
+     */
+    const esperadoCalc = Number(ses.opening_amount || 0)
+      + porMetodo.cash + porMetodo.card + porMetodo.sinpe + entradas - salidas;
+    const esperado = Number.isFinite(Number(desglose?.expectedTotal))
+      ? Number(desglose.expectedTotal) : esperadoCalc;
     const contado = Number(ses.closing_amount ?? 0);
+    const contadoPorMetodo = {
+      cash: Number(desglose?.counted?.cash ?? 0),
+      card: Number(desglose?.counted?.card ?? 0),
+      sinpe: Number(desglose?.counted?.sinpe ?? 0),
+    };
+    /** ¿Se pudo recuperar lo contado por método, o va en ceros? */
+    const conteoRecuperado = !!desglose?.counted;
 
     return ok(c, {
       reconstruido: true,
@@ -439,13 +488,17 @@ cashSessions.get('/:id/cierre', async (c) => {
         opening_amount: Number(ses.opening_amount || 0),
         system_cash: porMetodo.cash, system_card: porMetodo.card, system_sinpe: porMetodo.sinpe,
         system_credit: porMetodo.credit, system_transfer: porMetodo.transfer, system_other: porMetodo.other,
-        /* Lo que el cajero contó POR MÉTODO no se guardó nunca en estas cajas.
-           Van en 0 y el papel lo dice: inventar el reparto sería escribir un
-           arqueo que nadie hizo. */
-        cash_total: 0, card_total: 0, sinpe_total: 0,
+        /* Lo contado por método, recuperado del desglose guardado. Si esa
+           caja no lo tiene, van en 0 y el papel lo dice: inventar el reparto
+           sería escribir un arqueo que nadie hizo. */
+        cash_total: contadoPorMetodo.cash,
+        card_total: contadoPorMetodo.card,
+        sinpe_total: contadoPorMetodo.sinpe,
+        conteo_recuperado: conteoRecuperado,
         closing_amount: contado,
         expected_amount: esperado,
-        difference: contado - esperado,
+        difference: Number.isFinite(Number(desglose?.difference))
+          ? Number(desglose.difference) : contado - esperado,
         non_countable_sales: porMetodo.credit + porMetodo.transfer + porMetodo.other,
         invoices_count: vivas.length,
         invoices_total: vivas.reduce((t, i) => t + Number(i.total || 0), 0),
@@ -457,6 +510,19 @@ cashSessions.get('/:id/cierre', async (c) => {
           amount: Number(i.total || 0),
           motivo: i.void_reason ?? null,
         })),
+        /* Venta por venta, en orden. Es con lo que se cuadra un arqueo que no
+           cuadra, y el rearmado no lo traía: el reimpreso salía con los totales
+           y sin nada que revisar. */
+        sales: vivas
+          .map(i => ({
+            number: String(i.invoice_number ?? ''),
+            time: String(i.issued_at ?? ''),
+            method: String(i.payment_method ?? ''),
+            total: Number(i.total ?? 0),
+            kind: String(i.document_type ?? ''),
+            cliente: String(i.customer_name ?? ''),
+          }))
+          .sort((x, y) => x.time.localeCompare(y.time)),
         reservations_total: abonos.reduce((t, a) => t + a.amount, 0),
         reservations_count: abonos.length,
         reservations_by_method: Object.values(porMedio).sort((x, y) => y.amount - x.amount),
@@ -464,7 +530,9 @@ cashSessions.get('/:id/cierre', async (c) => {
         cash_movements: movimientos,
         opening_usd: Number(ses.opening_usd ?? 0),
         closing_usd: Number(ses.closing_usd ?? 0),
-        notes: ses.notes ?? null,
+        // La nota del cajero, sin el JSON del desglose: el papel imprime esto
+        // tal cual, y un volcado de JSON en el tiquete no lo lee nadie.
+        notes: notaHumana,
       },
     });
   } catch (err: any) { return fail(c, err.message, 500); }
