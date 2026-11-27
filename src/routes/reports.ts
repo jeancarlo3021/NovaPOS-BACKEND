@@ -410,6 +410,102 @@ reports.get('/vouchers', async (c) => {
     const voids = rows.filter(r => r.status === 'cancelled');
     const payments = rows.filter(r => r.status !== 'cancelled');
 
+    /**
+     * LAS FACTURAS A CRÉDITO, CON SU ESTADO DE COBRO.
+     *
+     * Estaban en el reporte, pero mezcladas con los cobros y sumadas al total
+     * de «pagos»: una venta a crédito se leía como plata que entró. No entró
+     * nada; quedó una cuenta por cobrar. Y no había forma de ver, desde el
+     * reporte, si alguien ya había abonado o si la factura sigue entera sin
+     * cobrar —que es justo lo que se va a mirar.
+     *
+     * Se resuelve en dos consultas para todas las facturas del rango, no una
+     * por factura: un reporte de mil comprobantes no puede hacer mil viajes.
+     */
+    const esCredito = (r: any) => String(r.payment_method ?? '') === 'credit'
+      || (Array.isArray(r.payments) && r.payments.some((p: any) => String(p?.method ?? '') === 'credit'));
+    /** Lo que de esta factura quedó a crédito (de un pago mixto, solo su parte). */
+    const parteCredito = (r: any): number => {
+      const splits = Array.isArray(r.payments) ? r.payments : [];
+      if (splits.length > 0) {
+        return splits
+          .filter((p: any) => String(p?.method ?? '') === 'credit')
+          .reduce((t: number, p: any) => t + Number(p?.amount || 0), 0);
+      }
+      return String(r.payment_method ?? '') === 'credit' ? Number(r.total || 0) : 0;
+    };
+
+    const aCredito = payments.filter(esCredito);
+    if (aCredito.length > 0) {
+      const ids = aCredito.map(r => r.id);
+      const cuentasPorFactura = new Map<string, any>();
+      /* Por tandas: `in` con mil ids es una URL que el servidor rechaza. */
+      for (let i = 0; i < ids.length; i += 200) {
+        const { data: cs } = await db.from('accounts_receivable')
+          .select('id, invoice_id, total_amount, paid_amount, status, due_date, paid_at')
+          .eq('tenant_id', tenantId).in('invoice_id', ids.slice(i, i + 200));
+        for (const cta of ((cs ?? []) as any[])) {
+          if (cta.invoice_id) cuentasPorFactura.set(String(cta.invoice_id), cta);
+        }
+      }
+
+      /* Los abonos de esas cuentas: cuántos y el último. El abono ANULADO no
+         cuenta —no entró esa plata—, y su monto ya está fuera de `paid_amount`. */
+      const abonosPorCuenta = new Map<string, { abonos: number; ultimo: string | null }>();
+      const cuentaIds = [...cuentasPorFactura.values()].map(c => String(c.id));
+      for (let i = 0; i < cuentaIds.length; i += 200) {
+        const lote = cuentaIds.slice(i, i + 200);
+        let pr: any = await db.from('accounts_receivable_payments')
+          .select('receivable_id, created_at, voided_at')
+          .eq('tenant_id', tenantId).in('receivable_id', lote);
+        if (pr.error && /voided_at/.test(pr.error.message ?? '')) {
+          pr = await db.from('accounts_receivable_payments')
+            .select('receivable_id, created_at')
+            .eq('tenant_id', tenantId).in('receivable_id', lote);
+        }
+        for (const ab of ((pr.data ?? []) as any[])) {
+          if (ab.voided_at) continue;
+          const k = String(ab.receivable_id);
+          const acc = abonosPorCuenta.get(k) ?? { abonos: 0, ultimo: null };
+          acc.abonos += 1;
+          const f = String(ab.created_at ?? '');
+          if (f && (!acc.ultimo || f > acc.ultimo)) acc.ultimo = f;
+          abonosPorCuenta.set(k, acc);
+        }
+      }
+
+      for (const r of aCredito) {
+        const credito = parteCredito(r);
+        const cta = cuentasPorFactura.get(String(r.id));
+        if (!cta) {
+          /* Crédito SIN cuenta por cobrar: nadie le va a cobrar nunca porque no
+             existe el registro. Se marca en vez de esconderse. */
+          r.credito = { monto: credito, sin_cuenta: true, pagado: 0, saldo: credito, abonos: 0 };
+          continue;
+        }
+        const ab = abonosPorCuenta.get(String(cta.id)) ?? { abonos: 0, ultimo: null };
+        const total = Number(cta.total_amount || 0);
+        const pagado = Number(cta.paid_amount || 0);
+        r.credito = {
+          monto: credito,
+          cuenta_id: cta.id,
+          total,
+          pagado,
+          saldo: Math.max(0, Math.round((total - pagado) * 100) / 100),
+          estado: cta.status ?? null,
+          vencimiento: cta.due_date ?? null,
+          abonos: ab.abonos,
+          ultimo_abono: ab.ultimo,
+          sin_cuenta: false,
+        };
+      }
+    }
+
+    const creditTotal = aCredito.reduce((t, r) => t + Number(r.credito?.monto ?? 0), 0);
+    const creditPagado = aCredito.reduce((t, r) => t + Number(r.credito?.pagado ?? 0), 0);
+    const creditSaldo = aCredito.reduce((t, r) => t + Number(r.credito?.saldo ?? 0), 0);
+    const creditSinCuenta = aCredito.filter(r => r.credito?.sin_cuenta).length;
+
     const totalPagos = payments.reduce((s, r) => s + Number(r.total ?? 0), 0);
     const totalAnulado = voids.reduce((s, r) => s + Number(r.total ?? 0), 0);
     // Desglose de pagos por método (incluye splits de pago mixto).
@@ -422,10 +518,19 @@ reports.get('/vouchers', async (c) => {
 
     return ok(c, {
       payments, voids,
+      credits: aCredito,
       summary: {
         payments_count: payments.length, payments_total: totalPagos,
         voids_count: voids.length, voids_total: totalAnulado,
         by_method: byMethod,
+        /* El crédito, aparte. `payments_total` incluye las ventas a crédito
+           porque es el total facturado; sin este desglose ese número se lee
+           como plata cobrada, y una parte todavía está en la calle. */
+        credit_count: aCredito.length,
+        credit_total: Math.round(creditTotal * 100) / 100,
+        credit_pagado: Math.round(creditPagado * 100) / 100,
+        credit_saldo: Math.round(creditSaldo * 100) / 100,
+        credit_sin_cuenta: creditSinCuenta,
       },
     });
   } catch (err: any) { return fail(c, err.message, 500); }
